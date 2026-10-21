@@ -1,0 +1,10 @@
+{
+  "name": "self-context",
+  "version": "0.1.0",
+  "description": "Lets a session read how full its context window is (tokens, window, percentage, and whether auto-compact is on), to decide at a break between two pieces of work whether to compact now.",
+  "author": { "name": "moefingers", "url": "https://github.com/moefingers" },
+  "homepage": "https://github.com/moefingers/claude-code-self-tools/tree/main/plugins/self-context#readme",
+  "repository": "https://github.com/moefingers/claude-code-self-tools",
+  "license": "MIT",
+  "keywords": ["context-window", "compact", "mod"]
+}

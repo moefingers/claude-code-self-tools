@@ -1,0 +1,11 @@
+{
+  "name": "self-remote-control",
+  "version": "0.1.0",
+  "description": "Lets a session report on its own Remote Control and turn it on: it connects only when the session reads as not connected, so it never toggles a live connection off.",
+  "author": { "name": "moefingers", "url": "https://github.com/moefingers" },
+  "homepage": "https://github.com/moefingers/claude-code-self-tools/tree/main/plugins/self-remote-control#readme",
+  "repository": "https://github.com/moefingers/claude-code-self-tools",
+  "license": "MIT",
+  "keywords": ["remote-control", "mobile", "mod"],
+  "types": "./types/index.d.ts"
+}

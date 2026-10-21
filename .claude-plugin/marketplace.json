@@ -1,6 +1,37 @@
 {
-  "name": "claude-code-self-compact-plugin",
-  "description": "The self-compact plugin for Claude Code: a session compacts itself between pieces of work and carries on.",
+  "name": "claude-code-self-tools",
+  "description": "Small Claude Code plugins that let a session act on itself: compact, reload its plugins, read its context window, switch its effort or model, wake itself later, and turn on Remote Control. Install only the ones you want.",
   "owner": { "name": "moefingers", "url": "https://github.com/moefingers" },
-  "plugins": [{ "name": "self-compact", "source": "./" }]
+  "plugins": [
+    {
+      "name": "self-compact",
+      "source": "./plugins/self-compact",
+      "description": "Compacts the conversation once the turn ends, at the break between two pieces of work, then resumes on its own."
+    },
+    {
+      "name": "self-reload",
+      "source": "./plugins/self-reload",
+      "description": "Reloads the session's plugins once the turn ends, as /reload-plugins does, then resumes on its own."
+    },
+    {
+      "name": "self-context",
+      "source": "./plugins/self-context",
+      "description": "Reads how full the context window is, and whether auto-compact is on, to decide whether to compact at a break."
+    },
+    {
+      "name": "self-config",
+      "source": "./plugins/self-config",
+      "description": "Switches the session's effort level and model, and nothing else, as the turn ends, announced from the old value to the new."
+    },
+    {
+      "name": "self-wake",
+      "source": "./plugins/self-wake",
+      "description": "Wakes the session some minutes after the turn ends with a note it sends itself, to check back on slow work."
+    },
+    {
+      "name": "self-remote-control",
+      "source": "./plugins/self-remote-control",
+      "description": "Reports on the session's Remote Control and connects it, never toggling a live connection off."
+    }
+  ]
 }

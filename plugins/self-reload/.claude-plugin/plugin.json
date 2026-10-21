@@ -1,0 +1,11 @@
+{
+  "name": "self-reload",
+  "version": "0.1.0",
+  "description": "Lets a session reload its own plugins once the current turn ends, as /reload-plugins does, then resume on its own: a tool queues the reload, and it runs as the turn ends.",
+  "author": { "name": "moefingers", "url": "https://github.com/moefingers" },
+  "homepage": "https://github.com/moefingers/claude-code-self-tools/tree/main/plugins/self-reload#readme",
+  "repository": "https://github.com/moefingers/claude-code-self-tools",
+  "license": "MIT",
+  "keywords": ["reload", "plugins", "mod"],
+  "types": "./types/index.d.ts"
+}

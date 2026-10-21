@@ -1,0 +1,11 @@
+{
+  "name": "self-wake",
+  "version": "0.1.0",
+  "description": "Lets a session wake itself later: a tool sets a wake-up some minutes after the turn ends, and the session then sends itself a note that starts a turn of its own.",
+  "author": { "name": "moefingers", "url": "https://github.com/moefingers" },
+  "homepage": "https://github.com/moefingers/claude-code-self-tools/tree/main/plugins/self-wake#readme",
+  "repository": "https://github.com/moefingers/claude-code-self-tools",
+  "license": "MIT",
+  "keywords": ["wake", "timer", "mod"],
+  "types": "./types/index.d.ts"
+}
