@@ -1,6 +1,6 @@
 {
   "name": "claude-code-self-tools",
-  "description": "Small Claude Code plugins that let a session act on itself: compact, reload its plugins, read its context window, switch its effort or model, wake itself later, and turn on Remote Control. Install only the ones you want.",
+  "description": "Small Claude Code plugins that let a session act on itself: compact, reload its plugins, read its context window, wake itself later, and turn on Remote Control. Install only the ones you want.",
   "owner": { "name": "moefingers", "url": "https://github.com/moefingers" },
   "plugins": [
     {
@@ -17,11 +17,6 @@
       "name": "self-context",
       "source": "./plugins/self-context",
       "description": "Reads how full the context window is, and whether auto-compact is on, to decide whether to compact at a break."
-    },
-    {
-      "name": "self-config",
-      "source": "./plugins/self-config",
-      "description": "Switches the session's effort level and model, and nothing else, as the turn ends, announced from the old value to the new."
     },
     {
       "name": "self-wake",

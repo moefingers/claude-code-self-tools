@@ -1,6 +1,6 @@
 # claude-code-self-tools
 
-Small [Claude Code](https://code.claude.com/docs) plugins that let a session act on itself. Each one gives Claude a tool or two for something you would otherwise do by hand from the prompt: compact the conversation, reload plugins, check the context window, switch the effort level or model, come back to a task later, turn on Remote Control.
+Small [Claude Code](https://code.claude.com/docs) plugins that let a session act on itself. Each one gives Claude a tool or two for something you would otherwise do by hand from the prompt: compact the conversation, reload plugins, check the context window, come back to a task later, turn on Remote Control.
 
 Each plugin is separate. Install only the ones you want.
 
@@ -11,7 +11,6 @@ Each plugin is separate. Install only the ones you want.
 | [self-compact](plugins/self-compact) | `compact_after_turn` | Compacts the conversation once the turn ends, keeping what the call says, then can resume on its own. | At the break between two pieces of work, so the next piece starts with room in the context window. |
 | [self-reload](plugins/self-reload) | `reload_plugins_after_turn` | Runs `/reload-plugins` once the turn ends, then can resume on its own. | After it has edited a plugin and needs the change live, for example to try a tool it just changed. |
 | [self-context](plugins/self-context) | `context_usage` | Reports the tokens used, the window, the percentage and whether auto-compact is on. Read-only. | At a break between pieces of work, to decide whether to compact now. |
-| [self-config](plugins/self-config) | `set_effort`, `set_model` | Switches the effort level (through `/effort`) or the model (through the `/config` Model row) once the turn ends, and nothing else. | When you ask for another effort level or model, or when its instructions let it choose one for the work ahead. |
 | [self-wake](plugins/self-wake) | `wake_after`, `cancel_wake` | Some minutes after the turn ends, sends the session a note that starts a turn of its own. | When it has to wait on something slow (a deploy, a long job) that won't report back by itself. |
 | [self-remote-control](plugins/self-remote-control) | `remote_control` | Reports whether this session's Remote Control is connected, and connects it if it isn't. | When you ask whether you can reach the session from your phone, or to make it reachable before you step away. |
 
@@ -33,7 +32,6 @@ Then install each plugin you want by name:
 /plugin install self-compact@claude-code-self-tools
 /plugin install self-reload@claude-code-self-tools
 /plugin install self-context@claude-code-self-tools
-/plugin install self-config@claude-code-self-tools
 /plugin install self-wake@claude-code-self-tools
 /plugin install self-remote-control@claude-code-self-tools
 ```
@@ -47,7 +45,6 @@ claude plugin marketplace add moefingers/claude-code-self-tools
 claude plugin install self-compact@claude-code-self-tools
 claude plugin install self-reload@claude-code-self-tools
 claude plugin install self-context@claude-code-self-tools
-claude plugin install self-config@claude-code-self-tools
 claude plugin install self-wake@claude-code-self-tools
 claude plugin install self-remote-control@claude-code-self-tools
 ```
@@ -60,11 +57,11 @@ A mod runs inside Claude Code with your permissions. To see what one hooks and c
 
 What they have in common:
 
-- **Actions wait for the turn to end.** A compaction, a reload, a switch of effort or model, a wake-up and a Remote Control connect are all queued by the tool call and run once the turn ends with Claude's answer. Claude Code can't run them while the turn is running, and a switch takes effect from the next turn anyway. Claude should end its turn after calling one of these tools.
+- **Actions wait for the turn to end.** A compaction, a reload, a wake-up and a Remote Control connect are all queued by the tool call and run once the turn ends with Claude's answer. Claude Code can't run them while the turn is running. Claude should end its turn after calling one of these tools.
 - **An interrupted turn cancels what it queued.** If you stop the turn (Esc or **Stop**), or it ends any way other than with Claude's answer, what that turn queued is dropped, and a notice says so. Something set in an earlier turn, such as an armed wake-up, stands.
 - **Subagents are refused.** These tools act on the main conversation. A subagent that calls one is told why it can't, and to finish its piece and return its result so the main session can act. `context_usage` refuses a subagent too, because the figures it reports are the main conversation's.
-- **Each change is announced.** A toast tells you what ran, and the tool result tells Claude. When Claude Code refuses an action (a command a plugin may not run, a setting that may not change), a toast says why, and Claude is told on its next turn.
-- **Built-in commands run as if you typed them.** self-reload runs `/reload-plugins`, self-config runs `/effort`, and self-remote-control runs `/remote-control`. Their lines show in the transcript, as yours would.
+- **Each change is announced.** A toast tells you what ran, and the tool result tells Claude. When Claude Code refuses an action (a command a plugin may not run), a toast says why, and Claude is told on its next turn.
+- **Built-in commands run as if you typed them.** self-reload runs `/reload-plugins`, and self-remote-control runs `/remote-control`. Their lines show in the transcript, as yours would. A command that asks for confirmation shows you its dialog and waits for your answer, as it would if you had typed it.
 
 ### Reloads
 
@@ -80,13 +77,9 @@ A reload replaces each plugin's code. What a plugin keeps in Claude Code's sessi
 
 The attached clients that `status` lists are the screens drawing the session now. A connected session with no phone open shows only the terminal, so that list doesn't tell you whether the session is connected.
 
-### Effort and model
+### Why there is no effort or model switch
 
-`set_effort` runs `/effort <level>`. As when you type a level after `/effort`, Claude Code also keeps it as your default for new sessions, except `max`, which applies to the current session only. A model takes only the levels it supports; the toast shows what `/effort` answered.
-
-`set_model` changes the `/config` menu's Model row, so the change is kept as any change made in `/config` is. It takes only the names that row offers.
-
-self-config changes nothing else: no other `/config` row, no other command. Its tests check this.
+Claude Code asks you to confirm a change of effort level partway through a conversation, because the next message then re-processes the whole history. A plugin that runs `/effort` gets the same dialog, so the switch can't run unattended. Effort and model stay yours to change with `/effort` and `/model`.
 
 ## Tell sessions when to use them
 
@@ -94,7 +87,6 @@ The tool descriptions say when to call each tool and when not to. To make it a h
 
 > - **Between pieces of work:** when you close one piece and move to the next, write your notes first. Check `context_usage`; if the window is filling, call `compact_after_turn` with `keep` and with `resume` naming the next piece. Leave `resume` out only when the next step waits on me, another session or a check.
 > - **After editing a plugin:** call `reload_plugins_after_turn` with `resume` saying what to try next, and end the turn.
-> - **Effort and model:** switch them with `set_effort` and `set_model` only when I ask. (Or: you may lower effort for routine work and raise it for hard problems; say so when you do.)
 > - **Waiting on something slow:** when a deploy, a long job or a check will take a while and nothing will tell you it's done, call `wake_after` with the minutes and a note saying what to check, and end the turn. Cancel it with `cancel_wake` if the answer comes first.
 > - **Remote Control:** when I say I'm stepping away, call `remote_control` with `connect`. Never try to disconnect it.
 
