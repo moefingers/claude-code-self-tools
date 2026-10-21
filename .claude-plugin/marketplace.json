@@ -1,0 +1,6 @@
+{
+  "name": "claude-code-self-compact-plugin",
+  "description": "The self-compact plugin for Claude Code: a session compacts itself between pieces of work and carries on.",
+  "owner": { "name": "moefingers", "url": "https://github.com/moefingers" },
+  "plugins": [{ "name": "self-compact", "source": "./" }]
+}

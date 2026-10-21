@@ -1,0 +1,11 @@
+{
+  "name": "self-compact",
+  "version": "0.2.2",
+  "description": "Lets a session compact itself as it closes one piece of work and moves to the next, then resume on its own: a tool queues the compaction, and it runs as the turn ends.",
+  "author": { "name": "moefingers", "url": "https://github.com/moefingers" },
+  "homepage": "https://github.com/moefingers/claude-code-self-compact-plugin#readme",
+  "repository": "https://github.com/moefingers/claude-code-self-compact-plugin",
+  "license": "MIT",
+  "keywords": ["compact", "context-window", "mod"],
+  "types": "./types/index.d.ts"
+}
