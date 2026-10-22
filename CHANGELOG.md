@@ -2,6 +2,10 @@
 
 Each entry names a plugin and its version, as `version` in `plugins/<name>/.claude-plugin/plugin.json` has it.
 
+## self-mcp 0.1.0 (2026-10-22)
+
+New: `reconnect_mcp_after_turn` runs `/mcp reconnect <server>`, or `/mcp reconnect all`, once the turn ends: the typed form of the `/mcp` menu's Reconnect, so it runs unattended. Its outcome is Claude Code's own transcript line; the toast and the optional `resume`, or a note Claude reads on its next turn, point to it. It refuses subagents, and an interrupted turn cancels it.
+
 ## 2026-10-21: a marketplace of plugins
 
 The repository is now `claude-code-self-tools`: a marketplace of separate plugins under `plugins/`, each installed by name, so you install only the ones you want.

@@ -1,0 +1,11 @@
+{
+  "name": "self-mcp",
+  "version": "0.1.0",
+  "description": "Lets a session reconnect an MCP server that broke (one by name, or all) once the current turn ends, as /mcp reconnect does, then resume on its own.",
+  "author": { "name": "moefingers", "url": "https://github.com/moefingers" },
+  "homepage": "https://github.com/moefingers/claude-code-self-tools/tree/main/plugins/self-mcp#readme",
+  "repository": "https://github.com/moefingers/claude-code-self-tools",
+  "license": "MIT",
+  "keywords": ["mcp", "reconnect", "mod"],
+  "types": "./types/index.d.ts"
+}

@@ -1,7 +1,10 @@
 {
   "name": "claude-code-self-tools",
-  "description": "Small Claude Code plugins that let a session act on itself: compact, reload its plugins, read its context window, wake itself later, and turn on Remote Control. Install only the ones you want.",
-  "owner": { "name": "moefingers", "url": "https://github.com/moefingers" },
+  "description": "Small Claude Code plugins that let a session act on itself: compact, reload its plugins, reconnect an MCP server, read its context window, wake itself later, and turn on Remote Control. Install only the ones you want.",
+  "owner": {
+    "name": "moefingers",
+    "url": "https://github.com/moefingers"
+  },
   "plugins": [
     {
       "name": "self-compact",
@@ -12,6 +15,11 @@
       "name": "self-reload",
       "source": "./plugins/self-reload",
       "description": "Reloads the session's plugins once the turn ends, as /reload-plugins does, then resumes on its own."
+    },
+    {
+      "name": "self-mcp",
+      "source": "./plugins/self-mcp",
+      "description": "Reconnects an MCP server that broke (one by name, or all) once the turn ends, as /mcp reconnect does, then resumes on its own."
     },
     {
       "name": "self-context",
