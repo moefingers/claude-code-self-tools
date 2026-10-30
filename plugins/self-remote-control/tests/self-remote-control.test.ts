@@ -12,19 +12,20 @@ type Options = {
   surfaces?: RenderSurface[]
   /** Commands the engine refuses. */
   refused?: readonly string[]
-  /** A remote-control run that doesn't change the connection: it stays connected, or not connected. */
-  stuck?: 'connected' | 'not connected'
+  /** A remote-control run while not connected doesn't connect. */
+  failsToConnect?: boolean
   /** Why the engine drops a prompt a plugin submits; left out, it enters. */
   dropped?: string
 }
 
 /**
- * The engine beneath the plugin. Its remote-control command is a toggle, as the real one is: run
- * while connected, it disconnects; run while not, it connects, titled with its argument. `rc` is
- * what the command list shows for it (`description` null: no such command in this session) and the
- * title the app shows; `local` is the session's own title, which /rename sets.
+ * The engine beneath the plugin. Its remote-control command, run while not connected, connects,
+ * titled with its argument; run while connected, it changes nothing, as the real one opens its panel
+ * in the terminal (the tests hold that the plugin never runs it then). `rc` is what the command list
+ * shows for it (`description` null: no such command in this session) and the title the app shows;
+ * `local` is the session's own title, which /rename sets.
  */
-function engine(on: On, { description = NOT_CONNECTED, remoteControl = 'false', surfaces = ['terminal'], refused = [], stuck, dropped }: Options = {}) {
+function engine(on: On, { description = NOT_CONNECTED, remoteControl = 'false', surfaces = ['terminal'], refused = [], failsToConnect, dropped }: Options = {}) {
   const commands: string[] = []
   const prompts: string[] = []
   const toasts: string[] = []
@@ -71,13 +72,9 @@ function engine(on: On, { description = NOT_CONNECTED, remoteControl = 'false', 
     commands.push(e.args === '' ? e.command : `${e.command} ${e.args}`)
     if (refused.includes(e.command)) return next(e)
     if (e.command === 'rename') local.title = e.args
-    if (e.command === 'remote-control') {
-      if (rc.description === CONNECTED) {
-        if (stuck !== 'connected') rc.description = NOT_CONNECTED
-      } else if (stuck !== 'not connected') {
-        rc.description = CONNECTED
-        rc.title = e.args === '' ? undefined : e.args
-      }
+    if (e.command === 'remote-control' && rc.description !== CONNECTED && !failsToConnect) {
+      rc.description = CONNECTED
+      rc.title = e.args === '' ? undefined : e.args
     }
     return { text: '' }
   })
@@ -178,14 +175,14 @@ test("a subagent's prompt doesn't set the session title", async ($, on) => {
   expect(commands).toEqual(['remote-control main title'])
 })
 
-test('connect never runs the toggle while connected', async ($, on) => {
+test('connect never runs the command while connected', async ($, on) => {
   const { commands, rc, clock } = engine(on, { description: CONNECTED })
   await $.session.start(start)
 
   const already = await $.tool.call({ tool: TOOL, action: 'connect' })
   expect(already.result).toBe('Remote Control is already connected; nothing to do.')
   const named = await $.tool.call({ tool: TOOL, action: 'connect', name: 'billing export' })
-  expect(named.result).toMatch(/already connected; nothing to do\. To title it "billing export", call rename/)
+  expect(named.result).toBe('Remote Control is already connected; nothing to do. To title it "billing export", call rename.')
   await $.turn.complete({ ...answered, turnId: 't1' })
   await clock.advance(5000)
   expect(commands).toEqual([])
@@ -266,20 +263,20 @@ test('a subagent is refused', async ($, on) => {
   expect(commands).toEqual([])
 })
 
-test('rename while connected renames, then reconnects under the new name', async ($, on) => {
+test('rename while connected runs /rename only, and says the app may need a reconnect', async ($, on) => {
   const { commands, toasts, rc, local, clock } = engine(on, { description: CONNECTED })
   await $.session.start(start)
 
   const queued = await $.tool.call({ tool: TOOL, action: 'rename', name: 'billing export' })
-  expect(queued.result).toMatch(/^Queued: once this turn ends, the session is renamed "billing export", and Remote Control, connected now, reconnects under that name/)
+  expect(queued.result).toMatch(/^Queued: once this turn ends, the session's local title is set to "billing export" \(\/rename\); Remote Control isn't touched\. /)
+  expect(queued.result).toMatch(/if it doesn't, the session needs reconnecting, or renaming in the app\./)
   expect(commands).toEqual([])
   await $.turn.complete({ ...answered, turnId: 't1' })
   await clock.advance(20000)
-  expect(commands).toEqual(['rename billing export', 'remote-control', 'remote-control billing export'])
+  expect(commands).toEqual(['rename billing export'])
   expect(local.title).toBe('billing export')
   expect(rc.description).toBe(CONNECTED)
-  expect(rc.title).toBe('billing export')
-  expect(toasts).toContain('Remote Control reconnected as "billing export".')
+  expect(toasts).toContain('Session renamed "billing export".')
 })
 
 test('rename while not connected only renames, and does not connect', async ($, on) => {
@@ -287,17 +284,17 @@ test('rename while not connected only renames, and does not connect', async ($, 
   await $.session.start(start)
 
   const queued = await $.tool.call({ tool: TOOL, action: 'rename', name: 'billing export' })
-  expect(queued.result).toMatch(/Remote Control isn't connected, so only the local name changes; it doesn't connect\./)
+  expect(queued.result).toMatch(/Remote Control isn't connected; connect takes this title when it connects\./)
   await $.turn.complete({ ...answered, turnId: 't1' })
   await clock.advance(20000)
   expect(commands).toEqual(['rename billing export'])
   expect(local.title).toBe('billing export')
   expect(rc.description).toBe(NOT_CONNECTED)
-  expect(toasts).toContain('Session renamed "billing export". Remote Control isn\'t connected, so only the local name changed.')
+  expect(toasts).toContain('Session renamed "billing export".')
 })
 
 test('rename and connect in one turn rename, then connect under the new name', async ($, on) => {
-  const { commands, rc, clock } = engine(on)
+  const { commands, rc, toasts, clock } = engine(on)
   await $.session.start(start)
 
   await $.tool.call({ tool: TOOL, action: 'rename', name: 'billing export' })
@@ -307,49 +304,21 @@ test('rename and connect in one turn rename, then connect under the new name', a
   await clock.advance(20000)
   expect(commands).toEqual(['rename billing export', 'remote-control billing export'])
   expect(rc.title).toBe('billing export')
-})
-
-test('a reconnect whose connect does not take is tried again, then told plainly to the person and the model', async ($, on) => {
-  // Connected; the disconnect takes, and from then on connecting doesn't.
-  const { commands, toasts, rc, clock, session } = engine(on, { description: CONNECTED, stuck: 'not connected' })
-  await $.session.start(start)
-
-  await $.tool.call({ tool: TOOL, action: 'rename', name: 'billing export' })
-  await $.turn.complete({ ...answered, turnId: 't1' })
-  await clock.advance(20000)
-  expect(commands).toEqual(['rename billing export', 'remote-control', 'remote-control billing export', 'remote-control billing export'])
-  expect(rc.description).toBe(NOT_CONNECTED)
-  expect(toasts.some(t => t.startsWith('Remote Control is disconnected: ') && /after 2 tries/.test(t) && /Run \/remote-control/.test(t))).toBe(true)
-  const told = JSON.stringify(session.appended())
-  expect(told).toMatch(/Remote Control is disconnected: /)
-  expect(told).toMatch(/can't reach this session from their phone until it connects/)
-})
-
-test('a reconnect never runs the toggle again when the disconnect does not take', async ($, on) => {
-  // Connected, and the command doesn't disconnect it (as a status panel would not).
-  const { commands, toasts, rc, clock, session } = engine(on, { description: CONNECTED, stuck: 'connected' })
-  await $.session.start(start)
-
-  await $.tool.call({ tool: TOOL, action: 'rename', name: 'billing export' })
-  await $.turn.complete({ ...answered, turnId: 't1' })
-  await clock.advance(20000)
-  expect(commands).toEqual(['rename billing export', 'remote-control'])
-  expect(rc.description).toBe(CONNECTED)
-  expect(toasts).toContain('Session renamed "billing export", but Remote Control didn\'t disconnect, so it is still connected under its old title.')
-  expect(JSON.stringify(session.appended())).toMatch(/still connected under its old title\. Nothing more ran\./)
+  expect(toasts).toContain('Session renamed "billing export". Remote Control connected as "billing export".')
 })
 
 test('a refused rename runs nothing else, and is told to the person and the model', async ($, on) => {
-  const { commands, toasts, rc, clock, session } = engine(on, { description: CONNECTED, refused: ['rename'] })
+  const { commands, toasts, rc, clock, session } = engine(on, { refused: ['rename'] })
   await $.session.start(start)
 
   await $.tool.call({ tool: TOOL, action: 'rename', name: 'billing export' })
+  await $.tool.call({ tool: TOOL, action: 'connect' })
   await $.turn.complete({ ...answered, turnId: 't1' })
   await clock.advance(20000)
   expect(commands).toEqual(['rename billing export'])
-  expect(rc.description).toBe(CONNECTED)
+  expect(rc.description).toBe(NOT_CONNECTED)
   expect(toasts.some(t => t.startsWith('Session not renamed:'))).toBe(true)
-  expect(JSON.stringify(session.appended())).toMatch(/rename to \\"billing export\\" you queued didn't run/)
+  expect(JSON.stringify(session.appended())).toMatch(/rename to \\"billing export\\" you queued didn't run: .*Nothing else ran, the Remote Control connect included\./)
 })
 
 test('rename needs a name on one line, within what /rename keeps', async ($, on) => {
@@ -391,42 +360,43 @@ test('with resume, the next turn starts with what happened, and the model gets n
   expect(session.appended()).toEqual([])
 })
 
-test('with resume, a reconnect that took starts the next turn saying so', async ($, on) => {
+test('with resume, a rename starts the next turn saying so', async ($, on) => {
   const { commands, prompts, clock } = engine(on, { description: CONNECTED })
   await $.session.start(start)
 
   await $.tool.call({ tool: TOOL, action: 'rename', name: 'billing export', resume: 'Carry on with the export.' })
   await $.turn.complete({ ...answered, turnId: 't1' })
   await clock.advance(20000)
-  expect(commands).toEqual(['rename billing export', 'remote-control', 'remote-control billing export'])
-  expect(prompts).toEqual(['Remote Control reconnected as "billing export". Resume: Carry on with the export.'])
+  expect(commands).toEqual(['rename billing export'])
+  expect(prompts).toEqual(['Session renamed "billing export". Resume: Carry on with the export.'])
 })
 
-test('with resume, a failed reconnect starts a turn that says plainly the session is disconnected', async ($, on) => {
-  const { prompts, toasts, rc, clock, session } = engine(on, { description: CONNECTED, stuck: 'not connected' })
+test('with resume, a connect that does not take starts a turn that says so', async ($, on) => {
+  const { commands, prompts, toasts, rc, clock, session } = engine(on, { failsToConnect: true })
   await $.session.start(start)
 
-  await $.tool.call({ tool: TOOL, action: 'rename', name: 'billing export', resume: 'Tell Mo how it went.' })
+  await $.tool.call({ tool: TOOL, action: 'connect', name: 'billing export', resume: 'Tell Mo how it went.' })
   await $.turn.complete({ ...answered, turnId: 't1' })
   await clock.advance(20000)
+  expect(commands).toEqual(['remote-control billing export'])
   expect(rc.description).toBe(NOT_CONNECTED)
-  expect(toasts.some(t => t.startsWith('Remote Control is disconnected: '))).toBe(true)
-  expect(prompts).toHaveLength(1)
-  expect(prompts[0]).toMatch(/^Remote Control is disconnected: it was disconnected to take the name "billing export", and connecting it again didn't take after 2 tries; it reads not connected\. /)
-  expect(prompts[0]).toMatch(/call remote_control with connect and name "billing export".* Resume: Tell Mo how it went\.$/)
+  expect(toasts).toContain('Remote Control: the command ran, but the session does not read as connected yet.')
+  expect(prompts).toEqual([
+    'The remote-control command ran, but this session did not read as connected a few seconds later; check with remote_control status. Resume: Tell Mo how it went.',
+  ])
   expect(session.appended()).toEqual([])
 })
 
 test('a resume the engine drops falls back to the note', async ($, on) => {
-  const { prompts, toasts, clock, session } = engine(on, { description: CONNECTED, stuck: 'not connected', dropped: 'a Stop hook blocked it' })
+  const { prompts, toasts, clock, session } = engine(on, { failsToConnect: true, dropped: 'a Stop hook blocked it' })
   await $.session.start(start)
 
-  await $.tool.call({ tool: TOOL, action: 'rename', name: 'billing export', resume: 'Tell Mo how it went.' })
+  await $.tool.call({ tool: TOOL, action: 'connect', name: 'billing export', resume: 'Tell Mo how it went.' })
   await $.turn.complete({ ...answered, turnId: 't1' })
   await clock.advance(20000)
   expect(prompts).toEqual([])
   expect(toasts).toContain('Resume not sent: a Stop hook blocked it')
-  expect(JSON.stringify(session.appended())).toMatch(/Remote Control is disconnected: /)
+  expect(JSON.stringify(session.appended())).toMatch(/did not read as connected a few seconds later/)
 })
 
 test('rename and connect in one turn keep the resume either one gave', async ($, on) => {
@@ -438,7 +408,7 @@ test('rename and connect in one turn keep the resume either one gave', async ($,
   expect(rename.result).toMatch(/then Remote Control connects under that name\. Then the session resumes with: Go on\.$/)
   await $.turn.complete({ ...answered, turnId: 't1' })
   await clock.advance(20000)
-  expect(prompts).toEqual(['Remote Control connected as "billing export". Resume: Go on.'])
+  expect(prompts).toEqual(['Session renamed "billing export". Remote Control connected as "billing export". Resume: Go on.'])
 })
 
 test('an interrupted turn cancels the resume with what it queued', async ($, on) => {

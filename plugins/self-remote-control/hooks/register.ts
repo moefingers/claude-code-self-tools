@@ -1,20 +1,17 @@
 // A session reads, turns on and names its own Remote Control: the link that lets the user follow and
 // steer it from a phone or a browser, whose session list shows each session by its title. `status`
 // reports. `connect` runs the remote-control command once the turn ends, only when this session is
-// not connected, titled with the name it was given, else with the session's own title. `rename`
-// renames the session once the turn ends and, when Remote Control is connected, reconnects it under
-// the new name: the app takes a session's title as it connects, and a rename after that never
-// reaches it. An optional `resume` is the message that starts the session's next turn once the
-// action has run, led by what happened; without one, the person gets a toast and the model a note
-// on its next turn when something didn't take.
+// not connected, titled with the name it was given, else with the session's own title: the app takes
+// a session's title as it connects. `rename` runs /rename once the turn ends and touches nothing
+// else. An optional `resume` is the message that starts the session's next turn once the action has
+// run, led by what happened; without one, the person gets a toast and the model a note on its next
+// turn when something didn't take.
 //
-// The remote-control command is a toggle: run while connected, it disconnects. So `connect` runs it
-// only on a reading it recognises as "not connected", taken again right before it runs, and refuses
-// on any reading it doesn't recognise. `rename`'s reconnect is the one time the plugin runs it while
-// connected: bare, to disconnect, then, only once it reads "not connected", with the new name. If it
-// never reads "not connected", nothing more runs and the session stays connected under its old
-// title. If the connect doesn't read "connected" a few seconds later, it runs once more, and the
-// person and the model are told plainly if that doesn't take either.
+// The remote-control command never runs while this session is connected. In the interactive terminal
+// it then opens the Remote Control panel (the session's link, Disconnect this session, Show QR code,
+// Continue) and waits for the person, so a run from here would hold the plugin on a panel nobody may
+// be there to close. So `connect` runs it only on a reading it recognises as "not connected", taken
+// again right before it runs, and refuses on any reading it doesn't recognise.
 //
 // The reading: the remote-control command's own description, which the engine works out from this
 // session's connection each time it lists the command. It is the one place the API says whether
@@ -40,11 +37,6 @@ const title = { plugin: 'self-remote-control', key: 'title' } as const
 const SETTLE_MS = 500
 /** How long after a connect to look again, for whether it took. */
 const CHECK_MS = 3000
-/** How often, and how long at most, a reconnect looks for the disconnect before it connects again. */
-const POLL_MS = 500
-const DISCONNECT_MS = 5000
-/** How many times a reconnect runs the connect while it reads not connected after it. */
-const RECONNECT_TRIES = 2
 /** The longest title /rename keeps. */
 const NAME_MAX = 200
 
@@ -55,11 +47,11 @@ const NOT_CONNECTED = 'Control this session from your phone or claude.ai/code'
 const DESCRIPTION = [
   'Reports on, connects or renames this session for Remote Control: the link that lets the user follow and steer the session from a phone or a browser, whose session list shows each session by its title.',
   '`status` says whether this session is connected now, its title, what the Remote Control for all sessions setting holds, and which clients are attached.',
-  "`connect` connects this session once the current turn ends, only if it is not connected then: titled `name` when given, else the session's own title (its /rename title) when it has one.",
-  '`rename` is how to give the session a proper title, a few words on what it is working on: once the turn ends it renames the session (/rename) to `name`, and if Remote Control is connected it reconnects under that name, because the app takes the title only as a session connects. If Remote Control is not connected, only the local name changes.',
+  "`connect` connects this session once the current turn ends, only if it is not connected then: titled `name` when given, else the session's own title (its /rename title) when it has one. The app takes the title as the session connects.",
+  "`rename` is how to give the session a proper title, a few words on what it is working on: once the turn ends it runs /rename with `name`, and nothing else. If the session is connected and the app doesn't show the new title, the session needs reconnecting, or renaming in the app.",
   'Call `status` when the user asks whether they can reach this session remotely, and `connect` when they ask to be able to, such as before stepping away, with a `name` unless the session already has a title.',
-  "It never disconnects, except for the moment `rename` reconnects; disconnecting is the user's to do with /remote-control.",
-  '`resume` is the message that starts your next turn once the action has run, after what happened: what to do next. Give it with `rename` while connected, so a reconnect that fails starts a turn that says so; leave it out when the next step waits on someone else (the user, another session, a check).',
+  "It never disconnects, and never runs /remote-control while connected; disconnecting is the user's to do from its panel.",
+  '`resume` is the message that starts your next turn once the action has run, after what happened: what to do next. Leave it out when the next step waits on someone else (the user, another session, a check).',
   'After `connect` or `rename`, end the turn; it runs once your answer is shown.',
 ].join(' ')
 
@@ -151,16 +143,9 @@ function refusal(reading: Reading): string {
     return "This session has no remote-control command (it needs a claude.ai subscription, and a policy can turn it off), so there is nothing to connect."
   }
   if (reading.state === 'unknown') {
-    return `Can't tell whether Remote Control is connected: the remote-control command reads "${reading.description}", which this plugin doesn't recognise. Run while connected, that command disconnects, so it isn't run.`
+    return `Can't tell whether Remote Control is connected: the remote-control command reads "${reading.description}", which this plugin doesn't recognise. Run while connected, that command opens its panel and waits for the user, so it isn't run.`
   }
   return 'Remote Control is already connected; nothing to do.'
-}
-
-/** A reading that is neither connected nor not connected, as a clause. */
-function unreadable(reading: Reading): string {
-  return reading.state === 'unknown'
-    ? `the remote-control command reads "${reading.description}", which this plugin doesn't recognise`
-    : 'the session has no remote-control command any more'
 }
 
 /** Runs the remote-control command, titled `name` when there is one. */
@@ -243,59 +228,52 @@ async function queueRename($: EngineInterface, name: string, resume: string | un
   const value = entry(connect, true, name, resume ?? earlier?.resume)
   await $.state.set(queued, value)
   $.ui.status(`Session renamed "${name}" when this turn ends`)
-  const renamed = `Queued: once this turn ends, the session is renamed "${name}"`
+  const renamed = `Queued: once this turn ends, the session's local title is set to "${name}" (/rename)`
   const plan =
     reading.state === 'connected'
-      ? `${renamed}, and Remote Control, connected now, reconnects under that name: the command disconnects it, then, once it reads disconnected, connects it again as "${name}". If it doesn't read disconnected, nothing more runs and it stays connected under its old title.`
-      : reading.state === 'not connected'
-        ? connect
-          ? `${renamed}, then Remote Control connects under that name.`
-          : `${renamed}. Remote Control isn't connected, so only the local name changes; it doesn't connect. Call connect to connect it under this name.`
-        : reading.state === 'unavailable'
-          ? `${renamed}. This session has no remote-control command, so only the local name changes.`
-          : `${renamed}. Remote Control isn't touched: ${refusal(reading)}`
+      ? `${renamed}; Remote Control isn't touched. The app normally shows the new title; if it doesn't, the session needs reconnecting, or renaming in the app.`
+      : connect && reading.state === 'not connected'
+        ? `${renamed}, then Remote Control connects under that name.`
+        : reading.state === 'not connected'
+          ? `${renamed}. Remote Control isn't connected; connect takes this title when it connects.`
+          : `${renamed}; Remote Control isn't touched.`
   return `${plan}${then(value.resume)}`
 }
 
-/** At the turn's end: the rename, then what the connection calls for, then the report. */
+/** At the turn's end: the rename, then the connect if one is queued, then the report. */
 async function runQueued($: EngineInterface, value: Queued): Promise<void> {
   $.ui.status(undefined)
   if (value.rename) {
     try {
       await $.command.run({ command: 'rename', args: value.name })
     } catch (err) {
-      const rest = value.connect ? 'Nothing else ran, the Remote Control connect included.' : 'Remote Control was not touched.'
+      const rest = value.connect ? ' Nothing else ran, the Remote Control connect included.' : ''
       await report(
         $,
-        { toast: `Session not renamed: ${why(err)}`, note: `The rename to "${value.name}" you queued didn't run: ${why(err)}. ${rest}` },
+        { toast: `Session not renamed: ${why(err)}`, note: `The rename to "${value.name}" you queued didn't run: ${why(err)}.${rest}` },
         value.resume,
       )
       return
     }
+    if (!value.connect) {
+      await report($, { toast: `Session renamed "${value.name}".` }, value.resume)
+      return
+    }
   }
-  const reading = await readNow($)
-  if (value.rename && reading.state === 'connected') {
-    await report($, await reconnect($, value.name), value.resume)
-    return
-  }
-  if (value.connect) return connectNow($, reading, value.name ?? (await sessionTitle($)), value.resume)
-  const toast =
-    reading.state === 'not connected'
-      ? `Session renamed "${value.name}". Remote Control isn't connected, so only the local name changed.`
-      : `Session renamed "${value.name}". Remote Control wasn't touched: ${unreadable(reading)}.`
-  await report($, { toast }, value.resume)
+  const lead = value.rename ? `Session renamed "${value.name}". ` : ''
+  await connectNow($, await readNow($), value.name ?? (await sessionTitle($)), value.resume, lead)
 }
 
-/** Connects, only on a fresh "not connected" reading, then says whether it took. */
-async function connectNow($: EngineInterface, reading: Reading, name: string | undefined, resume: string | undefined): Promise<void> {
+/** Connects, only on a fresh "not connected" reading, then says whether it took, after `lead`. */
+async function connectNow($: EngineInterface, reading: Reading, name: string | undefined, resume: string | undefined, lead: string): Promise<void> {
   if (reading.state === 'connected') {
-    await report($, { toast: 'Remote Control was already connected; nothing ran.' }, resume)
+    await report($, { toast: `${lead}Remote Control was already connected; nothing ran.` }, resume)
     return
   }
   if (reading.state !== 'not connected') {
     await report(
       $,
-      { toast: `Remote Control not connected: ${refusal(reading)}`, note: `The Remote Control connect you queued did not run. ${refusal(reading)}` },
+      { toast: `${lead}Remote Control not connected: ${refusal(reading)}`, note: `${lead}The Remote Control connect you queued did not run. ${refusal(reading)}` },
       resume,
     )
     return
@@ -305,76 +283,28 @@ async function connectNow($: EngineInterface, reading: Reading, name: string | u
   } catch (err) {
     await report(
       $,
-      { toast: `Remote Control didn't connect: ${why(err)}`, note: `The Remote Control connect you queued didn't run: ${why(err)}` },
+      { toast: `${lead}Remote Control didn't connect: ${why(err)}`, note: `${lead}The Remote Control connect you queued didn't run: ${why(err)}` },
       resume,
     )
     return
   }
-  $.clock.after(CHECK_MS, () => void checkConnected($, name, resume))
+  $.clock.after(CHECK_MS, () => void checkConnected($, name, resume, lead))
 }
 
-async function checkConnected($: EngineInterface, name: string | undefined, resume: string | undefined): Promise<void> {
+async function checkConnected($: EngineInterface, name: string | undefined, resume: string | undefined, lead: string): Promise<void> {
   const reading = await readNow($)
   if (reading.state === 'connected') {
-    await report($, { toast: `Remote Control connected${titled(name)}.` }, resume)
+    await report($, { toast: `${lead}Remote Control connected${titled(name)}.` }, resume)
     return
   }
   await report(
     $,
     {
-      toast: 'Remote Control: the command ran, but the session does not read as connected yet.',
-      note: 'The remote-control command ran, but this session did not read as connected a few seconds later; check with remote_control status.',
+      toast: `${lead}Remote Control: the command ran, but the session does not read as connected yet.`,
+      note: `${lead}The remote-control command ran, but this session did not read as connected a few seconds later; check with remote_control status.`,
     },
     resume,
   )
-}
-
-/**
- * Reconnects a connected session under `name`: runs the toggle bare, to disconnect, waits to read
- * "not connected", and only then connects as `name`. On any other reading it runs nothing more. It
- * runs the connect again while it reads "not connected" after it, and says plainly if that failed.
- */
-async function reconnect($: EngineInterface, name: string): Promise<Outcome> {
-  let refused: string | undefined
-  try {
-    await $.command.run({ command: 'remote-control' })
-  } catch (err) {
-    refused = why(err)
-  }
-  let reading = await readNow($)
-  for (let waited = 0; refused === undefined && reading.state !== 'not connected' && waited < DISCONNECT_MS; waited += POLL_MS) {
-    await $.clock.sleep(POLL_MS)
-    reading = await readNow($)
-  }
-  if (reading.state === 'connected') {
-    const said = `Session renamed "${name}", but Remote Control didn't disconnect${refused === undefined ? '' : ` (${refused})`}, so it is still connected under its old title.`
-    return { toast: said, note: `${said} Nothing more ran.` }
-  }
-  if (reading.state !== 'not connected') {
-    const said = `Remote Control may be disconnected: it was disconnected to take the name "${name}", and then ${unreadable(reading)}, so it wasn't connected again.`
-    return {
-      toast: said,
-      note: `${said} The user may not reach this session from their phone: check with remote_control status, and if it reads not connected, connect with name "${name}".`,
-    }
-  }
-  for (let tries = 1; ; tries++) {
-    let failed: string | undefined
-    try {
-      await runRemoteControl($, name)
-    } catch (err) {
-      failed = why(err)
-    }
-    await $.clock.sleep(CHECK_MS)
-    reading = await readNow($)
-    if (reading.state === 'connected') return { toast: `Remote Control reconnected as "${name}".` }
-    if (reading.state === 'not connected' && tries < RECONNECT_TRIES) continue
-    const now = reading.state === 'not connected' ? 'it reads not connected' : unreadable(reading)
-    const said = `Remote Control is disconnected: it was disconnected to take the name "${name}", and connecting it again didn't take after ${tries} ${tries === 1 ? 'try' : 'tries'}${failed === undefined ? '' : ` (${failed})`}; ${now}.`
-    return {
-      toast: `${said} Run /remote-control to connect it.`,
-      note: `${said} The user can't reach this session from their phone until it connects: call remote_control with connect and name "${name}", or ask the user to run /remote-control ${name}.`,
-    }
-  }
 }
 
 export const register: Register = on => {
@@ -390,7 +320,7 @@ export const register: Register = on => {
             type: 'string',
             enum: ['status', 'connect', 'rename'],
             description:
-              '`status` to report; `connect` to connect this session once the turn ends, if it is not connected; `rename` to retitle the session once the turn ends, reconnecting Remote Control under the new title if it is connected.',
+              '`status` to report; `connect` to connect this session once the turn ends, if it is not connected; `rename` to set the session\'s title (/rename) once the turn ends.',
           },
           name: {
             type: 'string',
@@ -435,7 +365,7 @@ export const register: Register = on => {
     const [reading, earlier] = await Promise.all([read($), $.state.get(queued)])
     if (input.action === 'rename' && name !== undefined) return { result: await queueRename($, name, resume, reading, earlier.value ?? null) }
     if (reading.state === 'connected') {
-      const retitle = name === undefined ? '' : ` To title it "${name}", call rename: it reconnects under the new name.`
+      const retitle = name === undefined ? '' : ` To title it "${name}", call rename.`
       return { result: `${refusal(reading)}${retitle}` }
     }
     if (reading.state !== 'not connected') return { deny: refusal(reading) }

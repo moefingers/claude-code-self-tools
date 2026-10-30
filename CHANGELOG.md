@@ -4,11 +4,12 @@ Each entry names a plugin and its version, as `version` in `plugins/<name>/.clau
 
 ## self-remote-control 0.2.0 (2026-10-30)
 
-Remote Control sessions get titles. The app takes a session's title as it connects, so a session connected with a bare `/remote-control` and no `/rename` title showed up as `<hostname>-<adjective>-<noun>`, and a `/rename` made after connecting never reached the app.
+Remote Control sessions get titles. The app takes a session's title as it connects, so a session connected with a bare `/remote-control` and no `/rename` title showed up as `<hostname>-<adjective>-<noun>`.
 
 - `connect` takes an optional `name` and runs `/remote-control <name>`. Without one, it connects under the session's own title (its `/rename` or `--name` title, which the plugin reads from the SessionStart and UserPromptSubmit hook inputs), and bare if the session has none.
-- New `rename` action, `name` required: once the turn ends it runs `/rename <name>`, and if Remote Control is connected, reconnects under the new title. It runs `/remote-control` to disconnect, waits for the session to read as not connected, then runs `/remote-control <name>`. If the session never reads as disconnected, nothing more runs and it stays connected under its old title. If the reconnect doesn't take, it is tried once more, then the person and Claude are told plainly that the session is disconnected. When Remote Control isn't connected, `rename` only renames. `rename` and `connect` in one turn rename, then connect under the new title.
-- New optional `resume`, as in self-mcp and self-reload: the message that starts the session's next turn once `connect` or `rename` has run, after what happened. A failed reconnect then starts a turn that says so. Without it, the toast and the note on Claude's next turn stay as they were.
+- New `rename` action, `name` required: once the turn ends it runs `/rename <name>`, and nothing else. A `/rename` while connected updated the title in the app too on Claude Code 2.1.314; if the app doesn't show it, the session needs reconnecting, or renaming in the app. `rename` and `connect` in one turn rename, then connect under the new title.
+- New optional `resume`, as in self-mcp and self-reload: the message that starts the session's next turn once `connect` or `rename` has run, after what happened. A connect that doesn't take then starts a turn that says so. Without it, the toast and the note on Claude's next turn stay as they were.
+- Corrected: run while the session is connected, `/remote-control` doesn't disconnect. In the interactive terminal it opens the Remote Control panel and waits for the person. The plugin never runs it then, as before.
 - `status` also reports the session's title.
 - The queued action is kept in session state under a new key, `queued`, in place of `connectQueued`.
 

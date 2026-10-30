@@ -1,7 +1,7 @@
 {
   "name": "self-remote-control",
   "version": "0.2.0",
-  "description": "Lets a session report on its own Remote Control, turn it on under a title, and rename itself so the new title reaches the phone. It connects only when the session reads as not connected, and disconnects only to reconnect under a new title.",
+  "description": "Lets a session report on its own Remote Control, turn it on under a title, and rename itself. It runs /remote-control only when the session reads as not connected, so it never opens the Remote Control panel or disconnects.",
   "author": { "name": "moefingers", "url": "https://github.com/moefingers" },
   "homepage": "https://github.com/moefingers/claude-code-self-tools/tree/main/plugins/self-remote-control#readme",
   "repository": "https://github.com/moefingers/claude-code-self-tools",
