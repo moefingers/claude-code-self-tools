@@ -8,6 +8,7 @@ Remote Control sessions get titles. The app takes a session's title as it connec
 
 - `connect` takes an optional `name` and runs `/remote-control <name>`. Without one, it connects under the session's own title (its `/rename` or `--name` title, which the plugin reads from the SessionStart and UserPromptSubmit hook inputs), and bare if the session has none.
 - New `rename` action, `name` required: once the turn ends it runs `/rename <name>`, and if Remote Control is connected, reconnects under the new title. It runs `/remote-control` to disconnect, waits for the session to read as not connected, then runs `/remote-control <name>`. If the session never reads as disconnected, nothing more runs and it stays connected under its old title. If the reconnect doesn't take, it is tried once more, then the person and Claude are told plainly that the session is disconnected. When Remote Control isn't connected, `rename` only renames. `rename` and `connect` in one turn rename, then connect under the new title.
+- New optional `resume`, as in self-mcp and self-reload: the message that starts the session's next turn once `connect` or `rename` has run, after what happened. A failed reconnect then starts a turn that says so. Without it, the toast and the note on Claude's next turn stay as they were.
 - `status` also reports the session's title.
 - The queued action is kept in session state under a new key, `queued`, in place of `connectQueued`.
 
