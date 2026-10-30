@@ -1,6 +1,6 @@
 {
   "name": "claude-code-self-tools",
-  "description": "Small Claude Code plugins that let a session act on itself: compact, reload its plugins, reconnect an MCP server, read its context window, wake itself later, and turn on Remote Control. Install only the ones you want.",
+  "description": "Small Claude Code plugins that let a session act on itself: compact, reload its plugins, reconnect an MCP server, read its context window, wake itself later, and turn on Remote Control under a title. Install only the ones you want.",
   "owner": {
     "name": "moefingers",
     "url": "https://github.com/moefingers"
@@ -34,7 +34,7 @@
     {
       "name": "self-remote-control",
       "source": "./plugins/self-remote-control",
-      "description": "Reports on the session's Remote Control and connects it, never toggling a live connection off."
+      "description": "Reports on the session's Remote Control, connects it under a title, and renames the session, reconnecting so the new title reaches the phone. It never toggles a live connection off otherwise."
     }
   ]
 }

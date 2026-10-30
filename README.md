@@ -1,6 +1,6 @@
 # claude-code-self-tools
 
-Small [Claude Code](https://code.claude.com/docs) plugins that let a session act on itself. Each one gives Claude a tool or two for something you would otherwise do by hand from the prompt: compact the conversation, reload plugins, reconnect an MCP server, check the context window, come back to a task later, turn on Remote Control.
+Small [Claude Code](https://code.claude.com/docs) plugins that let a session act on itself. Each one gives Claude a tool or two for something you would otherwise do by hand from the prompt: compact the conversation, reload plugins, reconnect an MCP server, check the context window, come back to a task later, turn on Remote Control under a title.
 
 Each plugin is separate. Install only the ones you want.
 
@@ -13,7 +13,7 @@ Each plugin is separate. Install only the ones you want.
 | [self-mcp](plugins/self-mcp) | `reconnect_mcp_after_turn` | Runs `/mcp reconnect <server>` (or `all`) once the turn ends, then can resume on its own. | When an MCP server's tools stop answering and a reconnect is all it needs, such as a browser extension that dropped. |
 | [self-context](plugins/self-context) | `context_usage` | Reports the tokens used, the window, the percentage and whether auto-compact is on. Read-only. | At a break between pieces of work, to decide whether to compact now. |
 | [self-wake](plugins/self-wake) | `wake_after`, `cancel_wake` | Some minutes after the turn ends, sends the session a note that starts a turn of its own. | When it has to wait on something slow (a deploy, a long job) that won't report back by itself. |
-| [self-remote-control](plugins/self-remote-control) | `remote_control` | Reports whether this session's Remote Control is connected, and connects it if it isn't. | When you ask whether you can reach the session from your phone, or to make it reachable before you step away. |
+| [self-remote-control](plugins/self-remote-control) | `remote_control` | Reports whether this session's Remote Control is connected, connects it under a title, and renames the session, reconnecting so the new title reaches the phone. | When you ask whether you can reach the session from your phone, to make it reachable before you step away, or to give it a title you'll recognise in the app's session list. |
 
 Claude sees each tool as `mcp__<plugin>__<tool>`, for example `mcp__self-wake__wake_after`.
 
@@ -64,7 +64,7 @@ What they have in common:
 - **An interrupted turn cancels what it queued.** If you stop the turn (Esc or **Stop**), or it ends any way other than with Claude's answer, what that turn queued is dropped, and a notice says so. Something set in an earlier turn, such as an armed wake-up, stands.
 - **Subagents are refused.** These tools act on the main conversation. A subagent that calls one is told why it can't, and to finish its piece and return its result so the main session can act. `context_usage` refuses a subagent too, because the figures it reports are the main conversation's.
 - **Each change is announced.** A toast tells you what ran, and the tool result tells Claude. When Claude Code refuses an action (a command a plugin may not run), a toast says why, and Claude is told on its next turn.
-- **Built-in commands run as if you typed them.** self-reload runs `/reload-plugins`, self-mcp runs `/mcp reconnect <server>`, and self-remote-control runs `/remote-control`. Their lines show in the transcript, as yours would. A command that asks for confirmation shows you its dialog and waits for your answer, as it would if you had typed it.
+- **Built-in commands run as if you typed them.** self-reload runs `/reload-plugins`, self-mcp runs `/mcp reconnect <server>`, and self-remote-control runs `/remote-control` and `/rename`. Their lines show in the transcript, as yours would. A command that asks for confirmation shows you its dialog and waits for your answer, as it would if you had typed it.
 
 ### Reloads
 
@@ -76,7 +76,9 @@ A reload replaces each plugin's code. What a plugin keeps in Claude Code's sessi
 
 ### Remote Control
 
-`/remote-control` is a toggle: run while the session is connected, it disconnects. self-remote-control reads whether the session is connected from the command's own description, which Claude Code works out from the session's connection each time it lists the command. It recognises two descriptions: `Disconnect Remote Control` (connected) and `Control this session from your phone or claude.ai/code` (not connected). It runs the command only on the second, read again right before it runs, and refuses on any description it doesn't recognise, so a future Claude Code that rewords it gets a refusal, not a disconnect. It never disconnects.
+`/remote-control` is a toggle: run while the session is connected, it disconnects. self-remote-control reads whether the session is connected from the command's own description, which Claude Code works out from the session's connection each time it lists the command. It recognises two descriptions: `Disconnect Remote Control` (connected) and `Control this session from your phone or claude.ai/code` (not connected). It runs the command only on the second, read again right before it runs, and refuses on any description it doesn't recognise, so a future Claude Code that rewords it gets a refusal, not a disconnect.
+
+The app's session list takes a session's title as the session connects: the name given to `/remote-control <name>`, or else its `/rename` title. A `/rename` after that doesn't reach the app, and a session with neither shows its last message or a name like `<hostname>-<adjective>-<noun>`. So `connect` passes a title: the `name` Claude gives, or else the session's own `/rename` title, which Claude Code passes to the SessionStart and UserPromptSubmit hooks. And `rename` runs `/rename`, then, if the session is connected, reconnects it under the new title. That is the one time the plugin disconnects. It runs `/remote-control` bare, waits for the session to read as not connected, and only then runs `/remote-control <name>`. If the session doesn't read as not connected, nothing more runs and it stays connected under its old title. If the reconnect doesn't take, it is tried once more, and if it still doesn't take, a toast says the session is disconnected.
 
 The attached clients that `status` lists are the screens drawing the session now. A connected session with no phone open shows only the terminal, so that list doesn't tell you whether the session is connected.
 
@@ -92,7 +94,7 @@ The tool descriptions say when to call each tool and when not to. To make it a h
 > - **After editing a plugin:** call `reload_plugins_after_turn` with `resume` saying what to try next, and end the turn.
 > - **An MCP server stopped answering:** when a server's tools fail in a way a reconnect fixes (the browser extension dropped, the server crashed or timed out), call `reconnect_mcp_after_turn` with the server's name and `resume` saying what to try again, and end the turn.
 > - **Waiting on something slow:** when a deploy, a long job or a check will take a while and nothing will tell you it's done, call `wake_after` with the minutes and a note saying what to check, and end the turn. Cancel it with `cancel_wake` if the answer comes first.
-> - **Remote Control:** when I say I'm stepping away, call `remote_control` with `connect`. Never try to disconnect it.
+> - **Remote Control:** when I say I'm stepping away, call `remote_control` with `connect` and a `name` saying what this session is working on. When the work changes, retitle it with `rename`. Never try to disconnect it.
 
 ## Develop
 
