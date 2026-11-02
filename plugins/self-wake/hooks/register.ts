@@ -10,6 +10,7 @@
 // takes the wake with a compare-and-set on its version, so it is sent once.
 import type { EngineInterface, Register, Timer } from 'claude-code'
 import type { Wake } from '../types'
+import { configureUpdateCheck, loadUpdateCheck, withUpdateNotice } from './update-check'
 
 const queued = { plugin: 'self-wake', key: 'queued' } as const
 const armed = { plugin: 'self-wake', key: 'armed' } as const
@@ -71,7 +72,13 @@ function arm($: EngineInterface, wake: Wake, now: number): void {
   $.ui.status(pinned(wake.note))
 }
 
-export const register: Register = on => {
+export const register: Register = (on, options) => {
+  configureUpdateCheck('self-wake', options)
+
+  // First, so it is outermost on this plugin's tools: it sees each answer, and adds the update
+  // notice when one is due. It never waits on the check; see update-check.ts.
+  on('tool.call', { tool: /^mcp__self-wake__/ }, async ($, e, next) => withUpdateNotice($, e, await next(e))).catch(($, e, next) => next(e))
+
   on('session.start', async ($, e, next) => {
     const started = await next(e)
     await $.tool.register({
@@ -100,6 +107,7 @@ export const register: Register = on => {
     // After a reload: the wake is still in $.state, its timer gone.
     const { value } = await $.state.get(armed)
     if (value) arm($, value, await $.clock.now())
+    loadUpdateCheck($)
     return started
   })
 

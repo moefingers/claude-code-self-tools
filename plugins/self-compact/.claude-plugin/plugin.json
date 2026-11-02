@@ -1,11 +1,20 @@
 {
   "name": "self-compact",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "description": "Lets a session compact itself as it closes one piece of work and moves to the next, then resume on its own: a tool queues the compaction, and it runs as the turn ends.",
   "author": { "name": "moefingers", "url": "https://github.com/moefingers" },
   "homepage": "https://github.com/moefingers/claude-code-self-tools/tree/main/plugins/self-compact#readme",
   "repository": "https://github.com/moefingers/claude-code-self-tools",
   "license": "MIT",
   "keywords": ["compact", "context-window", "mod"],
-  "types": "./types/index.d.ts"
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "updateCheck": {
+      "type": "string",
+      "title": "Update check",
+      "description": "on: when a tool of this plugin is called and the last check is 30 minutes old, fetch this plugin's published plugin.json from GitHub (a plain GET of a public file) and say when a newer version is out. off: never check.",
+      "default": "on",
+      "options": ["on", "off"]
+    }
+  }
 }
