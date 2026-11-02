@@ -19,9 +19,9 @@ const SESSION = 'session-1'
 
 /** The notice and the toast, spelled out here so that a change to either template shows. */
 const NOTICE = (latest: string) =>
-  `${PLUGIN} ${INSTALLED} is out of date (${latest} is published). To update, the person runs: claude plugin marketplace update claude-code-self-tools, then claude plugin update ${PLUGIN}@claude-code-self-tools (once for each scope it is installed at, adding --scope project or --scope local for those), then /reload-plugins. Don't run these yourself unless the person asks.`
+  `${PLUGIN} ${INSTALLED} is out of date (${latest} is published). To update, the person runs: claude plugin marketplace update claude-code-self-tools, then claude plugin update ${PLUGIN}@claude-code-self-tools, then /reload-plugins in each open session (a new session loads the update on its own). Don't run these yourself unless the person asks.`
 const TOAST = (latest: string) =>
-  `${PLUGIN} ${INSTALLED} is out of date (${latest} is published). To update: claude plugin marketplace update claude-code-self-tools, then claude plugin update ${PLUGIN}@claude-code-self-tools, then /reload-plugins.`
+  `${PLUGIN} ${INSTALLED} is out of date (${latest} is published). To update: claude plugin marketplace update claude-code-self-tools, then claude plugin update ${PLUGIN}@claude-code-self-tools, then /reload-plugins or a new session.`
 
 /** A published manifest's text. */
 const manifest = (version: unknown, extra: Record<string, unknown> = {}) => JSON.stringify({ name: PLUGIN, ...extra, version })
@@ -46,6 +46,7 @@ function engine(on: On, { installed, env = {}, store, published = { text: manife
   const writes: { key: string; value: unknown }[] = []
   const reads: string[] = []
   let answer = published
+  let sessionId = SESSION
   const clock = mock.clock(on, { now: T0 })
   // The plugin's own store, kept as the engine keeps it: JSON in, JSON out.
   const held = new Map<string, unknown>(Object.entries(store ?? {}))
@@ -62,7 +63,7 @@ function engine(on: On, { installed, env = {}, store, published = { text: manife
   on('store.keys', () => ({ value: [...held.keys()] }))
   mock.env(on, env)
   on('session.start', (_, e) => ({ cwd: e.cwd }))
-  on('session.id', () => ({ value: SESSION }))
+  on('session.id', () => ({ value: sessionId }))
   on('tool.register', (_, e) => ({ value: { tool: `mcp__${PLUGIN}__${e.name}` } }))
   on('ui.status', () => ({ value: undefined }))
   on('ui.toast', (_, e) => {
@@ -92,6 +93,11 @@ function engine(on: On, { installed, env = {}, store, published = { text: manife
     publish(next: Published) {
       answer = next
     },
+    /** A new session in the same load of the plugin (/clear, a resume). */
+    becomeSession(id: string) {
+      sessionId = id
+    },
+    held,
   }
 }
 
@@ -296,33 +302,91 @@ test('the opt-out stops it: no request, no store, no notice, no toast', { option
   expect(toasts).toEqual([])
 })
 
-test('CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC stops it, a stored answer included', async ($, on) => {
-  const { requests, toasts, clock } = engine(on, {
-    env: { CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1' },
-    published: { text: manifest('9.9.9') },
-    store: { updateCheck: { at: T0, latest: '9.9.9' } },
+// Any value at all, `0` and `false` included: Claude Code's own word is to unset it wherever it's set.
+for (const value of ['1', 'true', '0', 'false', ' ']) {
+  test(`CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC set to ${JSON.stringify(value)} stops it, a stored answer included`, async ($, on) => {
+    const { requests, toasts, clock } = engine(on, {
+      env: { CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: value },
+      published: { text: manifest('9.9.9') },
+      store: { updateCheck: { at: T0, latest: '9.9.9' } },
+    })
+    await $.session.start(start)
+    await clock.settle()
+    const plain = await call($)
+    await clock.advance(WINDOW_MS)
+    expect(await call($)).toBe(plain)
+    await clock.settle()
+    expect(plain).not.toMatch(/out of date/)
+    expect(requests).toEqual([])
+    expect(toasts).toEqual([])
   })
-  await $.session.start(start)
-  await clock.settle()
-  const plain = await call($)
-  await clock.advance(WINDOW_MS)
-  expect(await call($)).toBe(plain)
-  await clock.settle()
-  expect(plain).not.toMatch(/out of date/)
-  expect(requests).toEqual([])
-  expect(toasts).toEqual([])
-})
+}
 
-test("the check is kept in the plugin's own store", async ($, on) => {
-  const { writes, clock } = engine(on, { published: { text: manifest('1.3.0') } })
+test("the check, and what each session was told and when, are kept in the plugin's own store", async ($, on) => {
+  const { writes, held, clock } = engine(on, {
+    published: { text: manifest('1.3.0') },
+    store: {
+      updateSeen: {
+        // Told of an older check, but within 30 minutes: it still holds that session's notices back.
+        lately: { noticed: T0 - 2 * WINDOW_MS, noticedAt: T0 - 10 * MINUTE },
+        // Told of an older check, long ago: it holds nothing back, so it goes.
+        long: { noticed: T0 - 4 * WINDOW_MS, noticedAt: T0 - 3 * WINDOW_MS },
+      },
+    },
+  })
   await $.session.start(start)
   await call($)
   await clock.settle()
   expect(writes.find(w => w.key === 'updateCheck')?.value).toEqual({ at: T0, latest: '1.3.0' })
-  expect(writes.filter(w => w.key === 'updateSeen').at(-1)?.value).toEqual({ [SESSION]: { toasted: T0 } })
+  expect(held.get('updateSeen')).toEqual({
+    lately: { noticed: T0 - 2 * WINDOW_MS, noticedAt: T0 - 10 * MINUTE },
+    [SESSION]: { toasted: T0, toastedAt: T0 },
+  })
+  // Another session writes meanwhile: the next write keeps its entry.
+  held.set('updateSeen', { ...(held.get('updateSeen') as object), meanwhile: { toasted: T0, toastedAt: T0 } })
   await call($)
   await clock.settle()
-  expect(writes.filter(w => w.key === 'updateSeen').at(-1)?.value).toEqual({ [SESSION]: { noticed: T0, toasted: T0 } })
+  expect(held.get('updateSeen')).toEqual({
+    lately: { noticed: T0 - 2 * WINDOW_MS, noticedAt: T0 - 10 * MINUTE },
+    meanwhile: { toasted: T0, toastedAt: T0 },
+    [SESSION]: { noticed: T0, noticedAt: T0, toasted: T0, toastedAt: T0 },
+  })
+})
+
+test('a session is told at most once per 30 minutes, even when the check it was told of expires a minute later', async ($, on) => {
+  const { requests, toasts, clock } = engine(on, {
+    published: { text: manifest('1.4.0') },
+    store: { updateCheck: { at: T0 - 29 * MINUTE, latest: '1.3.0' } },
+  })
+  await $.session.start(start)
+  await clock.settle()
+  const first = await call($)
+  expect(first.endsWith(`\n\n${NOTICE('1.3.0')}`)).toBe(true)
+  const plain = first.slice(0, -`\n\n${NOTICE('1.3.0')}`.length)
+  await clock.settle()
+  expect(toasts).toEqual([TOAST('1.3.0')])
+
+  // A minute on, the stored check is 30 minutes old: this call checks again and finds 1.4.0, but the
+  // session was told a minute ago, so neither the next call nor a toast tells it again.
+  await clock.advance(MINUTE)
+  expect(await call($)).toBe(plain)
+  await clock.settle()
+  expect(requests).toHaveLength(1)
+  expect(await call($)).toBe(plain)
+  await clock.settle()
+  expect(toasts).toHaveLength(1)
+
+  // 30 minutes after it was told: a toast, then the notice.
+  await clock.advance(29 * MINUTE - 1)
+  expect(await call($)).toBe(plain)
+  await clock.settle()
+  expect(toasts).toHaveLength(1)
+  await clock.advance(1)
+  await call($)
+  await clock.settle()
+  expect(toasts).toEqual([TOAST('1.3.0'), TOAST('1.4.0')])
+  expect(await call($)).toBe(`${plain}\n\n${NOTICE('1.4.0')}`)
+  expect(await call($)).toBe(plain)
 })
 
 test('a fresh load (a reload, a new session) uses the stored check for 30 minutes, then checks again', async ($, on) => {
@@ -330,6 +394,8 @@ test('a fresh load (a reload, a new session) uses the stored check for 30 minute
   const { requests, toasts, clock } = engine(on, { store: { updateCheck: { at, latest: '1.3.0' } } })
   await $.session.start(start)
   await clock.settle()
+  // The session's start toasts nothing, whatever the store says: a toast is for a call.
+  expect(toasts).toEqual([])
   // Loaded at the session's start: the first call is told, and checks nothing.
   const first = await call($)
   expect(first.endsWith(`\n\n${NOTICE('1.3.0')}`)).toBe(true)
@@ -347,10 +413,10 @@ test('a fresh load (a reload, a new session) uses the stored check for 30 minute
   expect(requests).toHaveLength(1)
 })
 
-test('what a session was told survives a reload: it is not told the same check again', async ($, on) => {
+test('what a session was told survives a reload: not the same check again, nor anything within 30 minutes', async ($, on) => {
   const at = T0 - 10 * MINUTE
   const { requests, toasts, clock } = engine(on, {
-    store: { updateCheck: { at, latest: '1.3.0' }, updateSeen: { [SESSION]: { noticed: at, toasted: at }, other: { noticed: at - WINDOW_MS } } },
+    store: { updateCheck: { at, latest: '1.3.0' }, updateSeen: { [SESSION]: { noticed: at, noticedAt: at, toasted: at, toastedAt: at } } },
   })
   await $.session.start(start)
   await clock.settle()
@@ -359,6 +425,49 @@ test('what a session was told survives a reload: it is not told the same check a
   await clock.settle()
   expect(toasts).toEqual([])
   expect(requests).toEqual([])
+})
+
+test('a newer check found after a reload waits out the 30 minutes since the session was last told', async ($, on) => {
+  const { toasts, clock } = engine(on, {
+    store: {
+      updateCheck: { at: T0 - 5 * MINUTE, latest: '1.3.0' },
+      // Told of an older check 10 minutes ago, before the reload.
+      updateSeen: { [SESSION]: { noticed: T0 - 40 * MINUTE, noticedAt: T0 - 10 * MINUTE, toasted: T0 - 40 * MINUTE, toastedAt: T0 - 10 * MINUTE } },
+    },
+  })
+  await $.session.start(start)
+  await clock.settle()
+  const plain = await call($)
+  expect(plain).not.toMatch(/out of date/)
+  await clock.settle()
+  expect(toasts).toEqual([])
+  await clock.advance(20 * MINUTE)
+  expect(await call($)).toBe(plain)
+  await clock.settle()
+  expect(toasts).toEqual([TOAST('1.3.0')])
+  expect(await call($)).toBe(`${plain}\n\n${NOTICE('1.3.0')}`)
+})
+
+test('a new session in the same load (/clear, a resume) is told, once', async ($, on) => {
+  const { becomeSession, toasts, clock } = engine(on, { store: { updateCheck: { at: T0, latest: '1.3.0' } } })
+  await $.session.start(start)
+  await clock.settle()
+  const told = await call($)
+  expect(told).toMatch(/is out of date/)
+  const plain = await call($)
+  expect(told).toBe(`${plain}\n\n${NOTICE('1.3.0')}`)
+  // The same session starting again is not told again.
+  await $.session.start(start)
+  await clock.settle()
+  expect(await call($)).toBe(plain)
+  // A new session is.
+  becomeSession('session-2')
+  await $.session.start(start)
+  await clock.settle()
+  expect(await call($)).toBe(`${plain}\n\n${NOTICE('1.3.0')}`)
+  expect(await call($)).toBe(plain)
+  await clock.settle()
+  expect(toasts).toEqual([TOAST('1.3.0'), TOAST('1.3.0')])
 })
 
 test("a subagent's call checks nothing and is told nothing", async ($, on) => {
