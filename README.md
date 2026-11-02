@@ -65,6 +65,7 @@ What they have in common:
 - **Subagents are refused.** These tools act on the main conversation. A subagent that calls one is told why it can't, and to finish its piece and return its result so the main session can act. `context_usage` refuses a subagent too, because the figures it reports are the main conversation's.
 - **Each change is announced.** A toast tells you what ran, and the tool result tells Claude. When Claude Code refuses an action (a command a plugin may not run), a toast says why, and Claude is told on its next turn.
 - **Built-in commands run as if you typed them.** self-reload runs `/reload-plugins`, self-mcp runs `/mcp reconnect <server>`, and self-remote-control runs `/remote-control` and `/rename`. Their lines show in the transcript, as yours would. A command that asks for confirmation shows you its dialog and waits for your answer, as it would if you had typed it.
+- **Each says when it's out of date.** When Claude calls one of a plugin's tools, at most every 30 minutes, the plugin fetches its own published `plugin.json` from this repository and compares versions, without holding up the tool. The request is a plain GET of a public file: the plugin adds no headers, query or body, and GitHub sees what it sees of any web request (the address, the time, the headers Claude Code sends on its own). If a newer version is out, a toast tells you, and a tool result tells Claude the update steps for you to run, at most once every 30 minutes in a session. Turn it off with the plugin's `updateCheck` setting; it is also off while `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC` is set. Each plugin's README has the details.
 
 ### Reloads
 
@@ -106,6 +107,21 @@ claude plugin test plugins/self-wake
 ```
 
 `validate` checks the manifest and lists the events the hooks module handles and the calls it makes. `test` runs the plugin's `tests/*.test.ts` with no session, sign-in or network. `claude plugin validate .` at the top checks the marketplace file.
+
+Code every plugin shares lives once under `shared/`, today the update check (`shared/hooks/update-check.ts`) and its tests (`shared/tests/update-check.test.ts`). The plugins install separately, so each carries a copy at the same path in its own folder. Edit the files under `shared/`, then write the copies (which also removes the copies of files no longer in `shared/`) and check them, with Node:
+
+```
+node scripts/sync-shared.mjs
+node --test "scripts/*.test.mjs"
+```
+
+The test fails when a copy differs from `shared/`, or is left over from a file removed from it. Each plugin's `tests/update-check.fixture.ts` gives the shared test that plugin's name and a call of one of its tools.
+
+To run every check at once (the copies, then each plugin's `validate --strict` and `test`, then the marketplace file):
+
+```
+node scripts/test-all.mjs
+```
 
 To try a plugin from your working copy, start a session with `claude --plugin-dir plugins/<name>`.
 

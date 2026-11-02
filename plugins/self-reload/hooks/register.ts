@@ -11,6 +11,7 @@
 // it with a compare-and-set on its version, so the two can't both send it.
 import type { EngineInterface, Register } from 'claude-code'
 import type { Pending, Queued } from '../types'
+import { configureUpdateCheck, loadUpdateCheck, withUpdateNotice } from './update-check'
 
 const queued = { plugin: 'self-reload', key: 'queued' } as const
 const pending = { plugin: 'self-reload', key: 'pending' } as const
@@ -119,7 +120,13 @@ async function resumeAfterReload($: EngineInterface): Promise<void> {
   if (value.resume !== undefined) void sendResume($, 'Plugins reloaded.', value.resume)
 }
 
-export const register: Register = on => {
+export const register: Register = (on, options) => {
+  configureUpdateCheck('self-reload', options)
+
+  // First, so it is outermost on this plugin's tools: it sees each answer, and adds the update
+  // notice when one is due. It never waits on the check; see update-check.ts.
+  on('tool.call', { tool: /^mcp__self-reload__/ }, async ($, e, next) => withUpdateNotice($, e, await next(e))).catch(($, e, next) => next(e))
+
   on('session.start', async ($, e, next) => {
     const started = await next(e)
     await $.tool.register({
@@ -139,6 +146,7 @@ export const register: Register = on => {
       isDeferred: false,
     })
     await resumeAfterReload($)
+    loadUpdateCheck($)
     return started
   })
 

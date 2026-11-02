@@ -9,6 +9,7 @@
 // typed; the toast and the resume, or a note the model reads, point to it.
 import type { EngineInterface, Register } from 'claude-code'
 import type { Queued } from '../types'
+import { configureUpdateCheck, loadUpdateCheck, withUpdateNotice } from './update-check'
 
 const queued = { plugin: 'self-mcp', key: 'queued' } as const
 
@@ -80,7 +81,13 @@ async function reconnectNow($: EngineInterface, value: Queued): Promise<void> {
   else await tellModel($, said)
 }
 
-export const register: Register = on => {
+export const register: Register = (on, options) => {
+  configureUpdateCheck('self-mcp', options)
+
+  // First, so it is outermost on this plugin's tools: it sees each answer, and adds the update
+  // notice when one is due. It never waits on the check; see update-check.ts.
+  on('tool.call', { tool: /^mcp__self-mcp__/ }, async ($, e, next) => withUpdateNotice($, e, await next(e))).catch(($, e, next) => next(e))
+
   on('session.start', async ($, e, next) => {
     const started = await next(e)
     await $.tool.register({
@@ -104,6 +111,7 @@ export const register: Register = on => {
       },
       isDeferred: false,
     })
+    loadUpdateCheck($)
     return started
   })
 

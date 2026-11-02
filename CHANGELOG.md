@@ -2,6 +2,24 @@
 
 Each entry names a plugin and its version, as `version` in `plugins/<name>/.claude-plugin/plugin.json` has it.
 
+## 2026-11-01: the plugins say when they're out of date
+
+Every plugin gets the same update check. Nothing else in them changed.
+
+- When the main session calls one of a plugin's tools, and its last check is 30 minutes old or there hasn't been one, the plugin fetches its own `plugin.json` from the repository's `main` branch: a plain GET of a public file on raw.githubusercontent.com. The plugin adds no headers, query or body, and nothing about the person, the session or the machine; GitHub sees what it sees of any web request (the address, the time, the headers Claude Code sends on its own). It compares the `version` there with the installed one, number by number. The check's time and answer are kept in the plugin's own store, so a reload or another session on the machine uses that answer for the rest of the 30 minutes. Sessions that come due at the same moment each make their one request.
+- The tool call never waits on the check. A failure is silence: offline, refused by policy, a 404, a rate limit, no answer within 5 seconds, bad JSON, or a version that isn't three plain numbers.
+- When a newer version is out, a toast tells the person, and one of the session's next tool results ends with a fixed line: the plugin's name, the installed and the published versions, and the update steps for the person to run (`claude plugin marketplace update`, `claude plugin update`, then `/reload-plugins` or a new session), closing with "Don't run these yourself unless the person asks." Nothing else from the fetched file reaches the session. A session is told of each check once, and at most once every 30 minutes, kept across reloads, rather than on every call: these tools are called again and again in a long session, and the same line on every call would cost context and get tuned out. The toast follows the same rule.
+- New `updateCheck` setting, `on` by default; `off` never checks. Nothing is checked while `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC` is set, to any value, or for a subagent's call.
+
+The versions with it:
+
+- **self-compact 0.2.3**: the update check, on `compact_after_turn`.
+- **self-context 0.1.1**: the update check, on `context_usage`.
+- **self-mcp 0.1.1**: the update check, on `reconnect_mcp_after_turn`.
+- **self-reload 0.1.1**: the update check, on `reload_plugins_after_turn`.
+- **self-remote-control 0.2.1**: the update check, on `remote_control`.
+- **self-wake 0.1.1**: the update check, on `wake_after` and `cancel_wake`.
+
 ## self-remote-control 0.2.0 (2026-10-30)
 
 Remote Control sessions get titles. The app takes a session's title as it connects, so a session connected with a bare `/remote-control` and no `/rename` title showed up as `<hostname>-<adjective>-<noun>`.
