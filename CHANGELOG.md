@@ -2,6 +2,15 @@
 
 Each entry names a plugin and its version, as `version` in `plugins/<name>/.claude-plugin/plugin.json` has it.
 
+## 2026-11-03: self-restart 0.1.2, the restarted session saves its transcript
+
+- **self-restart 0.1.2**: the new window inherited the old session's environment, `CLAUDE_CODE_CHILD_SESSION` included. That marker makes a claude count as nested, and a nested interactive session saves no transcript and is left out of `--resume`. So a restarted session could have carried on with transcript saving off.
+- **The fix:** the window now clears a fixed list of the markers Claude Code sets in the processes it starts, right before it runs `claude --resume`:
+  - from the environment-variables reference: `CLAUDE_CODE_CHILD_SESSION`, `CLAUDECODE`, `CLAUDE_CODE_SESSION_ID`, `CLAUDE_PID`, `CLAUDE_EFFORT`, `CLAUDE_CODE_BRIDGE_SESSION_ID`, `CLAUDE_CODE_MESSAGING_SOCKET`, `CLAUDE_CODE_MESSAGING_TOKEN`, `CLAUDE_CODE_REMOTE`, `CLAUDE_CODE_REMOTE_SESSION_ID`, `CLAUDE_JOB_DIR`;
+  - and four that Claude Code sets in its tools' processes though that reference doesn't list them: `AI_AGENT`, `CLAUDE_CODE_ENTRYPOINT`, `CLAUDE_CODE_EXECPATH`, `CLAUDE_CODE_SESSION_ATTENDED`.
+- **Nothing else changes:** no other variable is touched, `CLAUDE_CODE_FORCE_SESSION_PERSISTENCE` and the rest of yours included.
+- self-clear and self-exit start no process, so they have nothing to clear.
+
 ## 2026-11-03: exit and restart only at a finished break
 
 - **self-exit 0.1.1**: `exit_after_turn`'s description says to call it only at a finished break, never mid-merge, mid-push or mid-task, the same rule as compacting. Its behaviour is unchanged.
