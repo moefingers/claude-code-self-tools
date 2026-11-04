@@ -284,6 +284,7 @@ test("the window clears the old session's markers before claude --resume, and no
     'CLAUDE_CODE_ENTRYPOINT',
     'CLAUDE_CODE_EXECPATH',
     'CLAUDE_CODE_SESSION_ATTENDED',
+    'CLAUDE_CODE_SSE_PORT',
   ])
   const script = launcherScript(ID)
   const clears = script.split(/\r?\n/).filter(line => line.includes('SetEnvironmentVariable'))

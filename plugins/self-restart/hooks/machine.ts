@@ -232,7 +232,7 @@ export const REGISTRY_KEYS = [
 ] as const
 
 /** The SHA-256 of plugins/self-switch/slot/claude-slot.ps1, as it is committed. */
-export const SLOT_SCRIPT_SHA256 = '588a799edb65660466cd626197e0fe04f7a0aa17e4ddb05989c419e99b907e7f'
+export const SLOT_SCRIPT_SHA256 = '5ce4364d0aca9290b7693235e2eb15dc43b17c8a10874e8dd36bb5de6e33fd12'
 
 /**
  * The variables Claude Code sets in the processes it starts, which a top-level claude must not inherit:
@@ -245,8 +245,9 @@ export const SLOT_SCRIPT_SHA256 = '588a799edb65660466cd626197e0fe04f7a0aa17e4ddb
  * CLAUDE_CODE_REMOTE_SESSION_ID (cloud sessions), CLAUDE_JOB_DIR (background sessions). Not in that
  * reference, but set by Claude Code 2.1.318 in its tools' processes, and in neither the user's
  * settings nor the Windows environment: AI_AGENT (`claude-code_<version>_agent`), CLAUDE_CODE_ENTRYPOINT,
- * CLAUDE_CODE_EXECPATH, CLAUDE_CODE_SESSION_ATTENDED. Never one a person sets, such as
- * CLAUDE_CODE_FORCE_SESSION_PERSISTENCE.
+ * CLAUDE_CODE_EXECPATH, CLAUDE_CODE_SESSION_ATTENDED. And CLAUDE_CODE_SSE_PORT, which an IDE's terminal sets:
+ * a session restarted or switched out of one would hand the old process's IDE link to the new one.
+ * Never one a person sets, such as CLAUDE_CODE_FORCE_SESSION_PERSISTENCE.
  */
 export const SESSION_MARKERS = [
   'CLAUDE_CODE_CHILD_SESSION',
@@ -264,6 +265,7 @@ export const SESSION_MARKERS = [
   'CLAUDE_CODE_ENTRYPOINT',
   'CLAUDE_CODE_EXECPATH',
   'CLAUDE_CODE_SESSION_ATTENDED',
+  'CLAUDE_CODE_SSE_PORT',
 ] as const
 
 /** The line that clears SESSION_MARKERS from a script's own environment, which claude inherits. */
