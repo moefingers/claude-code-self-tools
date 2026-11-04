@@ -4,7 +4,7 @@
  * first turn starts with (absent: it waits for the next message), and the conversation that asked
  * (its session id at the call): the switch runs only while this session is still that one.
  */
-export type Queued = { to: string; reason: string; notes: string; resume?: string; from?: string }
+export type Queued = { to: string; reason: string; notes: string; resume?: string; from: string }
 
 /**
  * A switch under way, kept in the plugin's own store (`$.store`, key `switches`) by the conversation

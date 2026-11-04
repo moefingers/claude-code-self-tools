@@ -453,6 +453,16 @@ test("the tool's description says pending wake-ups are dropped, and to set them 
 })
 
 describe('refusals, before and at the run', () => {
+  test("a session whose id can't be read queues nothing: the switch couldn't be tied to its conversation", async ($, on) => {
+    const { kinds, world, clock } = engine(on)
+    await $.session.start(start)
+    world.id = 'not-a-session-id'
+    expect((await $.tool.call(call)).deny).toBe("Not queued: this session's id can't be read, so the switch can't be tied to this conversation. Try again; if it persists, switch by hand.")
+    await $.turn.complete(answered)
+    await clock.advance(5000)
+    expect(kinds()).toEqual([])
+  })
+
   test('a subagent is refused, and nothing is queued', async ($, on) => {
     const { kinds, clock } = engine(on)
     await $.session.start(start)

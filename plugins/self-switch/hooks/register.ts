@@ -923,13 +923,16 @@ export const register: Register = (on, options) => {
       return { deny: 'A switch moves a terminal to another conversation, for a session run in a terminal with a person at its prompt; this one is not (a -p run, an SDK host, or an app).' }
     }
     const own = await sessionId($)
+    if (own === undefined || !SESSION_ID.test(own)) {
+      return { deny: "Not queued: this session's id can't be read, so the switch can't be tied to this conversation. Try again; if it persists, switch by hand." }
+    }
     if (own === to) return { deny: `This session is already conversation ${to}.` }
     const stop = blocked(await busyAgents($))
     if (stop !== undefined) return { deny: `Not queued: ${stop}. Wait for them to report, or stop them, then call again.` }
-    const lately = own !== undefined && SESSION_ID.test(own) ? await lastSwitch($, own) : undefined
+    const lately = await lastSwitch($, own)
     if (lately !== undefined) return { deny: `Not queued: ${await loop($, lately)}.` }
     const resume = text(input.resume)
-    const asked = { to, reason, notes, ...(own !== undefined && SESSION_ID.test(own) ? { from: own } : {}) }
+    const asked = { to, reason, notes, from: own }
     await $.state.set(queued, resume === undefined ? asked : { ...asked, resume })
     $.ui.status('switch queued for when this turn ends')
     return {
