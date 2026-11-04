@@ -28,8 +28,44 @@ function decode(encoded: string): string {
   return out
 }
 
+/** A probe's answer: claude.exe 100 in a pane, the probe under it, and `under`, what else runs under the session. */
+const probeOf = (under: Record<string, unknown>[] = []) =>
+  `${JSON.stringify({
+    v: 1,
+    self: 300,
+    session: { pid: 100, created: '134062345688901240' },
+    slot: null,
+    procs: [
+      { pid: 20, ppid: 10, created: '134062345678901240', name: 'powershell.exe', cls: 'shell' },
+      { pid: 100, ppid: 20, created: '134062345688901240', name: 'claude.exe' },
+      { pid: 300, ppid: 100, created: '134062355668901240', name: 'powershell.exe', cls: 'shell' },
+      { pid: 400, ppid: 100, created: '134062345788901240', name: 'node.exe' },
+      ...under,
+    ],
+    registry: [],
+    transcripts: [],
+    locks: [],
+    claim: null,
+    heavy: null,
+    freeKb: null,
+    errors: [],
+  })}\r\n`
+
+type Machine = {
+  /** What the probe answers: a machine (its stdout), or a failure. */
+  probe?: string | 'fails'
+  /** What git answers: no repository, or a failure. */
+  git?: 'no-repo' | 'fails'
+  /** Whether the session's folder can be read. */
+  cwd?: 'reads' | 'fails'
+}
+
 /** The engine beneath the plugin, its launcher answering `answer`; and what it was asked to run. */
-function engine(on: On, { answer, store = {} }: { answer: { exitCode: number; stdout: string }; store?: Record<string, unknown> }) {
+function engine(
+  on: On,
+  { answer, store = {}, probe = probeOf(), git = 'no-repo', cwd = 'reads' }: { answer: { exitCode: number; stdout: string }; store?: Record<string, unknown> } & Machine,
+) {
+  const probes: string[] = []
   const scripts: string[] = []
   const commands: string[] = []
   const toasts: string[] = []
@@ -44,6 +80,7 @@ function engine(on: On, { answer, store = {} }: { answer: { exitCode: number; st
   })
   on('session.start', (_, e) => ({ cwd: e.cwd }))
   on('session.id', () => ({ value: ID }))
+  on('session.cwd', () => (cwd === 'reads' ? { value: 'C:\\work\\repo' } : { deny: 'no folder' }))
   on('tool.register', () => ({ value: { tool: TOOL } }))
   on('ui.status', () => ({ value: undefined }))
   on('ui.toast', (_, e) => {
@@ -56,7 +93,18 @@ function engine(on: On, { answer, store = {} }: { answer: { exitCode: number; st
   on('prompt.submit', (_, e) => ({ text: e.text }))
   on('turn.complete', () => ({ text: 'done' }))
   on('process.run', (_, e) => {
+    if (e.argv[0] === 'git') {
+      return git === 'no-repo'
+        ? { value: { exitCode: 128, stdout: '', stderr: 'fatal: not a git repository', isStdoutTruncated: false, isStderrTruncated: false } }
+        : { value: { exitCode: 128, stdout: '', stderr: 'fatal: detected dubious ownership in repository', isStdoutTruncated: false, isStderrTruncated: false } }
+    }
     const script = decode(String(e.argv[4]))
+    if (script.includes('$ids = @(')) {
+      probes.push(script)
+      return probe === 'fails'
+        ? { value: { exitCode: 1, stdout: '', stderr: 'Get-CimInstance : Access denied', isStdoutTruncated: false, isStderrTruncated: false } }
+        : { value: { exitCode: 0, stdout: probe, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+    }
     scripts.push(script)
     if (script.includes("'not-ours'")) return { value: { exitCode: 0, stdout: 'released\r\n', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
     return { value: { ...answer, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
@@ -66,7 +114,7 @@ function engine(on: On, { answer, store = {} }: { answer: { exitCode: number; st
     await clock.sleep(HOUR)
     return {}
   })
-  return { scripts, commands, toasts, held, clock, session }
+  return { probes, scripts, commands, toasts, held, clock, session }
 }
 
 const start = { cwd: 'C:\\work\\repo', surface: 'terminal', isInteractive: true } as const
@@ -147,3 +195,44 @@ test('a claim another switch holds: the launcher resumes nothing, no window open
   expect(JSON.stringify(session.appended())).toMatch(/launcher exited 5: self-restart: another switch or restart holds the claim/)
   expect(held.get('restarts')).toEqual({})
 })
+
+test('before the launch, the full safe point: the probe asks of this session alone, and claims nothing', async ($, on) => {
+  const { probes, scripts, commands, clock } = engine(on, { answer: { exitCode: 0, stdout: `launched 17716\r\nclaim ${LAUNCH}\r\n` } })
+  await $.session.start(start)
+  await $.tool.call({ tool: TOOL, reason: 'Switched accounts.' })
+  await $.turn.complete(answered)
+  await clock.advance(1000)
+  expect(probes).toHaveLength(1)
+  expect(probes[0]).toContain(`$ids = @('${ID}')`)
+  expect(probes[0]).toContain('$configDirs = @()')
+  expect(probes[0]).toContain('$take = $null')
+  expect(probes[0]).toContain('$state = $null')
+  // An MCP server's node under the session doesn't count: the launch goes ahead.
+  expect(scripts).toEqual([launcherScript(ID)])
+  expect(commands).toEqual(['exit'])
+})
+
+for (const [name, machine, said] of [
+  [
+    'a background Bash job under the session',
+    { probe: probeOf([{ pid: 505, ppid: 100, created: '134062355678901240', name: 'bash.exe', cls: 'shell' }]) },
+    /isn't at a safe point \(S6: bash\.exe 505 runs under this session \(a background job of the Bash, PowerShell or Monitor tool\)\)/,
+  ],
+  ['a git process under the session', { probe: probeOf([{ pid: 501, ppid: 100, created: '134062355678901240', name: 'git.exe', cls: 'git' }]) }, /S2: git\.exe 501 runs under this session/],
+  ['a probe that fails (an unreadable process table)', { probe: 'fails' as const }, /the machine probe failed \(it exited 1: Get-CimInstance : Access denied\), so what runs under this session is unknown/],
+  ['git that cannot be read', { git: 'fails' as const }, /S2: git's state can't be read \(git rev-parse in C:\\\\work\\\\repo exited 128\)/],
+  ['a session folder that cannot be read', { cwd: 'fails' as const }, /this session's folder can't be read, so git's state there is unknown/],
+] as const) {
+  test(`${name} holds the restart: no window, no exit, and the model is told why`, async ($, on) => {
+    const { scripts, commands, toasts, held, session, clock } = engine(on, { answer: { exitCode: 0, stdout: `launched 17716\r\nclaim ${LAUNCH}\r\n` }, ...machine })
+    await $.session.start(start)
+    await $.tool.call({ tool: TOOL, reason: 'Switched accounts.' })
+    await $.turn.complete(answered)
+    await clock.advance(1000)
+    expect(scripts).toEqual([])
+    expect(commands).toEqual([])
+    expect(toasts.some(t => /Restart didn't run/.test(t))).toBe(true)
+    expect(JSON.stringify(session.appended())).toMatch(said)
+    expect(held.get('restarts')).toBeUndefined()
+  })
+}

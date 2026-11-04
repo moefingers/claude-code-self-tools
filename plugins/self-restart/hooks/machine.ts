@@ -433,10 +433,10 @@ export type ProbeInput = {
   readonly ids: readonly string[]
   /** Take the claim lock on this one (one of `ids`), in the same run. */
   readonly take?: string
-  /** The config folders known on this machine, this session's own first. */
+  /** The config folders known on this machine, this session's own first; none for a probe of the process tree alone. */
   readonly configDirs: readonly string[]
-  /** stateFolder(%LOCALAPPDATA%). */
-  readonly stateDir: string
+  /** stateFolder(%LOCALAPPDATA%): where the claim locks are; absent, they are neither read nor taken. */
+  readonly stateDir?: string
   /** The folder holding heavy-slot.sh's .gate-lock folders, when there is one. */
   readonly heavySlotRoot?: string
 }
@@ -457,9 +457,10 @@ export function probeScript(input: ProbeInput): string {
   if (ids.length < 1 || ids.length > 8) throw new Error('the probe asks about 1 to 8 conversations')
   const take = input.take === undefined ? undefined : checkId(input.take)
   if (take !== undefined && !ids.includes(take)) throw new Error('the probe claims only a conversation it asks about')
-  if (input.configDirs.length < 1 || input.configDirs.length > 8) throw new Error('the probe reads 1 to 8 config folders')
+  if (input.configDirs.length > 8) throw new Error('the probe reads at most 8 config folders')
   const configDirs = input.configDirs.map(dir => checkFolder('a config folder', dir))
-  const state = checkFolder('the state folder', input.stateDir)
+  const state = input.stateDir === undefined ? undefined : checkFolder('the state folder', input.stateDir)
+  if (take !== undefined && state === undefined) throw new Error('the probe claims only with the state folder')
   const heavy = input.heavySlotRoot === undefined ? undefined : checkFolder('the heavy-slot folder', input.heavySlotRoot)
   return [
     "$ErrorActionPreference = 'Stop'",
@@ -467,7 +468,7 @@ export function probeScript(input: ProbeInput): string {
     '[Console]::OutputEncoding = [Text.Encoding]::UTF8',
     `$ids = @(${ids.map(literal).join(', ')})`,
     `$configDirs = @(${configDirs.map(literal).join(', ')})`,
-    `$state = ${literal(state)}`,
+    `$state = ${state === undefined ? '$null' : literal(state)}`,
     `$heavyRoot = ${heavy === undefined ? '$null' : literal(heavy)}`,
     `$take = ${take === undefined ? '$null' : literal(take)}`,
     '$errors = New-Object System.Collections.ArrayList',
@@ -582,7 +583,7 @@ export function probeScript(input: ProbeInput): string {
     '}',
     // The claim locks on the asked-about conversations, as they stand after the take.
     '$locks = New-Object System.Collections.ArrayList',
-    'try {',
+    'if ($null -ne $state) { try {',
     '  foreach ($id in $ids) {',
     '    $lp = Join-Path $state ("claims\\" + $id + ".lock")',
     '    if (-not (Test-Path -LiteralPath $lp -PathType Leaf)) { continue }',
@@ -595,7 +596,7 @@ export function probeScript(input: ProbeInput): string {
     '    }',
     '    [void]$locks.Add($o)',
     '  }',
-    '} catch { [void]$errors.Add("locks:") }',
+    '} catch { [void]$errors.Add("locks:") } }',
     '$sessionOut = $null',
     'if ($null -ne $session) { $sessionOut = [ordered]@{ pid = [long]$session.ProcessId; created = (Get-Created $session) } }',
     '$result = [ordered]@{ v = 1; self = [long]$PID; session = $sessionOut; slot = $slot; procs = $procs; registry = $registry; transcripts = $transcripts; locks = $locks; claim = $claim; heavy = $heavy; freeKb = $freeKb; errors = $errors }',

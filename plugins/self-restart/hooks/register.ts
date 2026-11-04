@@ -35,7 +35,8 @@
 import type { EngineInterface, Register } from 'claude-code'
 import type { Queued, Restart } from '../types'
 import { CLAIMED, encodeCommand, LAUNCHED, launcherScript, powershellPath, RELEASED, releaseScript, SESSION_ID, SLOTTED, stateFolder, SYSTEM_ROOT, WAIT_SECONDS } from './launcher'
-import { isSafeFolder, powershellArgv } from './machine'
+import type { AgentLike } from './machine'
+import { isSafeFolder, parseProbe, powershellArgv, probeScript, readGit, safePoint } from './machine'
 import { configureUpdateCheck, loadUpdateCheck, withUpdateNotice } from './update-check'
 
 const queued = { plugin: 'self-restart', key: 'queued' } as const
@@ -153,6 +154,42 @@ async function env($: EngineInterface, read: () => Promise<string | undefined>):
   }
 }
 
+/** How long the probe of this session's processes may take. */
+const PROBE_MS = 60_000
+
+/**
+ * Why this session isn't at a safe point to exit, or undefined when it is: the shared safePoint, on a
+ * probe of the process tree (this session's id, no config folder, no claim) and git's state where the
+ * session started and works. A subagent, any job under this claude.exe (a background Bash, PowerShell
+ * or Monitor job, git, a build, a dev server, a heavy-slot job) or git in flight holds it; anything
+ * that can't be read holds it too.
+ */
+async function notSafe($: EngineInterface, launch: { powershell: string; id: string; cwd: string }): Promise<string | undefined> {
+  let probe: ReturnType<typeof parseProbe> | string
+  try {
+    const run = await $.process.run(powershellArgv(launch.powershell, probeScript({ ids: [launch.id], configDirs: [] })), { cwd: launch.cwd, timeoutMs: PROBE_MS })
+    probe = run.exitCode === 0 ? parseProbe(run.stdout) : `it exited ${run.exitCode}${brief(run.stderr) === '' ? '' : `: ${brief(run.stderr)}`}`
+  } catch (err) {
+    probe = `it didn't run: ${why(err)}`
+  }
+  if (typeof probe !== 'string' && 'error' in probe) probe = probe.error
+  let cwd: string
+  try {
+    cwd = await $.session.cwd()
+  } catch (err) {
+    return `this session's folder can't be read, so git's state there is unknown (${why(err)})`
+  }
+  const git = await readGit($, { cwd, folders: [launch.cwd], dirty: false })
+  let agents: readonly AgentLike[] | string
+  try {
+    agents = await $.agent.list()
+  } catch (err) {
+    agents = why(err)
+  }
+  const safe = safePoint(probe, git, agents)
+  return safe.verdict === 'clear' ? undefined : `this session isn't at a safe point (${safe.reasons.join('; ')})`
+}
+
 /** What the launch needs, each from the engine, never from the tool's input; or why it can't go ahead. */
 async function plan($: EngineInterface): Promise<{ powershell: string; id: string; cwd: string } | { refusal: string }> {
   const os = await env($, () => $.env.get('OS'))
@@ -257,6 +294,13 @@ async function restartNow($: EngineInterface, value: Queued): Promise<void> {
     armed = undefined
     const said = await loop($, lately)
     await refuse($, `Restart didn't run: ${said}.`, `The restart you queued didn't run: ${said}. The session goes on; if a restart is still the fix, tell the person, who can restart by hand.`)
+    return
+  }
+  // The safe point (S1-S6), as a switch's: nothing may still run under this session when it exits.
+  const unsafe = await notSafe($, launch)
+  if (unsafe !== undefined) {
+    armed = undefined
+    await refuse($, `Restart didn't run: ${unsafe}.`, `The restart you queued didn't run: ${unsafe}. The session goes on; call restart_after_turn again once they are done.`)
     return
   }
   // A turn that started while the checks above ran has taken it back, and said so.
