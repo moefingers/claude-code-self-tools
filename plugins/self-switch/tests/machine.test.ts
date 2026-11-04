@@ -491,7 +491,10 @@ describe('the scripts, as text', () => {
     expect(check).toBeGreaterThan(restart.indexOf('$slotOk = $slotHash -eq'))
     expect(check).toBeLessThan(restart.indexOf('if ($slotOk) { $by = "slot:"'))
     expect(restart).toContain('(Join-Path $dir ("projects\\" + $projectName + "\\" + $id + ".jsonl"))')
-    expect(restart).toContain('$folder -notmatch "[\\x00-\\x1f\\x22\\x27\\u2018\\u2019\\u201a\\u201b\\u201c\\u201d\\u201e]")) { $slotOk = $false }')
+    // The whole condition, line for line: the slot is given up unless all three hold.
+    expect(restart.split(/\r?\n/)).toContain(
+      '  if (-not ($inProject -and $folder -cmatch "^[A-Za-z]:\\\\" -and $folder -notmatch "[\\x00-\\x1f\\x22\\x27\\u2018\\u2019\\u201a\\u201b\\u201c\\u201d\\u201e]")) { $slotOk = $false }',
+    )
   })
 
   test('the restart launcher leaves a verified slot a record instead of a window', () => {
