@@ -567,7 +567,7 @@ describe('coordinated mode', () => {
     const { kinds, commands, session, world, clock } = engine(on, { gate: coordinated })
     await $.session.start(start)
     for (const input of [call, { ...call, to: OTHER }, { ...call, to: 'not-an-id' }, { ...call, reason: '' }]) {
-      expect((await $.tool.call(input)).deny).toBe('The coordinator runs switches in this session: ask the merger or Mo for a wrap-up.')
+      expect((await $.tool.call(input)).deny).toBe('The coordinator runs switches in this session: ask the merger or the owner for a wrap-up.')
     }
     world.gate = undefined
     await $.tool.call(call)

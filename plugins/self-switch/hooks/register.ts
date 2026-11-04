@@ -114,7 +114,7 @@ const DESCRIPTION = [
 const SUBAGENT =
   "A subagent can't switch the session to another conversation. Finish your piece and return its result, saying a switch is wanted and to which conversation: the main session can switch."
 
-const COORDINATED = 'The coordinator runs switches in this session: ask the merger or Mo for a wrap-up.'
+const COORDINATED = 'The coordinator runs switches in this session: ask the merger or the owner for a wrap-up.'
 const NO_GATE = "requireCoordinator is on and the coordinator's gate file for this session isn't there, so this session doesn't switch on its own."
 const UNREADABLE_GATE = "the coordinator's gate file for this session can't be read, so whether the coordinator runs switches here is unknown"
 
@@ -549,7 +549,7 @@ async function switchNow($: EngineInterface, value: Queued): Promise<void> {
   const ctx = await context($)
   if ('refusal' in ctx) return notRun(ctx.refusal)
   const gated = await gateRefusal($, ctx.state, ctx.own, await $.clock.now())
-  if (gated !== undefined) return notRun(gated === COORDINATED ? 'the coordinator runs switches in this session; ask the merger or Mo for a wrap-up' : gated)
+  if (gated !== undefined) return notRun(gated === COORDINATED ? 'the coordinator runs switches in this session; ask the merger or the owner for a wrap-up' : gated)
   if (ctx.own === to) return notRun(`this session is already conversation ${to}`)
   const stop = blocked(await busyAgents($))
   if (stop !== undefined) return notRun(stop)

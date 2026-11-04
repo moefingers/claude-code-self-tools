@@ -15,7 +15,7 @@ Where the [coordinator](https://github.com/moefingers/agent-coordinator-3000) ru
 
 ## How it behaves
 
-- **Only when you ask, at a finished break.** The tool's description says to call it only when you ask to switch, never mid-merge, mid-push or mid-task, with notes written first, and to cancel wake-ups and Monitor tasks first (an in-place switch keeps the same process, and its timers).
+- **Only when you ask, at a finished break.** The tool's description says to call it only when you ask to switch, never mid-merge, mid-push or mid-task, with notes written first, and to cancel wake-ups and Monitor tasks first (an in-place switch keeps the same process, and its timers). What an in-place switch does with a pending [self-wake](../self-wake) wake-up is unverified: it may fire in the conversation switched to.
 - **The switch waits for the turn to end.** The call queues it, and it runs once the turn ends with Claude's answer. A new turn, or an interrupted one, cancels it, with a notice: the break it was queued at is no longer one.
 - **A cancel is never lost.** When a new turn (a message, a watch event) takes a queued switch back, that turn reads a row: *self-switch: your queued switch to «…» was cancelled because a new turn started; queue it again at the next finished break.* Cancels of a switch to the same conversation are counted while they come in a row; from the third, the row adds that the session is busy, and to ask the merger to run it with the coordinated go, which waits for idle itself. A run that begins ends the count.
 - **Never two copies of one conversation.** Right before it acts, the plugin runs one fixed probe script (Windows PowerShell by its known path, its only inputs the two session ids and folders it checked) that reads every running `claude.exe`, Claude Code's own session registry (`<config>\sessions\<pid>.json`), the transcripts' folders and times, and the claim locks. The conversation counts as open, and the switch refuses saying why, when:
@@ -49,7 +49,7 @@ The [coordinator plugin](https://github.com/moefingers/agent-coordinator-3000) r
 { "v": 1, "coordinated": true, "at": 1793750400000 }
 ```
 
-`at` is when it was written, in milliseconds since the epoch. While that file is there and at most a day old, every call refuses: *The coordinator runs switches in this session: ask the merger or Mo for a wrap-up.* A gate file older than a day is ignored; one that can't be read refuses. With the `requireCoordinator` setting on, a session with no gate file refuses too.
+`at` is when it was written, in milliseconds since the epoch. While that file is there and at most a day old, every call refuses: *The coordinator runs switches in this session: ask the merger or the owner for a wrap-up.* A gate file older than a day is ignored; one that can't be read refuses. With the `requireCoordinator` setting on, a session with no gate file refuses too.
 
 The gate guards against mistakes, not against a session set on switching: a session in a permissive mode can run `claude --resume` from its shell itself.
 

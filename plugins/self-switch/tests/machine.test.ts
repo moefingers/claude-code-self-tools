@@ -354,7 +354,7 @@ describe('transports', () => {
   })
 
   test("a project's name is the folder with every character but a letter or digit made a dash", () => {
-    expect(projectName('O:\\redundant_local\\agent-coordinator-3000')).toBe('O--redundant-local-agent-coordinator-3000')
+    expect(projectName('D:\\work\\my_repo-3000')).toBe('D--work-my-repo-3000')
     expect(projectName(`C:\\${'x'.repeat(201)}`)).toBeUndefined()
   })
 })
@@ -394,7 +394,7 @@ describe("the coordinator's gate", () => {
 })
 
 describe('the scripts, as text', () => {
-  const probe = probeScript({ ids: [W, T], take: T, configDirs: [CONFIG, 'D:\\other cfg'], stateDir: STATE, heavySlotRoot: 'O:\\redundant_local' })
+  const probe = probeScript({ ids: [W, T], take: T, configDirs: [CONFIG, 'D:\\other cfg'], stateDir: STATE, heavySlotRoot: 'C:\\tools\\slots' })
   const restart = launcherScript(W)
   const window = launcherScript(T, { folder: ELSEWHERE, claim: LAUNCH, configDirs: [CONFIG], stateDir: STATE })
   const release = releaseScript({ stateDir: STATE, id: T, by: LAUNCH })
