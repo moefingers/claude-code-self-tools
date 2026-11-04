@@ -66,6 +66,7 @@ function engine(
   { answer, store = {}, probe = probeOf(), git = 'no-repo', cwd = 'reads' }: { answer: { exitCode: number; stdout: string }; store?: Record<string, unknown> } & Machine,
 ) {
   const probes: string[] = []
+  const described: string[] = []
   const scripts: string[] = []
   const commands: string[] = []
   const toasts: string[] = []
@@ -81,7 +82,10 @@ function engine(
   on('session.start', (_, e) => ({ cwd: e.cwd }))
   on('session.id', () => ({ value: ID }))
   on('session.cwd', () => (cwd === 'reads' ? { value: 'C:\\work\\repo' } : { deny: 'no folder' }))
-  on('tool.register', () => ({ value: { tool: TOOL } }))
+  on('tool.register', (_, e) => {
+    described.push(String(e.description))
+    return { value: { tool: TOOL } }
+  })
   on('ui.status', () => ({ value: undefined }))
   on('ui.toast', (_, e) => {
     toasts.push(String(e.text))
@@ -115,7 +119,7 @@ function engine(
     await clock.sleep(HOUR)
     return {}
   })
-  return { probes, scripts, commands, toasts, held, clock, session }
+  return { probes, described, scripts, commands, toasts, held, clock, session }
 }
 
 const start = { cwd: 'C:\\work\\repo', surface: 'terminal', isInteractive: true } as const
@@ -256,11 +260,21 @@ test('a queued restart a new turn cancels is told in a plugin row; the third in 
   expect(said[1]).toContain(`${row} The restart you queued didn't go ahead`)
   expect(said[1]).not.toContain('in a row')
   expect(said[2]).toContain(
-    `${row} That is 3 in a row: this session is busy, and messages keep starting turns before the restart can run. Ask the merger to run it with the coordinated go, which waits for idle itself.`,
+    `${row} That is 3 in a row: this session is busy. Queue it again when it's idle, or ask the merger or the owner.`,
   )
   // The break holds: the restart runs, and the count is over.
   await $.tool.call({ tool: TOOL, reason: 'Switched accounts.' })
   await $.turn.complete(answered)
   await clock.advance(1000)
   expect(commands).toEqual(['exit'])
+})
+
+test("the tool's description says it holds on the full safe point, and what still ends with the process", async ($, on) => {
+  const { described } = engine(on, { answer: { exitCode: 0, stdout: '' } })
+  await $.session.start(start)
+  const [text] = described
+  expect(text).toContain('It refuses unless the session is at a safe point')
+  expect(text).toContain('while anything runs under this session (a background Bash, PowerShell or Monitor job, git, a build, test or lint, a dev server or Playwright, a heavy-slot job)')
+  expect(text).toContain("while any of that can't be read")
+  expect(text).toContain("What still ends with this process: wake-ups, background tasks it can't see")
 })

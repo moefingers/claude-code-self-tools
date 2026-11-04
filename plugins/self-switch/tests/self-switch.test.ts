@@ -388,7 +388,7 @@ describe('refusals, before and at the run', () => {
     expect(said[0]).toBe(row)
     expect(said[1]).toBe(row)
     expect(said[2]).toBe(
-      `${row} That is 3 in a row: this session is busy, and messages keep starting turns before the switch can run. Ask the merger to run it with the coordinated go, which waits for idle itself.`,
+      `${row} That is 3 in a row: this session is busy. Queue it again when it's idle, or ask the merger or the owner.`,
     )
     // A fourth says it again, counting on.
     await cancel('t5')

@@ -520,7 +520,7 @@ async function arrive($: EngineInterface, id: string): Promise<void> {
 /**
  * A queued switch that a new turn took back, told to the model in a plugin row, never lost silently.
  * Cancels of a switch to the same conversation are counted while they come in a row; from the third,
- * the row says the session is busy and points to the coordinator's go, which waits for idle itself.
+ * the row says the session is busy: queue it again when it is idle, or ask the merger or the owner.
  */
 async function cancelled($: EngineInterface, value: Queued): Promise<void> {
   let count = 1
@@ -531,15 +531,20 @@ async function cancelled($: EngineInterface, value: Queued): Promise<void> {
   } catch {
     // Counted or not, the row goes.
   }
-  const busy = count >= BUSY_AFTER ? ` That is ${count} in a row: this session is busy, and messages keep starting turns before the switch can run. Ask the merger to run it with the coordinated go, which waits for idle itself.` : ''
+  const busy = count >= BUSY_AFTER ? ` That is ${count} in a row: this session is busy. Queue it again when it's idle, or ask the merger or the owner.` : ''
   await tellModel($, `self-switch: your queued switch to ${quoted(value.to)} was cancelled because a new turn started; queue it again at the next finished break.${busy}`)
 }
 
 /** Runs the switch, step by step; says so at each step that didn't go ahead. */
 async function switchNow($: EngineInterface, value: Queued): Promise<void> {
   if (armed !== value) return
-  // The break held long enough for the run to start: the cancels in a row end here.
-  await $.state.set(cancelsKey, null)
+  // The break held long enough for the run to start: the cancels in a row end here. A count that
+  // can't be cleared never stops the run.
+  try {
+    await $.state.set(cancelsKey, null)
+  } catch {
+    // The next cancel counts on from it; nothing else depends on it.
+  }
   $.ui.status(undefined)
   const { to } = value
   const notRun = async (said: string): Promise<void> => {

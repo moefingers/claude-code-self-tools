@@ -76,7 +76,7 @@ const DESCRIPTION = [
   'Call it when a restart is the fix: the person switched accounts, changed a setting that takes effect at startup, or a plugin won\'t reload (try reload_plugins_after_turn first, if it is available). Only at a finished break: never mid-merge, mid-push or mid-task. Never on your own to clear a problem a restart doesn\'t fix.',
   'Windows only, in a session run in a terminal.',
   '`reason` (required) says why; it is recorded in the transcript. `resume` is the message that starts your first turn in the restarted session: what to check or do next. Give it whenever you have a next step of your own; leave it out only when the next step waits on someone else.',
-  'Everything this process runs ends with it: wake-ups, background tasks, Remote Control (with Remote Control on for all sessions, the resumed session connects again). It refuses while subagents you started are still running, and refuses a second restart within 2 minutes of the last.',
+  'It refuses unless the session is at a safe point: while subagents you started are still running, while anything runs under this session (a background Bash, PowerShell or Monitor job, git, a build, test or lint, a dev server or Playwright, a heavy-slot job), while a git operation is in flight in the repo, and while any of that can\'t be read. It refuses a second restart within 2 minutes of the last. What still ends with this process: wake-ups, background tasks it can\'t see, Remote Control (with Remote Control on for all sessions, the resumed session connects again).',
   'End the turn after calling it; the restart starts once your answer is shown.',
 ].join(' ')
 
@@ -280,7 +280,7 @@ const record = ({ reason }: Queued): string => `This session restarted at its ow
 /**
  * A queued restart that a new turn took back, told to the model in a plugin row, never lost silently;
  * `then` says what became of it. Cancels are counted while they come in a row; from the third, the row
- * says the session is busy and points to the coordinator's go, which waits for idle itself.
+ * says the session is busy: queue it again when it is idle, or ask the merger or the owner.
  */
 async function cancelled($: EngineInterface, then: string): Promise<void> {
   let count = 1
@@ -291,15 +291,20 @@ async function cancelled($: EngineInterface, then: string): Promise<void> {
   } catch {
     // Counted or not, the row goes.
   }
-  const busy = count >= BUSY_AFTER ? ` That is ${count} in a row: this session is busy, and messages keep starting turns before the restart can run. Ask the merger to run it with the coordinated go, which waits for idle itself.` : ''
+  const busy = count >= BUSY_AFTER ? ` That is ${count} in a row: this session is busy. Queue it again when it's idle, or ask the merger or the owner.` : ''
   await tellModel($, `self-restart: your queued restart was cancelled because a new turn started; queue it again at the next finished break.${busy} ${then}`)
 }
 
 /** Opens the window, then exits; says so at each step that didn't go ahead. */
 async function restartNow($: EngineInterface, value: Queued): Promise<void> {
   if (armed !== value) return
-  // The break held long enough for the run to start: the cancels in a row end here.
-  await $.state.set(cancelsKey, null)
+  // The break held long enough for the run to start: the cancels in a row end here. A count that
+  // can't be cleared never stops the run.
+  try {
+    await $.state.set(cancelsKey, null)
+  } catch {
+    // The next cancel counts on from it; nothing else depends on it.
+  }
   $.ui.status(undefined)
   const stop = blocked(await busyAgents($))
   if (stop !== undefined) {
