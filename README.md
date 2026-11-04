@@ -1,6 +1,6 @@
 # claude-code-self-tools
 
-Small [Claude Code](https://code.claude.com/docs) plugins that let a session act on itself. Each one gives Claude a tool or two for something you would otherwise do by hand from the prompt: compact the conversation, reload plugins, reconnect an MCP server, check the context window, come back to a task later, turn on Remote Control under a title.
+Small [Claude Code](https://code.claude.com/docs) plugins that let a session act on itself. Each one gives Claude a tool or two for something you would otherwise do by hand from the prompt: compact or clear the conversation, reload plugins, reconnect an MCP server, check the context window, come back to a task later, turn on Remote Control under a title, exit or restart.
 
 Each plugin is separate. Install only the ones you want.
 
@@ -14,6 +14,9 @@ Each plugin is separate. Install only the ones you want.
 | [self-context](plugins/self-context) | `context_usage` | Reports the tokens used, the window, the percentage and whether auto-compact is on. Read-only. | At a break between pieces of work, to decide whether to compact now. |
 | [self-wake](plugins/self-wake) | `wake_after`, `cancel_wake` | Some minutes after the turn ends, sends the session a note that starts a turn of its own. | When it has to wait on something slow (a deploy, a long job) that won't report back by itself. |
 | [self-remote-control](plugins/self-remote-control) | `remote_control` | Reports whether this session's Remote Control is connected, connects it under a title, and renames the session. | When you ask whether you can reach the session from your phone, to make it reachable before you step away, or to give it a title you'll recognise in the app's session list. |
+| [self-clear](plugins/self-clear) | `clear_after_turn` | Runs `/clear` once the turn ends, then sends the handoff it was given as the cleared conversation's first prompt. | Between two independent pieces of work, when the next needs nothing of this conversation, its notes written down first. |
+| [self-exit](plugins/self-exit) | `exit_after_turn` | Runs `/exit` once the turn ends, its reason (and a note for whoever resumes it) recorded in the transcript first. | When you asked it to end the session, or its instructions say to close once its work is done or handed off. |
+| [self-restart](plugins/self-restart) | `restart_after_turn` | On Windows: opens a new terminal window, exits, and the window resumes the same conversation once the old process has gone, then can resume on its own. | After an account switch, a setting that takes effect at startup, or a plugin that won't reload. |
 
 Claude sees each tool as `mcp__<plugin>__<tool>`, for example `mcp__self-wake__wake_after`.
 
@@ -36,6 +39,9 @@ Then install each plugin you want by name:
 /plugin install self-context@claude-code-self-tools
 /plugin install self-wake@claude-code-self-tools
 /plugin install self-remote-control@claude-code-self-tools
+/plugin install self-clear@claude-code-self-tools
+/plugin install self-exit@claude-code-self-tools
+/plugin install self-restart@claude-code-self-tools
 ```
 
 Each install opens the plugin in the `/plugin` panel, where you choose a scope.
@@ -50,6 +56,9 @@ claude plugin install self-mcp@claude-code-self-tools
 claude plugin install self-context@claude-code-self-tools
 claude plugin install self-wake@claude-code-self-tools
 claude plugin install self-remote-control@claude-code-self-tools
+claude plugin install self-clear@claude-code-self-tools
+claude plugin install self-exit@claude-code-self-tools
+claude plugin install self-restart@claude-code-self-tools
 ```
 
 The install says whether the plugin is already active in the open session or needs `/reload-plugins` there. New sessions load it when they start.
@@ -60,11 +69,12 @@ A mod runs inside Claude Code with your permissions. To see what one hooks and c
 
 What they have in common:
 
-- **Actions wait for the turn to end.** A compaction, a reload, an MCP reconnect, a wake-up and a Remote Control connect are all queued by the tool call and run once the turn ends with Claude's answer. Claude Code can't run them while the turn is running. Claude should end its turn after calling one of these tools.
+- **Actions wait for the turn to end.** A compaction, a clear, a reload, an MCP reconnect, a wake-up, a Remote Control connect, an exit and a restart are all queued by the tool call and run once the turn ends with Claude's answer. Claude Code can't run them while the turn is running. Claude should end its turn after calling one of these tools.
 - **An interrupted turn cancels what it queued.** If you stop the turn (Esc or **Stop**), or it ends any way other than with Claude's answer, what that turn queued is dropped, and a notice says so. Something set in an earlier turn, such as an armed wake-up, stands.
 - **Subagents are refused.** These tools act on the main conversation. A subagent that calls one is told why it can't, and to finish its piece and return its result so the main session can act. `context_usage` refuses a subagent too, because the figures it reports are the main conversation's.
 - **Each change is announced.** A toast tells you what ran, and the tool result tells Claude. When Claude Code refuses an action (a command a plugin may not run), a toast says why, and Claude is told on its next turn.
-- **Built-in commands run as if you typed them.** self-reload runs `/reload-plugins`, self-mcp runs `/mcp reconnect <server>`, and self-remote-control runs `/remote-control` and `/rename`. Their lines show in the transcript, as yours would. A command that asks for confirmation shows you its dialog and waits for your answer, as it would if you had typed it.
+- **Built-in commands run as if you typed them.** self-reload runs `/reload-plugins`, self-mcp runs `/mcp reconnect <server>`, self-remote-control runs `/remote-control` and `/rename`, self-clear runs `/clear`, and self-exit and self-restart run `/exit`. Their lines show in the transcript, as yours would. A command that asks for confirmation shows you its dialog and waits for your answer, as it would if you had typed it.
+- **What can't be undone needs a reason.** A clear keeps nothing of the conversation but its `handoff`, and an exit or a restart ends the process, so each of those tools requires its `handoff` or `reason`. Each refuses while a subagent is still running, whose result or work would be lost. They act only on the session itself: none changes a setting, a permission, CLAUDE.md or any other configuration.
 - **Each says when it's out of date.** When Claude calls one of a plugin's tools, at most every 30 minutes, the plugin fetches its own published `plugin.json` from this repository and compares versions, without holding up the tool. The request is a plain GET of a public file: the plugin adds no headers, query or body, and GitHub sees what it sees of any web request (the address, the time, the headers Claude Code sends on its own). If a newer version is out, a toast tells you, and a tool result tells Claude the update steps for you to run, at most once every 30 minutes in a session. Turn it off with the plugin's `updateCheck` setting; it is also off while `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC` is set. Each plugin's README has the details.
 
 ### Reloads
@@ -83,9 +93,22 @@ The app's session list takes a session's title as the session connects: the name
 
 The attached clients that `status` lists are the screens drawing the session now. A connected session with no phone open shows only the terminal, so that list doesn't tell you whether the session is connected.
 
-### Why there is no effort or model switch
+### Restarts
 
-Claude Code asks you to confirm a change of effort level partway through a conversation, because the next message then re-processes the whole history. A plugin that runs `/effort` gets the same dialog, so the switch can't run unattended. Effort and model stay yours to change with `/effort` and `/model`.
+self-restart opens its window with Windows PowerShell, by its known path under the Windows folder, running one fixed script whose only variable is the session's id.
+
+- **The window.** The script finds the session's own `claude.exe` and opens a new console window with `Start-Process`. `cmd /c start` would hand the plugin's output pipes on to the new session, and hold the plugin's call open for as long as that session runs.
+- **The wait.** The window waits for the old `claude.exe` to exit before it runs `claude --resume <id>`. So two copies never write one session, and Remote Control, which a second copy would leave off, connects in the new one.
+- **The first prompt** waits in the plugin's own store, never on a command line, and the resumed session's copy of the plugin sends it.
+- **Windows only** for now.
+
+### Why there is no effort, model or permission switch
+
+- **Effort.** Claude Code asks you to confirm a change of effort level partway through a conversation, because the next message then re-processes the whole history. A plugin that runs `/effort` gets the same dialog, so the switch can't run unattended.
+- **Model.** `/model` also sets your default for new sessions, which is a settings change.
+- **Permissions.** A session that raises its own permission mode, or widens its own file access, would be taking a decision that is yours.
+
+Effort, model and permissions stay yours to change.
 
 ## Tell sessions when to use them
 
@@ -96,6 +119,8 @@ The tool descriptions say when to call each tool and when not to. To make it a h
 > - **An MCP server stopped answering:** when a server's tools fail in a way a reconnect fixes (the browser extension dropped, the server crashed or timed out), call `reconnect_mcp_after_turn` with the server's name and `resume` saying what to try again, and end the turn.
 > - **Waiting on something slow:** when a deploy, a long job or a check will take a while and nothing will tell you it's done, call `wake_after` with the minutes and a note saying what to check, and end the turn. Cancel it with `cancel_wake` if the answer comes first.
 > - **Remote Control:** when I say I'm stepping away, call `remote_control` with `connect` and a `name` saying what this session is working on. When the work changes, retitle it with `rename`, with a `resume` naming your next step. Never try to disconnect it.
+> - **A fresh start between independent pieces:** when the next piece needs nothing of this conversation, write your notes, then call `clear_after_turn` with a `handoff` naming the piece and where its notes are. When it builds on this one, compact instead.
+> - **Ending or restarting:** call `exit_after_turn` only when I ask you to end the session or your brief says to close it when done, with the `reason`. After I switch accounts or change a setting that needs a restart, call `restart_after_turn` with the `reason` and a `resume` naming the next step.
 
 ## Develop
 

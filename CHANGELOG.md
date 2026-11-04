@@ -2,6 +2,27 @@
 
 Each entry names a plugin and its version, as `version` in `plugins/<name>/.claude-plugin/plugin.json` has it.
 
+## 2026-11-03: a session clears, exits and restarts itself
+
+Three new plugins. Each queues its action at the call and runs it once the turn ends with an answer. Each cancels it when the turn is interrupted, and refuses subagents, as the others do.
+
+Each also requires the parameter that makes its action safe to take unattended (`handoff` or `reason`), and refuses while a subagent is pending, running or waiting. That is checked at the call and again right before the action. None of them changes a setting, a permission, CLAUDE.md or any other configuration.
+
+- **self-clear 0.1.0**, new:
+  - `clear_after_turn` runs `/clear`, then sends `handoff`, which is required, as the cleared conversation's first prompt.
+  - A clear starts a conversation under a new session id. If the id hasn't changed, the clear didn't take, and the handoff isn't sent as if it had.
+  - A handoff Claude Code drops is kept as a note for the next message.
+- **self-exit 0.1.0**, new:
+  - `exit_after_turn` runs `/exit`. `reason` is required; an optional `note` is for whoever resumes the session.
+  - Before the exit, both are recorded as a conversation row, which a later `claude --resume` loads, and as a transcript line the person sees.
+  - It is refused where no one is at the prompt (`-p`, an SDK host).
+  - A refused exit, or a session still open a few seconds after `/exit`, is told to the person and the model.
+- **self-restart 0.1.0**, new, Windows only:
+  - **The launch.** `restart_after_turn` runs Windows PowerShell, by its known path under the Windows folder, on one fixed script whose only variable is the session's id, which must be a UUID. That script opens a new console window with `Start-Process`. Then the session runs `/exit`. Nothing from the tool's input reaches the launch.
+  - **The wait.** The window waits for the session's own `claude.exe` to exit, then runs `claude --resume <id>` from PATH in the session's folder. After 10 minutes it gives up and says so.
+  - **The first prompt.** `resume` waits in the plugin's store under the session's id, and the resumed session's copy of the plugin sends it once. One older than 15 minutes is dropped.
+- **The update check's list of names** gains the three. The other plugins' copies of the shared file change by that line alone and behave as before, so their versions stand.
+
 ## 2026-11-01: the plugins say when they're out of date
 
 Every plugin gets the same update check. Nothing else in them changed.
