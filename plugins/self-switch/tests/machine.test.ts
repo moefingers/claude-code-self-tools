@@ -595,6 +595,23 @@ describe('the scripts, as text', () => {
     expect(window).toContain('if ($null -eq $lock -or $lock.by -cne $by) { "self-switch: the claim on this conversation does not name this launch')
   })
 
+  test("the last-moment re-check refuses whenever a running claude.exe's file names the id, whatever its procStart", () => {
+    // The start time only words the line: a procStart in another unit, or one that moved to another
+    // field (procStartFt), must never read as free.
+    const at = RECHECK.indexOf('    if ($e.sessionId -ceq $id) {')
+    expect(at).toBeGreaterThan(0)
+    expect(RECHECK.slice(at + 1, at + 6)).toEqual([
+      '      $near = $false',
+      '      try { $near = [math]::Abs([double]$p.CreationDate.ToFileTimeUtc() - [double]$e.procStart) -le 10000 } catch { $near = $false }',
+      '      if ($near) { $live = "it is open elsewhere: Claude Code $($f.BaseName) holds it (L1)" } else { $live = "it may be open elsewhere: the registry file of running Claude Code $($f.BaseName) names it, though its procStart is not that process start time (a stale file, or a format this check does not know)" }',
+      '      break',
+      '    }',
+    ])
+    expect(RECHECK.some(line => line.includes('sessionId -ceq $id -and'))).toBe(false)
+    // The window carries it after the wait, and the restart's launcher too.
+    for (const script of [restart, window]) for (const line of RECHECK.slice(at, at + 6)) expect(script).toContain(`'    ${line}'`)
+  })
+
   test('the slot is hashed by .NET, never by Get-FileHash, and a hash that fails keeps its reason', () => {
     // Get-FileHash is missing where Windows PowerShell 5.1 loads PowerShell 7's Utility module (a
     // Windows Terminal tab with 7's module folders first): .NET's SHA256 needs no module.

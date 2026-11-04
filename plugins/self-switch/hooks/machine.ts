@@ -255,7 +255,7 @@ export const REGISTRY_FIELDS = ['pid', 'sessionId', 'procStart'] as const
 export const REGISTRY_VERSION_MARKERS = ['v', 'schema', 'schemaVersion', 'formatVersion', 'registryVersion'] as const
 
 /** The SHA-256 of plugins/self-switch/slot/claude-slot.ps1, as it is committed. */
-export const SLOT_SCRIPT_SHA256 = '97afd4f28bc8cb4b5dbe080161845fb81bcb5e9e4fade5b074460740dd03d252'
+export const SLOT_SCRIPT_SHA256 = 'ace5d3acdb177beba905dd7694f0c7277ee01674fdcc2a904f6be1277e637c8f'
 
 /**
  * The variables Claude Code sets in the processes it starts, which a top-level claude must not inherit:
@@ -397,7 +397,8 @@ const TAKE_CLAIM = [
  * A registry file of a running claude.exe that can't be read, or reads in another shape, is read again
  * twice, 250 ms apart (Claude Code may be rewriting it), and then counts as unknown, which resumes
  * nothing. Anything else that can't be read throws, and a caller that catches it resumes nothing. No
- * single quote in these lines: the launcher carries each inside one. procStart compares as a [double]:
+ * single quote in these lines: the launcher carries each inside one. A running claude.exe whose file
+ * names $id refuses whatever its procStart; the start time only words the line. procStart compares as a [double]:
  * a string of digits, as Claude Code 2.1.318 writes it, converts as a number does, and at today's
  * FILETIMEs a double is off by at most 32 ticks, well within the 1 ms tolerance.
  */
@@ -420,7 +421,14 @@ export const RECHECK = [
   '      if ($null -eq $e -and $try -lt 3) { Start-Sleep -Milliseconds 250 }',
   '    }',
   '    if ($null -eq $e) { $live = "whether it is open elsewhere is unknown: the registry file of Claude Code $($f.BaseName) could not be read, three times, or has another shape"; break }',
-  `    if ($e.sessionId -ceq $id -and [math]::Abs([double]$p.CreationDate.ToFileTimeUtc() - [double]$e.procStart) -le ${PROC_START_TOLERANCE}) { $live = "it is open elsewhere: Claude Code $($f.BaseName) holds it (L1)"; break }`,
+  // A running claude.exe whose file names the id holds it, whatever its procStart: the start time only
+  // words the line (a unit or a field that moved, procStartFt, must never read as free).
+  '    if ($e.sessionId -ceq $id) {',
+  '      $near = $false',
+  `      try { $near = [math]::Abs([double]$p.CreationDate.ToFileTimeUtc() - [double]$e.procStart) -le ${PROC_START_TOLERANCE} } catch { $near = $false }`,
+  '      if ($near) { $live = "it is open elsewhere: Claude Code $($f.BaseName) holds it (L1)" } else { $live = "it may be open elsewhere: the registry file of running Claude Code $($f.BaseName) names it, though its procStart is not that process start time (a stale file, or a format this check does not know)" }',
+  '      break',
+  '    }',
   '  }',
   '}',
 ] as const

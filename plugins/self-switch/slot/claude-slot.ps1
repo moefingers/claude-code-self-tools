@@ -65,7 +65,12 @@ function Get-Live($id, $configDirs) {
         if ($null -eq $e -and $try -lt 3) { Start-Sleep -Milliseconds 250 }
       }
       if ($null -eq $e) { $live = "whether it is open elsewhere is unknown: the registry file of Claude Code $($f.BaseName) could not be read, three times, or has another shape"; break }
-      if ($e.sessionId -ceq $id -and [math]::Abs([double]$p.CreationDate.ToFileTimeUtc() - [double]$e.procStart) -le 10000) { $live = "it is open elsewhere: Claude Code $($f.BaseName) holds it (L1)"; break }
+      if ($e.sessionId -ceq $id) {
+        $near = $false
+        try { $near = [math]::Abs([double]$p.CreationDate.ToFileTimeUtc() - [double]$e.procStart) -le 10000 } catch { $near = $false }
+        if ($near) { $live = "it is open elsewhere: Claude Code $($f.BaseName) holds it (L1)" } else { $live = "it may be open elsewhere: the registry file of running Claude Code $($f.BaseName) names it, though its procStart is not that process start time (a stale file, or a format this check does not know)" }
+        break
+      }
     }
   }
   return $live
