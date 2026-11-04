@@ -58,12 +58,17 @@ type Machine = {
   git?: 'no-repo' | 'fails'
   /** Whether the session's folder can be read. */
   cwd?: 'reads' | 'fails'
+  /** The session's crons, as CronList lists them. */
+  crons?: readonly { readonly id: string; readonly humanSchedule?: string; readonly prompt?: string }[]
 }
+
+/** The pending marker's path for this session. */
+const MARKER = `${WINDOWS.LOCALAPPDATA}\\claude-self-tools\\pending\\${ID}.json`
 
 /** The engine beneath the plugin, its launcher answering `answer`; and what it was asked to run. */
 function engine(
   on: On,
-  { answer, store = {}, probe = probeOf(), git = 'no-repo', cwd = 'reads', released = 'released' }: { answer: { exitCode: number; stdout: string }; store?: Record<string, unknown>; released?: 'released' | 'busy' } & Machine,
+  { answer, store = {}, probe = probeOf(), git = 'no-repo', cwd = 'reads', crons = [], released = 'released' }: { answer: { exitCode: number; stdout: string }; store?: Record<string, unknown>; released?: 'released' | 'busy' } & Machine,
 ) {
   const probes: string[] = []
   const described: string[] = []
@@ -71,10 +76,23 @@ function engine(
   const commands: string[] = []
   const toasts: string[] = []
   const logs: string[] = []
+  const writes: { path: string; text: string }[] = []
+  /** The machine as it is now: a test changes it between the call and the run. */
+  const world: Required<Machine> = { probe, git, cwd, crons }
   const held = new Map<string, unknown>(Object.entries(store))
   const clock = mock.clock(on, { now: 1_000_000 })
   const session = mock.session(on)
   mock.env(on, WINDOWS)
+  on('tool.check', { tool: 'CronList' }, () => ({ decision: 'allow' as const }))
+  // CronList as the engine answers it (live check SS2): `{ result: { jobs }, text }`, and an error result
+  // for a call that puts its arguments under `input`. `as never`: its record's type is the engine's own.
+  on('tool.call', { tool: 'CronList' }, (_, e) =>
+    ('input' in e ? { isError: true, result: 'InputValidationError', text: 'InputValidationError' } : { result: { jobs: world.crons }, text: `${world.crons.length} scheduled jobs.` }) as never,
+  )
+  on('fs.write', (_, e) => {
+    writes.push({ path: e.path, text: e.text })
+    return { value: undefined }
+  })
   on('store.get', (_, e) => ({ value: held.get(e.key) }))
   on('store.set', (_, e) => {
     held.set(e.key, JSON.parse(JSON.stringify(e.value)))
@@ -82,7 +100,7 @@ function engine(
   })
   on('session.start', (_, e) => ({ cwd: e.cwd }))
   on('session.id', () => ({ value: ID }))
-  on('session.cwd', () => (cwd === 'reads' ? { value: 'C:\\work\\repo' } : { deny: 'no folder' }))
+  on('session.cwd', () => (world.cwd === 'reads' ? { value: 'C:\\work\\repo' } : { deny: 'no folder' }))
   on('tool.register', (_, e) => {
     described.push(String(e.description))
     return { value: { tool: TOOL } }
@@ -103,16 +121,16 @@ function engine(
   on('turn.complete', () => ({ text: 'done' }))
   on('process.run', (_, e) => {
     if (e.argv[0] === 'git') {
-      return git === 'no-repo'
+      return world.git === 'no-repo'
         ? { value: { exitCode: 128, stdout: '', stderr: 'fatal: not a git repository', isStdoutTruncated: false, isStderrTruncated: false } }
         : { value: { exitCode: 128, stdout: '', stderr: 'fatal: detected dubious ownership in repository', isStdoutTruncated: false, isStderrTruncated: false } }
     }
     const script = String(e.init?.stdin ?? '')
     if (script.includes('$ids = @(')) {
       probes.push(script)
-      return probe === 'fails'
+      return world.probe === 'fails'
         ? { value: { exitCode: 1, stdout: '', stderr: 'Get-CimInstance : Access denied', isStdoutTruncated: false, isStderrTruncated: false } }
-        : { value: { exitCode: 0, stdout: probe, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+        : { value: { exitCode: 0, stdout: world.probe, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
     }
     scripts.push(script)
     if (script.includes("'not-ours'")) return { value: { exitCode: 0, stdout: `${released}\r\n`, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
@@ -123,7 +141,7 @@ function engine(
     await clock.sleep(HOUR)
     return {}
   })
-  return { probes, described, scripts, commands, toasts, logs, held, clock, session }
+  return { probes, described, scripts, commands, toasts, logs, writes, world, held, clock, session }
 }
 
 const start = { cwd: 'C:\\work\\repo', surface: 'terminal', isInteractive: true } as const
@@ -229,37 +247,46 @@ test('a claim another switch holds: the launcher resumes nothing, no window open
   expect(held.get('restarts')).toEqual({})
 })
 
-test('before the launch, the full safe point: the probe asks of this session alone, and claims nothing', async ($, on) => {
+test('at the call and before the launch, the full safe point: the probe asks of this session alone, and claims nothing', async ($, on) => {
   const { probes, scripts, commands, clock } = engine(on, { answer: { exitCode: 0, stdout: `launched 17716\r\nclaim ${LAUNCH}\r\n` } })
   await $.session.start(start)
   await $.tool.call({ tool: TOOL, reason: 'Switched accounts.' })
+  // The pre-check at the call, then again before the launch.
   await $.turn.complete(answered)
   await clock.advance(1000)
-  expect(probes).toHaveLength(1)
-  expect(probes[0]).toContain(`$ids = @('${ID}')`)
-  expect(probes[0]).toContain('$configDirs = @()')
-  expect(probes[0]).toContain('$take = $null')
-  expect(probes[0]).toContain('$state = $null')
+  expect(probes).toHaveLength(2)
+  for (const probe of probes) {
+    expect(probe).toContain(`$ids = @('${ID}')`)
+    expect(probe).toContain('$configDirs = @()')
+    expect(probe).toContain('$take = $null')
+    expect(probe).toContain('$state = $null')
+  }
   // An MCP server's node under the session doesn't count: the launch goes ahead.
   expect(scripts).toEqual([launcherScript(ID)])
   expect(commands).toEqual(['exit'])
 })
 
+const BASH = { pid: 505, ppid: 100, created: '134062355678901240', name: 'bash.exe', cls: 'shell' }
+const CRON = { id: '7f3a9c21', humanSchedule: 'Every 5 minutes', prompt: 'check the deploy' }
+
 for (const [name, machine, said] of [
   [
     'a background Bash job under the session',
-    { probe: probeOf([{ pid: 505, ppid: 100, created: '134062355678901240', name: 'bash.exe', cls: 'shell' }]) },
-    /isn't at a safe point \(S6: bash\.exe 505 runs under this session \(a background job of the Bash, PowerShell or Monitor tool\)\)/,
+    { probe: probeOf([BASH]) },
+    /the background shell bash\.exe 505 runs under this session \(a background job of the Bash, PowerShell or Monitor tool\): stop it with TaskStop/,
   ],
+  ['a session cron', { crons: [CRON] }, /cron 7f3a9c21 \(Every 5 minutes: \u00abcheck the deploy\u00bb\) is set to wake this session: delete it with CronDelete \(id 7f3a9c21\)/],
   ['a git process under the session', { probe: probeOf([{ pid: 501, ppid: 100, created: '134062355678901240', name: 'git.exe', cls: 'git' }]) }, /S2: git\.exe 501 runs under this session/],
-  ['a probe that fails (an unreadable process table)', { probe: 'fails' as const }, /the machine probe failed \(it exited 1: Get-CimInstance : Access denied\), so what runs under this session is unknown/],
+  ['a probe that fails (an unreadable process table)', { probe: 'fails' as const }, /can't tell what runs under this session: the machine probe failed \(it exited 1: Get-CimInstance : Access denied\)/],
   ['git that cannot be read', { git: 'fails' as const }, /S2: git's state can't be read \(git rev-parse in C:\\\\work\\\\repo exited 128\)/],
   ['a session folder that cannot be read', { cwd: 'fails' as const }, /this session's folder can't be read, so git's state there is unknown/],
 ] as const) {
-  test(`${name} holds the restart: no window, no exit, and the model is told why`, async ($, on) => {
-    const { scripts, commands, toasts, held, session, clock } = engine(on, { answer: { exitCode: 0, stdout: `launched 17716\r\nclaim ${LAUNCH}\r\n` }, ...machine })
+  test(`${name}, there by the time the restart is armed, holds it: no window, no exit, the model told why, the marker done`, async ($, on) => {
+    const { scripts, commands, toasts, held, session, writes, world, clock } = engine(on, { answer: { exitCode: 0, stdout: `launched 17716\r\nclaim ${LAUNCH}\r\n` } })
     await $.session.start(start)
-    await $.tool.call({ tool: TOOL, reason: 'Switched accounts.' })
+    expect((await $.tool.call({ tool: TOOL, reason: 'Switched accounts.' })).deny).toBeUndefined()
+    // It comes after the call, before the turn ends.
+    Object.assign(world, machine)
     await $.turn.complete(answered)
     await clock.advance(1000)
     expect(scripts).toEqual([])
@@ -267,8 +294,71 @@ for (const [name, machine, said] of [
     expect(toasts.some(t => /Restart didn't run/.test(t))).toBe(true)
     expect(JSON.stringify(session.appended())).toMatch(said)
     expect(held.get('restarts')).toBeUndefined()
+    expect(writes.map(w => w.text)).toEqual(['{"v":1,"kind":"restart","at":1000000}', '{"v":1,"kind":"restart","at":1000000}', '{"v":1,"done":true}'])
   })
 }
+
+for (const [name, machine, said] of [
+  [
+    'a background Bash job under the session',
+    { probe: probeOf([BASH]) },
+    'Not queued: the background shell bash.exe 505 runs under this session (a background job of the Bash, PowerShell or Monitor tool): stop it with TaskStop (the task id its Bash, PowerShell or Monitor call gave), or let it finish. Each would make the restart\'s exit stop at its confirmation, or end with this process: stop them, then call again.',
+  ],
+  [
+    'a session cron',
+    { crons: [CRON] },
+    "Not queued: cron 7f3a9c21 (Every 5 minutes: \u00abcheck the deploy\u00bb) is set to wake this session: delete it with CronDelete (id 7f3a9c21). Each would make the restart's exit stop at its confirmation, or end with this process: stop them, then call again.",
+  ],
+  [
+    'a probe that fails',
+    { probe: 'fails' as const },
+    "Not queued: can't tell what runs under this session: the machine probe failed (it exited 1: Get-CimInstance : Access denied): call again in a moment; if it still can't be read, tell the person, who can act by hand. Each would make the restart's exit stop at its confirmation, or end with this process: stop them, then call again.",
+  ],
+] as const) {
+  test(`${name} at the call refuses it, naming how to stop it: nothing is queued, armed or marked`, async ($, on) => {
+    const { scripts, commands, writes, clock } = engine(on, { answer: { exitCode: 0, stdout: `launched 17716\r\nclaim ${LAUNCH}\r\n` }, ...machine })
+    await $.session.start(start)
+    expect((await $.tool.call({ tool: TOOL, reason: 'Switched accounts.' })).deny).toBe(said)
+    await $.turn.complete(answered)
+    await clock.advance(1000)
+    expect(scripts).toEqual([])
+    expect(commands).toEqual([])
+    expect(writes).toEqual([])
+  })
+}
+
+test('the pending marker: written at the call and at the arm, done right before the exit runs', async ($, on) => {
+  const { commands, writes, clock } = engine(on, { answer: { exitCode: 0, stdout: `launched 17716\r\nclaim ${LAUNCH}\r\n` } })
+  await $.session.start(start)
+  await $.tool.call({ tool: TOOL, reason: 'Switched accounts.' })
+  expect(writes).toEqual([{ path: MARKER, text: '{"v":1,"kind":"restart","at":1000000}' }])
+  await $.turn.complete(answered)
+  await clock.advance(1000)
+  expect(commands).toEqual(['exit'])
+  expect(writes.map(w => w.path)).toEqual([MARKER, MARKER, MARKER])
+  expect(writes.map(w => w.text)).toEqual(['{"v":1,"kind":"restart","at":1000000}', '{"v":1,"kind":"restart","at":1000000}', '{"v":1,"done":true}'])
+})
+
+test('the pending marker says done when the restart is cancelled: a new turn, an interrupted turn, a launcher that fails', async ($, on) => {
+  const { writes, clock } = engine(on, { answer: { exitCode: 3, stdout: 'self-restart: no claude.exe above this launcher\r\n' } })
+  await $.session.start(start)
+  const kinds = () => writes.map(w => (w.text.includes('"done":true') ? 'done' : 'restart'))
+
+  await $.tool.call({ tool: TOOL, reason: 'Switched accounts.' })
+  await $.turn.complete(answered)
+  await $.turn.start({ text: 'a message', turnId: 't2' })
+  await clock.advance(1000)
+  expect(kinds()).toEqual(['restart', 'restart', 'done'])
+
+  await $.tool.call({ tool: TOOL, reason: 'Switched accounts.' })
+  await $.turn.complete({ ...answered, turnId: 't3', isAborted: true, reason: 'aborted' })
+  expect(kinds()).toEqual(['restart', 'restart', 'done', 'restart', 'done'])
+
+  await $.tool.call({ tool: TOOL, reason: 'Switched accounts.' })
+  await $.turn.complete({ ...answered, turnId: 't4' })
+  await clock.advance(1000)
+  expect(kinds()).toEqual(['restart', 'restart', 'done', 'restart', 'done', 'restart', 'restart', 'done'])
+})
 
 test('a queued restart a new turn cancels is told in a plugin row; the third in a row says the session is busy', async ($, on) => {
   const { scripts, commands, session, clock } = engine(on, { answer: { exitCode: 0, stdout: `launched 17716\r\nclaim ${LAUNCH}\r\n` } })

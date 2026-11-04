@@ -23,10 +23,21 @@
 // at the classic SessionStart with `source: "resume"` for that id. One older than 15 minutes is
 // dropped: the window had given up, and the session was resumed later by hand.
 //
-// It refuses while a subagent is running, whose work would end with this process; checked at the
-// call, again right before the launch, and again right before the exit. And no restart loop: a
-// session whose restart opened its window less than 2 minutes ago is refused another, at the call
-// and right before the launch (the plugin's store keeps when, by session id).
+// The pre-check (exitBlockers, in the shared machine code), as self-exit's: it refuses while anything
+// would make the exit stop at its confirmation, or end work still running: a session cron (the
+// built-in CronList, read through $.tool.call once $.tool.check allows it, so never a dialog), a
+// background job under the session (the probe's S6), a subagent; each named with how to stop it, and
+// anything unreadable refuses too. It runs at the call, so nothing is queued while a blocker stands,
+// and again when the restart is armed, with the rest of the safe point. A subagent is checked again
+// right before the exit. And no restart loop: a session whose restart opened its window less than 2
+// minutes ago is refused another, at the call and right before the launch (the plugin's store keeps
+// when, by session id).
+//
+// The pending marker: while the restart is queued or armed, %LOCALAPPDATA%\claude-self-tools\pending\
+// <conversation>.json says so ({ v: 1, kind: 'restart', at }), and the coordinator holds its
+// deliveries meanwhile, so that none starts a turn that would cancel the restart. It says done
+// ({ v: 1, done: true }) once the exit runs or the restart is cancelled; the resumed session gets the
+// deliveries.
 //
 // The exit waits for the session to be idle, so a message that arrives between the turn's end and the
 // exit would start a turn the exit then cuts off. A main-loop turn that starts before the exit has
@@ -35,8 +46,8 @@
 import type { EngineInterface, Register } from 'claude-code'
 import type { Queued, Restart } from '../types'
 import { CLAIMED, FALLBACK, LAUNCHED, launcherScript, powershellPath, RELEASED, releaseScript, SESSION_ID, SLOTTED, stateFolder, SYSTEM_ROOT, WAIT_SECONDS } from './launcher'
-import type { AgentLike } from './machine'
-import { isSafeFolder, oneLine, parseProbe, powershellCall, probeScript, quoted, readGit, safePoint } from './machine'
+import type { PendingKind } from './machine'
+import { blockersText, exitBlockers, isSafeFolder, markPending, oneLine, powershellCall, quoted, readExit, readGit, safePoint } from './machine'
 import { configureUpdateCheck, loadUpdateCheck, withUpdateNotice } from './update-check'
 
 const queued = { plugin: 'self-restart', key: 'queued' } as const
@@ -76,7 +87,7 @@ const DESCRIPTION = [
   'Call it when a restart is the fix: the person switched accounts, changed a setting that takes effect at startup, or a plugin won\'t reload (try reload_plugins_after_turn first, if it is available). Only at a finished break: never mid-merge, mid-push or mid-task. Never on your own to clear a problem a restart doesn\'t fix.',
   'Windows only, in a session run in a terminal.',
   '`reason` (required) says why; it is recorded in the transcript. `resume` is the message that starts your first turn in the restarted session: what to check or do next. Give it whenever you have a next step of your own; leave it out only when the next step waits on someone else.',
-  'It refuses unless the session is at a safe point: while subagents you started are still running, while anything runs under this session (a background Bash, PowerShell or Monitor job, git, a build, test or lint, a dev server or Playwright, a heavy-slot job), while a git operation is in flight in the repo, and while any of that can\'t be read. It refuses a second restart within 2 minutes of the last. What still ends with this process: wake-ups, background tasks it can\'t see, Remote Control (with Remote Control on for all sessions, the resumed session connects again).',
+  'It refuses unless the session is at a safe point: while a session cron is set (delete it with CronDelete), while subagents you started are still running, while anything runs under this session (a background Bash, PowerShell or Monitor job, git, a build, test or lint, a dev server or Playwright, a heavy-slot job), while a git operation is in flight in the repo, and while any of that can\'t be read; each is named with how to stop it. It refuses a second restart within 2 minutes of the last. What still ends with this process: wake-ups, background tasks it can\'t see, Remote Control (with Remote Control on for all sessions, the resumed session connects again).',
   'End the turn after calling it; the restart starts once your answer is shown.',
 ].join(' ')
 
@@ -158,26 +169,29 @@ async function env($: EngineInterface, read: () => Promise<string | undefined>):
   }
 }
 
-/** How long the probe of this session's processes may take. */
-const PROBE_MS = 60_000
+/**
+ * What stands in the exit's way now (the pre-check: crons, the probe's S6 when the launch can be
+ * planned, subagents), each with how to stop it, as one line; undefined when nothing does. Off
+ * Windows, or where the launch can't be planned, the probe isn't run: the restart is refused when
+ * armed, saying why, and nothing exits.
+ */
+async function blockers($: EngineInterface, launch: { powershell: string; id: string } | undefined): Promise<string | undefined> {
+  const found = exitBlockers(await readExit($, launch))
+  return found.length === 0 ? undefined : blockersText(found)
+}
 
 /**
- * Why this session isn't at a safe point to exit, or undefined when it is: the shared safePoint, on a
- * probe of the process tree (this session's id, no config folder, no claim) and git's state where the
- * session started and works. A subagent, any job under this claude.exe (a background Bash, PowerShell
- * or Monitor job, git, a build, a dev server, a heavy-slot job) or git in flight holds it; anything
- * that can't be read holds it too.
+ * Why this session isn't at a safe point to exit, or undefined when it is. First the pre-check
+ * (exitBlockers: a session cron, a background job under the session, a subagent, each with how to
+ * stop it); then the shared safePoint, on the same probe of the process tree (this session's id, no
+ * config folder, no claim) and git's state where the session started and works: git, a dev server or
+ * a heavy-slot job under this claude.exe, or git in flight, holds it too. Anything that can't be read
+ * holds it.
  */
 async function notSafe($: EngineInterface, launch: { powershell: string; id: string; cwd: string }): Promise<string | undefined> {
-  let probe: ReturnType<typeof parseProbe> | string
-  try {
-    const call = powershellCall(launch.powershell, probeScript({ ids: [launch.id], configDirs: [] }))
-    const run = await $.process.run(call.argv, { stdin: call.stdin, cwd: launch.cwd, timeoutMs: PROBE_MS })
-    probe = run.exitCode === 0 ? parseProbe(run.stdout) : `it exited ${run.exitCode}${brief(run.stderr) === '' ? '' : `: ${brief(run.stderr)}`}`
-  } catch (err) {
-    probe = `it didn't run: ${why(err)}`
-  }
-  if (typeof probe !== 'string' && 'error' in probe) probe = probe.error
+  const read = await readExit($, launch)
+  const found = exitBlockers(read)
+  if (found.length > 0) return blockersText(found)
   let cwd: string
   try {
     cwd = await $.session.cwd()
@@ -185,14 +199,15 @@ async function notSafe($: EngineInterface, launch: { powershell: string; id: str
     return `this session's folder can't be read, so git's state there is unknown (${why(err)})`
   }
   const git = await readGit($, { start: launch.cwd, folders: [cwd], dirty: false })
-  let agents: readonly AgentLike[] | string
-  try {
-    agents = await $.agent.list()
-  } catch (err) {
-    agents = why(err)
-  }
-  const safe = safePoint(probe, git, agents)
+  // The probe and the agents were read whole above, or the pre-check would have held.
+  const safe = safePoint(read.busy ?? 'it was not run', git, read.agents)
   return safe.verdict === 'clear' ? undefined : `this session isn't at a safe point (${safe.reasons.join('; ')})`
+}
+
+/** The pending marker: `kind` while the restart is queued or armed, null once it ran or was cancelled. */
+async function mark($: EngineInterface, kind: PendingKind | null): Promise<void> {
+  const failed = await markPending($, kind)
+  if (failed !== undefined) $.ui.log(`the pending marker wasn't written (${failed}); the coordinator ignores an old one after 15 minutes.`)
 }
 
 /** What the launch needs, each from the engine, never from the tool's input; or why it can't go ahead. */
@@ -270,7 +285,9 @@ async function loop($: EngineInterface, at: number): Promise<string> {
   return `this session restarted ${seconds} seconds ago, and a second restart within 2 minutes is refused, so that restarts can't loop unattended`
 }
 
+/** Says an armed restart didn't go ahead: the pending marker done, a toast for the person, a note for the model. */
 async function refuse($: EngineInterface, toast: string, note: string): Promise<void> {
+  await mark($, null)
   $.ui.toast(toast)
   await tellModel($, note)
 }
@@ -330,7 +347,8 @@ async function restartNow($: EngineInterface, value: Queued): Promise<void> {
     await refuse($, `Restart didn't run: ${said}.`, `The restart you queued didn't run: ${said}. The session goes on; if a restart is still the fix, tell the person, who can restart by hand.`)
     return
   }
-  // The safe point (S1-S6), as a switch's: nothing may still run under this session when it exits.
+  // The pre-check again, and the safe point (S1-S6), as a switch's: nothing may still run under this
+  // session when it exits, and no cron may make the exit ask.
   const unsafe = await notSafe($, launch)
   if (unsafe !== undefined) {
     armed = undefined
@@ -401,6 +419,8 @@ async function restartNow($: EngineInterface, value: Queued): Promise<void> {
   if (fallback !== undefined) $.ui.log(`this pane's slot runner isn't used: ${fallback}. A new window resumes the session.`)
   const where = slot !== undefined ? "this pane's slot" : 'a new window'
   $.ui.toast(`Restarting: ${where} resumes this session once it has exited${fallback === undefined ? '' : `, not this pane's slot (${fallback})`}. ${value.reason}`)
+  // Done as the exit runs: the coordinator delivers again, to the resumed session.
+  await mark($, null)
   try {
     await $.command.run({ command: 'exit' })
   } catch (err) {
@@ -519,14 +539,22 @@ export const register: Register = (on, options) => {
     if (!isTerminal) {
       return { deny: 'A restart opens a terminal window for a session run in a terminal with a person at its prompt; this one is not (a -p run, an SDK host, or an app).' }
     }
-    const stop = blocked(await busyAgents($))
-    if (stop !== undefined) return { deny: `Not queued: ${stop}. Wait for them to report, or stop them, then call again.` }
+    // What the launch needs: where it can't be planned (off Windows, an id claude --resume doesn't
+    // take), the restart is refused when armed, saying why; the probe is run only where it can be.
+    const planned = await plan($)
+    const launch = 'refusal' in planned ? undefined : planned
     // No restart loop: a session that restarted less than 2 minutes ago is refused another.
-    const id = await $.session.id().catch(() => undefined)
+    const id = launch?.id ?? (await $.session.id().catch(() => undefined))
     const lately = id !== undefined && SESSION_ID.test(id) ? await lastRestart($, id) : undefined
     if (lately !== undefined) return { deny: `Not queued: ${await loop($, lately)}. If a restart is still the fix, tell the person, who can restart by hand.` }
+    // The pre-check at the call: nothing is queued while anything stands.
+    const stop = await blockers($, launch)
+    if (stop !== undefined) {
+      return { deny: `Not queued: ${stop}. Each would make the restart's exit stop at its confirmation, or end with this process: stop them, then call again.` }
+    }
     const resume = text(input.resume)
     await $.state.set(queued, entry(reason, resume))
+    await mark($, 'restart')
     $.ui.status('restart queued for when this turn ends')
     const then = resume === undefined ? 'then waits for the next message' : `then resumes with: ${resume}`
     return {
@@ -543,9 +571,11 @@ export const register: Register = (on, options) => {
     if (e.isAborted || e.reason !== 'answer') {
       $.ui.status(undefined)
       $.ui.toast("Restart cancelled: the turn didn't finish.")
+      await mark($, null)
       return done
     }
     armed = value
+    await mark($, 'restart')
     $.clock.after(SETTLE_MS, () => void restartNow($, value))
     return done
   })
@@ -557,6 +587,7 @@ export const register: Register = (on, options) => {
     armed = undefined
     $.ui.status(undefined)
     $.ui.toast('Restart cancelled: a new turn started before this session exited.')
+    void mark($, null)
     void cancelled($, "The restart you queued didn't go ahead: a new turn started before this session exited. The session goes on.")
     return started
   })

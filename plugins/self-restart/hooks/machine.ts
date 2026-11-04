@@ -1,11 +1,12 @@
-// The machine code self-restart and self-switch share: what runs on this machine, who holds which
-// conversation, whether a session is at a safe point, and the fixed scripts that look and launch.
+// The machine code self-restart, self-switch, self-exit and self-check share: what runs on this
+// machine, who holds which conversation, whether a session is at a safe point, what would make /exit
+// ask, the fixed scripts that look and launch, and the files the coordinator reads.
 //
 // Canonical copy: shared/hooks/machine.ts. It is copied, identical, to the plugins named on the next
 // line, at plugins/<name>/hooks/machine.ts; `node scripts/sync-shared.mjs` writes those copies and
 // `node --test "scripts/*.test.mjs"` fails when one differs, or sits in a plugin not named. Edit the
 // canonical copy only.
-// Copies: self-restart, self-switch
+// Copies: self-check, self-exit, self-restart, self-switch
 //
 // One self-contained module: it imports nothing but the engine's types, so another plugin (the
 // coordinator's, agent-coordinator-3000) can vendor it byte for byte. Copies outside this repository
@@ -36,7 +37,15 @@
 // - The slot runner's hash (SLOT_SCRIPT_SHA256): plugins/self-switch/slot/claude-slot.ps1, byte for
 //   byte. A pane is used as a slot only when the script its parent runs has this hash.
 // - The gate file the coordinator writes (gatePath, readGate), and git's state (readGit).
-import type { EngineInterface, ProcessRunResult } from 'claude-code'
+// - The exit pre-check (exitBlockers, readExit): what would make a queued /exit stop at its
+//   confirmation, or end work still running: session crons (the built-in CronList, through
+//   $.tool.call once $.tool.check allows it), background jobs under the session (the probe's S6),
+//   subagents, a pending wake-up. Anything it can't read is a blocker of its own ("can't tell: ..."),
+//   never none.
+// - The files the coordinator reads, each at an id-shaped path (pendingPath, selfcheckPath: a session
+//   id, checked, or no path at all): the pending marker self-exit and self-restart keep while an exit
+//   or restart is queued (readPending), and the last self-check's failed tools (readSelfcheck).
+import type { EngineInterface, ProcessRunResult, Timer } from 'claude-code'
 
 // ---------------------------------------------------------------------------------------------
 // Inputs, and how they reach a script.
@@ -1236,7 +1245,7 @@ export type GitState =
  */
 export type Baseline = { readonly folder: string; readonly fingerprint: string; readonly at: number; readonly usedAt?: number }
 
-export type AgentLike = { readonly status: string; readonly description?: string; readonly type?: string }
+export type AgentLike = { readonly status: string; readonly description?: string; readonly type?: string; readonly id?: string }
 
 export type SafePoint = { readonly verdict: 'clear' | 'hold'; readonly reasons: readonly string[] }
 
@@ -1868,4 +1877,348 @@ export function readGate(text: string, now: number): 'coordinated' | 'open' | 's
   if (!Number.isFinite(at)) return 'bad'
   if (now - at > GATE_MS) return 'stale'
   return raw.coordinated ? 'coordinated' : 'open'
+}
+
+// ---------------------------------------------------------------------------------------------
+// The exit pre-check: what would make a queued /exit stop at its confirmation, or end work still
+// running. self-exit and self-restart read it at the call and again when the exit is armed, and
+// refuse while anything stands, so that nothing is queued that /exit would meet a dialog over; the
+// coordinator's ready_for_reboot reads the same.
+
+/** One job as the built-in CronList tool lists it: a session cron (CronCreate, ScheduleWakeup, /loop). */
+export type CronJob = {
+  readonly id: string
+  readonly humanSchedule?: string
+  readonly cron?: string
+  readonly prompt?: string
+  readonly recurring?: boolean
+}
+
+/** A wake-up self-wake holds for this session, by its note. */
+export type WakeLike = { readonly note: string }
+
+/**
+ * What exitBlockers reads. Each is what was read, or a string: why it couldn't be read.
+ * - `crons`: CronList's jobs.
+ * - `busy`: the probe, whose S6 says what runs under this session, or why it failed. Absent where
+ *   there is no probe to run (off Windows: the probe is a Windows PowerShell script), which looks at
+ *   nothing and says nothing; a caller on Windows always passes it.
+ * - `agents`: `$.agent.list()`.
+ * - `wake`: self-wake's pending wake-up, null for none. Absent while nothing reads it.
+ */
+export type ExitInputs = {
+  readonly crons: readonly CronJob[] | string
+  readonly busy?: Probe | string
+  readonly agents: readonly AgentLike[] | string
+  readonly wake?: WakeLike | null | string
+}
+
+/**
+ * What stands in an exit's way: a session cron, a background job under the session (`shell`), a
+ * subagent, a pending wake-up, or something that couldn't be read (`unknown`). `monitor` is kept for a
+ * caller that can tell a Monitor's job from a Bash one: the probe can't (both are a shell under the
+ * session), so from the probe a Monitor's job is a `shell`.
+ */
+export type ExitBlockerKind = 'cron' | 'shell' | 'monitor' | 'subagent' | 'wake' | 'unknown'
+
+/** One blocker: its kind, its id when it has one (a cron's, a process's, an agent's), what it is, and how to stop it. */
+export type ExitBlocker = { readonly kind: ExitBlockerKind; readonly id?: string; readonly what: string; readonly howToStop: string }
+
+/** The process classes whose top-most process under the session is a background job: a shell, a build, a heavy-slot run. */
+type JobClass = 'shell' | 'build' | 'heavy-slot'
+
+/** What each job class is, as a blocker names it. */
+const JOB_WHAT: Readonly<Record<JobClass, (p: ProcessEntry) => string>> = {
+  shell: p => `the background shell ${p.name} ${p.pid} runs under this session (a background job of the Bash, PowerShell or Monitor tool)`,
+  build: p => `${p.name} ${p.pid} under this session is a build, test or lint`,
+  'heavy-slot': p => `a heavy-slot job (${p.name} ${p.pid}) runs under this session`,
+}
+
+/** A process's job class, or undefined when its class is none of them. */
+const jobClass = (p: ProcessEntry): JobClass | undefined => (p.cls === 'shell' || p.cls === 'build' || p.cls === 'heavy-slot' ? p.cls : undefined)
+
+/** How an unreadable input is resolved: by reading it again, or by the person. */
+const UNREADABLE = "call again in a moment; if it still can't be read, tell the person, who can act by hand"
+
+/** An id as a blocker shows it: plain, or quoted when it holds anything but letters, digits, `-` and `_`. */
+const idText = (id: string): string => (/^[A-Za-z0-9_-]{1,64}$/.test(id) ? id : quoted(id))
+
+/**
+ * The top-most background jobs under this session: each process under it of a job class (S6's shell
+ * and build, and a heavy-slot run) with no such process above it under the session, so a shell and
+ * the build it runs are one job. A git, dev server or browser under the session alone is no job here
+ * (Claude Code runs git of its own; an MCP server may be a browser): the safe point holds on those.
+ */
+function busyJobs(probe: Probe): ProcessEntry[] {
+  const under = descendants(probe)
+  const table = byPid(probe)
+  const pids = new Set(under.map(p => p.pid))
+  return under.filter(p => {
+    if (jobClass(p) === undefined) return false
+    let up = parentOf(table, p)
+    for (let i = 0; i < 32 && up !== undefined && pids.has(up.pid); i += 1) {
+      if (jobClass(up) !== undefined) return false
+      up = parentOf(table, up)
+    }
+    return true
+  })
+}
+
+/**
+ * Everything that stands in an exit's way, each with how to stop it; empty only when every input
+ * given could be read and none holds anything. An input that couldn't be read is a blocker of kind
+ * `unknown` ("can't tell: ..."), never none. Pure: a function of what was read.
+ */
+export function exitBlockers(input: ExitInputs): ExitBlocker[] {
+  const found: ExitBlocker[] = []
+  const unknown = (what: string): void => {
+    found.push({ kind: 'unknown', what: `can't tell ${what}`, howToStop: UNREADABLE })
+  }
+  if (typeof input.crons === 'string') unknown(`whether a session cron is set (${oneLine(input.crons, 300)})`)
+  else {
+    for (const job of input.crons) {
+      const id = idText(job.id)
+      const when = oneLine(job.humanSchedule ?? job.cron ?? 'its schedule', 80)
+      const words = job.prompt === undefined ? '' : `: ${quoted(oneLine(job.prompt, 80))}`
+      found.push({ kind: 'cron', id: job.id, what: `cron ${id} (${when}${words}) is set to wake this session`, howToStop: `delete it with CronDelete (id ${id})` })
+    }
+  }
+  if (input.busy !== undefined) {
+    if (typeof input.busy === 'string') unknown(`what runs under this session: the machine probe failed (${oneLine(input.busy, 300)})`)
+    else if (sessionProcess(input.busy, byPid(input.busy)) === undefined) unknown("what runs under this session: its own claude.exe wasn't found above the probe")
+    else {
+      for (const p of busyJobs(input.busy)) {
+        found.push({
+          kind: 'shell',
+          id: String(p.pid),
+          what: JOB_WHAT[jobClass(p) ?? 'shell'](p),
+          howToStop: 'stop it with TaskStop (the task id its Bash, PowerShell or Monitor call gave), or let it finish',
+        })
+      }
+    }
+  }
+  if (typeof input.agents === 'string') unknown(`whether a subagent is still running: the session's subagents can't be read (${oneLine(input.agents, 300)})`)
+  else {
+    for (const agent of input.agents) {
+      if (!BUSY_AGENTS.includes(agent.status)) continue
+      const described = agent.description?.trim() ?? ''
+      const name = oneLine(described !== '' ? described : (agent.type ?? 'an agent'), 120)
+      const id = typeof agent.id === 'string' && agent.id !== '' ? agent.id : undefined
+      found.push({
+        kind: 'subagent',
+        ...(id === undefined ? {} : { id }),
+        what: `a subagent is still running (${name})`,
+        howToStop: `wait for it to report, or stop it with TaskStop${id === undefined ? '' : ` (${idText(id)})`}`,
+      })
+    }
+  }
+  if (typeof input.wake === 'string') unknown(`whether a wake-up is pending (${oneLine(input.wake, 300)})`)
+  else if (input.wake !== undefined && input.wake !== null) {
+    found.push({ kind: 'wake', what: `a wake-up is pending (${quoted(oneLine(input.wake.note, 80))})`, howToStop: "cancel it with cancel_wake: it doesn't outlive this process" })
+  }
+  return found
+}
+
+/** The blockers as one line of a refusal: each what it is and how to stop it, `; ` between. */
+export const blockersText = (blockers: readonly ExitBlocker[]): string => blockers.map(b => `${b.what}: ${b.howToStop}`).join('; ')
+
+/** How long the pre-check's reads of the engine may each take: CronList's permission, its call, the agents. */
+export const EXIT_READ_MS = 5000
+
+/** How long the probe may take. */
+export const PROBE_MS = 60_000
+
+/** What an error says, as one line. */
+const errorLine = (err: unknown): string => {
+  const text = oneLine(err instanceof Error ? err.message : String(err), 300)
+  return text === '' ? 'no reason given' : text
+}
+
+/**
+ * `work`, or `undefined` once `ms` have passed on the engine's clock first. A timer, never a sleep, so
+ * the wait isn't the calling hook's own time; `work` goes on, its late answer dropped.
+ */
+export async function within<T>($: EngineInterface, ms: number, work: Promise<T>): Promise<{ readonly value: T } | undefined> {
+  let timer: Timer | undefined
+  const late = new Promise<undefined>(resolve => {
+    timer = $.clock.after(ms, () => resolve(undefined))
+  })
+  const answered = work.then(value => ({ value }))
+  // A rejection after the wait has ended is no one's to see.
+  answered.catch(() => undefined)
+  try {
+    return await Promise.race([answered, late])
+  } finally {
+    timer?.cancel()
+  }
+}
+
+/** CronList's `jobs`, each with a non-empty id; undefined when the answer isn't of that shape. */
+export function cronJobs(result: unknown): CronJob[] | undefined {
+  if (!isRecord(result) || !Array.isArray(result.jobs)) return undefined
+  const jobs: CronJob[] = []
+  for (const job of result.jobs) {
+    if (!isRecord(job) || typeof job.id !== 'string' || job.id === '') return undefined
+    jobs.push({
+      id: job.id,
+      ...(typeof job.humanSchedule === 'string' ? { humanSchedule: job.humanSchedule } : {}),
+      ...(typeof job.cron === 'string' ? { cron: job.cron } : {}),
+      ...(typeof job.prompt === 'string' ? { prompt: job.prompt } : {}),
+      ...(typeof job.recurring === 'boolean' ? { recurring: job.recurring } : {}),
+    })
+  }
+  return jobs
+}
+
+/**
+ * The session's crons, by the built-in CronList tool: first its permission verdict (`$.tool.check`,
+ * which opens no dialog), then, only when that is `allow`, the call (`$.tool.call`), each within
+ * EXIT_READ_MS. A string says why they couldn't be read: a verdict other than allow (the call would
+ * ask, or is refused), a refusal, an error, no answer in time, or an answer of another shape.
+ * The two shapes differ: `$.tool.check` takes the arguments under `input`, `$.tool.call` takes them
+ * at the top level (CronList has none). A call with `input:` is an error result (`isError`), which
+ * reads as unknown. Live (SS2): CronList answers `{ result: { jobs }, text }` mid-turn and at idle
+ * from a timer, in about 20 ms, with no transcript row; it lists ScheduleWakeup and /loop jobs too.
+ */
+export async function readCrons($: EngineInterface, ms = EXIT_READ_MS): Promise<readonly CronJob[] | string> {
+  const seconds = `${ms / 1000} s`
+  try {
+    const verdict = await within($, ms, $.tool.check({ tool: 'CronList', input: {} }))
+    if (verdict === undefined) return `CronList's permission wasn't answered within ${seconds}`
+    const { decision, reason } = verdict.value
+    if (decision !== 'allow') return `CronList would ${decision === 'ask' ? 'ask for permission' : 'be refused'} here${typeof reason === 'string' && reason.trim() !== '' ? `: ${oneLine(reason, 200)}` : ''}`
+    const ran = await within($, ms, $.tool.call({ tool: 'CronList' }))
+    if (ran === undefined) return `CronList didn't answer within ${seconds}`
+    const run = ran.value as { readonly deny?: string; readonly isError?: boolean; readonly result?: unknown; readonly text?: string }
+    if (typeof run.deny === 'string') return `CronList was refused: ${oneLine(run.deny, 200)}`
+    if (run.isError === true) return `CronList failed: ${oneLine(String(run.text ?? 'no reason given'), 200)}`
+    return cronJobs(run.result) ?? "CronList answered in a shape this plugin doesn't know"
+  } catch (err) {
+    return `CronList didn't run: ${errorLine(err)}`
+  }
+}
+
+/** The session's agents, or why they can't be read (no answer within EXIT_READ_MS among them). */
+export async function readAgents($: EngineInterface, ms = EXIT_READ_MS): Promise<readonly AgentLike[] | string> {
+  try {
+    const listed = await within($, ms, $.agent.list())
+    return listed === undefined ? `the list wasn't answered within ${ms / 1000} s` : listed.value
+  } catch (err) {
+    return errorLine(err)
+  }
+}
+
+/**
+ * The probe of this session's process tree alone (its id, no config folder, no claim), run as every
+ * script is: Windows PowerShell by its known path, the script on standard input (powershellCall).
+ * A string says why it failed.
+ */
+export async function runProbe($: EngineInterface, target: { readonly powershell: string; readonly id: string }): Promise<Probe | string> {
+  try {
+    const call = powershellCall(target.powershell, probeScript({ ids: [target.id], configDirs: [] }))
+    const run = await $.process.run(call.argv, { stdin: call.stdin, timeoutMs: PROBE_MS })
+    if (run.exitCode !== 0) {
+      const err = oneLine(run.stderr, 300)
+      return `it exited ${run.exitCode}${err === '' ? '' : `: ${err}`}`
+    }
+    const probe = parseProbe(run.stdout)
+    return 'error' in probe ? probe.error : probe
+  } catch (err) {
+    return `it didn't run: ${errorLine(err)}`
+  }
+}
+
+/**
+ * What the exit pre-check reads, all at once: the crons, the agents, and the probe when `probe` says
+ * where it runs from (a string there: why it can't run, which is passed on as the probe's failure;
+ * absent: no probe, off Windows).
+ */
+export async function readExit($: EngineInterface, probe?: { readonly powershell: string; readonly id: string } | string): Promise<ExitInputs> {
+  const [crons, agents, busy] = await Promise.all([readCrons($), readAgents($), probe === undefined || typeof probe === 'string' ? Promise.resolve(probe) : runProbe($, probe)])
+  return busy === undefined ? { crons, agents } : { crons, agents, busy }
+}
+
+// ---------------------------------------------------------------------------------------------
+// The files the coordinator reads: the pending marker, and the last self-check.
+
+/** A pending marker older than this is ignored: the exit or restart it stood for didn't run, or ran without saying so. */
+export const PENDING_MS = 15 * 60 * 1000
+
+/** What a pending marker stands for. */
+export type PendingKind = 'exit' | 'restart'
+
+/**
+ * The pending marker for conversation `id`: `<state>\pending\<id>.json`. Undefined for an id that
+ * isn't a session id, so nothing else (`..\x`) is ever joined into a path.
+ */
+export const pendingPath = (state: string, id: string): string | undefined => (SESSION_ID.test(id) ? `${state}\\pending\\${id}.json` : undefined)
+
+/** The marker while an exit or restart is queued or armed: `{ v: 1, kind, at }`, `at` in milliseconds since the epoch. */
+export const pendingMarker = (kind: PendingKind, at: number): string => JSON.stringify({ v: 1, kind, at })
+
+/** The marker once the exit or restart ran or was cancelled. */
+export const PENDING_DONE = JSON.stringify({ v: 1, done: true })
+
+/**
+ * A pending marker as the coordinator reads it: `pending` (an exit or restart is queued or armed,
+ * and the marker is at most 15 minutes old: hold deliveries), `done` (it ran or was cancelled),
+ * `stale` (older than 15 minutes), or `bad` (another shape). Only `pending` holds anything.
+ */
+export function readPending(text: string, now: number): 'pending' | 'done' | 'stale' | 'bad' {
+  let raw: unknown
+  try {
+    raw = JSON.parse(text)
+  } catch {
+    return 'bad'
+  }
+  if (!isRecord(raw) || raw.v !== 1) return 'bad'
+  if (raw.done === true) return 'done'
+  if (raw.kind !== 'exit' && raw.kind !== 'restart') return 'bad'
+  if (typeof raw.at !== 'number' || !Number.isFinite(raw.at)) return 'bad'
+  return now - raw.at > PENDING_MS ? 'stale' : 'pending'
+}
+
+/**
+ * Writes this conversation's pending marker: `kind` while an exit or restart is queued or armed,
+ * null once it ran or was cancelled. Nothing is written where %LOCALAPPDATA% isn't a plain folder
+ * (off Windows) or the session's id isn't a session id. Never throws: the marker is the
+ * coordinator's hint, ignored after 15 minutes. Returns why a write failed, if one did.
+ */
+export async function markPending($: EngineInterface, kind: PendingKind | null): Promise<string | undefined> {
+  try {
+    const local = await $.env.get('LOCALAPPDATA')
+    if (!isSafeFolder(local)) return undefined
+    const path = pendingPath(stateFolder(local), await $.session.id())
+    if (path === undefined) return undefined
+    await $.fs.write(path, kind === null ? PENDING_DONE : pendingMarker(kind, await $.clock.now()))
+    return undefined
+  } catch (err) {
+    return errorLine(err)
+  }
+}
+
+/** The most tool names a self-check record carries. */
+export const SELFCHECK_MAX = 8
+
+/** A tool name a self-check record carries: Bash, PowerShell, or an MCP server by its tool-name spelling. */
+export const SELFCHECK_NAME = /^(?:Bash|PowerShell|mcp:[A-Za-z0-9_-]{1,64})$/
+
+/** The last self-check of conversation `id`: `<state>\selfcheck\<id>.json`. Undefined for an id that isn't a session id. */
+export const selfcheckPath = (state: string, id: string): string | undefined => (SESSION_ID.test(id) ? `${state}\\selfcheck\\${id}.json` : undefined)
+
+/** A self-check record: `{ v: 1, at, failed }`, the failed tools by name only, at most SELFCHECK_MAX. */
+export const selfcheckRecord = (at: number, failed: readonly string[]): string =>
+  JSON.stringify({ v: 1, at, failed: failed.filter(name => SELFCHECK_NAME.test(name)).slice(0, SELFCHECK_MAX) })
+
+/** A self-check record as the coordinator reads it: when, and the failed tools' names; undefined for another shape. */
+export function readSelfcheck(text: string): { readonly at: number; readonly failed: readonly string[] } | undefined {
+  let raw: unknown
+  try {
+    raw = JSON.parse(text)
+  } catch {
+    return undefined
+  }
+  if (!isRecord(raw) || raw.v !== 1 || typeof raw.at !== 'number' || !Number.isFinite(raw.at) || !Array.isArray(raw.failed)) return undefined
+  if (raw.failed.length > SELFCHECK_MAX || !raw.failed.every(name => typeof name === 'string' && SELFCHECK_NAME.test(name))) return undefined
+  return { at: raw.at, failed: raw.failed as string[] }
 }

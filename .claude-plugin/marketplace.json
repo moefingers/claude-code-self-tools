@@ -1,6 +1,6 @@
 {
   "name": "claude-code-self-tools",
-  "description": "Small Claude Code plugins that let a session act on itself: compact or clear its conversation, reload its plugins, reconnect an MCP server, read its context window, wake itself later, turn on Remote Control under a title, exit or restart, and switch to another conversation. Install only the ones you want.",
+  "description": "Small Claude Code plugins that let a session act on itself: compact or clear its conversation, reload its plugins, reconnect an MCP server, read its context window, check its own tools, wake itself later, turn on Remote Control under a title, exit or restart, and switch to another conversation. Install only the ones you want.",
   "owner": {
     "name": "moefingers",
     "url": "https://github.com/moefingers"
@@ -14,7 +14,7 @@
     {
       "name": "self-clear",
       "source": "./plugins/self-clear",
-      "description": "Clears the conversation once the turn ends, between two independent pieces of work, and starts the next piece from a handoff it writes."
+      "description": "Clears the conversation once the turn ends, only when its work is complete or its context is contaminated, and starts the next piece from a handoff it writes."
     },
     {
       "name": "self-reload",
@@ -32,6 +32,11 @@
       "description": "Reads how full the context window is, and whether auto-compact is on, to decide whether to compact at a break."
     },
     {
+      "name": "self-check",
+      "source": "./plugins/self-check",
+      "description": "Checks that the session's own tools answer: a nonce echoed through Bash and PowerShell as the model calls them, and the MCP servers listed (exercised only through probes you name). Quietly again at resume, saying only what failed."
+    },
+    {
       "name": "self-wake",
       "source": "./plugins/self-wake",
       "description": "Wakes the session some minutes after the turn ends with a note it sends itself, to check back on slow work."
@@ -44,7 +49,7 @@
     {
       "name": "self-exit",
       "source": "./plugins/self-exit",
-      "description": "Ends the session once the turn ends, as /exit does, with a stated reason recorded in its transcript for whoever resumes it."
+      "description": "Ends the session once the turn ends, as /exit does, with a stated reason recorded in its transcript for whoever resumes it; it refuses while a session cron, a background job or a subagent would make /exit ask, saying how to stop each."
     },
     {
       "name": "self-restart",

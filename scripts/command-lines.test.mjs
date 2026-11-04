@@ -31,6 +31,7 @@ const restart = machine.launcherScript(T)
 const scripts = [
   ["self-switch's probe: two ids, the claim, 8 config folders, a heavy-slot root", machine.probeScript({ ids: [W, T], take: T, configDirs, stateDir: state, heavySlotRoot: folder('F', 'heavy') })],
   ["self-restart's probe", machine.probeScript({ ids: [W], configDirs: [], stateDir: state })],
+  ["the exit pre-check's probe (runProbe, for self-exit and self-restart)", machine.probeScript({ ids: [W], configDirs: [] })],
   ['the in-place claim check, 8 config folders', machine.claimCheckScript({ stateDir: state, id: T, by: BY, configDirs })],
   ['the release', machine.releaseScript({ stateDir: state, id: T, by: BY })],
   ["a switch's launcher, 8 config folders", window],
@@ -110,5 +111,25 @@ test("every run of a script passes it on standard input: the bootstrap never rea
     assert.ok(calls > 0, `${plugin} runs its scripts through powershellCall`)
     assert.equal(runs, calls, `${plugin}: every $.process.run is of a powershellCall`)
     assert.equal(withStdin, calls, `${plugin}: every run passes the call's stdin`)
+  }
+})
+
+test('the machine code runs PowerShell only through powershellCall with its stdin, and git by fixed argv', () => {
+  const text = readFileSync(join(ROOT, 'shared', 'hooks', 'machine.ts'), 'utf8')
+  const runs = text.split('$.process.run(').length - 1
+  const git = (text.match(/\$\.process\.run\(\['git', /g) ?? []).length
+  const withStdin = (text.match(/\$\.process\.run\(call\.argv, \{ stdin: call\.stdin,/g) ?? []).length
+  const calls = (text.match(/const call = powershellCall\(/g) ?? []).length
+  assert.equal(git, 1, 'one git runner (gitIn)')
+  assert.ok(withStdin >= 1, 'the probe runs from the machine code (runProbe)')
+  assert.equal(runs, git + withStdin, 'every other $.process.run in the machine code is a powershellCall with its stdin')
+  assert.equal(calls, withStdin, 'each powershellCall is run with its stdin')
+})
+
+test('self-exit and self-check start no process of their own: the probe runs through the machine code, the tools through $.tool.call', () => {
+  for (const plugin of ['self-exit', 'self-check']) {
+    const text = readFileSync(join(ROOT, 'plugins', plugin, 'hooks', 'register.ts'), 'utf8')
+    assert.equal(text.includes('$.process.run('), false, `${plugin} runs no process itself`)
+    assert.equal(text.includes('$.process.spawn('), false, `${plugin} spawns no process itself`)
   }
 })

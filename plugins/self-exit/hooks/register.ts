@@ -9,15 +9,25 @@
 // reads when the session is resumed (`claude --resume`), together with the optional `note` for
 // whoever resumes it; and as a transcript line the person sees, which the debug log keeps too.
 //
-// It refuses while a subagent is running, whose work would end with the session; checked at the
-// call and again right before the command runs. Background tasks can't be listed, so the
-// description warns about them.
+// The pre-check (exitBlockers, in the shared machine code): it refuses while anything would make /exit
+// stop at its confirmation, or end work still running: a session cron (the built-in CronList, read
+// through $.tool.call once $.tool.check allows it, so never a dialog), a background job under the
+// session (the probe's S6, on Windows), a subagent. Each is named with how to stop it. Anything it
+// can't read refuses too, saying so. It runs at the call, so nothing is queued while a blocker
+// stands, and again when the exit is armed, right before the command.
+//
+// The pending marker: while the exit is queued or armed, %LOCALAPPDATA%\claude-self-tools\pending\
+// <conversation>.json says so ({ v: 1, kind: 'exit', at }), and the coordinator holds its deliveries
+// meanwhile, so that none starts a turn that would cancel the exit. It says done ({ v: 1, done: true })
+// once the exit runs or is cancelled.
 //
 // The command waits for the session to be idle, so a message that arrives between the turn's end and
 // the command would start a turn the exit then cuts off. A main-loop turn that starts before the
 // command has started cancels the exit, as an interrupted turn does.
 import type { EngineInterface, Register } from 'claude-code'
 import type { Queued } from '../types'
+import { blockersText, exitBlockers, markPending, powershellPath, readExit, SESSION_ID, SYSTEM_ROOT } from './machine'
+import type { PendingKind } from './machine'
 import { configureUpdateCheck, loadUpdateCheck, withUpdateNotice } from './update-check'
 
 const queued = { plugin: 'self-exit', key: 'queued' } as const
@@ -27,14 +37,12 @@ const SETTLE_MS = 500
 /** How long after the exit command to look whether the session is still here. */
 const CHECK_MS = 5000
 
-/** An agent in one of these is still to report. */
-const BUSY: readonly string[] = ['pending', 'running', 'waiting']
-
 const DESCRIPTION = [
   'Ends this session once the current turn ends, as /exit does: Claude Code closes, and nothing more happens here until someone resumes the session (claude --resume).',
   'Call it only when the person asked you to end the session, or your instructions say to close it once its work is done or handed off. Only at a finished break: never mid-merge, mid-push or mid-task. Never to get out of a task, and not to restart (restart_after_turn, if it is available, does that).',
   '`reason` (required) says why; it is recorded in the transcript. `note` is for whoever resumes this session: what was left, and where its notes are. Write your notes down first.',
-  'Everything the session runs ends with it: Remote Control (the phone and browser lose the session), wake-ups, background tasks. It refuses while subagents you started are still running.',
+  "It refuses while anything would make /exit stop at its confirmation or cut work off, naming each with how to stop it: a session cron (delete it with CronDelete), a background Bash, PowerShell or Monitor job (stop it with TaskStop), a subagent still running; and while any of that can't be read. Stop them, then call again.",
+  'What still ends with the session: Remote Control (the phone and browser lose the session) and wake-ups.',
   'End the turn after calling it; the exit runs once your answer is shown.',
 ].join(' ')
 
@@ -74,20 +82,47 @@ async function tellModel($: EngineInterface, note: string): Promise<void> {
   }
 }
 
-/** The agents still to report, by their task's description; undefined when the list can't be read. */
-async function busyAgents($: EngineInterface): Promise<string[] | undefined> {
+/**
+ * A variable of this process's environment, or undefined when unset or unreadable. `read` is the
+ * engine's read with the variable's name written out: the engine lists the variables a module reads by
+ * the literal names at its call sites.
+ */
+async function env(read: () => Promise<string | undefined>): Promise<string | undefined> {
   try {
-    return (await $.agent.list()).filter(a => BUSY.includes(a.status)).map(a => (a.description.trim() === '' ? a.type : a.description))
+    return await read()
   } catch {
     return undefined
   }
 }
 
-/** Why an exit can't go ahead with these agents, or undefined when none is still to report. */
-function blocked(busy: string[] | undefined): string | undefined {
-  if (busy === undefined) return "the session's subagents can't be read, so whether any is still running is unknown"
-  if (busy.length === 0) return undefined
-  return `${busy.length === 1 ? 'a subagent is' : `${busy.length} subagents are`} still running (${busy.join('; ')}), and ${busy.length === 1 ? 'its work' : 'their work'} would end with the session`
+/**
+ * Where the probe runs from: Windows PowerShell by its known path, for this session's id. Undefined
+ * off Windows, where there is no probe; on Windows, a string says why it can't run, which refuses.
+ */
+async function probeTarget($: EngineInterface): Promise<{ powershell: string; id: string } | string | undefined> {
+  if ((await env(() => $.env.get('OS'))) !== 'Windows_NT') return undefined
+  const root = await env(() => $.env.get('SystemRoot'))
+  if (root === undefined || !SYSTEM_ROOT.test(root)) return `the Windows folder (SystemRoot) reads ${JSON.stringify(root ?? '')}, so PowerShell can't be found by its known path`
+  let id: string
+  try {
+    id = await $.session.id()
+  } catch (err) {
+    return `this session's id can't be read: ${why(err)}`
+  }
+  if (!SESSION_ID.test(id)) return `this session's id (${JSON.stringify(id)}) is not a session id`
+  return { powershell: powershellPath(root), id }
+}
+
+/** What stands in the exit's way now, each with how to stop it, as one line; undefined when nothing does. */
+async function blockers($: EngineInterface): Promise<string | undefined> {
+  const found = exitBlockers(await readExit($, await probeTarget($)))
+  return found.length === 0 ? undefined : blockersText(found)
+}
+
+/** The pending marker: `kind` while the exit is queued or armed, null once it ran or was cancelled. */
+async function mark($: EngineInterface, kind: PendingKind | null): Promise<void> {
+  const failed = await markPending($, kind)
+  if (failed !== undefined) $.ui.log(`the pending marker wasn't written (${failed}); the coordinator ignores an old one after 15 minutes.`)
 }
 
 /** The row the model reads when the session is resumed: why it ended, and the note. */
@@ -98,19 +133,23 @@ const record = ({ reason, note }: Queued): string =>
 async function exitNow($: EngineInterface, value: Queued): Promise<void> {
   if (armed !== value) return
   $.ui.status(undefined)
-  const stop = blocked(await busyAgents($))
-  if (stop !== undefined) {
-    armed = undefined
-    $.ui.toast(`Exit cancelled: ${stop}.`)
-    await tellModel($, `The exit you queued didn't run: ${stop}. The session goes on; call exit_after_turn again once they have reported.`)
-    return
-  }
+  // The pre-check again, right before the command: anything set since the call holds it.
+  const stop = await blockers($)
   // A turn that started while the check above ran has taken it back, and said so.
   if (armed !== value) return
+  if (stop !== undefined) {
+    armed = undefined
+    await mark($, null)
+    $.ui.toast(`Exit cancelled: ${stop}.`)
+    await tellModel($, `The exit you queued didn't run: ${stop}. The session goes on; stop them, then call exit_after_turn again.`)
+    return
+  }
   armed = undefined
   await tellModel($, record(value))
   $.ui.log(`Exiting at the session's own request: ${value.reason}`)
   $.ui.toast(`Exiting: ${value.reason}`)
+  // Done as the exit runs: the coordinator delivers again, to whoever resumes the conversation.
+  await mark($, null)
   try {
     await $.command.run({ command: 'exit' })
   } catch (err) {
@@ -162,14 +201,18 @@ export const register: Register = (on, options) => {
     const reason = text(input.reason)
     if (reason === undefined) return { deny: 'Say why the session ends (`reason`); it is recorded in the transcript.' }
     if (!isInteractive) return { deny: 'This session has no one at its prompt (a -p run or an SDK host), which ends it by itself; nothing to exit.' }
-    const stop = blocked(await busyAgents($))
-    if (stop !== undefined) return { deny: `Not queued: ${stop}. Wait for them to report, or stop them, then call again.` }
+    // The pre-check at the call: nothing is queued while anything stands.
+    const stop = await blockers($)
+    if (stop !== undefined) {
+      return { deny: `Not queued: ${stop}. Each would make /exit stop at its confirmation, or end with the session: stop them, then call again.` }
+    }
     const note = text(input.note)
     await $.state.set(queued, entry(reason, note))
+    await mark($, 'exit')
     $.ui.status('exit queued for when this turn ends')
     const kept = note === undefined ? '' : ' The note goes in with it, for whoever resumes the session.'
     return {
-      result: `Queued. This session exits once this turn ends; the reason is recorded in the transcript: ${reason}.${kept} Remote Control, wake-ups and background tasks end with it.`,
+      result: `Queued. This session exits once this turn ends; the reason is recorded in the transcript: ${reason}.${kept} Remote Control and wake-ups end with it. Right before the exit it checks again for session crons, background jobs and subagents.`,
     }
   }).catch(($, e, next) => (next.called ? next(e) : { deny: 'self-exit: queuing the exit failed; nothing is queued.' }))
 
@@ -182,9 +225,11 @@ export const register: Register = (on, options) => {
     if (e.isAborted || e.reason !== 'answer') {
       $.ui.status(undefined)
       $.ui.toast("Exit cancelled: the turn didn't finish.")
+      await mark($, null)
       return done
     }
     armed = value
+    await mark($, 'exit')
     $.clock.after(SETTLE_MS, () => void exitNow($, value))
     return done
   })
@@ -196,6 +241,7 @@ export const register: Register = (on, options) => {
     armed = undefined
     $.ui.status(undefined)
     $.ui.toast('Exit cancelled: a new turn started before it ran.')
+    void mark($, null)
     void tellModel($, "The exit you queued didn't run: a new turn started before it could. The session goes on; call exit_after_turn again when the work is done.")
     return started
   })
