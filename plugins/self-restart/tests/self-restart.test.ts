@@ -211,6 +211,26 @@ test('the launcher script refuses anything but a session id', () => {
   expect(launcherScript(ID)).toContain(`--resume '$id'`)
 })
 
+test('the launcher script: quiet progress, parents older than their children, quotes escaped, a pause when the resume fails', () => {
+  const script = launcherScript(ID)
+  // Windows PowerShell 5.1's module progress, as CLIXML, would fill the one-line failure.
+  expect(script).toContain("$ProgressPreference = 'SilentlyContinue'")
+  // Every step up the walk, both of them, takes a parent only while it is older than the child.
+  expect(script).toContain('-Property ProcessId, ParentProcessId, Name, CreationDate')
+  expect(script).toContain('if ($null -ne $up -and $up.CreationDate -le $child.CreationDate) { return $up }')
+  expect(script.split('= Get-Parent $').length - 1).toBe(2)
+  expect(script).not.toContain('$table[[int]$at.ParentProcessId]')
+  // Every quote PowerShell reads as one, curly ones included, is doubled in claude's path.
+  expect(script).toContain('[Management.Automation.Language.CodeGeneration]::EscapeSingleQuotedStringContent($claude.Source)')
+  expect(script).not.toContain('-replace')
+  // An error, or an end within 10 seconds: the window says how to resume by hand, and waits.
+  expect(script).toContain("'$code = $LASTEXITCODE'")
+  expect(script).toContain("'if ($code -ne 0 -or ((Get-Date) - $started).TotalSeconds -lt 10) {'")
+  expect(script).toContain('resume it yourself: claude --resume $id')
+  expect(script.split("Read-Host 'Press Enter to close this window'").length - 1).toBe(2)
+  expect(script).not.toContain('-NoExit')
+})
+
 test('the encoded command is the script as UTF-16LE base64', () => {
   expect(encodeCommand('dir')).toBe('ZABpAHIA')
   expect(encodeCommand('a')).toBe('YQA=')
