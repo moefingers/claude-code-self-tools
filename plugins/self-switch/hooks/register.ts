@@ -4,8 +4,10 @@
 // for this conversation says `coordinated: true`) it refuses, since the coordinator runs switches
 // there. The model calls switch_after_turn with `to`, `reason` and `notes`, all required; a command
 // can't run while the turn the model is in waits on it, so the call is queued and the switch runs
-// once the turn has ended with an answer. An interrupted turn, or a new one, cancels it. Only the
-// main conversation switches this way, never a subagent, and only one run in a terminal.
+// once the turn has ended with an answer. An interrupted turn, or a new one, cancels it; so does a
+// resume or a clear that makes this session another conversation first: a queued switch runs only in
+// the conversation that queued it. Only the main conversation switches this way, never a subagent,
+// and only one run in a terminal.
 //
 // Before anything moves, one probe of the machine (machine.ts) reads every running claude.exe, the
 // engine's session registry, the transcripts' project folders and the claim locks, and takes the
@@ -567,13 +569,19 @@ async function arrive($: EngineInterface, id: string): Promise<void> {
     if (found === undefined) return
     const now = await $.clock.now()
     const where = await machine($)
-    if (!('refusal' in where)) await release($, where.powershell, where.state, id, found.by)
+    const free = async (): Promise<void> => {
+      if (!('refusal' in where)) await release($, where.powershell, where.state, id, found.by)
+    }
     if (now - found.at > TICKET_MS || now < found.at) {
+      await free()
       $.ui.toast("A switch's arrival note was dropped: the conversation came back more than 15 minutes after the switch.")
       return
     }
+    // The row first, then the claim's release: the claim, then the transcript the row writes, covers
+    // this conversation throughout.
     await noteRecent($, id)
     await tellModel($, arrival(found, now))
+    await free()
     $.ui.toast(`Switched here from session ${found.from.slice(0, 8)}: ${oneLine(found.reason, 120)}`)
     const resume = found.resume
     // Later, not awaited: a prompt submitted from the start's hook would wait on that hook.
@@ -603,6 +611,22 @@ async function cancelled($: EngineInterface, value: Queued): Promise<void> {
   await tellModel($, `self-switch: your queued switch to ${quoted(value.to)} was cancelled because a new turn started; queue it again at the next finished break.${busy}`)
 }
 
+/** Why a queued switch doesn't run in this session now: it isn't the conversation that queued it. */
+function movedOn(value: Queued, own: string | undefined): string | undefined {
+  if (value.from === undefined || own === value.from) return undefined
+  return `this session is now conversation ${own ?? '(unknown)'}, not ${value.from}, which queued it (a /resume or /clear came in between)`
+}
+
+/** A switch whose conversation moved on: told here, as a switch another conversation queued. */
+async function movedAway($: EngineInterface, value: Queued, said: string): Promise<void> {
+  if (armed === value) armed = undefined
+  await refuse(
+    $,
+    "Switch didn't run: this session became another conversation after it was queued.",
+    `self-switch: a switch to ${quoted(value.to)}, queued in conversation ${quoted(value.from ?? '')}, didn't run: ${said}. Nothing moved.`,
+  )
+}
+
 /** Runs the switch, step by step; says so at each step that didn't go ahead. */
 async function switchNow($: EngineInterface, value: Queued): Promise<void> {
   if (armed !== value) return
@@ -621,8 +645,11 @@ async function switchNow($: EngineInterface, value: Queued): Promise<void> {
   }
   const ctx = await context($)
   if ('refusal' in ctx) return notRun(ctx.refusal)
+  const moved = movedOn(value, ctx.own)
+  if (moved !== undefined) return movedAway($, value, moved)
+  const gateSaid = (gated: string): string => (gated === COORDINATED ? 'the coordinator runs switches in this session; ask the merger or the owner for a wrap-up' : gated)
   const gated = await gateRefusal($, ctx.state, ctx.own, await $.clock.now())
-  if (gated !== undefined) return notRun(gated === COORDINATED ? 'the coordinator runs switches in this session; ask the merger or the owner for a wrap-up' : gated)
+  if (gated !== undefined) return notRun(gateSaid(gated))
   if (ctx.own === to) return notRun(`this session is already conversation ${to}`)
   const stop = blocked(await busyAgents($))
   if (stop !== undefined) return notRun(stop)
@@ -658,6 +685,11 @@ async function switchNow($: EngineInterface, value: Queued): Promise<void> {
     }
     // A turn that started meanwhile has taken it back, and said so.
     if (armed !== value) return
+    // A resume or clear meanwhile, or a gate written meanwhile, stops it too.
+    const movedNow = movedOn(value, await sessionId($))
+    if (movedNow !== undefined) return movedAway($, value, movedNow)
+    const gatedNow = await gateRefusal($, ctx.state, ctx.own, await $.clock.now())
+    if (gatedNow !== undefined) return notRun(gateSaid(gatedNow))
     looked = await look()
     if ('failure' in looked) return notRun(`the machine probe failed (${looked.failure}), so whether ${to} is open elsewhere is unknown`)
   }
@@ -716,9 +748,11 @@ async function switchNow($: EngineInterface, value: Queued): Promise<void> {
     const still = await claimStill($, ctx, to, by)
     if (still !== undefined) return undo(still)
     if (armed !== value) return undo('a new turn started')
-    armed = undefined
     await noteRecent($, ctx.own)
     $.ui.log(`Switching in place to ${to}: ${value.reason}`)
+    // Taken back right before the command, after the last wait: a turn that starts up to here stops it.
+    if (armed !== value) return undo('a new turn started')
+    armed = undefined
     try {
       await $.command.run({ command: 'resume', args: to })
     } catch (err) {
@@ -765,9 +799,11 @@ async function switchNow($: EngineInterface, value: Queued): Promise<void> {
   // then turns away the window or the slot.
   const late = armed !== value ? 'a new turn started' : blocked(await busyAgents($))
   if (late !== undefined) return undo(late, record)
-  armed = undefined
   await noteRecent($, ctx.own)
   const where = pick.transport === 'slot' ? "this pane's slot resumes it here" : fallback === undefined ? 'a new window resumes it' : `a new window resumes it, not this pane's slot (${fallback})`
+  // Taken back right before the command, after the last wait: a turn that starts up to here stops it.
+  if (armed !== value) return undo('a new turn started', record)
+  armed = undefined
   $.ui.log(`Switching to ${to}: ${value.reason}`)
   if (fallback !== undefined) $.ui.log(`self-switch: this pane's slot runner isn't used: ${fallback}. A new window resumes ${to}.`)
   $.ui.toast(`Switching to ${to}: this session exits, and ${where} once this process has gone.`)
@@ -846,6 +882,13 @@ export const register: Register = (on, options) => {
   // left, and its `$.state` may still be in place (the start folder comes from the module).
   on('classic.SessionStart', async ($, e, next) => {
     const done = await next(e)
+    // A resume or a clear to another conversation before an armed switch has run takes it back: the
+    // switch was that conversation's, not this one's.
+    if (e.agent_id === undefined && armed !== undefined && armed.from !== undefined && e.session_id !== armed.from) {
+      armed = undefined
+      $.ui.status(undefined)
+      $.ui.toast('Switch cancelled: this session became another conversation before it ran.')
+    }
     if (e.agent_id !== undefined || (e.source !== 'resume' && e.source !== 'startup')) return done
     const id = e.session_id
     if (typeof id !== 'string' || !SESSION_ID.test(id)) return done
@@ -876,7 +919,8 @@ export const register: Register = (on, options) => {
     const lately = own !== undefined && SESSION_ID.test(own) ? await lastSwitch($, own) : undefined
     if (lately !== undefined) return { deny: `Not queued: ${await loop($, lately)}.` }
     const resume = text(input.resume)
-    await $.state.set(queued, resume === undefined ? { to, reason, notes } : { to, reason, notes, resume })
+    const asked = { to, reason, notes, ...(own !== undefined && SESSION_ID.test(own) ? { from: own } : {}) }
+    await $.state.set(queued, resume === undefined ? asked : { ...asked, resume })
     $.ui.status('switch queued for when this turn ends')
     return {
       result: `Queued. Once this turn ends, this terminal switches to conversation ${to}: this conversation ends here, untouched, and ${to} resumes in this process, in this pane's slot, or in a new window, whichever applies. First the plugin checks that ${to} is open nowhere on this machine and that nothing runs under this session; if anything is, nothing moves and you are told on your next turn. If this pane runs a slot that can't be used, the switch says why, in the leaving row, a toast and the arrival, and a new window opens. Pending wake-ups in this process are dropped by the switch: set them again in ${to} if they are still needed. Reason: ${quoted(reason)}. Notes: ${quoted(notes)}.`,

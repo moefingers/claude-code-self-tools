@@ -675,6 +675,60 @@ describe('refusals, before and at the run', () => {
     expect(rows(session)).toMatch(/your queued switch to .+ was cancelled because a new turn started/)
   })
 
+  test("a switch queued in one conversation doesn't run in another: a /resume or /clear came in between", async ($, on) => {
+    const { commands, kinds, toasts, session, world, clock } = engine(on)
+    await $.session.start(start)
+    expect((await $.tool.call(call)).deny).toBeUndefined()
+    await $.turn.complete(answered)
+    // The person resumes X before the switch runs; no SessionStart reaches the plugin here.
+    world.id = X
+    await clock.advance(1000)
+    expect(kinds()).toEqual([])
+    expect(commands).toEqual([])
+    expect(toasts).toContain("Switch didn't run: this session became another conversation after it was queued.")
+    expect(texts(session).at(-1)).toBe(
+      `self-switch: a switch to \u00ab${T}\u00bb, queued in conversation \u00ab${W}\u00bb, didn't run: this session is now conversation ${X}, not ${W}, which queued it (a /resume or /clear came in between). Nothing moved.`,
+    )
+  })
+
+  test("the SessionStart of a resume to another conversation takes an armed switch back", async ($, on) => {
+    const { commands, kinds, toasts, session, world, clock } = engine(on)
+    await $.session.start(start)
+    await $.tool.call(call)
+    await $.turn.complete(answered)
+    await $.classic.SessionStart({ source: 'resume', session_id: X })
+    world.id = X
+    await clock.advance(5000)
+    expect(kinds()).toEqual([])
+    expect(commands).toEqual([])
+    expect(toasts).toContain('Switch cancelled: this session became another conversation before it ran.')
+    expect(toasts.some(t => /didn't run/.test(t))).toBe(false)
+    expect(rows(session)).not.toMatch(/didn't run/)
+  })
+
+  test('a resume during the wait for one more look stops the switch: no second look', async ($, on) => {
+    const { commands, kinds, toasts, world, clock } = engine(on, { probe: machine(starting) })
+    await $.session.start(start)
+    await switchNow($, clock)
+    expect(kinds()).toEqual(['probe', 'release'])
+    world.id = X
+    await clock.advance(5000)
+    expect(kinds()).toEqual(['probe', 'release'])
+    expect(commands).toEqual([])
+    expect(toasts).toContain("Switch didn't run: this session became another conversation after it was queued.")
+  })
+
+  test('a gate written during the wait for one more look stops the switch: no second look', async ($, on) => {
+    const { commands, kinds, session, world, clock } = engine(on, { probe: machine(starting) })
+    await $.session.start(start)
+    await switchNow($, clock)
+    world.gate = JSON.stringify({ v: 1, coordinated: true, at: NOW })
+    await clock.advance(5000)
+    expect(kinds()).toEqual(['probe', 'release'])
+    expect(commands).toEqual([])
+    expect(rows(session)).toMatch(/the coordinator runs switches in this session; ask the merger or the owner for a wrap-up/)
+  })
+
   test('live is not looked at again: only unknown is', async ($, on) => {
     const { kinds, clock } = engine(on, {
       probe: machine(p => {
