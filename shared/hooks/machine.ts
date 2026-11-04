@@ -1447,12 +1447,29 @@ export function releaseScript(input: { readonly stateDir: string; readonly id: s
 /** The claim check's answer: the lock names the claimant, names another (or can't be read), or isn't there. */
 export const CLAIM_CHECKED = /^(ours|not-ours|absent)\s*$/m
 
-/** Reads the claim lock on `id` and says whether it names `by`; changes nothing. For the last look before an in-place /resume. */
-export function claimCheckScript(input: { readonly stateDir: string; readonly id: string; readonly by: string }): string {
+/** The claim check's other answer: the conversation is held, or may be, by another process now (L1, L2). */
+export const CLAIM_CHECK_LIVE = /^live (.{1,1000}?)\s*$/m
+
+/**
+ * The last look before an in-place /resume, as the window and the slot take theirs: first the
+ * re-check (RECHECK: L1 and L2 of `id`, from `configDirs`' registries and every process's command
+ * line), answering `live <why>` when anything holds it or can't be read; then the claim lock on `id`,
+ * whether it names `by`. Changes nothing.
+ */
+export function claimCheckScript(input: { readonly stateDir: string; readonly id: string; readonly by: string; readonly configDirs: readonly string[] }): string {
   const { state, id, by } = checkClaim(input)
+  if (input.configDirs.length < 1 || input.configDirs.length > 8) throw new Error('the claim check reads 1 to 8 config folders')
+  const configDirs = input.configDirs.map(dir => checkFolder('a config folder', dir))
   return [
     "$ErrorActionPreference = 'Stop'",
     "$ProgressPreference = 'SilentlyContinue'",
+    `$id = '${id}'`,
+    `$configDirs = @(${configDirs.map(literal).join(', ')})`,
+    '$live = $null',
+    'try {',
+    ...RECHECK.map(line => `  ${line}`),
+    '} catch { $live = "whether it is open elsewhere is unknown: the registry or the process table could not be read (" + $_.Exception.Message + ")" }',
+    String.raw`if ($null -ne $live) { "live " + ($live -split "\r?\n")[0]; exit 0 }`,
     `$path = Join-Path ${literal(state)} 'claims\\${id}.lock'`,
     "if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { 'absent'; exit 0 }",
     '$lock = $null',

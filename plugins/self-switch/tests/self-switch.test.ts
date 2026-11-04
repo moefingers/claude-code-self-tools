@@ -43,6 +43,8 @@ type Options = {
   launcher?: 'opens' | 'fails'
   /** What the in-place claim check reads: the lock still this switch's, another's, or none. */
   claim?: 'ours' | 'not-ours' | 'absent'
+  /** What the in-place last look's re-check finds holding the conversation now, if anything. */
+  checkLive?: string
   /** What a release answers. */
   released?: 'released' | 'busy'
   /** What /resume does: switch the session, leave it as it was, or be refused. */
@@ -78,6 +80,7 @@ function engine(
     exit = 'exits',
     perConversation = false,
     liveResume,
+    checkLive,
   }: Options = {},
 ) {
   const runs: Run[] = []
@@ -170,7 +173,7 @@ function engine(
     }
     if (kind === 'launcher') return launcher === 'opens' ? ok(`launched 100\r\nclaim ${LAUNCH}\r\n`) : ok('self-switch: no claude on PATH\r\n', 4)
     if (kind === 'release') return ok(`${released}\r\n`)
-    if (kind === 'check') return ok(`${claim}\r\n`)
+    if (kind === 'check') return ok(checkLive === undefined ? `${claim}\r\n` : `live ${checkLive}\r\n`)
     return ok('', 1)
   })
   on('command.run', async (_, e, next) => {
@@ -231,6 +234,9 @@ describe('transports', () => {
     // The probe, then the last look at the claim, right before /resume.
     expect(kinds()).toEqual(['probe', 'check'])
     expect(runs.find(r => r.kind === 'check')?.script).toContain(`$lock.by -ceq '${LAUNCH}'`)
+    // ...and, before the lock, L1 and L2 of T read again, from this session's config folder.
+    expect(runs.find(r => r.kind === 'check')?.script).toContain(`$id = '${T}'`)
+    expect(runs.find(r => r.kind === 'check')?.script).toContain(`$configDirs = @('${CONFIG}')`)
     const probe = runs.find(r => r.kind === 'probe')
     expect(probe?.argv.slice(0, 4)).toEqual([POWERSHELL, '-NoProfile', '-NonInteractive', '-EncodedCommand'])
     expect(probe?.argv).toHaveLength(5)
@@ -364,6 +370,16 @@ describe('transports', () => {
     expect(commands).toEqual([])
     expect(kinds()).toEqual(['probe', 'release'])
     expect(rows(session)).toMatch(/folder isn't known here/)
+  })
+
+  test('held by another process at the last look before the in-place /resume (L1 or L2 read again): nothing resumes', async ($, on) => {
+    const { commands, kinds, tickets, session, clock } = engine(on, { checkLive: 'it is open elsewhere: process 4242 names it on its command line (L2)' })
+    await $.session.start(start)
+    await switchNow($, clock)
+    expect(commands).toEqual([])
+    expect(kinds()).toEqual(['probe', 'check', 'release'])
+    expect(tickets()).toEqual({})
+    expect(rows(session)).toContain(`didn't happen after all: at the last look before /resume, it is open elsewhere: process 4242 names it on its command line (L2)`)
   })
 
   for (const claim of ['not-ours', 'absent'] as const) {

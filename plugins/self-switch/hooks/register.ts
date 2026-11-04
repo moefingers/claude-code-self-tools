@@ -47,6 +47,7 @@ import type { Heartbeat, Queued, Ticket } from '../types'
 import type { AgentLike, Probe } from './machine'
 import {
   BUSY_AGENTS,
+  CLAIM_CHECK_LIVE,
   CLAIM_CHECKED,
   claimCheckScript,
   gatePath,
@@ -413,10 +414,15 @@ async function release($: EngineInterface, powershell: string, state: string, id
   }
 }
 
-/** Why the claim on `to` no longer names `by`, or undefined when it still does. */
+/**
+ * The last look before an in-place /resume: why `to` is held by another process now (L1, L2, read
+ * again), or why the claim on it no longer names `by`; undefined when neither.
+ */
 async function claimStill($: EngineInterface, ctx: Context, to: string, by: string): Promise<string | undefined> {
   try {
-    const run = await $.process.run(powershellArgv(ctx.powershell, claimCheckScript({ stateDir: ctx.state, id: to, by })), { timeoutMs: RELEASE_MS })
+    const run = await $.process.run(powershellArgv(ctx.powershell, claimCheckScript({ stateDir: ctx.state, id: to, by, configDirs: ctx.configDirs })), { timeoutMs: RELEASE_MS })
+    const held = run.exitCode === 0 ? CLAIM_CHECK_LIVE.exec(run.stdout)?.[1] : undefined
+    if (held !== undefined) return `at the last look before /resume, ${oneLine(held, 300)}`
     const said = run.exitCode === 0 ? CLAIM_CHECKED.exec(run.stdout)?.[1] : undefined
     if (said === 'ours') return undefined
     return said === undefined ? `the claim on ${to} couldn't be read again before the resume` : `the claim on ${to} no longer names this switch (${said})`
@@ -743,8 +749,8 @@ async function switchNow($: EngineInterface, value: Queued): Promise<void> {
   }
 
   if (pick.transport === 'in-place') {
-    // The last look: the claim must still name this switch. No window or slot checks it for an
-    // in-place move, so this does, right before the command.
+    // The last look, as the window and the slot take theirs: no other process holds `to` now (L1, L2,
+    // read again), and the claim still names this switch. Right before the command.
     const still = await claimStill($, ctx, to, by)
     if (still !== undefined) return undo(still)
     if (armed !== value) return undo('a new turn started')

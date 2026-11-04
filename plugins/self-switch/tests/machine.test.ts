@@ -26,6 +26,7 @@ import {
   REGISTRY_VERSION_MARKERS,
   releaseScript,
   claimCheckScript,
+  CLAIM_CHECK_LIVE,
   SESSION_MARKERS,
   SLOT_SCRIPT_SHA256,
   safePoint,
@@ -672,8 +673,23 @@ describe('the scripts, as text', () => {
     expect(release).toContain("for ($try = 0; $try -lt 3 -and $answer -eq 'busy'; $try++) {")
     expect(release).toContain('  if ($try -gt 0) { Start-Sleep -Milliseconds 250 }')
     expect(release).not.toContain('Get-Content')
-    const check = claimCheckScript({ stateDir: STATE, id: T, by: LAUNCH })
+    const check = claimCheckScript({ stateDir: STATE, id: T, by: LAUNCH, configDirs: [CONFIG] })
     expect(check).toContain(`if ($null -ne $lock -and $lock.by -ceq '${LAUNCH}') { 'ours' } else { 'not-ours' }`)
     expect(check).not.toMatch(/Delete|Set-Content|WriteAll|Open\(/)
+  })
+
+  test("the in-place switch's last look re-reads L1 and L2 of the target, as the window's and the slot's do, before the claim", () => {
+    const check = claimCheckScript({ stateDir: STATE, id: T, by: LAUNCH, configDirs: [CONFIG, 'D:\\other cfg'] })
+    expect(check).toContain(`$id = '${T}'`)
+    expect(check).toContain("$configDirs = @('C:\\Users\\u\\.claude', 'D:\\other cfg')")
+    for (const line of RECHECK) expect(check).toContain(`  ${line}`)
+    const held = check.indexOf('if ($null -ne $live) { "live " + ($live -split "\\r?\\n")[0]; exit 0 }')
+    expect(held).toBeGreaterThan(check.indexOf(RECHECK[RECHECK.length - 1] ?? ''))
+    expect(held).toBeLessThan(check.indexOf('$lock = $null'))
+    // Anything it can't read is said as held: the switch doesn't go.
+    expect(check).toContain('} catch { $live = "whether it is open elsewhere is unknown: the registry or the process table could not be read (" + $_.Exception.Message + ")" }')
+    expect(CLAIM_CHECK_LIVE.exec('live it is open elsewhere: Claude Code 4242 holds it (L1)\r\n')?.[1]).toBe('it is open elsewhere: Claude Code 4242 holds it (L1)')
+    expect(() => claimCheckScript({ stateDir: STATE, id: T, by: LAUNCH, configDirs: ["C:\\o'brien"] })).toThrow(/not an absolute folder/)
+    expect(() => claimCheckScript({ stateDir: STATE, id: T, by: LAUNCH, configDirs: [] })).toThrow(/1 to 8/)
   })
 })
