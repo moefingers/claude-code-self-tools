@@ -10,8 +10,13 @@
 //
 // The launch: one fixed PowerShell script by Windows PowerShell's known path, its only variable the
 // session's id, which must be a UUID; see launcher.ts. Nothing from the tool's input reaches the
-// launch. The new window waits for this session's claude.exe to exit before it resumes, so two
-// copies never write one session.
+// launch. It takes the claim lock on the conversation, so a switch moving it at the same time can't
+// resume it too. The new window waits for this session's claude.exe to exit, then reads the session
+// registry and the process table again, and resumes only when nothing else holds the conversation,
+// so two copies never write one session. When this session runs in a slot (a Windows Terminal pane
+// running self-switch's claude-slot.ps1 of the shipped hash), the launcher leaves the slot a record
+// instead, and the slot resumes the session in the same pane once it has exited. The resumed session's
+// copy of this plugin releases the claim lock.
 //
 // The first prompt never goes on a command line. It waits in the plugin's own store, under the
 // session's id, and the copy of this plugin in the process that resumes the session sends it, once,
@@ -29,7 +34,8 @@
 // left waiting, and the person and the model are told so.
 import type { EngineInterface, Register } from 'claude-code'
 import type { Queued, Restart } from '../types'
-import { encodeCommand, LAUNCHED, launcherScript, powershellPath, SESSION_ID, SYSTEM_ROOT, WAIT_SECONDS } from './launcher'
+import { CLAIMED, encodeCommand, LAUNCHED, launcherScript, powershellPath, RELEASED, releaseScript, SESSION_ID, SLOTTED, stateFolder, SYSTEM_ROOT, WAIT_SECONDS } from './launcher'
+import { isSafeFolder, powershellArgv } from './machine'
 import { configureUpdateCheck, loadUpdateCheck, withUpdateNotice } from './update-check'
 
 const queued = { plugin: 'self-restart', key: 'queued' } as const
@@ -46,6 +52,10 @@ const SETTLE_MS = 500
 const CHECK_MS = 5000
 /** How long the launcher may take to open the window. */
 const LAUNCH_MS = 30_000
+/** How long releasing the claim lock may take. */
+const RELEASE_MS = 15_000
+/** How long a slot honours the record the launcher left it, in seconds. */
+const SLOT_SECONDS = 120
 /** A restart's first prompt older than this is dropped, not sent: the window waits 10 minutes at most. */
 const STALE_MS = 15 * 60 * 1000
 /** The most restarts under way the store keeps. */
@@ -172,7 +182,12 @@ async function restarts($: EngineInterface, now: number): Promise<Record<string,
   for (const [id, value] of Object.entries(stored)) {
     if (!SESSION_ID.test(id) || !isRecord(value) || typeof value.at !== 'number' || typeof value.reason !== 'string') continue
     if (now - value.at > STALE_MS && now >= value.at) continue
-    kept[id] = typeof value.resume === 'string' ? { at: value.at, reason: value.reason, resume: value.resume } : { at: value.at, reason: value.reason }
+    kept[id] = {
+      at: value.at,
+      reason: value.reason,
+      ...(typeof value.resume === 'string' ? { resume: value.resume } : {}),
+      ...(typeof value.claim === 'string' ? { claim: value.claim } : {}),
+    }
   }
   return kept
 }
@@ -250,14 +265,20 @@ async function restartNow($: EngineInterface, value: Queued): Promise<void> {
   const kept: Restart = { at: await $.clock.now(), ...value }
   await keep($, launch.id, kept)
   let opened: string | undefined
+  let slot: string | undefined
   try {
     const run = await $.process.run([launch.powershell, '-NoProfile', '-NonInteractive', '-EncodedCommand', encodeCommand(launcherScript(launch.id))], {
       cwd: launch.cwd,
       timeoutMs: LAUNCH_MS,
     })
-    if (run.exitCode !== 0 || !LAUNCHED.test(run.stdout)) {
+    slot = SLOTTED.exec(run.stdout)?.[1]
+    if (run.exitCode !== 0 || (slot === undefined && !LAUNCHED.test(run.stdout))) {
       const said = brief(`${run.stdout} ${run.stderr}`)
       opened = `the launcher exited ${run.exitCode}${said === '' ? '' : `: ${said}`}`
+    } else {
+      // The claim the launcher took: the resumed session's copy of this plugin releases it.
+      const claim = CLAIMED.exec(run.stdout)?.[1]
+      if (claim !== undefined) await keep($, launch.id, { ...kept, claim })
     }
   } catch (err) {
     opened = `the launcher didn't run: ${why(err)}`
@@ -275,6 +296,14 @@ async function restartNow($: EngineInterface, value: Queued): Promise<void> {
     armed = undefined
     await keep($, launch.id, null)
     const minutes = WAIT_SECONDS / 60
+    if (slot !== undefined) {
+      await refuse(
+        $,
+        `Restart stopped before the exit: ${late ?? 'a new turn started'}. This pane's slot resumes the session if it exits (/exit) within ${SLOT_SECONDS / 60} minutes.`,
+        `The restart left this pane's slot a record, but this session didn't exit: ${late ?? 'a new turn started'}. The session goes on. If it exits within ${SLOT_SECONDS / 60} minutes, the slot resumes it in this pane; after that the record is ignored.`,
+      )
+      return
+    }
     await refuse(
       $,
       `Restart stopped before the exit: ${late ?? 'a new turn started'}. Its window waits up to ${minutes} minutes for this session to exit, then gives up; close it, or exit (/exit) to resume there.`,
@@ -285,11 +314,16 @@ async function restartNow($: EngineInterface, value: Queued): Promise<void> {
   armed = undefined
   await tellModel($, record(value))
   $.ui.log(`Restarting at the session's own request: ${value.reason}`)
-  $.ui.toast(`Restarting: a new window resumes this session once it has exited. ${value.reason}`)
+  $.ui.toast(`Restarting: ${slot === undefined ? 'a new window' : "this pane's slot"} resumes this session once it has exited. ${value.reason}`)
   try {
     await $.command.run({ command: 'exit' })
   } catch (err) {
     const minutes = WAIT_SECONDS / 60
+    if (slot !== undefined) {
+      $.ui.toast(`Exit didn't run: ${why(err)}. This pane's slot resumes the session if it exits (/exit) within ${SLOT_SECONDS / 60} minutes.`)
+      await tellModel($, `The restart left this pane's slot a record, but the exit didn't run: ${why(err)}. If this process exits within ${SLOT_SECONDS / 60} minutes, the slot resumes the session in this pane; after that this session goes on as it is.`)
+      return
+    }
     $.ui.toast(`Exit didn't run: ${why(err)}. The new window waits ${minutes} minutes for this session to exit (/exit), then gives up.`)
     await tellModel(
       $,
@@ -302,6 +336,19 @@ async function restartNow($: EngineInterface, value: Queued): Promise<void> {
     $.ui.toast(`The exit ran, but the session is still open. The new window waits up to ${WAIT_SECONDS / 60} minutes for it to exit.`)
     void tellModel($, 'The restart\'s exit ran, but the session is still open (a dialog may have been answered no). The new window waits for it to exit, then resumes it there.')
   })
+}
+
+/** Removes the claim lock the restart's launcher took, once the resumed session holds the conversation. */
+async function release($: EngineInterface, id: string, claim: string): Promise<void> {
+  try {
+    const root = await $.env.get('SystemRoot')
+    const local = await $.env.get('LOCALAPPDATA')
+    if (root === undefined || !SYSTEM_ROOT.test(root) || !isSafeFolder(local)) return
+    const run = await $.process.run(powershellArgv(powershellPath(root), releaseScript({ stateDir: stateFolder(local), id, by: claim })), { timeoutMs: RELEASE_MS })
+    if (run.exitCode !== 0 || !RELEASED.test(run.stdout)) $.ui.log(`self-restart: the claim lock on ${id} wasn't released (exit ${run.exitCode}); it goes stale 15 minutes after the old process exited.`)
+  } catch (err) {
+    $.ui.log(`self-restart: the claim lock on ${id} wasn't released (${why(err)}); it goes stale 15 minutes after the old process exited.`)
+  }
 }
 
 /** In the process that resumed a session: the restart's first prompt, if one waits for this session. */
@@ -318,6 +365,9 @@ async function welcome($: EngineInterface, id: unknown): Promise<void> {
     return
   }
   $.ui.toast(`Restarted: ${found.reason}`)
+  // The claim lock the launcher took on this conversation: this process holds it now.
+  const claim = found.claim
+  if (claim !== undefined) $.clock.after(SETTLE_MS, () => void release($, id, claim))
   const resume = found.resume
   // Later, not awaited: a prompt submitted from the start's hook would wait on that hook.
   if (resume !== undefined) $.clock.after(SETTLE_MS, () => void sendResume($, 'Restarted.', resume))

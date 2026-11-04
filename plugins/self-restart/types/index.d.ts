@@ -7,9 +7,10 @@ export type Queued = { reason: string; resume?: string }
 /**
  * A restart under way, kept in the plugin's own store (`$.store`, key `restarts`) by session id, so
  * that the copy of the plugin in the process that resumes the session finds it: when it was written
- * (`$.clock.now()` milliseconds), why, and the first prompt.
+ * (`$.clock.now()` milliseconds), why, the first prompt, and the claim lock's claimant (`slot:...` or
+ * `launch:...`), which that copy releases.
  */
-export type Restart = { at: number; reason: string; resume?: string }
+export type Restart = { at: number; reason: string; resume?: string; claim?: string }
 
 /**
  * The folder the session started in, as the first session.start of this process gave it: where
