@@ -17,12 +17,16 @@ function engine(on: On, { clear = 'clears', agents = [], dropped }: Options = {}
   const commands: string[] = []
   const prompts: string[] = []
   const toasts: string[] = []
+  const described: string[] = []
   const world = { id: 'session-1', agents }
   const clock = mock.clock(on)
   const session = mock.session(on)
   on('session.start', (_, e) => ({ cwd: e.cwd }))
   on('session.id', () => ({ value: world.id }))
-  on('tool.register', () => ({ value: { tool: TOOL } }))
+  on('tool.register', (_, e) => {
+    described.push(String(e.description))
+    return { value: { tool: TOOL } }
+  })
   on('ui.status', () => ({ value: undefined }))
   on('ui.toast', (_, e) => {
     toasts.push(String(e.text))
@@ -44,7 +48,7 @@ function engine(on: On, { clear = 'clears', agents = [], dropped }: Options = {}
     if (clear === 'clears' && e.command === 'clear') world.id = 'session-2'
     return {}
   })
-  return { commands, prompts, toasts, clock, session, world }
+  return { commands, prompts, toasts, described, clock, session, world }
 }
 
 const start = { cwd: '/', surface: 'terminal', isInteractive: true } as const
@@ -54,7 +58,7 @@ test('the clear runs only once the turn has ended, and the handoff is the first 
   const { commands, prompts, toasts, clock } = engine(on)
   await $.session.start(start)
 
-  const queued = await $.tool.call({ tool: TOOL, handoff: ' Start ticket 42; notes in docs/42.md. ' })
+  const queued = await $.tool.call({ tool: TOOL, why: 'complete', handoff: ' Start ticket 42; notes in docs/42.md. ' })
   expect(queued.deny).toBeUndefined()
   expect(queued.result).toMatch(/Start ticket 42; notes in docs\/42\.md\.$/)
   // Nothing runs while the turn does, however long it goes on: not at the call, not at the turn's
@@ -75,12 +79,12 @@ test('the clear runs only once the turn has ended, and the handoff is the first 
   expect(prompts).toHaveLength(1)
 })
 
-test('a call without a handoff is refused, and nothing is queued', async ($, on) => {
+test('a call without a handoff is refused, and nothing is queued: `handoff` is still required', async ($, on) => {
   const { commands, clock } = engine(on)
   await $.session.start(start)
 
   for (const input of [{}, { handoff: '' }, { handoff: '   ' }, { handoff: 42 }]) {
-    const refused = await $.tool.call({ tool: TOOL, ...input })
+    const refused = await $.tool.call({ tool: TOOL, why: 'complete', ...input })
     expect(refused.deny).toMatch(/handoff/)
   }
   await $.turn.complete(answered)
@@ -88,11 +92,64 @@ test('a call without a handoff is refused, and nothing is queued', async ($, on)
   expect(commands).toEqual([])
 })
 
+/** The refusal of a clear that is neither complete nor contaminated, spelled out so that a change to it shows. */
+const NOT_WHY =
+  "A clear loses this session's memory of the whole story. Compact instead (compact_after_turn), or restart into the same conversation (restart_after_turn). Clear only when the work is complete (why: 'complete') or the context is contaminated (why: 'contaminated'), with the notes named in handoff."
+
+test("a clear without why, or with any why but 'complete' or 'contaminated', is refused at the call: nothing is queued or armed", async ($, on) => {
+  const { commands, prompts, session, clock } = engine(on)
+  await $.session.start(start)
+
+  for (const why of [undefined, 'tidy', '', ' complete', 'Complete', 'complete ', 'contaminated, and tidy', 7, true, ['complete'], null]) {
+    const refused = await $.tool.call({ tool: TOOL, ...(why === undefined ? {} : { why }), handoff: 'Start ticket 42; notes in docs/42.md.' })
+    expect(refused.deny).toBe(NOT_WHY)
+  }
+  // Not at the turn's end either: nothing was queued, so nothing runs.
+  await $.turn.complete(answered)
+  await clock.advance(1000)
+  expect(commands).toEqual([])
+  expect(prompts).toEqual([])
+  expect(session.appended()).toEqual([])
+})
+
+for (const [why, said] of [
+  ['complete', 'its work is complete'],
+  ['contaminated', 'its context was contaminated'],
+] as const) {
+  test(`why: '${why}' clears as before, and says why in the leaving row and the toast`, async ($, on) => {
+    const { commands, prompts, toasts, session, clock } = engine(on)
+    await $.session.start(start)
+
+    const queued = await $.tool.call({ tool: TOOL, why, handoff: 'Start ticket 42; notes in docs/42.md.' })
+    expect(queued.deny).toBeUndefined()
+    expect(queued.result).toMatch(new RegExp(`^Queued \\(why: ${why}\\)\\.`))
+    await $.turn.complete(answered)
+    await clock.advance(1000)
+    expect(commands).toEqual(['clear'])
+    expect(prompts).toEqual(['Context cleared at your own request (clear_after_turn). Handoff: Start ticket 42; notes in docs/42.md.'])
+    const rows = session.appended().flatMap(row => ((row as { message?: { content?: { text?: unknown }[] } }).message?.content ?? []).map(block => String(block.text)))
+    // The leaving row: the conversation's last before the clear.
+    expect(rows).toEqual([
+      `This conversation was cleared at its own request (clear_after_turn), because ${said} (why: ${why}). The cleared conversation starts from the handoff: Start ticket 42; notes in docs/42.md.`,
+    ])
+    expect(toasts).toContain(`Conversation cleared because ${said}; the handoff is its first prompt.`)
+  })
+}
+
+test('the description leads with compacting and restarting, and names the two reasons a clear is for', async ($, on) => {
+  const { described } = engine(on)
+  await $.session.start(start)
+  const [text] = described
+  expect(text?.startsWith("Prefer compact_after_turn, which keeps a summary of this conversation, or restart_after_turn, which gives a fresh process and resumes this same conversation: a clear loses this session's memory of the whole story.")).toBe(true)
+  expect(text).toContain("Only when `why` is 'complete'")
+  expect(text).toContain("or 'contaminated'")
+})
+
 test('a clear that leaves the session as it was sends no handoff, and says so', async ($, on) => {
   const { commands, prompts, toasts, session, clock } = engine(on, { clear: 'no-op' })
   await $.session.start(start)
 
-  await $.tool.call({ tool: TOOL, handoff: 'Go on.' })
+  await $.tool.call({ tool: TOOL, why: 'complete', handoff: 'Go on.' })
   await $.turn.complete(answered)
   await clock.advance(1000)
   expect(commands).toEqual(['clear'])
@@ -106,7 +163,7 @@ test('a refused clear sends no handoff, and tells the model the conversation sta
   const { prompts, toasts, session, clock } = engine(on, { clear: 'refused' })
   await $.session.start(start)
 
-  await $.tool.call({ tool: TOOL, handoff: 'Go on.' })
+  await $.tool.call({ tool: TOOL, why: 'complete', handoff: 'Go on.' })
   await $.turn.complete(answered)
   await clock.advance(1000)
   expect(prompts).toEqual([])
@@ -118,7 +175,7 @@ test('a handoff the engine drops is kept as a note for the next message', async 
   const { prompts, toasts, session, clock } = engine(on, { dropped: 'a Stop stands' })
   await $.session.start(start)
 
-  await $.tool.call({ tool: TOOL, handoff: 'Start ticket 42.' })
+  await $.tool.call({ tool: TOOL, why: 'complete', handoff: 'Start ticket 42.' })
   await $.turn.complete(answered)
   await clock.advance(1000)
   expect(prompts).toEqual([])
@@ -130,12 +187,12 @@ test('a running subagent refuses the call, and one started before the turn ends 
   const { commands, prompts, toasts, world, clock } = engine(on, { agents: [{ description: 'Run the e2e suite', status: 'running' }] })
   await $.session.start(start)
 
-  const refused = await $.tool.call({ tool: TOOL, handoff: 'Go on.' })
+  const refused = await $.tool.call({ tool: TOOL, why: 'complete', handoff: 'Go on.' })
   expect(refused.deny).toMatch(/still running \(Run the e2e suite\)/)
 
   // It reported; the call queues. Then another starts before the turn ends: the clear doesn't run.
   world.agents = [{ description: 'Run the e2e suite', status: 'completed' }]
-  expect((await $.tool.call({ tool: TOOL, handoff: 'Go on.' })).deny).toBeUndefined()
+  expect((await $.tool.call({ tool: TOOL, why: 'complete', handoff: 'Go on.' })).deny).toBeUndefined()
   world.agents = [{ description: 'Lint', status: 'pending' }]
   await $.turn.complete(answered)
   await clock.advance(1000)
@@ -148,7 +205,7 @@ test('a message that starts a turn before the clear has run cancels it, and says
   const { commands, prompts, toasts, session, clock } = engine(on)
   await $.session.start(start)
 
-  await $.tool.call({ tool: TOOL, handoff: 'Go on.' })
+  await $.tool.call({ tool: TOOL, why: 'complete', handoff: 'Go on.' })
   await $.turn.complete(answered)
   // The person's next message starts its turn before the queued command has run.
   await $.turn.start({ text: 'one more thing', turnId: 't2' })
@@ -163,7 +220,7 @@ test("a subagent's turn, starting or ending, leaves the queued clear alone", asy
   const { commands, toasts, clock } = engine(on)
   await $.session.start(start)
 
-  await $.tool.call({ tool: TOOL, handoff: 'Go on.' })
+  await $.tool.call({ tool: TOOL, why: 'complete', handoff: 'Go on.' })
   // A subagent's turn ends before the main one: the clear stays queued, and doesn't run yet.
   await $.turn.complete({ ...answered, turnId: 'a-t1', agentId: 'a1' })
   await clock.advance(60_000)
@@ -180,7 +237,7 @@ test('an interrupted turn cancels the clear and its handoff', async ($, on) => {
   const { commands, prompts, toasts, clock } = engine(on)
   await $.session.start(start)
 
-  await $.tool.call({ tool: TOOL, handoff: 'Go on.' })
+  await $.tool.call({ tool: TOOL, why: 'complete', handoff: 'Go on.' })
   await $.turn.complete({ ...answered, isAborted: true, reason: 'aborted' })
   await clock.advance(1000)
   expect(commands).toEqual([])
@@ -192,7 +249,7 @@ test('a subagent is refused, and nothing is queued', async ($, on) => {
   const { commands, clock } = engine(on)
   await $.session.start(start)
 
-  const refused = await $.tool.call({ tool: TOOL, handoff: 'Go on.', agentId: 'a1' })
+  const refused = await $.tool.call({ tool: TOOL, why: 'complete', handoff: 'Go on.', agentId: 'a1' })
   expect(refused.deny).toMatch(/subagent/)
   await $.turn.complete(answered)
   await clock.advance(1000)

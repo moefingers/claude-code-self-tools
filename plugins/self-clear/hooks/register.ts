@@ -1,8 +1,14 @@
-// A session clears its own conversation between two independent pieces of work, as /clear does, and
-// starts the next piece from a handoff it wrote. The model calls clear_after_turn with `handoff`,
-// required, since a clear keeps nothing else; a command can't run while the turn the model is in
-// waits on it, so the call is queued and the clear runs once the turn has ended with an answer. An
+// A session clears its own conversation, as /clear does, and starts the next piece from a handoff it
+// wrote; only when its work is complete or its context is contaminated. The model calls
+// clear_after_turn with `why` and `handoff`, both required: a clear loses the session's memory of the
+// whole story, which compacting (self-compact) keeps a summary of and a restart (self-restart) keeps
+// whole, so `why` must be 'complete' or 'contaminated', or the call is refused and nothing is queued;
+// and the handoff is all the cleared conversation has. A command can't run while the turn the model is
+// in waits on it, so the call is queued and the clear runs once the turn has ended with an answer. An
 // interrupted turn cancels it. Only the main conversation clears this way, never a subagent.
+//
+// Before the command, a leaving row (the conversation's last) records why it was cleared and the
+// handoff, for whoever reads or resumes it later; the toast says why too.
 //
 // A /clear ends the conversation and the process goes on under a new session id; no session.start
 // fires for it, so this module, its timers and its tools stay as they are. The continuation that ran
@@ -17,7 +23,7 @@
 // the command would start a turn the clear then wipes. A main-loop turn that starts before the
 // command has started cancels the clear, as an interrupted turn does.
 import type { EngineInterface, Register } from 'claude-code'
-import type { Queued } from '../types'
+import type { Queued, Why } from '../types'
 import { configureUpdateCheck, loadUpdateCheck, withUpdateNotice } from './update-check'
 
 const queued = { plugin: 'self-clear', key: 'queued' } as const
@@ -28,11 +34,24 @@ const SETTLE_MS = 500
 /** An agent in one of these is still to report. */
 const BUSY: readonly string[] = ['pending', 'running', 'waiting']
 
+/** The two reasons a clear is for, and how the leaving row and the toast say each. */
+const WHY: Readonly<Record<Why, string>> = {
+  complete: 'its work is complete',
+  contaminated: 'its context was contaminated',
+}
+
+/** Whether `raw` is one of the two reasons, exactly. */
+const isWhy = (raw: unknown): raw is Why => raw === 'complete' || raw === 'contaminated'
+
+/** Why a clear without one of the two reasons is refused, and what to do instead. */
+const NOT_WHY =
+  "A clear loses this session's memory of the whole story. Compact instead (compact_after_turn), or restart into the same conversation (restart_after_turn). Clear only when the work is complete (why: 'complete') or the context is contaminated (why: 'contaminated'), with the notes named in handoff."
+
 const DESCRIPTION = [
+  "Prefer compact_after_turn, which keeps a summary of this conversation, or restart_after_turn, which gives a fresh process and resumes this same conversation: a clear loses this session's memory of the whole story.",
   'Clears this conversation once the current turn ends, as /clear does: the context starts empty, and `handoff` is the first prompt it reads.',
-  'Irreversible: nothing of this conversation is kept but `handoff` and what you wrote down. Before calling it, write what the next piece needs where your notes live (memory, files, the PR), and say where in `handoff`.',
-  'Call it only between two independent pieces of work, when the next piece needs nothing of this conversation; never mid-task.',
-  'When the next piece builds on this one, compact instead (compact_after_turn, if it is available), which keeps a summary.',
+  "Only when `why` is 'complete' (the work is done, and its notes are written down) or 'contaminated' (what this context holds misleads the work); any other call is refused, and nothing is queued.",
+  'Irreversible: nothing of this conversation is kept but `handoff` and what you wrote down. Before calling it, write what the next piece needs where your notes live (memory, files, the PR), and say where in `handoff`. Never mid-task.',
   'It refuses while subagents you started are still running. Background tasks you started report into the cleared conversation, which no longer knows why it asked: let them finish first.',
   'End the turn after calling it; the clear runs once your answer is shown.',
 ].join(' ')
@@ -92,10 +111,14 @@ async function sessionId($: EngineInterface): Promise<string | undefined> {
   }
 }
 
+/** The leaving row, the conversation's last before the clear: why it was cleared, and the handoff. */
+const leaving = ({ why: reason, handoff }: Queued): string =>
+  `This conversation was cleared at its own request (clear_after_turn), because ${WHY[reason]} (why: ${reason}). The cleared conversation starts from the handoff: ${handoff}`
+
 /** Runs the clear, then sends the handoff as the cleared conversation's first prompt. */
 async function clearNow($: EngineInterface, value: Queued): Promise<void> {
   if (armed !== value) return
-  const { handoff } = value
+  const { handoff, why: reason } = value
   $.ui.status(undefined)
   const stop = blocked(await busyAgents($))
   if (stop !== undefined) {
@@ -107,6 +130,7 @@ async function clearNow($: EngineInterface, value: Queued): Promise<void> {
   // A turn that started while the checks above ran has taken it back, and said so.
   if (armed !== value) return
   armed = undefined
+  await tellModel($, leaving(value))
   try {
     await $.command.run({ command: 'clear' })
   } catch (err) {
@@ -123,7 +147,7 @@ async function clearNow($: EngineInterface, value: Queued): Promise<void> {
     )
     return
   }
-  $.ui.toast('Conversation cleared; the handoff is its first prompt.')
+  $.ui.toast(`Conversation cleared because ${WHY[reason]}; the handoff is its first prompt.`)
   const prompt = `Context cleared at your own request (clear_after_turn). Handoff: ${handoff}`
   try {
     const sent = await $.prompt.submit({ text: prompt })
@@ -151,13 +175,19 @@ export const register: Register = (on, options) => {
       inputSchema: {
         type: 'object',
         properties: {
+          why: {
+            type: 'string',
+            enum: ['complete', 'contaminated'],
+            description:
+              "Why this conversation clears: 'complete' (its work is done, and its notes are written down) or 'contaminated' (what this context holds misleads the work). Nothing else clears: compact or restart instead.",
+          },
           handoff: {
             type: 'string',
             description:
               'The first prompt of the cleared conversation, which knows nothing else: the next piece of work, where its notes and details are, and anything it must not redo.',
           },
         },
-        required: ['handoff'],
+        required: ['why', 'handoff'],
         additionalProperties: false,
       },
       isDeferred: false,
@@ -168,16 +198,20 @@ export const register: Register = (on, options) => {
 
   on('tool.call', { tool: 'mcp__self-clear__clear_after_turn' }, async ($, e) => {
     if (e.agentId !== undefined) return { deny: SUBAGENT }
-    const handoff = text((e as { handoff?: unknown }).handoff)
+    const input = e as { why?: unknown; handoff?: unknown }
+    // Checked at the call, exactly: nothing is queued for a clear that isn't one of the two.
+    if (!isWhy(input.why)) return { deny: NOT_WHY }
+    const reason = input.why
+    const handoff = text(input.handoff)
     if (handoff === undefined) {
       return { deny: 'Say what the cleared conversation starts from (`handoff`): the next piece of work and where its notes are. A clear keeps nothing else.' }
     }
     const stop = blocked(await busyAgents($))
     if (stop !== undefined) return { deny: `Not queued: ${stop}. Wait for them to report, or stop them, then call again.` }
-    await $.state.set(queued, { handoff })
+    await $.state.set(queued, { why: reason, handoff })
     $.ui.status('clear queued for when this turn ends')
     return {
-      result: `Queued. This conversation clears once this turn ends, and nothing of it is kept but the handoff, which is the first prompt after the clear: ${handoff}`,
+      result: `Queued (why: ${reason}). This conversation clears once this turn ends, and nothing of it is kept but the handoff, which is the first prompt after the clear: ${handoff}`,
     }
   }).catch(($, e, next) => (next.called ? next(e) : { deny: 'self-clear: queuing the clear failed; nothing is queued.' }))
 
@@ -190,6 +224,13 @@ export const register: Register = (on, options) => {
     if (e.isAborted || e.reason !== 'answer') {
       $.ui.status(undefined)
       $.ui.toast("Clear cancelled: the turn didn't finish.")
+      return done
+    }
+    // A clear queued before `why` was required (an older copy of this plugin, reloaded mid-turn).
+    if (!isWhy(value.why)) {
+      $.ui.status(undefined)
+      $.ui.toast('Clear cancelled: it was queued without a why.')
+      await tellModel($, `The clear you queued didn't run: it was queued without a why. ${NOT_WHY}`)
       return done
     }
     armed = value
