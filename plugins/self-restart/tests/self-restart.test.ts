@@ -42,6 +42,26 @@ function decode(encoded: string): string {
   return out
 }
 
+/** The probe's answer for a session with nothing running under it: claude.exe 100 in a pane, the probe under it. */
+const AT_REST = `${JSON.stringify({
+  v: 1,
+  self: 300,
+  session: { pid: 100, created: '134062345688901240' },
+  slot: null,
+  procs: [
+    { pid: 20, ppid: 10, created: '134062345678901240', name: 'powershell.exe', cls: 'shell' },
+    { pid: 100, ppid: 20, created: '134062345688901240', name: 'claude.exe' },
+    { pid: 300, ppid: 100, created: '134062355668901240', name: 'powershell.exe', cls: 'shell' },
+  ],
+  registry: [],
+  transcripts: [],
+  locks: [],
+  claim: null,
+  heavy: null,
+  freeKb: null,
+  errors: [],
+})}\r\n`
+
 /** The engine beneath the plugin: its environment, session id, store and agents; and what it was asked to run. */
 function engine(on: On, { env = WINDOWS, id = ID, launcher = 'opens', exit = 'exits', agents = [], store = {}, launchMs = 0 }: Options = {}) {
   const runs: Run[] = []
@@ -66,6 +86,7 @@ function engine(on: On, { env = WINDOWS, id = ID, launcher = 'opens', exit = 'ex
   on('store.keys', () => ({ value: [...held.keys()] }))
   on('session.start', (_, e) => ({ cwd: e.cwd }))
   on('session.id', () => ({ value: world.id }))
+  on('session.cwd', () => ({ value: 'C:\\work\\repo' }))
   on('tool.register', () => ({ value: { tool: TOOL } }))
   on('ui.status', () => ({ value: undefined }))
   on('ui.toast', (_, e) => {
@@ -87,6 +108,10 @@ function engine(on: On, { env = WINDOWS, id = ID, launcher = 'opens', exit = 'ex
   on('turn.start', (_, e) => ({ turnId: e.turnId }))
   on('turn.complete', () => ({ text: 'done' }))
   on('process.run', async (_, e) => {
+    // The safe point's reads before the launch, answered as a machine at rest and kept out of `runs`,
+    // which are the launcher's: git finds no repository, and the probe finds nothing under the session.
+    if (e.argv[0] === 'git') return { value: { exitCode: 128, stdout: '', stderr: 'fatal: not a git repository (or any of the parent directories): .git', isStdoutTruncated: false, isStderrTruncated: false } }
+    if (decode(String(e.argv[4] ?? '')).includes('$ids = @(')) return { value: { exitCode: 0, stdout: AT_REST, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
     runs.push({ argv: [...e.argv], init: e.init === undefined ? undefined : { ...e.init } })
     if (launchMs > 0) await clock.sleep(launchMs)
     if (launcher === 'throws') return { deny: 'spawn EPERM' }
@@ -284,6 +309,7 @@ test("the window clears the old session's markers before claude --resume, and no
     'CLAUDE_CODE_ENTRYPOINT',
     'CLAUDE_CODE_EXECPATH',
     'CLAUDE_CODE_SESSION_ATTENDED',
+    'CLAUDE_CODE_SSE_PORT',
   ])
   const script = launcherScript(ID)
   const clears = script.split(/\r?\n/).filter(line => line.includes('SetEnvironmentVariable'))

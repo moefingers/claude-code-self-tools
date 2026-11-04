@@ -2,6 +2,31 @@
 
 Each entry names a plugin and its version, as `version` in `plugins/<name>/.claude-plugin/plugin.json` has it.
 
+## 2026-11-03: self-switch 0.1.0, and self-restart 0.1.3 on the shared machine code
+
+- **self-switch 0.1.0**, new, Windows only, for your own use:
+  - `switch_after_turn({ to, reason, notes, resume? })` switches the terminal to conversation `to` once the turn ends: in place (`/resume`) when both conversations live in one project folder, else in the pane's slot, else in a new window. `reason` and `notes` are required and recorded in both conversations; `resume` is the resumed conversation's first prompt, in the plugin's frame.
+  - **Another session's words stay data.** `reason`, `notes` and `resume` are kept as one line each (every line break and tab a space; every character a reader can't see dropped, in any Unicode plane: control and format characters, the tag characters that can carry hidden text among them, private-use, unassigned and default-ignorable code points; at most 400 characters), and the resumed conversation reads them quoted in «…», with any guillemet inside escaped, in a row that opens *self-switch: a message from session «…»* and says they are that session's words, not the person's, granting no new permission. The `resume` prompt is framed the same way.
+  - **Never two copies of one conversation.** A fixed probe reads every running `claude.exe`, Claude Code's session registry, the transcripts' folders and times, and the claim locks. The switch refuses, naming the evidence, when `to` is held by a running Claude Code, named on a command line, written in the last 10 minutes, alive by its heartbeat, or claimed by another move; and when anything can't be read, a registry file is of a shape not verified (a key outside the 18 seen, or `pid`, `sessionId`, `procStart` or `status` missing or of another type), a `claude.exe` is accounted for by no registry, or `to` has no transcript here, or two.
+  - **Only at a safe point.** It refuses while a subagent, a background Bash, PowerShell or Monitor job, git (or a git operation in flight in any worktree), a build, test or lint, a dev server, Playwright or a heavy-slot job runs under the session, and for an in-place switch while the checkout has uncommitted changes. Anything unreadable holds it.
+  - **The claim lock** (`%LOCALAPPDATA%\claude-self-tools\claims\<id>.lock`) is taken with CreateNew in the probe run that judged, and released where the conversation arrives. A stale lock is taken over, and a lock released, through one handle that keeps every other writer out, never by a delete and a create; a release a reader blocks is tried again, then left in place and logged; an in-place switch reads the claim again right before `/resume`.
+  - **Coordinated mode.** While the coordinator's gate file for the conversation says `coordinated: true` (at most a day old), every call refuses. `requireCoordinator: on` refuses where there is no gate file.
+  - **The slot runner** (`slot/claude-slot.ps1`) keeps a Windows Terminal pane: it runs `claude`, and when it exits, resumes the conversation a switch or restart left it a record for, in the same pane, after checking it all again, the folder being the conversation's own project among it. The plugins use it only when its SHA-256 is the one they ship; the slot's id is compared as the exact string the probe prints. The pane's profile line uses `-ExecutionPolicy RemoteSigned`, and the runner clears it before `claude` starts.
+  - **The last look.** A registry file that can't be read at the last moment is read twice more, 250 ms apart; still unknown, the window or slot says so and gives the `claude --resume <id>` line to run by hand.
+  - No transport passes a permission flag: the resumed conversation starts in the mode a new session would.
+  - It refuses subagents, outside a terminal, off Windows, within 2 minutes of a switch, and while subagents run. A new turn or an interrupted one cancels it; a new turn's cancel is told in a plugin row, and from the third in a row the row says the session is busy: queue it again when idle, or ask the merger or the owner.
+  - Where the coordinator runs switches, it refuses: *ask the merger or the owner for a wrap-up*.
+- **self-restart 0.1.3**: its launcher is now the shared one, version 2.
+  - It takes the claim lock on the conversation, with CreateNew, and the resumed session releases it, so a switch moving the same conversation can't resume it too.
+  - After the wait, right before `claude --resume`, the window reads the registry and the process table again and resumes nothing if another process holds the conversation, or if the claim no longer names it.
+  - In a pane set up as a slot, it leaves the slot a record instead of opening a window, when the start folder is one the runner takes.
+  - Right before the launch it runs the full safe point, as a switch does: a background job, git, a build, a dev server or a heavy-slot job under the session, git in flight, or anything unreadable holds it.
+  - A new turn's cancel is told in a plugin row, counted as for self-switch.
+  - The scrub of Claude Code's markers adds `CLAUDE_CODE_SSE_PORT`; no permission flag is passed.
+- **The shared machine code**, `shared/hooks/machine.ts`, copied into self-restart and self-switch only: the probe, liveness, the safe point, the transports, the launcher, the claim lock, the gate and the slot runner's hash. It imports nothing but the engine's types, so the coordinator can vendor it byte for byte.
+- **sync-shared**: a shared file with a line `Copies: <plugin>, ...` is copied only into those plugins, and a copy anywhere else is stale. `scripts/slot-runner.test.mjs` checks the slot runner, as text and by its hash.
+- The update check knows self-switch.
+
 ## 2026-11-03: self-restart 0.1.2, the restarted session saves its transcript
 
 - **self-restart 0.1.2**: the new window inherited the old session's environment, `CLAUDE_CODE_CHILD_SESSION` included. That marker makes a claude count as nested, and a nested interactive session saves no transcript and is left out of `--resume`. So a restarted session could have carried on with transcript saving off.

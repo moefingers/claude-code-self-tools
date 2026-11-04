@@ -10,8 +10,13 @@
 //
 // The launch: one fixed PowerShell script by Windows PowerShell's known path, its only variable the
 // session's id, which must be a UUID; see launcher.ts. Nothing from the tool's input reaches the
-// launch. The new window waits for this session's claude.exe to exit before it resumes, so two
-// copies never write one session.
+// launch. It takes the claim lock on the conversation, so a switch moving it at the same time can't
+// resume it too. The new window waits for this session's claude.exe to exit, then reads the session
+// registry and the process table again, and resumes only when nothing else holds the conversation,
+// so two copies never write one session. When this session runs in a slot (a Windows Terminal pane
+// running self-switch's claude-slot.ps1 of the shipped hash), the launcher leaves the slot a record
+// instead, and the slot resumes the session in the same pane once it has exited. The resumed session's
+// copy of this plugin releases the claim lock.
 //
 // The first prompt never goes on a command line. It waits in the plugin's own store, under the
 // session's id, and the copy of this plugin in the process that resumes the session sends it, once,
@@ -29,11 +34,17 @@
 // left waiting, and the person and the model are told so.
 import type { EngineInterface, Register } from 'claude-code'
 import type { Queued, Restart } from '../types'
-import { encodeCommand, LAUNCHED, launcherScript, powershellPath, SESSION_ID, SYSTEM_ROOT, WAIT_SECONDS } from './launcher'
+import { CLAIMED, encodeCommand, LAUNCHED, launcherScript, powershellPath, RELEASED, releaseScript, SESSION_ID, SLOTTED, stateFolder, SYSTEM_ROOT, WAIT_SECONDS } from './launcher'
+import type { AgentLike } from './machine'
+import { isSafeFolder, parseProbe, powershellArgv, probeScript, readGit, safePoint } from './machine'
 import { configureUpdateCheck, loadUpdateCheck, withUpdateNotice } from './update-check'
 
 const queued = { plugin: 'self-restart', key: 'queued' } as const
 const folder = { plugin: 'self-restart', key: 'folder' } as const
+const cancelsKey = { plugin: 'self-restart', key: 'cancels' } as const
+
+/** After this many cancels in a row by a new turn, the row says the session is busy. */
+const BUSY_AFTER = 3
 
 /** The plugin's store key for restarts under way, by session id. */
 const RESTARTS = 'restarts'
@@ -46,6 +57,10 @@ const SETTLE_MS = 500
 const CHECK_MS = 5000
 /** How long the launcher may take to open the window. */
 const LAUNCH_MS = 30_000
+/** How long releasing the claim lock may take. */
+const RELEASE_MS = 15_000
+/** How long a slot honours the record the launcher left it, in seconds. */
+const SLOT_SECONDS = 120
 /** A restart's first prompt older than this is dropped, not sent: the window waits 10 minutes at most. */
 const STALE_MS = 15 * 60 * 1000
 /** The most restarts under way the store keeps. */
@@ -61,7 +76,7 @@ const DESCRIPTION = [
   'Call it when a restart is the fix: the person switched accounts, changed a setting that takes effect at startup, or a plugin won\'t reload (try reload_plugins_after_turn first, if it is available). Only at a finished break: never mid-merge, mid-push or mid-task. Never on your own to clear a problem a restart doesn\'t fix.',
   'Windows only, in a session run in a terminal.',
   '`reason` (required) says why; it is recorded in the transcript. `resume` is the message that starts your first turn in the restarted session: what to check or do next. Give it whenever you have a next step of your own; leave it out only when the next step waits on someone else.',
-  'Everything this process runs ends with it: wake-ups, background tasks, Remote Control (with Remote Control on for all sessions, the resumed session connects again). It refuses while subagents you started are still running, and refuses a second restart within 2 minutes of the last.',
+  'It refuses unless the session is at a safe point: while subagents you started are still running, while anything runs under this session (a background Bash, PowerShell or Monitor job, git, a build, test or lint, a dev server or Playwright, a heavy-slot job), while a git operation is in flight in the repo, and while any of that can\'t be read. It refuses a second restart within 2 minutes of the last. What still ends with this process: wake-ups, background tasks it can\'t see, Remote Control (with Remote Control on for all sessions, the resumed session connects again).',
   'End the turn after calling it; the restart starts once your answer is shown.',
 ].join(' ')
 
@@ -143,6 +158,42 @@ async function env($: EngineInterface, read: () => Promise<string | undefined>):
   }
 }
 
+/** How long the probe of this session's processes may take. */
+const PROBE_MS = 60_000
+
+/**
+ * Why this session isn't at a safe point to exit, or undefined when it is: the shared safePoint, on a
+ * probe of the process tree (this session's id, no config folder, no claim) and git's state where the
+ * session started and works. A subagent, any job under this claude.exe (a background Bash, PowerShell
+ * or Monitor job, git, a build, a dev server, a heavy-slot job) or git in flight holds it; anything
+ * that can't be read holds it too.
+ */
+async function notSafe($: EngineInterface, launch: { powershell: string; id: string; cwd: string }): Promise<string | undefined> {
+  let probe: ReturnType<typeof parseProbe> | string
+  try {
+    const run = await $.process.run(powershellArgv(launch.powershell, probeScript({ ids: [launch.id], configDirs: [] })), { cwd: launch.cwd, timeoutMs: PROBE_MS })
+    probe = run.exitCode === 0 ? parseProbe(run.stdout) : `it exited ${run.exitCode}${brief(run.stderr) === '' ? '' : `: ${brief(run.stderr)}`}`
+  } catch (err) {
+    probe = `it didn't run: ${why(err)}`
+  }
+  if (typeof probe !== 'string' && 'error' in probe) probe = probe.error
+  let cwd: string
+  try {
+    cwd = await $.session.cwd()
+  } catch (err) {
+    return `this session's folder can't be read, so git's state there is unknown (${why(err)})`
+  }
+  const git = await readGit($, { cwd, folders: [launch.cwd], dirty: false })
+  let agents: readonly AgentLike[] | string
+  try {
+    agents = await $.agent.list()
+  } catch (err) {
+    agents = why(err)
+  }
+  const safe = safePoint(probe, git, agents)
+  return safe.verdict === 'clear' ? undefined : `this session isn't at a safe point (${safe.reasons.join('; ')})`
+}
+
 /** What the launch needs, each from the engine, never from the tool's input; or why it can't go ahead. */
 async function plan($: EngineInterface): Promise<{ powershell: string; id: string; cwd: string } | { refusal: string }> {
   const os = await env($, () => $.env.get('OS'))
@@ -172,7 +223,12 @@ async function restarts($: EngineInterface, now: number): Promise<Record<string,
   for (const [id, value] of Object.entries(stored)) {
     if (!SESSION_ID.test(id) || !isRecord(value) || typeof value.at !== 'number' || typeof value.reason !== 'string') continue
     if (now - value.at > STALE_MS && now >= value.at) continue
-    kept[id] = typeof value.resume === 'string' ? { at: value.at, reason: value.reason, resume: value.resume } : { at: value.at, reason: value.reason }
+    kept[id] = {
+      at: value.at,
+      reason: value.reason,
+      ...(typeof value.resume === 'string' ? { resume: value.resume } : {}),
+      ...(typeof value.claim === 'string' ? { claim: value.claim } : {}),
+    }
   }
   return kept
 }
@@ -221,9 +277,34 @@ async function refuse($: EngineInterface, toast: string, note: string): Promise<
 /** The row the model reads in the restarted session: why it restarted. */
 const record = ({ reason }: Queued): string => `This session restarted at its own request (restart_after_turn). Reason: ${reason}`
 
+/**
+ * A queued restart that a new turn took back, told to the model in a plugin row, never lost silently;
+ * `then` says what became of it. Cancels are counted while they come in a row; from the third, the row
+ * says the session is busy: queue it again when it is idle, or ask the merger or the owner.
+ */
+async function cancelled($: EngineInterface, then: string): Promise<void> {
+  let count = 1
+  try {
+    const { value: last } = await $.state.get(cancelsKey)
+    count = last !== null && last !== undefined && last.key === 'restart' ? last.count + 1 : 1
+    await $.state.set(cancelsKey, { key: 'restart', count })
+  } catch {
+    // Counted or not, the row goes.
+  }
+  const busy = count >= BUSY_AFTER ? ` That is ${count} in a row: this session is busy. Queue it again when it's idle, or ask the merger or the owner.` : ''
+  await tellModel($, `self-restart: your queued restart was cancelled because a new turn started; queue it again at the next finished break.${busy} ${then}`)
+}
+
 /** Opens the window, then exits; says so at each step that didn't go ahead. */
 async function restartNow($: EngineInterface, value: Queued): Promise<void> {
   if (armed !== value) return
+  // The break held long enough for the run to start: the cancels in a row end here. A count that
+  // can't be cleared never stops the run.
+  try {
+    await $.state.set(cancelsKey, null)
+  } catch {
+    // The next cancel counts on from it; nothing else depends on it.
+  }
   $.ui.status(undefined)
   const stop = blocked(await busyAgents($))
   if (stop !== undefined) {
@@ -244,20 +325,33 @@ async function restartNow($: EngineInterface, value: Queued): Promise<void> {
     await refuse($, `Restart didn't run: ${said}.`, `The restart you queued didn't run: ${said}. The session goes on; if a restart is still the fix, tell the person, who can restart by hand.`)
     return
   }
+  // The safe point (S1-S6), as a switch's: nothing may still run under this session when it exits.
+  const unsafe = await notSafe($, launch)
+  if (unsafe !== undefined) {
+    armed = undefined
+    await refuse($, `Restart didn't run: ${unsafe}.`, `The restart you queued didn't run: ${unsafe}. The session goes on; call restart_after_turn again once they are done.`)
+    return
+  }
   // A turn that started while the checks above ran has taken it back, and said so.
   if (armed !== value) return
   // Kept before the window opens: the process it starts reads it once this one has exited.
   const kept: Restart = { at: await $.clock.now(), ...value }
   await keep($, launch.id, kept)
   let opened: string | undefined
+  let slot: string | undefined
   try {
     const run = await $.process.run([launch.powershell, '-NoProfile', '-NonInteractive', '-EncodedCommand', encodeCommand(launcherScript(launch.id))], {
       cwd: launch.cwd,
       timeoutMs: LAUNCH_MS,
     })
-    if (run.exitCode !== 0 || !LAUNCHED.test(run.stdout)) {
+    slot = SLOTTED.exec(run.stdout)?.[1]
+    if (run.exitCode !== 0 || (slot === undefined && !LAUNCHED.test(run.stdout))) {
       const said = brief(`${run.stdout} ${run.stderr}`)
       opened = `the launcher exited ${run.exitCode}${said === '' ? '' : `: ${said}`}`
+    } else {
+      // The claim the launcher took: the resumed session's copy of this plugin releases it.
+      const claim = CLAIMED.exec(run.stdout)?.[1]
+      if (claim !== undefined) await keep($, launch.id, { ...kept, claim })
     }
   } catch (err) {
     opened = `the launcher didn't run: ${why(err)}`
@@ -275,6 +369,14 @@ async function restartNow($: EngineInterface, value: Queued): Promise<void> {
     armed = undefined
     await keep($, launch.id, null)
     const minutes = WAIT_SECONDS / 60
+    if (slot !== undefined) {
+      await refuse(
+        $,
+        `Restart stopped before the exit: ${late ?? 'a new turn started'}. This pane's slot resumes the session if it exits (/exit) within ${SLOT_SECONDS / 60} minutes.`,
+        `The restart left this pane's slot a record, but this session didn't exit: ${late ?? 'a new turn started'}. The session goes on. If it exits within ${SLOT_SECONDS / 60} minutes, the slot resumes it in this pane; after that the record is ignored.`,
+      )
+      return
+    }
     await refuse(
       $,
       `Restart stopped before the exit: ${late ?? 'a new turn started'}. Its window waits up to ${minutes} minutes for this session to exit, then gives up; close it, or exit (/exit) to resume there.`,
@@ -285,11 +387,16 @@ async function restartNow($: EngineInterface, value: Queued): Promise<void> {
   armed = undefined
   await tellModel($, record(value))
   $.ui.log(`Restarting at the session's own request: ${value.reason}`)
-  $.ui.toast(`Restarting: a new window resumes this session once it has exited. ${value.reason}`)
+  $.ui.toast(`Restarting: ${slot === undefined ? 'a new window' : "this pane's slot"} resumes this session once it has exited. ${value.reason}`)
   try {
     await $.command.run({ command: 'exit' })
   } catch (err) {
     const minutes = WAIT_SECONDS / 60
+    if (slot !== undefined) {
+      $.ui.toast(`Exit didn't run: ${why(err)}. This pane's slot resumes the session if it exits (/exit) within ${SLOT_SECONDS / 60} minutes.`)
+      await tellModel($, `The restart left this pane's slot a record, but the exit didn't run: ${why(err)}. If this process exits within ${SLOT_SECONDS / 60} minutes, the slot resumes the session in this pane; after that this session goes on as it is.`)
+      return
+    }
     $.ui.toast(`Exit didn't run: ${why(err)}. The new window waits ${minutes} minutes for this session to exit (/exit), then gives up.`)
     await tellModel(
       $,
@@ -302,6 +409,23 @@ async function restartNow($: EngineInterface, value: Queued): Promise<void> {
     $.ui.toast(`The exit ran, but the session is still open. The new window waits up to ${WAIT_SECONDS / 60} minutes for it to exit.`)
     void tellModel($, 'The restart\'s exit ran, but the session is still open (a dialog may have been answered no). The new window waits for it to exit, then resumes it there.')
   })
+}
+
+/** Removes the claim lock the restart's launcher took, once the resumed session holds the conversation. */
+async function release($: EngineInterface, id: string, claim: string): Promise<void> {
+  try {
+    const root = await $.env.get('SystemRoot')
+    const local = await $.env.get('LOCALAPPDATA')
+    if (root === undefined || !SYSTEM_ROOT.test(root) || !isSafeFolder(local)) return
+    const run = await $.process.run(powershellArgv(powershellPath(root), releaseScript({ stateDir: stateFolder(local), id, by: claim })), { timeoutMs: RELEASE_MS })
+    const said = run.exitCode === 0 ? RELEASED.exec(run.stdout)?.[1] : undefined
+    if (said !== 'released' && said !== 'absent' && said !== 'not-ours') {
+      const what = said === 'busy' ? 'another process had it open throughout' : `exit ${run.exitCode}`
+      $.ui.log(`self-restart: the claim lock on ${id} wasn't released (${what}); it is left in place, and goes stale 15 minutes after the old process exited.`)
+    }
+  } catch (err) {
+    $.ui.log(`self-restart: the claim lock on ${id} wasn't released (${why(err)}); it goes stale 15 minutes after the old process exited.`)
+  }
 }
 
 /** In the process that resumed a session: the restart's first prompt, if one waits for this session. */
@@ -318,6 +442,9 @@ async function welcome($: EngineInterface, id: unknown): Promise<void> {
     return
   }
   $.ui.toast(`Restarted: ${found.reason}`)
+  // The claim lock the launcher took on this conversation: this process holds it now.
+  const claim = found.claim
+  if (claim !== undefined) $.clock.after(SETTLE_MS, () => void release($, id, claim))
   const resume = found.resume
   // Later, not awaited: a prompt submitted from the start's hook would wait on that hook.
   if (resume !== undefined) $.clock.after(SETTLE_MS, () => void sendResume($, 'Restarted.', resume))
@@ -416,7 +543,7 @@ export const register: Register = (on, options) => {
     armed = undefined
     $.ui.status(undefined)
     $.ui.toast('Restart cancelled: a new turn started before this session exited.')
-    void tellModel($, "The restart you queued didn't go ahead: a new turn started before this session exited. The session goes on; call restart_after_turn again at the next break.")
+    void cancelled($, "The restart you queued didn't go ahead: a new turn started before this session exited. The session goes on.")
     return started
   })
 }
