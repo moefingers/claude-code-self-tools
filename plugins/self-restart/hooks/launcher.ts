@@ -18,6 +18,12 @@
 // or within seconds (the resume didn't take), the window shows the command to resume by hand and
 // waits for Enter, rather than closing on the message; a resume that ran and ended closes as a
 // terminal does. Not -NoExit: that would leave every window at a PowerShell prompt after a normal exit.
+//
+// The window inherits the old session's environment, which carries the markers Claude Code sets in
+// the processes it starts. CLAUDE_CODE_CHILD_SESSION among them makes a claude count as nested, and a
+// nested interactive session saves no transcript and is left out of --resume. So the window clears
+// SESSION_MARKERS, a fixed list of those markers, right before it runs claude, and touches no other
+// variable.
 
 /** A session id `claude --resume` takes: a UUID, lowercase as Claude Code writes it. */
 export const SESSION_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
@@ -30,6 +36,41 @@ export const WAIT_SECONDS = 600
 
 /** A Claude Code that ends sooner than this after the resume, in seconds, is taken not to have resumed. */
 export const SHORT_RUN_SECONDS = 10
+
+/**
+ * The variables Claude Code sets in the processes it starts, which a top-level claude must not inherit:
+ * the window clears these before `claude --resume`, and no other. From the environment-variables
+ * reference (code.claude.com/docs/en/env-vars), each "set by Claude Code" or "set automatically":
+ * CLAUDE_CODE_CHILD_SESSION (makes a claude nested: no transcript, left out of --resume), CLAUDECODE,
+ * CLAUDE_CODE_SESSION_ID, CLAUDE_PID, CLAUDE_EFFORT, CLAUDE_CODE_BRIDGE_SESSION_ID (the old Remote
+ * Control connection), CLAUDE_CODE_MESSAGING_SOCKET and CLAUDE_CODE_MESSAGING_TOKEN (each session
+ * exports its own, "never one inherited from a parent"), CLAUDE_CODE_REMOTE and
+ * CLAUDE_CODE_REMOTE_SESSION_ID (cloud sessions), CLAUDE_JOB_DIR (background sessions). Not in that
+ * reference, but set by Claude Code 2.1.318 in its tools' processes, and in neither the user's
+ * settings nor the Windows environment: AI_AGENT (`claude-code_<version>_agent`), CLAUDE_CODE_ENTRYPOINT,
+ * CLAUDE_CODE_EXECPATH, CLAUDE_CODE_SESSION_ATTENDED. Never one a person sets, such as
+ * CLAUDE_CODE_FORCE_SESSION_PERSISTENCE.
+ */
+export const SESSION_MARKERS = [
+  'CLAUDE_CODE_CHILD_SESSION',
+  'CLAUDECODE',
+  'CLAUDE_CODE_SESSION_ID',
+  'CLAUDE_PID',
+  'CLAUDE_EFFORT',
+  'CLAUDE_CODE_BRIDGE_SESSION_ID',
+  'CLAUDE_CODE_MESSAGING_SOCKET',
+  'CLAUDE_CODE_MESSAGING_TOKEN',
+  'CLAUDE_CODE_REMOTE',
+  'CLAUDE_CODE_REMOTE_SESSION_ID',
+  'CLAUDE_JOB_DIR',
+  'AI_AGENT',
+  'CLAUDE_CODE_ENTRYPOINT',
+  'CLAUDE_CODE_EXECPATH',
+  'CLAUDE_CODE_SESSION_ATTENDED',
+] as const
+
+/** The window's line that clears SESSION_MARKERS from its own environment, which claude inherits. */
+const CLEAR_MARKERS = `foreach ($name in ${SESSION_MARKERS.map(name => `"${name}"`).join(', ')}) { [Environment]::SetEnvironmentVariable($name, $null, [EnvironmentVariableTarget]::Process) }`
 
 /** Windows PowerShell by its known path under the Windows folder. */
 export const powershellPath = (systemRoot: string): string => `${systemRoot}\\System32\\WindowsPowerShell\\v1.0\\powershell.exe`
@@ -88,6 +129,8 @@ export function launcherScript(id: string): string {
     `  "  Read-Host 'Press Enter to close this window' | Out-Null",`,
     '  "  exit 1",',
     '  "}",',
+    // The old session's markers, gone before claude starts: a claude that inherits them is nested.
+    `  '${CLEAR_MARKERS}',`,
     "  '$started = Get-Date',",
     `  "& '$exe' --resume '$id'",`,
     "  '$code = $LASTEXITCODE',",

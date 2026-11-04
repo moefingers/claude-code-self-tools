@@ -1,6 +1,6 @@
 import { describe, expect, mock, test } from 'claude-code/testing'
 import type { AgentStatus, On } from 'claude-code'
-import { encodeCommand, launcherScript } from '../hooks/launcher'
+import { encodeCommand, launcherScript, SESSION_MARKERS } from '../hooks/launcher'
 
 const TOOL = 'mcp__self-restart__restart_after_turn'
 const HOUR = 60 * 60 * 1000
@@ -264,6 +264,41 @@ test('the launcher script: quiet progress, parents older than their children, qu
   expect(script).toContain('resume it yourself: claude --resume $id')
   expect(script.split("Read-Host 'Press Enter to close this window'").length - 1).toBe(2)
   expect(script).not.toContain('-NoExit')
+})
+
+test("the window clears the old session's markers before claude --resume, and nothing else", () => {
+  // Claude Code's own markers, from the environment-variables reference and from what its tools' processes carry.
+  expect(SESSION_MARKERS).toEqual([
+    'CLAUDE_CODE_CHILD_SESSION',
+    'CLAUDECODE',
+    'CLAUDE_CODE_SESSION_ID',
+    'CLAUDE_PID',
+    'CLAUDE_EFFORT',
+    'CLAUDE_CODE_BRIDGE_SESSION_ID',
+    'CLAUDE_CODE_MESSAGING_SOCKET',
+    'CLAUDE_CODE_MESSAGING_TOKEN',
+    'CLAUDE_CODE_REMOTE',
+    'CLAUDE_CODE_REMOTE_SESSION_ID',
+    'CLAUDE_JOB_DIR',
+    'AI_AGENT',
+    'CLAUDE_CODE_ENTRYPOINT',
+    'CLAUDE_CODE_EXECPATH',
+    'CLAUDE_CODE_SESSION_ATTENDED',
+  ])
+  const script = launcherScript(ID)
+  const clears = script.split(/\r?\n/).filter(line => line.includes('SetEnvironmentVariable'))
+  expect(clears).toHaveLength(1)
+  const clear = clears[0] ?? ''
+  // Exactly the listed names, each quoted, CLAUDE_CODE_CHILD_SESSION (nested: no transcript) first.
+  expect(clear.match(/"[A-Za-z_]+"/g)).toEqual(SESSION_MARKERS.map(name => `"${name}"`))
+  expect(clear).toContain('[Environment]::SetEnvironmentVariable($name, $null, [EnvironmentVariableTarget]::Process)')
+  // Never a variable a person sets.
+  for (const name of ['CLAUDE_CODE_FORCE_SESSION_PERSISTENCE', 'CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC', 'ANTHROPIC_API_KEY', 'PATH']) {
+    expect(clear).not.toContain(`"${name}"`)
+  }
+  // In the window, after the wait and before claude runs.
+  expect(script.indexOf(clear)).toBeGreaterThan(script.indexOf('Wait-Process'))
+  expect(script.indexOf(clear)).toBeLessThan(script.indexOf("--resume '$id'"))
 })
 
 test('the encoded command is the script as UTF-16LE base64', () => {
