@@ -36,7 +36,7 @@
 // - The slot runner's hash (SLOT_SCRIPT_SHA256): plugins/self-switch/slot/claude-slot.ps1, byte for
 //   byte. A pane is used as a slot only when the script its parent runs has this hash.
 // - The gate file the coordinator writes (gatePath, readGate), and git's state (readGit).
-import type { EngineInterface } from 'claude-code'
+import type { EngineInterface, ProcessRunResult } from 'claude-code'
 
 // ---------------------------------------------------------------------------------------------
 // Inputs, and how they reach a script.
@@ -278,7 +278,7 @@ export const REGISTRY_VERSION_MARKERS = ['v', 'schema', 'schemaVersion', 'format
 export const LAUNCH_LINE_TRUSTED_AFTER_MS = 60_000
 
 /** The SHA-256 of plugins/self-switch/slot/claude-slot.ps1, as it is committed. */
-export const SLOT_SCRIPT_SHA256 = 'f3d86d794130b60b4270776cf9f1238b02c1de659a543b794b8b015284f1354b'
+export const SLOT_SCRIPT_SHA256 = '9e8c984c89ea6d1503635a5280c6fc224406ef724767f7b5e31323d4e6be490e'
 
 /**
  * The variables Claude Code sets in the processes it starts, which a top-level claude must not inherit:
@@ -293,7 +293,11 @@ export const SLOT_SCRIPT_SHA256 = 'f3d86d794130b60b4270776cf9f1238b02c1de659a543
  * settings nor the Windows environment: AI_AGENT (`claude-code_<version>_agent`), CLAUDE_CODE_ENTRYPOINT,
  * CLAUDE_CODE_EXECPATH, CLAUDE_CODE_SESSION_ATTENDED. And CLAUDE_CODE_SSE_PORT, which an IDE's terminal sets:
  * a session restarted or switched out of one would hand the old process's IDE link to the new one.
- * Never one a person sets, such as CLAUDE_CODE_FORCE_SESSION_PERSISTENCE.
+ * And NO_COLOR, which Claude Code sets to 1 in its tool shells: a session started from one would draw
+ * no colour. The window and the slot runner clear these, and no other. Never one a person sets
+ * otherwise; never CLAUDE_CODE_DISABLE_BG_SHELL_PRESSURE_REAP (kept as it is: the person's choice);
+ * never WT_SESSION or WT_PROFILE_ID (Claude Code's terminal detection reads WT_SESSION on Windows to
+ * draw its Unicode prompt and its links: cleared, a resumed session showed `>` and no links).
  */
 export const SESSION_MARKERS = [
   'CLAUDE_CODE_CHILD_SESSION',
@@ -312,9 +316,16 @@ export const SESSION_MARKERS = [
   'CLAUDE_CODE_EXECPATH',
   'CLAUDE_CODE_SESSION_ATTENDED',
   'CLAUDE_CODE_SSE_PORT',
+  'NO_COLOR',
 ] as const
 
-/** The line that clears SESSION_MARKERS from a script's own environment, which claude inherits. */
+/**
+ * Set in every process a launcher starts claude in (the window, and the slot runner's): transcripts on,
+ * whatever marker a later Claude Code adds that this list doesn't clear yet.
+ */
+export const FORCE_PERSISTENCE = '$env:CLAUDE_CODE_FORCE_SESSION_PERSISTENCE = "1"'
+
+/** The line that clears SESSION_MARKERS from a window's own environment, which claude inherits. */
 export const CLEAR_MARKERS = `foreach ($name in ${SESSION_MARKERS.map(name => `"${name}"`).join(', ')}) { [Environment]::SetEnvironmentVariable($name, $null, [EnvironmentVariableTarget]::Process) }`
 
 // ---------------------------------------------------------------------------------------------
@@ -1194,8 +1205,36 @@ export function liveness(probe: Probe, id: string, now: number, opts: { lane?: L
 // ---------------------------------------------------------------------------------------------
 // The safe point.
 
-/** Git's state where the session works: what's in flight in every worktree of its repos, and the dirty count. */
-export type GitState = { readonly isReadable: true; readonly markers: readonly string[]; readonly dirty?: number } | { readonly isReadable: false; readonly why: string }
+/**
+ * One tree the safe point reads for S11: the session's start folder (`start`); a worktree of the same
+ * repository the caller named, or the session's own folder when it is one (`named`); or the session's
+ * own folder when it is in another repository (`cwd`). Its branch (null when detached, or no
+ * repository), its head commit (null when there is none yet), how many files are uncommitted, and the
+ * fingerprint of that dirty state (fingerprintOf; null when it can't be read whole).
+ */
+export type TreeState = {
+  readonly path: string
+  readonly role: 'start' | 'named' | 'cwd'
+  readonly branch: string | null
+  readonly head: string | null
+  readonly dirty: number
+  readonly fingerprint: string | null
+}
+
+/**
+ * Git's state where the session works: what's in flight in every worktree of its repos (S2), and each
+ * tree S11 reads. Unreadable, it holds; `check` names the check a refusal belongs to (S11 for a named
+ * tree that isn't a worktree of the start folder's repository; S2 otherwise).
+ */
+export type GitState =
+  | { readonly isReadable: true; readonly markers: readonly string[]; readonly trees: readonly TreeState[] }
+  | { readonly isReadable: false; readonly why: string; readonly check?: 'S2' | 'S11' }
+
+/**
+ * The start folder's dirty state when the conversation started (S11's baseline): the folder, its
+ * fingerprint then, and when it was taken. Its dirt then holds only once the fingerprint has changed.
+ */
+export type Baseline = { readonly folder: string; readonly fingerprint: string; readonly at: number; readonly usedAt?: number }
 
 export type AgentLike = { readonly status: string; readonly description?: string; readonly type?: string }
 
@@ -1217,10 +1256,13 @@ const CHECK: Record<ProcessClass, (p: ProcessEntry) => string> = {
  * - S3: a heavy slot whose job's Windows pid runs under the session, or a heavy-slot job under it;
  * - S4: a dev server, Playwright or a debugged browser under it;
  * - S6: a build, test or lint under it, and any shell under it: a background job;
- * - S11: uncommitted changes, when `git.dirty` was read (an in-place switch shares the checkout).
+ * - S11: uncommitted changes in a tree `git` read: in a named worktree, or the session's own folder,
+ *   any (a worker's own tree must be clean); in the start folder, only once its fingerprint differs
+ *   from `baseline`, taken when the conversation started (a shared checkout may carry changes that
+ *   aren't this session's). With no baseline for that folder, its dirt holds, saying so.
  * `probe` is a string when the probe failed: why.
  */
-export function safePoint(probe: Probe | string, git: GitState, agents: readonly AgentLike[] | string): SafePoint {
+export function safePoint(probe: Probe | string, git: GitState, agents: readonly AgentLike[] | string, baseline?: Baseline): SafePoint {
   const reasons: string[] = []
   if (typeof agents === 'string') reasons.push(`S1: the session's subagents can't be read (${agents})`)
   else {
@@ -1241,29 +1283,185 @@ export function safePoint(probe: Probe | string, git: GitState, agents: readonly
       for (const p of under) if (p.cls !== undefined && !(p.cls === 'heavy-slot' && heldPids.has(p.pid))) reasons.push(CHECK[p.cls](p))
     }
   }
-  if (!git.isReadable) reasons.push(`S2: git's state can't be read (${git.why})`)
+  if (!git.isReadable) reasons.push(git.check === 'S11' ? `S11: ${git.why}` : `S2: git's state can't be read (${git.why})`)
   else {
     for (const marker of git.markers) reasons.push(`S2: ${marker}`)
-    if (git.dirty !== undefined && git.dirty > 0) reasons.push(`S11: ${git.dirty === 1 ? '1 file is' : `${git.dirty} files are`} uncommitted in this checkout, which the next conversation works in`)
+    for (const tree of git.trees) {
+      const why = s11(tree, baseline)
+      if (why !== undefined) reasons.push(why)
+    }
   }
   return { verdict: reasons.length === 0 ? 'clear' : 'hold', reasons }
+}
+
+/** Two folders compared as Windows compares paths: either slash, no trailing one, without regard to case. */
+export const sameFolder = (a: string, b: string): boolean => folderKey(a) === folderKey(b)
+const folderKey = (path: string): string => path.replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase()
+
+/** Why `tree`'s uncommitted changes hold (S11), or undefined when they don't. */
+function s11(tree: TreeState, baseline: Baseline | undefined): string | undefined {
+  if (tree.dirty === 0) return undefined
+  const files = tree.dirty === 1 ? '1 file is' : `${tree.dirty} files are`
+  if (tree.role === 'named') return `S11: ${files} uncommitted in ${tree.path}, dirty, no baseline: a named worktree must be clean (commit or stash them)`
+  if (tree.role === 'cwd') return `S11: ${files} uncommitted in ${tree.path}, the folder this session works in, dirty, no baseline: commit or stash them, or the merger's anyway`
+  if (baseline === undefined || !sameFolder(baseline.folder, tree.path)) {
+    return `S11: ${files} uncommitted in ${tree.path}, the start folder, dirty, no baseline (this conversation started before one was kept, or it can't be read): commit or stash them, or the merger's anyway`
+  }
+  if (tree.fingerprint === null) return `S11: ${files} uncommitted in ${tree.path}, the start folder, and they can't be read whole to compare with the baseline: commit or stash them, or the merger's anyway`
+  if (tree.fingerprint === baseline.fingerprint) return undefined
+  return `S11: ${files} uncommitted in ${tree.path}, the start folder, dirty since this conversation started: commit or stash them, or the merger's anyway`
 }
 
 /** The files and folders in a git folder that say an operation is in flight. */
 const IN_FLIGHT = ['index.lock', 'rebase-merge', 'rebase-apply', 'MERGE_HEAD', 'CHERRY_PICK_HEAD', 'REVERT_HEAD', 'BISECT_LOG']
 
+/** Git by fixed argv in `folder`, with a 5-second bound. */
+function gitIn($: EngineInterface, folder: string, args: readonly string[]): Promise<ProcessRunResult> {
+  return $.process.run(['git', '--no-optional-locks', '-C', folder, ...args], { cwd: folder, timeoutMs: GIT_TIMEOUT_MS })
+}
+
+/** The most trees a caller may name besides the start folder. */
+export const MAX_TREES = 8
+
 /**
- * Git's state for the safe point, each read by argv with a 5-second bound: in every worktree of the
- * repos of `folders`, an operation in flight (S2); and with `dirty`, the count of changed files in
- * `cwd` (S11, from `git status --porcelain`). A folder outside any repo has nothing in flight and
- * nothing dirty. Anything that can't be read makes the state unreadable, which holds.
+ * The trees a caller named, checked: each an absolute folder without quotes, and a worktree of the
+ * same repository as `start`, by `git worktree list --porcelain` there (paths compared with either
+ * slash and without regard to case, as Windows does). Anything else is refused, naming the path.
  */
-export async function readGit($: EngineInterface, opts: { readonly cwd: string; readonly folders: readonly string[]; readonly dirty: boolean }): Promise<GitState> {
-  const git = async (folder: string, args: readonly string[]) => $.process.run(['git', '--no-optional-locks', '-C', folder, ...args], { cwd: folder, timeoutMs: GIT_TIMEOUT_MS })
+export async function checkTrees($: EngineInterface, start: string, trees: readonly string[]): Promise<{ readonly trees: readonly string[] } | { readonly refusal: string }> {
+  if (trees.length === 0) return { trees: [] }
+  if (trees.length > MAX_TREES) return { refusal: `${trees.length} trees are named, more than ${MAX_TREES}` }
+  for (const tree of trees) if (!isSafeFolder(tree)) return { refusal: `${JSON.stringify(tree)} is not an absolute folder without quotes or control characters` }
+  try {
+    const run = await gitIn($, start, ['worktree', 'list', '--porcelain'])
+    if (run.exitCode !== 0 || run.isStdoutTruncated) return { refusal: `the worktrees of the repository at ${start}, the start folder, can't be listed (git worktree list exited ${run.exitCode}), so no tree can be named` }
+    const known = run.stdout
+      .split(/\r?\n/)
+      .filter(line => line.startsWith('worktree '))
+      .map(line => line.slice('worktree '.length).trim())
+    const kept: string[] = []
+    for (const tree of trees) {
+      if (!known.some(path => sameFolder(path, tree))) return { refusal: `${tree} is not a worktree of the repository at ${start}, the start folder` }
+      if (!kept.some(path => sameFolder(path, tree))) kept.push(tree)
+    }
+    return { trees: kept }
+  } catch (err) {
+    return { refusal: `the worktrees of the repository at ${start} can't be listed: ${err instanceof Error && err.message.trim() !== '' ? err.message.trim() : 'git did not answer'}` }
+  }
+}
+
+/**
+ * The git reads that fingerprint a tree's dirty state: the coordinator's (S5), each with the
+ * repository's fsmonitor off, and the diff with no textconv, so that no setting of the repository's
+ * own can hide a change from it.
+ */
+export const FINGERPRINT_READS = {
+  status: ['-c', 'core.fsmonitor=false', 'status', '--porcelain=v1', '-z', '--untracked-files=all'],
+  diff: ['-c', 'core.fsmonitor=false', 'diff', 'HEAD', '--no-ext-diff', '--no-textconv', '--no-color', '--binary'],
+  untracked: ['-c', 'core.fsmonitor=false', 'ls-files', '--others', '--exclude-standard', '-z'],
+} as const
+
+/** The most untracked files a fingerprint stats; past it, the fingerprint can't be read whole. */
+export const MAX_UNTRACKED = 50
+
+/**
+ * A tree's dirty state as one hash (SHA-256, hex), as the coordinator's S5 takes it: the porcelain
+ * status, the diff against HEAD (binary included), and each untracked file's size and time, joined.
+ * A further edit to a file already dirty changes it where the count doesn't. Null when any part can't
+ * be read whole (a read that fails, an output past the engine's 4 MiB, more than 50 untracked files).
+ * `status`, when given, is the status read already.
+ */
+export async function fingerprintOf($: EngineInterface, folder: string, status?: string): Promise<string | null> {
+  try {
+    let statusText = status
+    if (statusText === undefined) {
+      const run = await gitIn($, folder, FINGERPRINT_READS.status)
+      if (run.exitCode !== 0 || run.isStdoutTruncated) return null
+      statusText = run.stdout
+    }
+    const diff = await gitIn($, folder, FINGERPRINT_READS.diff)
+    const untracked = await gitIn($, folder, FINGERPRINT_READS.untracked)
+    if ([diff, untracked].some(run => run.exitCode !== 0 || run.isStdoutTruncated)) return null
+    const names = untracked.stdout.split('\0').filter(name => name !== '')
+    if (names.length > MAX_UNTRACKED) return null
+    const stats: string[] = []
+    for (const name of names) {
+      const st = await $.fs.stat(`${folder}\\${name.replace(/\//g, '\\')}`)
+      stats.push(`${name}\t${st.size}\t${st.mtimeMs}`)
+    }
+    const bytes = new TextEncoder().encode([statusText, diff.stdout, ...stats].join('\0\0'))
+    return [...new Uint8Array(await crypto.subtle.digest('SHA-256', bytes))].map(b => b.toString(16).padStart(2, '0')).join('')
+  } catch {
+    return null
+  }
+}
+
+/** How many files a `status --porcelain=v1 -z` names: a rename or a copy carries its origin as one more field. */
+export function countStatus(z: string): number {
+  const fields = z.split('\0')
+  let count = 0
+  for (let i = 0; i < fields.length; i += 1) {
+    const field = fields[i] as string
+    if (field.length < 4) continue
+    count += 1
+    if (/[RC]/.test(field.slice(0, 2))) i += 1
+  }
+  return count
+}
+
+/**
+ * One tree's state for S11: its status (porcelain, -z), branch, head and fingerprint. A start folder
+ * outside any repository reads clean, with no branch or head; a named tree there, which checkTrees
+ * found listed, is a broken worktree, and can't be read (S11). `why` when it can't be read.
+ */
+async function treeState($: EngineInterface, path: string, role: TreeState['role']): Promise<TreeState | { readonly why: string; readonly check?: 'S11' }> {
+  const status = await gitIn($, path, FINGERPRINT_READS.status)
+  if (status.exitCode !== 0) {
+    if (/not a git repository/i.test(status.stderr)) {
+      if (role === 'start') return { path, role, branch: null, head: null, dirty: 0, fingerprint: null }
+      const what = role === 'named' ? `${path} is listed as a worktree of the start folder's repository, but git finds no repository there (a broken worktree)` : `git finds no repository in ${path}, the folder this session works in, though it found one a moment before`
+      return { why: `${what}, so what it holds can't be read`, check: 'S11' }
+    }
+    return { why: `git status in ${path} exited ${status.exitCode}` }
+  }
+  if (status.isStdoutTruncated) return { why: `git status in ${path} printed more than can be read` }
+  const branch = await gitIn($, path, ['branch', '--show-current'])
+  const head = await gitIn($, path, ['rev-parse', '--verify', '--quiet', 'HEAD'])
+  const sha = head.stdout.trim()
+  return {
+    path,
+    role,
+    branch: branch.exitCode === 0 && branch.stdout.trim() !== '' ? branch.stdout.trim() : null,
+    head: head.exitCode === 0 && /^[0-9a-f]{40}$/.test(sha) ? sha : null,
+    dirty: countStatus(status.stdout),
+    fingerprint: await fingerprintOf($, path, status.stdout),
+  }
+}
+
+/**
+ * Git's state for the safe point, each read by fixed argv with a 5-second bound:
+ * - in every worktree of the repos of `start`, the named `trees` and `folders`, an operation in
+ *   flight (S2);
+ * - each tree's state for S11 (TreeState): the start folder's when `dirty`, every named tree's, and
+ *   `cwd`'s, the session's own folder, always, when it is in another worktree than the start folder's
+ *   (its top, by `git rev-parse --show-toplevel`): a worktree of the start folder's repository reads as
+ *   named, one of another repository as `cwd`; outside any repository, nothing. A tree named that
+ *   isn't a worktree of the start folder's repository makes the state unreadable for S11 (checkTrees);
+ *   a named tree that is the start folder reads as named.
+ * A folder outside any repo has nothing in flight and nothing dirty. Anything that can't be read
+ * makes the state unreadable, which holds.
+ */
+export async function readGit(
+  $: EngineInterface,
+  opts: { readonly start: string; readonly trees?: readonly string[]; readonly cwd?: string; readonly folders?: readonly string[]; readonly dirty: boolean },
+): Promise<GitState> {
+  const git = (folder: string, args: readonly string[]) => gitIn($, folder, args)
   const markers: string[] = []
   const commons = new Set<string>()
   try {
-    for (const folder of new Set([opts.cwd, ...opts.folders])) {
+    const checked = await checkTrees($, opts.start, opts.trees ?? [])
+    if ('refusal' in checked) return { isReadable: false, why: checked.refusal, check: 'S11' }
+    for (const folder of new Set([opts.start, ...checked.trees, ...(opts.folders ?? [])])) {
       const run = await git(folder, ['rev-parse', '--path-format=absolute', '--git-common-dir'])
       if (run.exitCode !== 0) {
         if (/not a git repository/i.test(run.stderr)) continue
@@ -1281,13 +1479,33 @@ export async function readGit($: EngineInterface, opts: { readonly cwd: string; 
         for (const name of IN_FLIGHT) if (names.has(name)) markers.push(`${name} in ${dir}: a git operation is in flight there`)
       }
     }
-    if (!opts.dirty) return { isReadable: true, markers }
-    const status = await git(opts.cwd, ['status', '--porcelain'])
-    if (status.exitCode !== 0) {
-      if (/not a git repository/i.test(status.stderr)) return { isReadable: true, markers, dirty: 0 }
-      return { isReadable: false, why: `git status in ${opts.cwd} exited ${status.exitCode}` }
+    const reads: { path: string; role: TreeState['role'] }[] = []
+    if (opts.dirty && !checked.trees.some(tree => sameFolder(tree, opts.start))) reads.push({ path: opts.start, role: 'start' })
+    for (const tree of checked.trees) reads.push({ path: tree, role: 'named' })
+    // The session's own folder: when it is in another worktree than the start folder's, that tree too,
+    // named or not. Not model input, so never refused: of another repository, it reads as `cwd`.
+    // Outside any repository, nothing, unless it is a worktree the start folder's repository lists (a
+    // broken one), which reads as named, and so holds.
+    if (opts.cwd !== undefined && !sameFolder(opts.cwd, opts.start)) {
+      const own = await git(opts.cwd, ['rev-parse', '--show-toplevel'])
+      const outside = own.exitCode !== 0 && /not a git repository/i.test(own.stderr)
+      if (own.exitCode !== 0 && !outside) return { isReadable: false, why: `git rev-parse in ${opts.cwd} exited ${own.exitCode}` }
+      const top = outside ? opts.cwd : own.stdout.trim().replace(/\//g, '\\')
+      const startTop = outside ? undefined : await git(opts.start, ['rev-parse', '--show-toplevel'])
+      const isStart = startTop !== undefined && startTop.exitCode === 0 && sameFolder(startTop.stdout.trim(), top)
+      if (!isStart && !reads.some(read => sameFolder(read.path, top))) {
+        const listed = isSafeFolder(top) && !('refusal' in (await checkTrees($, opts.start, [top])))
+        if (listed) reads.push({ path: top, role: 'named' })
+        else if (!outside) reads.push({ path: top, role: 'cwd' })
+      }
     }
-    return { isReadable: true, markers, dirty: status.stdout.split(/\r?\n/).filter(l => l.trim() !== '').length }
+    const trees: TreeState[] = []
+    for (const read of reads) {
+      const state = await treeState($, read.path, read.role)
+      if ('why' in state) return { isReadable: false, why: state.why, ...(state.check === undefined ? {} : { check: state.check }) }
+      trees.push(state)
+    }
+    return { isReadable: true, markers, trees }
   } catch (err) {
     return { isReadable: false, why: err instanceof Error && err.message.trim() !== '' ? err.message.trim() : 'git did not answer' }
   }
@@ -1516,6 +1734,7 @@ export function launcherScript(id: string, options?: LaunchOptions): string {
     "  '}',",
     // The old session's markers, gone before claude starts: a claude that inherits them is nested.
     `  '${CLEAR_MARKERS}',`,
+    `  '${FORCE_PERSISTENCE}',`,
     "  'Set-Location -LiteralPath $folder',",
     "  '$started = Get-Date',",
     `  "& '$exe' --resume '$id'",`,

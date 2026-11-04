@@ -3,8 +3,12 @@
 // text. No script runs here.
 import { describe, expect, test } from 'claude-code/testing'
 import {
+  type Baseline,
   CLEAR_MARKERS,
+  countStatus,
+  FORCE_PERSISTENCE,
   descendants,
+  FINGERPRINT_READS,
   FALLBACK,
   GET_CLI,
   LAUNCH_LINE_TRUSTED_AFTER_MS,
@@ -31,6 +35,8 @@ import {
   claimCheckScript,
   CLAIM_CHECK_LIVE,
   SESSION_MARKERS,
+  sameFolder,
+  type TreeState,
   SLOT_NOT_RECOGNISED,
   SLOT_SCRIPT_SHA256,
   safePoint,
@@ -48,7 +54,7 @@ function probeOf(change?: (probe: RawProbe) => void): Probe {
 }
 
 const live = (change?: (probe: RawProbe) => void, opts?: Parameters<typeof liveness>[3]) => liveness(probeOf(change), T, NOW, { mine: LAUNCH, ...opts })
-const CLEAN: GitState = { isReadable: true, markers: [] }
+const CLEAN: GitState = { isReadable: true, markers: [], trees: [] }
 
 describe('liveness', () => {
   test('the default machine: T is not live, and nothing is unknown', () => {
@@ -468,14 +474,78 @@ describe('the safe point', () => {
   })
 
   test('a worktree with index.lock, or a rebase in flight, holds it', () => {
-    const git: GitState = { isReadable: true, markers: ['index.lock in C:/work/repo/.git/worktrees/feature: a git operation is in flight there'] }
+    const git: GitState = { isReadable: true, markers: ['index.lock in C:/work/repo/.git/worktrees/feature: a git operation is in flight there'], trees: [] }
     expect(point(undefined, git)).toEqual({ verdict: 'hold', reasons: ['S2: index.lock in C:/work/repo/.git/worktrees/feature: a git operation is in flight there'] })
   })
 
-  test('S11 counts the uncommitted files, when they were asked for', () => {
-    expect(point(undefined, { isReadable: true, markers: [], dirty: 3 }).reasons).toEqual(['S11: 3 files are uncommitted in this checkout, which the next conversation works in'])
-    expect(point(undefined, { isReadable: true, markers: [], dirty: 1 }).reasons).toEqual(['S11: 1 file is uncommitted in this checkout, which the next conversation works in'])
-    expect(point(undefined, { isReadable: true, markers: [], dirty: 0 }).verdict).toBe('clear')
+  describe('S11, per tree', () => {
+    const FP = 'a'.repeat(64)
+    const tree = (over: Partial<TreeState> = {}): TreeState => ({ path: REPO, role: 'start', branch: 'main', head: 'b'.repeat(40), dirty: 3, fingerprint: FP, ...over })
+    const s11 = (trees: TreeState[], baseline?: Baseline) => safePoint(probeOf(), { isReadable: true, markers: [], trees }, [], baseline).reasons
+    const BASE: Baseline = { folder: REPO, fingerprint: FP, at: NOW - 3_600_000 }
+
+    test("the start folder's dirt as it was when the conversation started doesn't hold; changed since, it does", () => {
+      expect(s11([tree()], BASE)).toEqual([])
+      // The baseline's folder compared as Windows compares paths.
+      expect(s11([tree()], { ...BASE, folder: 'c:/WORK/repo/' })).toEqual([])
+      expect(s11([tree({ fingerprint: 'c'.repeat(64) })], BASE)).toEqual([
+        "S11: 3 files are uncommitted in C:\\work\\repo, the start folder, dirty since this conversation started: commit or stash them, or the merger's anyway",
+      ])
+      expect(s11([tree({ dirty: 1, fingerprint: 'c'.repeat(64) })], BASE)[0]).toMatch(/^S11: 1 file is uncommitted in /)
+      // Clean, nothing holds, whatever the baseline says.
+      expect(s11([tree({ dirty: 0, fingerprint: 'c'.repeat(64) })], BASE)).toEqual([])
+    })
+
+    test('no baseline, one of another folder, or dirt that can\'t be read whole: the start folder\'s dirt holds, saying why', () => {
+      const none = "S11: 3 files are uncommitted in C:\\work\\repo, the start folder, dirty, no baseline (this conversation started before one was kept, or it can't be read): commit or stash them, or the merger's anyway"
+      expect(s11([tree()])).toEqual([none])
+      expect(s11([tree()], { ...BASE, folder: 'C:\\work\\other' })).toEqual([none])
+      expect(s11([tree({ fingerprint: null })], BASE)).toEqual([
+        "S11: 3 files are uncommitted in C:\\work\\repo, the start folder, and they can't be read whole to compare with the baseline: commit or stash them, or the merger's anyway",
+      ])
+    })
+
+    test('a named worktree holds on any dirt: no baseline, a worker\'s own tree must be clean', () => {
+      const named = tree({ path: 'C:\\work\\wt-a', role: 'named', branch: 'feat/a', dirty: 2 })
+      expect(s11([tree({ dirty: 0 }), named], BASE)).toEqual(['S11: 2 files are uncommitted in C:\\work\\wt-a, dirty, no baseline: a named worktree must be clean (commit or stash them)'])
+      // Even with a baseline of its own folder: a named tree has none.
+      expect(s11([named], { ...BASE, folder: 'C:\\work\\wt-a', fingerprint: FP })).toHaveLength(1)
+      expect(s11([{ ...named, dirty: 0 }])).toEqual([])
+    })
+
+    test("the session's own folder in another repository holds on any dirt, as v1 did: no baseline applies", () => {
+      const cwd = tree({ path: 'D:\\other\\repo', role: 'cwd', branch: 'main', dirty: 2 })
+      expect(s11([cwd], { ...BASE, folder: 'D:\\other\\repo' })).toEqual([
+        "S11: 2 files are uncommitted in D:\\other\\repo, the folder this session works in, dirty, no baseline: commit or stash them, or the merger's anyway",
+      ])
+      expect(s11([{ ...cwd, dirty: 0 }])).toEqual([])
+    })
+
+    test('a broken named worktree (git finds no repository there) holds as S11', () => {
+      const why = "C:\\work\\wt-a is listed as a worktree of the start folder's repository, but git finds no repository there (a broken worktree), so what it holds can't be read"
+      expect(safePoint(probeOf(), { isReadable: false, why, check: 'S11' }, []).reasons).toEqual([`S11: ${why}`])
+    })
+
+    test('a named tree that is not a worktree of the start folder\'s repository holds as S11, naming it', () => {
+      expect(safePoint(probeOf(), { isReadable: false, why: 'C:\\x is not a worktree of the repository at C:\\work\\repo, the start folder', check: 'S11' }, []).reasons).toEqual([
+        'S11: C:\\x is not a worktree of the repository at C:\\work\\repo, the start folder',
+      ])
+      expect(safePoint(probeOf(), { isReadable: false, why: 'git status in C:\\x exited 128' }, []).reasons).toEqual(["S2: git's state can't be read (git status in C:\\x exited 128)"])
+    })
+
+    test('the fingerprint reads what the coordinator\'s S5 reads; a status names a file per entry, a rename one', () => {
+      // Each with the repository's fsmonitor off, the diff with no textconv: no setting of the
+      // repository's own hides a change.
+      expect(FINGERPRINT_READS).toEqual({
+        status: ['-c', 'core.fsmonitor=false', 'status', '--porcelain=v1', '-z', '--untracked-files=all'],
+        diff: ['-c', 'core.fsmonitor=false', 'diff', 'HEAD', '--no-ext-diff', '--no-textconv', '--no-color', '--binary'],
+        untracked: ['-c', 'core.fsmonitor=false', 'ls-files', '--others', '--exclude-standard', '-z'],
+      })
+      expect(countStatus(' M a.ts\0?? b.ts\0R  new.ts\0old.ts\0')).toBe(3)
+      expect(countStatus('')).toBe(0)
+      expect(sameFolder('O:/redundant_local/OutlastSite', 'o:\\Redundant_Local\\outlastsite\\')).toBe(true)
+      expect(sameFolder('O:/redundant_local/OutlastSite', 'O:/redundant_local/OutlastSite2')).toBe(false)
+    })
   })
 
   test('a subagent still running holds it', () => {
@@ -667,12 +737,49 @@ describe('the scripts, as text', () => {
     expect(probe.indexOf('New-Claim $claimPath $claimText')).toBeLessThan(probe.indexOf('$locks = New-Object'))
   })
 
+  test("a launched claude's environment: every session marker cleared, NO_COLOR too, WT_SESSION and WT_PROFILE_ID untouched, transcripts forced on, the REAP setting kept", () => {
+    for (const name of [
+      'AI_AGENT',
+      'CLAUDECODE',
+      'CLAUDE_PID',
+      'CLAUDE_CODE_CHILD_SESSION',
+      'CLAUDE_CODE_ENTRYPOINT',
+      'CLAUDE_CODE_SESSION_ID',
+      'CLAUDE_CODE_SESSION_ATTENDED',
+      'CLAUDE_CODE_BRIDGE_SESSION_ID',
+      'CLAUDE_CODE_MESSAGING_SOCKET',
+      'CLAUDE_CODE_MESSAGING_TOKEN',
+      'CLAUDE_CODE_EXECPATH',
+      'CLAUDE_EFFORT',
+      'CLAUDE_CODE_SSE_PORT',
+      'NO_COLOR',
+    ]) {
+      expect(SESSION_MARKERS as readonly string[]).toContain(name)
+    }
+    // Never cleared: the person's choice, and the terminal's (Claude Code reads WT_SESSION on Windows to
+    // draw its Unicode prompt and its links).
+    for (const name of ['CLAUDE_CODE_DISABLE_BG_SHELL_PRESSURE_REAP', 'CLAUDE_CODE_FORCE_SESSION_PERSISTENCE', 'WT_SESSION', 'WT_PROFILE_ID']) {
+      expect(SESSION_MARKERS as readonly string[]).not.toContain(name)
+      expect(CLEAR_MARKERS).not.toContain(name)
+    }
+    expect(CLEAR_MARKERS.match(/"[A-Za-z_]+"/g)).toEqual(SESSION_MARKERS.map(name => `"${name}"`))
+    expect(FORCE_PERSISTENCE).toBe('$env:CLAUDE_CODE_FORCE_SESSION_PERSISTENCE = "1"')
+    for (const script of [restart, window]) {
+      expect(script).not.toContain('CLAUDE_CODE_DISABLE_BG_SHELL_PRESSURE_REAP')
+      // The new tab's or window's own, exactly as it has them: nothing names them.
+      expect(script).not.toContain('WT_SESSION')
+      expect(script).not.toContain('WT_PROFILE_ID')
+      expect(script.indexOf(`  '${FORCE_PERSISTENCE}',`)).toBe(script.indexOf(`  '${CLEAR_MARKERS}',`) + `  '${CLEAR_MARKERS}',`.length + 2)
+    }
+  })
+
   test('the launcher: the scrub list, then the folder, then claude; the re-check after the wait and before claude', () => {
     for (const script of [restart, window]) {
       const clears = script.split(/\r?\n/).filter(line => line.includes('SetEnvironmentVariable'))
       expect(clears).toHaveLength(1)
       expect(clears[0]).toContain(CLEAR_MARKERS)
       expect(clears[0]?.match(/"[A-Za-z_]+"/g)).toEqual(SESSION_MARKERS.map(name => `"${name}"`))
+      expect(script).toContain(`  '${FORCE_PERSISTENCE}',`)
       const wait = script.indexOf('Wait-Process')
       const recheck = script.indexOf(RECHECK[2])
       const claimCheck = script.indexOf('the claim on it no longer names this window')

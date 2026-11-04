@@ -313,6 +313,7 @@ test("the window clears the old session's markers before claude --resume, and no
     'CLAUDE_CODE_EXECPATH',
     'CLAUDE_CODE_SESSION_ATTENDED',
     'CLAUDE_CODE_SSE_PORT',
+    'NO_COLOR',
   ])
   const script = launcherScript(ID)
   const clears = script.split(/\r?\n/).filter(line => line.includes('SetEnvironmentVariable'))
@@ -320,14 +321,22 @@ test("the window clears the old session's markers before claude --resume, and no
   const clear = clears[0] ?? ''
   // Exactly the listed names, each quoted, CLAUDE_CODE_CHILD_SESSION (nested: no transcript) first.
   expect(clear.match(/"[A-Za-z_]+"/g)).toEqual(SESSION_MARKERS.map(name => `"${name}"`))
+  // WT_SESSION and WT_PROFILE_ID stay as the new window has them: Claude Code reads WT_SESSION to draw
+  // its Unicode prompt and its links. Nothing in the script names either.
+  expect(script).not.toContain('WT_SESSION')
+  expect(script).not.toContain('WT_PROFILE_ID')
   expect(clear).toContain('[Environment]::SetEnvironmentVariable($name, $null, [EnvironmentVariableTarget]::Process)')
   // Never a variable a person sets.
-  for (const name of ['CLAUDE_CODE_FORCE_SESSION_PERSISTENCE', 'CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC', 'ANTHROPIC_API_KEY', 'PATH']) {
+  for (const name of ['CLAUDE_CODE_FORCE_SESSION_PERSISTENCE', 'CLAUDE_CODE_DISABLE_BG_SHELL_PRESSURE_REAP', 'CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC', 'ANTHROPIC_API_KEY', 'PATH']) {
     expect(clear).not.toContain(`"${name}"`)
   }
   // In the window, after the wait and before claude runs.
   expect(script.indexOf(clear)).toBeGreaterThan(script.indexOf('Wait-Process'))
   expect(script.indexOf(clear)).toBeLessThan(script.indexOf("--resume '$id'"))
+  // Transcripts on whatever a later Claude Code adds: set after the clear, before claude.
+  const force = script.indexOf(`'$env:CLAUDE_CODE_FORCE_SESSION_PERSISTENCE = "1"'`)
+  expect(force).toBeGreaterThan(script.indexOf(clear))
+  expect(force).toBeLessThan(script.indexOf("--resume '$id'"))
 })
 
 test('the encoded command is the script as UTF-16LE base64', () => {

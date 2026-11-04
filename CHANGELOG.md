@@ -2,6 +2,15 @@
 
 Each entry names a plugin and its version, as `version` in `plugins/<name>/.claude-plugin/plugin.json` has it.
 
+## 2026-11-04: self-switch 0.1.2 and self-restart 0.1.5, S11 v2: named worktrees and a baseline
+
+- **self-switch 0.1.2**:
+  - **S11 per tree.** Uncommitted changes held a switch by the folder the session started in, which for lanes that start in a shared checkout and work in git worktrees was the wrong tree: the shared checkout's long-standing changes held everyone, and the worker's own were never looked at. Now `switch_after_turn` takes `trees`, the worktrees the session worked in (each a worktree of the start folder's repository, checked at the call and again at the run), and each must be clean. The folder the session works in, when it is another tree, must be clean too, named or not. The start folder (in place) holds only on changes made since the conversation started, against a fingerprint kept at a startup's SessionStart, carried unchanged across a `/clear` (never taken at a `/clear`, a resume or a fork, when the folder may hold the conversation's own changes), and dropped 30 days after its last use; with none, it holds as before and says there is no baseline. A broken worktree (listed, but git finds no repository there) holds.
+  - Every S11 hold names the tree, the file count, and whether the changes are *dirty since this conversation started* or *dirty, no baseline*.
+  - **The launch environment.** The window and the slot runner clear `NO_COLOR` with the session markers (a launched session drew no colour), and both set `CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1` before claude, which nested `claude` runs inherit; `CLAUDE_CODE_DISABLE_BG_SHELL_PRESSURE_REAP`, `WT_SESSION` and `WT_PROFILE_ID` are left as they are (cleared, `WT_SESSION` cost the Unicode prompt and the links).
+- **self-restart 0.1.5**: its copy of the shared machine code (S11 v2 is unused by it: a restart keeps its checkout). Its window clears `NO_COLOR` with the session markers, and sets `CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1`.
+- **The shared machine code**: `checkTrees`, `fingerprintOf` (`FINGERPRINT_READS`, the coordinator's S5 reads with `-c core.fsmonitor=false`, and the diff with `--no-textconv`), `readGit` taking `{ start, trees, cwd, folders, dirty }` and giving per-tree `TreeState`s (path, role `start`, `named` or `cwd`, branch, head, dirty count, fingerprint), `safePoint` taking a `Baseline` (`usedAt` optional), `sameFolder`, `countStatus`; `SESSION_MARKERS` with `NO_COLOR`, `FORCE_PERSISTENCE`. The slot runner changed (its clear, and FORCE), so `SLOT_SCRIPT_SHA256` did too.
+
 ## 2026-11-04: self-switch 0.1.1 and self-restart 0.1.4, from the live checks
 
 - **self-switch 0.1.1**:

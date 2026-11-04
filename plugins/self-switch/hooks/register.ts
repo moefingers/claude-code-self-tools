@@ -37,6 +37,15 @@
 // Every conversation this plugin runs in keeps a heartbeat (`alive:<id>`: when, its start folder and
 // project) at each turn's start and end and every 2 minutes; liveness reads it (L5), and a switch to a
 // conversation of another project reads its folder from it. Heartbeats 30 days old are dropped.
+// S11, uncommitted changes: in each worktree the call names (`trees`, each checked to be a worktree of
+// the start folder's repository) and in the session's own folder when it is another tree, any hold; in
+// the start folder (for an in-place switch), only changes made since the conversation started: the
+// classic SessionStart of a startup keeps a fingerprint of the start folder's dirty state
+// (`baseline:<id>` in the plugin's store), a `/clear` carries the baseline of the conversation it
+// ends to the one it starts (none when that one had none, or one of another folder), and a resume or
+// a fork takes none; the start folder's dirt holds only once that fingerprint has changed, or when
+// there is none. A baseline is pruned 30 days after it was last used (read at a switch, or touched by
+// the heartbeat), never by its age.
 // `/resume` swaps `$.state` for the conversation resumed, start folder included, and at the classic
 // SessionStart of the resume `$.session.id()` and `$.state` may still be the conversation that left
 // (seen live on 2.1.318). So the start folder is read from the module first, where session.start keeps
@@ -47,7 +56,10 @@ import type { Heartbeat, Queued, Ticket } from '../types'
 import type { AgentLike, Probe } from './machine'
 import {
   BUSY_AGENTS,
+  type Baseline,
+  checkTrees,
   CLAIM_CHECK_LIVE,
+  fingerprintOf,
   CLAIM_CHECKED,
   claimCheckScript,
   gatePath,
@@ -66,6 +78,7 @@ import {
   quoted,
   readGate,
   readGit,
+  sameFolder,
   RELEASED,
   releaseScript,
   SESSION_ID,
@@ -91,6 +104,8 @@ const SWITCHES = 'switches'
 const RECENT = 'recentSwitches'
 /** The plugin's store keys for heartbeats: `alive:<session id>`. */
 const ALIVE = 'alive:'
+/** The plugin's store keys for S11's baselines: `baseline:<session id>`, the start folder's dirty state at the conversation's start. */
+const BASELINE = 'baseline:'
 
 /**
  * The waits before each look again while the verdict is unknown: a claude.exe that is starting or
@@ -113,6 +128,8 @@ const TICKET_MS = 15 * 60 * 1000
 const LOOP_MS = 2 * 60 * 1000
 /** How often the heartbeat is written between turns. */
 const BEAT_MS = 2 * 60 * 1000
+/** A day, in milliseconds. */
+const DAY_MS = 24 * 60 * 60 * 1000
 /** Heartbeats older than this are dropped. */
 const KEEP_BEATS_MS = 30 * 24 * 60 * 60 * 1000
 /** How often old heartbeats are looked for. */
@@ -127,7 +144,8 @@ const DESCRIPTION = [
   "For the person's own use: call it only when they ask you to switch to another conversation, at a finished break (never mid-merge, mid-push or mid-task), with your notes written first. Stop Monitor tasks first. Pending wake-ups in this process are dropped by the switch, whichever way it goes: set them again in the conversation switched to, if they are still needed.",
   'Where the coordinator runs, switches come from it: this tool refuses there.',
   '`reason` and `notes` (where your notes are) are required; both are recorded in this conversation and in the one resumed. `resume` is the message that starts the resumed conversation\'s first turn.',
-  'Before anything runs it checks, and refuses saying why: when `to` is open, or may be open, anywhere on this machine; when anything still runs under this session (subagents, background Bash or Monitor jobs, git, builds, dev servers, a heavy slot); when an in-place switch would leave uncommitted changes in the checkout both share; within 2 minutes of a switch. Windows only, in a terminal.',
+  'Before anything runs it checks, and refuses saying why: when `to` is open, or may be open, anywhere on this machine; when anything still runs under this session (subagents, background Bash or Monitor jobs, git, builds, dev servers, a heavy slot); when an in-place switch would leave changes made since this conversation started uncommitted in the checkout both share; when a worktree named in `trees`, or the one this session works in, has uncommitted changes; within 2 minutes of a switch. Windows only, in a terminal.',
+  '`trees` (optional): the git worktrees you worked in, absolute paths, each a worktree of the repository this session started in; each must be clean.',
   'End the turn after calling it; the switch starts once your answer is shown.',
 ].join(' ')
 
@@ -157,6 +175,12 @@ let beat: Timer | undefined
  * is read first (startFolderOf). A reload of the module sets it again from `$.state`.
  */
 let startFolder: string | undefined
+/**
+ * The conversation this process holds now: from each main-loop classic SessionStart's own id (the
+ * event's: `$.session.id()` may still read the one before), and at session.start when none is known
+ * yet. A `/clear` carries the S11 baseline of this conversation to the one it starts.
+ */
+let current: string | undefined
 /** The registry keys not in REGISTRY_KEYS already logged by this process: each is logged once. */
 const seenKeys = new Set<string>()
 /** When old heartbeats were last looked for. */
@@ -467,8 +491,75 @@ async function heartbeat($: EngineInterface, resumed?: string): Promise<void> {
     if (folder === undefined) return
     const value: Heartbeat = { at: await $.clock.now(), folder, project: projectName(folder) ?? '' }
     await $.store.set(`${ALIVE}${id}`, value)
+    await touchBaseline($, id, value.at)
   } catch {
     // A heartbeat missed is one live sign fewer; the next one comes in 2 minutes.
+  }
+}
+
+/** A stored S11 baseline, checked; undefined when it isn't one. */
+function baselineOf(value: unknown): Baseline | undefined {
+  if (!isRecord(value) || !isSafeFolder(value.folder) || typeof value.fingerprint !== 'string' || !/^[0-9a-f]{64}$/.test(value.fingerprint) || typeof value.at !== 'number') return undefined
+  return { folder: value.folder, fingerprint: value.fingerprint, at: value.at, ...(typeof value.usedAt === 'number' ? { usedAt: value.usedAt } : {}) }
+}
+
+/**
+ * This conversation's S11 baseline, checked, and marked used now (it is pruned 30 days after its last
+ * use); undefined when there is none, or it can't be read.
+ */
+async function readBaseline($: EngineInterface, id: string): Promise<Baseline | undefined> {
+  try {
+    const kept = baselineOf(await $.store.get(`${BASELINE}${id}`))
+    if (kept === undefined) return undefined
+    await $.store.set(`${BASELINE}${id}`, { ...kept, usedAt: await $.clock.now() })
+    return kept
+  } catch {
+    return undefined
+  }
+}
+
+/** Marks conversation `id`'s baseline used at `now`, when it was last used more than a day before. */
+async function touchBaseline($: EngineInterface, id: string, now: number): Promise<void> {
+  const kept = baselineOf(await $.store.get(`${BASELINE}${id}`))
+  if (kept !== undefined && now - (kept.usedAt ?? kept.at) > DAY_MS) await $.store.set(`${BASELINE}${id}`, { ...kept, usedAt: now })
+}
+
+/**
+ * Keeps a started conversation's S11 baseline: the fingerprint of `folder`'s dirty state now. Only
+ * when nothing is stored under its key, a value that can't be read included: a baseline is never
+ * replaced. Nothing when the folder can't be read whole: S11 then holds the start folder's dirt,
+ * saying there is no baseline.
+ */
+async function keepBaseline($: EngineInterface, id: string, folder: string): Promise<void> {
+  try {
+    if ((await $.store.get(`${BASELINE}${id}`)) !== undefined) return
+    const fingerprint = await fingerprintOf($, folder)
+    if (fingerprint === null) return
+    const at = await $.clock.now()
+    const value: Baseline = { folder, fingerprint, at, usedAt: at }
+    await $.store.set(`${BASELINE}${id}`, value)
+  } catch {
+    // No baseline: the start folder's dirt holds, and says why.
+  }
+}
+
+/**
+ * At a `/clear`: carries the S11 baseline of `from`, the conversation it ended, to `to`, the one it
+ * started, when it is of `folder`: its fingerprint and `at` as they were, used now. Never a fresh
+ * fingerprint: by now the folder holds `from`'s own changes, and one taken now would let them
+ * through. Nothing when `from` had none, or one of another folder, or `to` has one already: S11
+ * then holds the start folder's dirt, saying there is no baseline.
+ */
+async function carryBaseline($: EngineInterface, from: string | undefined, to: string, folder: string): Promise<void> {
+  try {
+    if (from === undefined || from === to) return
+    if ((await $.store.get(`${BASELINE}${to}`)) !== undefined) return
+    const kept = baselineOf(await $.store.get(`${BASELINE}${from}`))
+    if (kept === undefined || !sameFolder(kept.folder, folder)) return
+    const value: Baseline = { folder: kept.folder, fingerprint: kept.fingerprint, at: kept.at, usedAt: await $.clock.now() }
+    await $.store.set(`${BASELINE}${to}`, value)
+  } catch {
+    // No baseline: the start folder's dirt holds, and says why.
   }
 }
 
@@ -484,10 +575,12 @@ async function pruneBeats($: EngineInterface, now: number): Promise<void> {
   if (now - prunedAt < PRUNE_EVERY_MS) return
   prunedAt = now
   for (const key of await $.store.keys()) {
-    if (!key.startsWith(ALIVE)) continue
+    const prefix = key.startsWith(ALIVE) ? ALIVE : key.startsWith(BASELINE) ? BASELINE : undefined
+    if (prefix === undefined) continue
     const value = await $.store.get(key)
-    const at = isRecord(value) ? value.at : undefined
-    if (!SESSION_ID.test(key.slice(ALIVE.length)) || typeof at !== 'number' || now - at > KEEP_BEATS_MS) await $.store.delete(key)
+    // A heartbeat by its time; a baseline by its last use, never by its age.
+    const at = !isRecord(value) ? undefined : prefix === BASELINE && typeof value.usedAt === 'number' ? value.usedAt : value.at
+    if (!SESSION_ID.test(key.slice(prefix.length)) || typeof at !== 'number' || now - at > KEEP_BEATS_MS) await $.store.delete(key)
   }
 }
 
@@ -720,8 +813,10 @@ async function switchNow($: EngineInterface, value: Queued): Promise<void> {
   if ('refusal' in pick) return held(pick.refusal)
   if (pick.transport === 'slot' && by !== `slot:${pick.slot}`) return held("the claim lock doesn't name this pane's slot")
   if (pick.transport === 'window' && !by.startsWith('launch:')) return held("the claim lock doesn't name a launch")
-  const git = await readGit($, { cwd: ctx.cwd, folders: [ctx.folder], dirty: pick.transport === 'in-place' })
-  const safe = safePoint(found, git, await agentList($))
+  // S11: the start folder (in place: the next conversation works in it) against its baseline; the named
+  // worktrees, and the session's own folder when it is another tree, always.
+  const git = await readGit($, { start: ctx.folder, trees: value.trees ?? [], cwd: ctx.cwd, folders: [ctx.cwd], dirty: pick.transport === 'in-place' })
+  const safe = safePoint(found, git, await agentList($), await readBaseline($, ctx.own))
   if (safe.verdict !== 'clear') return held(`this session isn't at a safe point (${safe.reasons.join('; ')})`)
   if (armed !== value) return free()
 
@@ -867,6 +962,10 @@ export const register: Register = (on, options) => {
     const { value: first } = await $.state.get(folderKey)
     if (typeof first !== 'string' || first === '') await $.state.set(folderKey, e.cwd)
     startFolder = typeof first === 'string' && first !== '' ? first : e.cwd
+    if (current === undefined) {
+      const own = await sessionId($)
+      if (own !== undefined && SESSION_ID.test(own)) current = own
+    }
     await $.tool.register({
       name: 'switch_after_turn',
       description: DESCRIPTION,
@@ -876,6 +975,12 @@ export const register: Register = (on, options) => {
           to: { type: 'string', description: 'The id of the conversation to switch to: a session id, as claude --resume takes it.' },
           reason: { type: 'string', description: 'Why this terminal switches to that conversation. Recorded in both conversations.' },
           notes: { type: 'string', description: "Where this conversation's notes are, written before the switch: a path, a PR, a memory file. Recorded in both conversations." },
+          trees: {
+            type: 'array',
+            items: { type: 'string' },
+            description:
+              "The git worktrees you worked in, absolute paths, each a worktree of the repository this session started in: each must have no uncommitted changes before the switch. The worktree this session works in is checked anyway, named or not, and the folder it started in for an in-place switch, against the changes it already had when this conversation started.",
+          },
           resume: {
             type: 'string',
             description: 'The message that starts the resumed conversation\'s first turn: what to check or do next there. Leave it out only when the next step waits on someone else.',
@@ -903,12 +1008,23 @@ export const register: Register = (on, options) => {
       $.ui.status(undefined)
       $.ui.toast('Switch cancelled: this session became another conversation before it ran.')
     }
-    if (e.agent_id !== undefined || (e.source !== 'resume' && e.source !== 'startup')) return done
     const id = e.session_id
+    // The conversation this process held until now, and the one it holds from here, by the event's id.
+    const previous = current
+    if (e.agent_id === undefined && typeof id === 'string' && SESSION_ID.test(id)) current = id
+    if (e.agent_id !== undefined || (e.source !== 'resume' && e.source !== 'startup' && e.source !== 'clear')) return done
     if (typeof id !== 'string' || !SESSION_ID.test(id)) return done
     // The heartbeat now; the tick's pruning waits for the next beat, after the arrival took its ticket.
     if (e.source === 'resume') startBeat($, id)
-    $.clock.after(SETTLE_MS, () => void arrive($, id))
+    // A clear starts a new conversation with nothing to deliver: its baseline only.
+    if (e.source !== 'clear') $.clock.after(SETTLE_MS, () => void arrive($, id))
+    // S11's baseline, by the event's id: a startup fingerprints the start folder's dirty state; a /clear
+    // carries the baseline of the conversation it ends (the folder holds that one's changes by now: a
+    // fresh fingerprint would let them through), or takes none. A resume takes none, nor a fork (its
+    // source is `fork`, filtered out above), for the same reason: without one, the dirt holds.
+    const folder = startFolder ?? (typeof e.cwd === 'string' && isSafeFolder(e.cwd) ? e.cwd : undefined)
+    if (folder !== undefined && e.source === 'startup') $.clock.after(SETTLE_MS, () => void keepBaseline($, id, folder))
+    if (folder !== undefined && e.source === 'clear') await carryBaseline($, previous, id, folder)
     return done
   })
 
@@ -916,7 +1032,7 @@ export const register: Register = (on, options) => {
     if (e.agentId !== undefined) return { deny: SUBAGENT }
     const gated = await gateAtCall($)
     if (gated !== undefined) return { deny: gated === COORDINATED ? COORDINATED : `Not queued: ${gated}.` }
-    const input = e as { to?: unknown; reason?: unknown; notes?: unknown; resume?: unknown }
+    const input = e as { to?: unknown; reason?: unknown; notes?: unknown; resume?: unknown; trees?: unknown }
     const to = typeof input.to === 'string' ? input.to.trim() : ''
     if (!SESSION_ID.test(to)) return { deny: '`to` must be the id of the conversation to switch to: a session id, the lowercase UUID claude --resume takes.' }
     const reason = text(input.reason)
@@ -936,7 +1052,17 @@ export const register: Register = (on, options) => {
     const lately = await lastSwitch($, own)
     if (lately !== undefined) return { deny: `Not queued: ${await loop($, lately)}.` }
     const resume = text(input.resume)
-    const asked = { to, reason, notes, from: own }
+    // The named trees: worktrees of this session's repository, checked now and again at the run.
+    let trees: string[] = []
+    if (input.trees !== undefined) {
+      if (!Array.isArray(input.trees) || input.trees.some(tree => typeof tree !== 'string')) return { deny: '`trees` must be a list of absolute paths: the git worktrees you worked in.' }
+      const start = await startFolderOf($)
+      if (start === undefined) return { deny: "Not queued: the folder this session started in isn't known, so the trees named can't be checked against its repository." }
+      const checked = await checkTrees($, start, input.trees as string[])
+      if ('refusal' in checked) return { deny: `Not queued: ${checked.refusal}. Name only git worktrees of the repository this session started in.` }
+      trees = [...checked.trees]
+    }
+    const asked = { to, reason, notes, from: own, ...(trees.length > 0 ? { trees } : {}) }
     await $.state.set(queued, resume === undefined ? asked : { ...asked, resume })
     $.ui.status('switch queued for when this turn ends')
     return {
