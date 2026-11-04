@@ -213,8 +213,8 @@ export const BUSY_AGENTS: readonly string[] = ['pending', 'running', 'waiting']
 
 /**
  * Every key a session registry file (`<config>\sessions\<pid>.json`) was seen to hold on Claude Code
- * 2.1.318. A file of a running claude.exe with any other key is of a shape not verified, and makes
- * the verdict unknown, so nothing is resumed until this list is checked and extended.
+ * 2.1.318. Any other key is logged once per process by name, and ignored: what liveness reads is
+ * REGISTRY_FIELDS, checked strictly, and a new format is caught by REGISTRY_VERSION_MARKERS.
  */
 export const REGISTRY_KEYS = [
   'pid',
@@ -235,7 +235,24 @@ export const REGISTRY_KEYS = [
   'updatedAt',
   'statusUpdatedAt',
   'bridgeSessionId',
+  'asksForConvertedSkills',
+  'nameSince',
 ] as const
+
+/**
+ * The fields liveness reads from a registry file (L1): the process's id (also the file's name), the
+ * conversation it holds, and its creation time. Each is strict: missing, of another type, or not of
+ * its pattern, the file makes the verdict unknown, naming the field. procStart is a whole number, or
+ * a string of digits, as Claude Code 2.1.318 writes it; compared exactly, never as a JavaScript number.
+ */
+export const REGISTRY_FIELDS = ['pid', 'sessionId', 'procStart'] as const
+
+/**
+ * Keys that would mark a new registry format: a file holding one makes the verdict unknown, naming it.
+ * `version` isn't one: in today's shape it is Claude Code's own version, a string, and a `version` of
+ * any other type refuses the same way.
+ */
+export const REGISTRY_VERSION_MARKERS = ['v', 'schema', 'schemaVersion', 'formatVersion', 'registryVersion'] as const
 
 /** The SHA-256 of plugins/self-switch/slot/claude-slot.ps1, as it is committed. */
 export const SLOT_SCRIPT_SHA256 = '97afd4f28bc8cb4b5dbe080161845fb81bcb5e9e4fade5b074460740dd03d252'
@@ -299,8 +316,10 @@ const GET_CREATED = ['function Get-Created($p) { if ($null -eq $p.CreationDate) 
 /**
  * The slot runner this session's claude.exe runs under, when its parent is one: `$up` is that parent
  * (from the walk), and it counts only when it is Windows PowerShell running `-File ...\claude-slot.ps1`.
- * Sets `$slot` (pid, created, id = `<pid>-<created>`, path, sha256; created and id strings) and `$slotOk`
- * (its script has the shipped hash).
+ * Sets `$slot` (pid, created, id = `<pid>-<created>`, path, sha256, and hashError when it couldn't be
+ * hashed; created and id strings) and `$slotOk` (its script has the shipped hash). The hash is .NET's,
+ * never Get-FileHash: in a Windows Terminal tab whose PSModulePath puts PowerShell 7's folders first,
+ * Windows PowerShell 5.1 loads 7's Utility module, which has no Get-FileHash.
  */
 const FIND_SLOT = [
   '$slot = $null',
@@ -308,9 +327,11 @@ const FIND_SLOT = [
   String.raw`if ($null -ne $session -and $null -ne $up -and $up.Name -eq "powershell.exe" -and "$($up.CommandLine)" -match "-File\s+(\x22?)(?<path>[A-Za-z]:\\[^\x22]*?\\claude-slot\.ps1)\1(\s|\z)") {`,
   '  $slotPath = $Matches["path"]',
   '  $slotHash = $null',
-  '  try { $slotHash = (Get-FileHash -LiteralPath $slotPath -Algorithm SHA256).Hash.ToLowerInvariant() } catch { $slotHash = $null }',
+  '  $slotHashError = $null',
+  '  try { $hasher = [Security.Cryptography.SHA256]::Create(); try { $slotHash = [BitConverter]::ToString($hasher.ComputeHash([IO.File]::ReadAllBytes($slotPath))).Replace("-", "").ToLowerInvariant() } finally { $hasher.Dispose() } } catch { $slotHash = $null; $slotHashError = "$($_.Exception.Message)" }',
   '  $slotCreated = Get-Created $up',
   '  $slot = [ordered]@{ pid = [long]$up.ProcessId; created = $slotCreated; id = "$($up.ProcessId)-$slotCreated"; path = $slotPath; sha256 = $slotHash }',
+  '  if ($null -ne $slotHashError) { $slot["hashError"] = $slotHashError }',
   `  $slotOk = $slotHash -eq '${SLOT_SCRIPT_SHA256}'`,
   '}',
 ]
@@ -376,7 +397,9 @@ const TAKE_CLAIM = [
  * A registry file of a running claude.exe that can't be read, or reads in another shape, is read again
  * twice, 250 ms apart (Claude Code may be rewriting it), and then counts as unknown, which resumes
  * nothing. Anything else that can't be read throws, and a caller that catches it resumes nothing. No
- * single quote in these lines: the launcher carries each inside one.
+ * single quote in these lines: the launcher carries each inside one. procStart compares as a [double]:
+ * a string of digits, as Claude Code 2.1.318 writes it, converts as a number does, and at today's
+ * FILETIMEs a double is off by at most 32 ticks, well within the 1 ms tolerance.
  */
 export const RECHECK = [
   '$live = $null',
@@ -513,7 +536,8 @@ export function probeScript(input: ProbeInput): string {
     '  if ($found.Count -gt 0) { $o["ids"] = [object[]]$found }',
     '  [void]$procs.Add($o)',
     '}',
-    // The registry: per file, whether it parses, its key names, and six values as their JSON types.
+    // The registry: per file, whether it parses, its key names, and seven values as their JSON types; a
+    // value that is a list or an object comes as { nested = "list" } or { nested = "object" }, never as null.
     '$registry = New-Object System.Collections.ArrayList',
     'for ($k = 0; $k -lt $configDirs.Count; $k++) {',
     '  $reg = Join-Path $configDirs[$k] "sessions"',
@@ -531,9 +555,9 @@ export function probeScript(input: ProbeInput): string {
     '      if ($e -is [Management.Automation.PSCustomObject]) {',
     '        $o["ok"] = $true',
     '        $o["keys"] = [object[]]@($e.PSObject.Properties | ForEach-Object { $_.Name })',
-    '        foreach ($key in "pid", "sessionId", "procStart", "status", "statusUpdatedAt", "kind") {',
+    '        foreach ($key in "pid", "sessionId", "procStart", "status", "statusUpdatedAt", "kind", "version") {',
     '          $prop = $e.PSObject.Properties | Where-Object { $_.Name -ceq $key } | Select-Object -First 1',
-    '          if ($null -ne $prop) { $v = $prop.Value; if ($null -ne $v -and -not ($v -is [string] -or $v -is [ValueType])) { $v = $null }; $o[$key] = $v }',
+    '          if ($null -ne $prop) { $v = $prop.Value; if ($null -ne $v -and -not ($v -is [string] -or $v -is [ValueType])) { if ($v -is [Array]) { $v = [ordered]@{ nested = "list" } } else { $v = [ordered]@{ nested = "object" } } }; $o[$key] = $v }',
     '        }',
     '      }',
     '      [void]$registry.Add($o)',
@@ -618,7 +642,17 @@ export type ProcessEntry = { readonly pid: number; readonly ppid: number; readon
 
 /** A registry file, as its shape was judged: `ok` holds what L1 reads; `bad` says what's wrong with it. */
 export type RegistryEntry =
-  | { readonly dir: number; readonly file: number; readonly shape: 'ok'; readonly pid: number; readonly sessionId: string; readonly procStart: number; readonly status: string }
+  | {
+      readonly dir: number
+      readonly file: number
+      readonly shape: 'ok'
+      readonly pid: number
+      readonly sessionId: string
+      /** A FILETIME: a number, or a string of digits as Claude Code 2.1.318 writes it. */
+      readonly procStart: number | string
+      /** Keys not in REGISTRY_KEYS: ignored, and logged once per process by the plugin. */
+      readonly extra: readonly string[]
+    }
   | { readonly dir: number; readonly file: number; readonly shape: 'bad'; readonly why: string }
 
 export type Transcript = { readonly id: string; readonly dir: number; readonly project: string; readonly mtime: number }
@@ -630,7 +664,7 @@ export type LockEntry =
 export type ClaimResult = { readonly id: string; readonly taken: true; readonly by: string } | { readonly id: string; readonly taken: false; readonly why: string }
 
 /** The slot runner: its pid, its creation FILETIME and its id (`<pid>-<created>`) as exact strings, its script and that script's hash. */
-export type SlotParent = { readonly pid: number; readonly created: string; readonly id: string; readonly path: string; readonly sha256: string | null }
+export type SlotParent = { readonly pid: number; readonly created: string; readonly id: string; readonly path: string; readonly sha256: string | null; readonly hashError?: string }
 
 export type HeavySlot = { readonly slot: '.gate-lock' | '.gate-lock-2'; readonly winpid: number | null }
 
@@ -649,6 +683,8 @@ export type Probe = {
   readonly heavy: readonly HeavySlot[] | null
   readonly freeKb: number | null
   readonly errors: readonly { readonly source: ProbeError; readonly dir?: number }[]
+  /** Every key a registry file held that isn't in REGISTRY_KEYS, each once: ignored, for the plugin to log. */
+  readonly extraKeys: readonly string[]
 }
 
 const isRecord = (value: unknown): value is Record<string, unknown> => typeof value === 'object' && value !== null && !Array.isArray(value)
@@ -678,31 +714,41 @@ function fields(value: unknown, what: string, required: readonly string[], optio
 
 const list = (value: unknown, what: string): unknown[] => (Array.isArray(value) ? value : bad(`${what} is not a list`))
 
+/** What a value is, as a refusal names it: null, a nested object, a list, or its JavaScript type. */
+const kindOf = (value: unknown): string => {
+  if (value === null) return 'null'
+  if (Array.isArray(value) || (isRecord(value) && value.nested === 'list')) return 'list'
+  return typeof value === 'object' ? 'nested object' : typeof value
+}
+
 /**
- * One registry file's shape, judged strictly: the keys all in REGISTRY_KEYS; pid, sessionId,
- * procStart and status there; pid a whole number equal to the file's name, sessionId a session id,
- * procStart a whole number, status a word; statusUpdatedAt a number and kind a word when there.
+ * One registry file's shape, judged by what liveness reads (REGISTRY_FIELDS), strictly: pid a whole
+ * number equal to the file's name, sessionId a session id, procStart a whole number or a string of
+ * digits. Missing or of another type, the file is `bad`, naming the field. A key of
+ * REGISTRY_VERSION_MARKERS, or a `version` that isn't a string, is a new format: `bad` too, naming it.
+ * Any other key is ignored, and listed in `extra` when it isn't in REGISTRY_KEYS.
  */
 function registryShape(raw: Record<string, unknown>, dir: number, file: number): RegistryEntry {
   const no = (why: string): RegistryEntry => ({ dir, file, shape: 'bad', why })
   if (raw.ok !== true) return no("can't be parsed as a JSON object")
   const keys = list(raw.keys, 'a registry entry\'s keys')
-  for (const key of keys) {
-    if (typeof key !== 'string' || !KEY.test(key)) return no('holds a key that is not a plain name')
-    if (!(REGISTRY_KEYS as readonly string[]).includes(key)) return no(`holds the key "${key}", which is not one of the ${REGISTRY_KEYS.length} verified`)
-  }
-  for (const key of ['pid', 'sessionId', 'procStart', 'status'] as const) if (!keys.includes(key) || !(key in raw)) return no(`has no ${key}`)
-  const { pid, sessionId, procStart, status, statusUpdatedAt, kind } = raw
-  if (typeof pid !== 'number') return no(`has a pid that is a ${typeof pid}, not a number`)
+  for (const key of keys) if (typeof key !== 'string' || !KEY.test(key)) return no('holds a key that is not a plain name')
+  const names = keys as string[]
+  for (const marker of REGISTRY_VERSION_MARKERS) if (names.includes(marker)) return no(`holds the key "${marker}", which marks a new format`)
+  if ('version' in raw && typeof raw.version !== 'string') return no(`has a version that is a ${kindOf(raw.version)}, not Claude Code's version as a string`)
+  for (const key of REGISTRY_FIELDS) if (!names.includes(key) || !(key in raw)) return no(`has no ${key}`)
+  const { pid, sessionId, procStart } = raw
+  if (typeof pid !== 'number') return no(`has a pid that is a ${kindOf(pid)}, not a number`)
   if (!isPid(pid) || pid !== file) return no('has a pid that is not its file\'s')
-  if (typeof sessionId !== 'string') return no(`has a sessionId that is a ${sessionId === null ? 'null' : typeof sessionId}, not a string`)
+  if (typeof sessionId !== 'string') return no(`has a sessionId that is a ${kindOf(sessionId)}, not a string`)
   if (!SESSION_ID.test(sessionId)) return no('has a sessionId that is not a session id')
-  if (typeof procStart !== 'number') return no(`has a procStart that is a ${procStart === null ? 'null' : typeof procStart}, not a number`)
-  if (!isCount(procStart, Number.MAX_VALUE)) return no('has a procStart that is not a whole number')
-  if (typeof status !== 'string' || !STATUS.test(status)) return no('has a status that is not a word')
-  if ('statusUpdatedAt' in raw && typeof statusUpdatedAt !== 'number') return no('has a statusUpdatedAt that is not a number')
-  if ('kind' in raw && (typeof kind !== 'string' || !STATUS.test(kind))) return no('has a kind that is not a word')
-  return { dir, file, shape: 'ok', pid, sessionId, procStart, status }
+  if (typeof procStart === 'number') {
+    if (!isCount(procStart, Number.MAX_VALUE)) return no('has a procStart that is not a whole number')
+  } else if (typeof procStart === 'string') {
+    if (!/^[0-9]{1,20}$/.test(procStart)) return no('has a procStart that is a string, but not of digits')
+  } else return no(`has a procStart that is a ${kindOf(procStart)}, not a number or a string of digits`)
+  const extra = names.filter(key => !(REGISTRY_KEYS as readonly string[]).includes(key))
+  return { dir, file, shape: 'ok', pid, sessionId, procStart, extra }
 }
 
 /** The probe's answer, every field checked; `{ error }` naming the first that isn't what it must be. */
@@ -731,12 +777,20 @@ export function parseProbe(stdout: string): Probe | { error: string } {
     }
     let slot: SlotParent | null = null
     if (top.slot !== null) {
-      const s = fields(top.slot, 'the slot', ['pid', 'created', 'id', 'path', 'sha256'])
+      const s = fields(top.slot, 'the slot', ['pid', 'created', 'id', 'path', 'sha256'], ['hashError'])
+      if ('hashError' in s && (typeof s.hashError !== 'string' || s.hashError.length > 2000)) bad("the slot's hash error is not a line of text")
       if (!isPid(s.pid) || !isTicks(s.created)) bad('the slot is not a pid and a time as a string')
       if (s.id !== `${s.pid}-${s.created}`) bad("the slot's id is not its pid and time")
       if (!isSafeFolder(s.path) || !/\\claude-slot\.ps1$/i.test(s.path as string)) bad("the slot's script is not a plain path")
       if (s.sha256 !== null && (typeof s.sha256 !== 'string' || !SHA256.test(s.sha256))) bad("the slot's hash is not a SHA-256")
-      slot = { pid: s.pid as number, created: s.created as string, id: s.id as string, path: s.path as string, sha256: s.sha256 as string | null }
+      slot = {
+        pid: s.pid as number,
+        created: s.created as string,
+        id: s.id as string,
+        path: s.path as string,
+        sha256: s.sha256 as string | null,
+        ...(typeof s.hashError === 'string' ? { hashError: s.hashError } : {}),
+      }
     }
     const procs = list(top.procs, 'the processes').map((value): ProcessEntry => {
       const p = fields(value, 'a process', ['pid', 'ppid', 'created', 'name'], ['cls', 'ids'])
@@ -755,7 +809,7 @@ export function parseProbe(stdout: string): Probe | { error: string } {
       }
     })
     const registry = list(top.registry, 'the registry').map((value): RegistryEntry => {
-      const r = fields(value, 'a registry entry', ['dir', 'file', 'ok'], ['keys', 'pid', 'sessionId', 'procStart', 'status', 'statusUpdatedAt', 'kind'])
+      const r = fields(value, 'a registry entry', ['dir', 'file', 'ok'], ['keys', 'pid', 'sessionId', 'procStart', 'status', 'statusUpdatedAt', 'kind', 'version'])
       if (!isCount(r.dir, 7) || !isPid(r.file) || typeof r.ok !== 'boolean') bad('a registry entry has no folder, file or parse flag')
       if (r.ok === false && 'keys' in r) bad('a registry entry that did not parse has keys')
       return registryShape(r, r.dir as number, r.file as number)
@@ -810,7 +864,8 @@ export function parseProbe(stdout: string): Probe | { error: string } {
       if (m === null) return bad('an error is not one of the fixed list')
       return m[2] === '' ? { source: m[1] as ProbeError } : { source: m[1] as ProbeError, dir: Number(m[2]) }
     })
-    return { self: top.self as number, session, slot, procs, registry, transcripts, locks, claim, heavy, freeKb: top.freeKb as number | null, errors }
+    const extraKeys = [...new Set(registry.flatMap(entry => (entry.shape === 'ok' ? entry.extra : [])))]
+    return { self: top.self as number, session, slot, procs, registry, transcripts, locks, claim, heavy, freeKb: top.freeKb as number | null, errors, extraKeys }
   } catch (err) {
     if (err instanceof Bad) return { error: `the probe's answer is not what it must be: ${err.message}` }
     throw err
@@ -822,7 +877,7 @@ export function parseProbe(stdout: string): Probe | { error: string } {
 
 const isClaude = (p: ProcessEntry): boolean => p.name.toLowerCase() === 'claude.exe'
 
-/** A FILETIME, exact: from the probe's string, or from a registry number (a double already). */
+/** A FILETIME, exact: from the probe's string, a registry's string of digits (Claude Code 2.1.318), or a registry number (a double already). */
 export const ticks = (value: string | number): bigint => BigInt(typeof value === 'number' ? Math.trunc(value) : value)
 
 /** How far apart two FILETIMEs are, in ticks, exactly. */
@@ -843,7 +898,7 @@ function parentOf(table: Map<number, ProcessEntry>, p: ProcessEntry): ProcessEnt
 }
 
 /** A FILETIME as a time a person reads: UTC, to the minute. */
-const when = (filetime: number): string => new Date(filetime / 10_000 - 11_644_473_600_000).toISOString().slice(0, 16).replace('T', ' ')
+const when = (filetime: number | string): string => new Date(Number(filetime) / 10_000 - 11_644_473_600_000).toISOString().slice(0, 16).replace('T', ' ')
 
 /** How long ago, in whole minutes or seconds. */
 const ago = (ms: number): string => (ms >= 60_000 ? `${Math.round(ms / 60_000)} min` : `${Math.max(0, Math.round(ms / 1000))} s`)
@@ -907,6 +962,16 @@ function isStale(lock: LockEntry, table: Map<number, ProcessEntry>, now: number)
 }
 
 /**
+ * The keys of the probe's registry files not in REGISTRY_KEYS that `seen` doesn't hold yet: added to it,
+ * and returned for the caller to log, so each new key name is logged once per process.
+ */
+export function newRegistryKeys(probe: Probe, seen: Set<string>): string[] {
+  const fresh = probe.extraKeys.filter(key => !seen.has(key))
+  for (const key of fresh) seen.add(key)
+  return fresh
+}
+
+/**
  * Whether conversation `id` is live on this machine, from one probe (\u00a73.2 of the design):
  * - L1: a current registry entry (its pid a running claude.exe started within 1 ms of its procStart)
  *   holds it; an entry whose process has gone, or whose pid another process took, is ignored;
@@ -916,7 +981,8 @@ function isStale(lock: LockEntry, table: Map<number, ProcessEntry>, now: number)
  * - L5: its heartbeat is younger than 5 minutes;
  * - L6: a claim lock on it that isn't `mine` and isn't stale.
  * Unknown, which refuses too: a source the probe couldn't read; a registry file of a running
- * claude.exe that can't be parsed or has another shape; a claude.exe no current entry accounts for,
+ * claude.exe that can't be parsed, whose REGISTRY_FIELDS are missing or of another type, or that
+ * marks a new format (registryShape); a claude.exe no current entry accounts for,
  * itself or through an older ancestor; the coordinator unreachable; no transcript of it on this
  * machine, or more than one.
  */
@@ -1072,14 +1138,25 @@ export async function readGit($: EngineInterface, opts: { readonly cwd: string; 
 // ---------------------------------------------------------------------------------------------
 // Transports.
 
-export type Transport = { readonly transport: 'in-place' } | { readonly transport: 'slot'; readonly slot: string; readonly folder: string } | { readonly transport: 'window'; readonly folder: string }
+/** `fallback`, on a window: why this pane's slot runner wasn't used, when it runs in one. */
+export type Transport =
+  | { readonly transport: 'in-place' }
+  | { readonly transport: 'slot'; readonly slot: string; readonly folder: string }
+  | { readonly transport: 'window'; readonly folder: string; readonly fallback?: string }
+
+/** Why a slot runner found under this session isn't used, as the leaving row and the toast say it. */
+export function slotFallback(slot: SlotParent): string {
+  if (slot.sha256 === null) return `slot hash unreadable: ${slot.hashError === undefined ? 'no reason given' : oneLine(slot.hashError, 200)}`
+  return "this pane's claude-slot.ps1 has another SHA-256 than the one shipped (an edited or older copy: copy the shipped script and restart the pane)"
+}
 
 /**
  * How conversation `to` comes to this pane, from the probe that judged it (\u00a75.3 of the design):
  * - in place (`/resume`), only when this session's transcript and `to`'s sit in the same project
  *   folder of the same config folder, compared without regard to case;
  * - else in the slot this claude.exe runs under, only when its script has the shipped hash;
- * - else a new window.
+ * - else a new window, with `fallback` saying why when this claude.exe runs under a slot runner that
+ *   isn't used (slotFallback).
  * The slot and the window resume `to` in `folder` (its own, from its heartbeat): an absolute folder
  * whose project name is `to`'s project folder, in this session's own config folder.
  */
@@ -1098,6 +1175,7 @@ export function pickTransport(probe: Probe, from: string, to: string, folder: st
   const slot = probe.slot
   // The slot's id as the probe printed it: a FILETIME through a JavaScript number would not round-trip.
   if (slot !== null && slot.sha256 === SLOT_SCRIPT_SHA256) return { transport: 'slot', slot: slot.id, folder }
+  if (slot !== null) return { transport: 'window', folder, fallback: slotFallback(slot) }
   return { transport: 'window', folder }
 }
 
@@ -1112,6 +1190,9 @@ export const SLOTTED = /^slot (\d{1,10}-\d{1,20})\s*$/m
 
 /** The line naming the claim the launcher took or checked: `claim <by>`. */
 export const CLAIMED = /^claim ((?:slot|launch):[0-9a-f-]{1,40})\s*$/m
+
+/** The line self-restart's launcher adds when it found this pane's slot runner but opened a window: why. */
+export const FALLBACK = /^fallback (.{1,1000}?)\s*$/m
 
 /** A switch's window: where it resumes, the claim it must find, what the re-check reads. */
 export type LaunchOptions = {
@@ -1153,11 +1234,14 @@ export function launcherScript(id: string, options?: LaunchOptions): string {
       // The slot only for a folder its runner takes, checked now, before this session exits: absolute,
       // no quote or control character, and the conversation's own (its project holds the transcript).
       // Otherwise the window, which escapes the folder itself.
+      // A slot runner found but not used is said, never passed over in silence.
+      '$slotFallback = $null',
+      'if ($null -ne $slot -and -not $slotOk) { if ($null -ne $slotHashError) { $slotFallback = "slot hash unreadable: " + $slotHashError } else { $slotFallback = "this pane" + [char]39 + "s claude-slot.ps1 has another SHA-256 than the one shipped" } }',
       'if ($slotOk) {',
       '  $projectName = [regex]::Replace($folder, "[^A-Za-z0-9]", "-")',
       '  $inProject = $false',
       '  foreach ($dir in $configDirs) { if ($projectName.Length -le 200 -and (Test-Path -LiteralPath (Join-Path $dir ("projects\\" + $projectName + "\\" + $id + ".jsonl")) -PathType Leaf)) { $inProject = $true } }',
-      String.raw`  if (-not ($inProject -and $folder -cmatch "^[A-Za-z]:\\" -and $folder -notmatch "[\x00-\x1f\x22\x27\u2018\u2019\u201a\u201b\u201c\u201d\u201e]")) { $slotOk = $false }`,
+      String.raw`  if (-not ($inProject -and $folder -cmatch "^[A-Za-z]:\\" -and $folder -notmatch "[\x00-\x1f\x22\x27\u2018\u2019\u201a\u201b\u201c\u201d\u201e]")) { $slotOk = $false; $slotFallback = "the folder this session started in isn" + [char]39 + "t one the slot runner takes" }`,
       '}',
       // The claim: the slot by its id, or this window by a fresh UUID; taken here, in this run.
       'if ($slotOk) { $by = "slot:" + $slot["id"]; $transport = "slot" } else { $by = "launch:" + [guid]::NewGuid().ToString(); $transport = "window" }',
@@ -1284,6 +1368,7 @@ export function launcherScript(id: string, options?: LaunchOptions): string {
     "Start-Process -FilePath (Join-Path $PSHOME 'powershell.exe') -ArgumentList '-NoProfile', '-EncodedCommand', $encoded",
     '"launched $wait"',
     '"claim $by"',
+    ...(options === undefined ? ['if ($null -ne $slotFallback) { "fallback " + ($slotFallback -split "\r?\n")[0] }'] : []),
   ].join('\r\n')
 }
 

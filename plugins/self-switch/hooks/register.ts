@@ -9,17 +9,23 @@
 //
 // Before anything moves, one probe of the machine (machine.ts) reads every running claude.exe, the
 // engine's session registry, the transcripts' project folders and the claim locks, and takes the
-// claim lock on `to` in the same run. The switch goes ahead only when `to` is NOT LIVE (liveness) and
-// this session is at a safe point (safePoint: no subagent, nothing busy under its claude.exe, git at
-// rest, and for an in-place switch a clean checkout); anything that can't be read refuses, saying
-// what. Then the leaving row goes into this conversation, the ticket into the plugin's store, keyed
-// by `to`, and one transport runs (pickTransport):
+// claim lock on `to` in the same run. A verdict of unknown gets one more probe 2.5 seconds later (a
+// claude.exe starting or exiting reads as unknown for a moment), the claim given back meanwhile. The
+// switch goes ahead only when `to` is NOT LIVE (liveness) and this session is at a safe point
+// (safePoint: no subagent, nothing busy under its claude.exe, git at rest, and for an in-place switch
+// a clean checkout); anything that can't be read refuses, saying what. Then the leaving row goes into
+// this conversation, the ticket into the plugin's store, keyed by `to`, and one transport runs
+// (pickTransport):
 // - in place, `/resume <to>`, when both conversations' transcripts sit in one project folder; the
 //   session id must then read `to`, or the switch didn't take and is said not to have;
 // - the slot, when this claude.exe runs in a pane's claude-slot.ps1 of the shipped hash: a record for
 //   the slot, then `/exit`; the slot runner checks it all again and resumes `to` in the same pane;
 // - a new window otherwise: the launcher, which waits for this process to exit, checks again, and
-//   resumes `to`; then `/exit`.
+//   resumes `to`; then `/exit`. When this pane runs a slot runner that can't be used (its script
+//   can't be hashed, or has another hash), the leaving row, the toast and the arrival say why.
+// Every transport drops this process's pending wake-ups (self-wake keeps them in the conversation's
+// `$.state`, which `/resume` swaps; an exit ends them): the tool's result, the leaving row and the
+// arrival say so, so they can be set again.
 // No transport passes a permission flag: the resumed conversation starts in the mode a new session would.
 //
 // The process that resumes `to` (this one, in place; the slot's or the window's otherwise) finds the
@@ -29,6 +35,9 @@
 // Every conversation this plugin runs in keeps a heartbeat (`alive:<id>`: when, its start folder and
 // project) at each turn's start and end and every 2 minutes; liveness reads it (L5), and a switch to a
 // conversation of another project reads its folder from it. Heartbeats 30 days old are dropped.
+// `/resume` swaps `$.state` for the conversation resumed, start folder included: the classic
+// SessionStart of a resume puts the process's start folder back and starts the heartbeat again, so an
+// arrived conversation can switch on.
 import type { EngineInterface, Register, Timer } from 'claude-code'
 import type { Heartbeat, Queued, Ticket } from '../types'
 import type { AgentLike, Probe } from './machine'
@@ -42,6 +51,7 @@ import {
   launcherScript,
   oneLine,
   liveness,
+  newRegistryKeys,
   pickTransport,
   parseProbe,
   powershellArgv,
@@ -77,6 +87,8 @@ const RECENT = 'recentSwitches'
 /** The plugin's store keys for heartbeats: `alive:<session id>`. */
 const ALIVE = 'alive:'
 
+/** How long to wait before the one more look, when the first says unknown. */
+const RETRY_MS = 2500
 /** A beat after the turn's end, so the turn is no longer running when the switch starts. */
 const SETTLE_MS = 500
 /** How long after the exit command to look whether the session is still here. */
@@ -104,7 +116,7 @@ const MAX_KEPT = 50
 
 const DESCRIPTION = [
   "Switches this terminal to another conversation once the current turn ends: this conversation ends here, its context untouched, and conversation `to` (a session id, as claude --resume takes) is resumed in its place: in this same process when both live in one project folder, else in this pane's slot (a Windows Terminal pane running self-switch's claude-slot.ps1), else in a new window.",
-  "For the person's own use: call it only when they ask you to switch to another conversation, at a finished break (never mid-merge, mid-push or mid-task), with your notes written first. Cancel wake-ups and Monitor tasks first: an in-place switch carries this process's timers into the next conversation.",
+  "For the person's own use: call it only when they ask you to switch to another conversation, at a finished break (never mid-merge, mid-push or mid-task), with your notes written first. Stop Monitor tasks first. Pending wake-ups in this process are dropped by the switch, whichever way it goes: set them again in the conversation switched to, if they are still needed.",
   'Where the coordinator runs, switches come from it: this tool refuses there.',
   '`reason` and `notes` (where your notes are) are required; both are recorded in this conversation and in the one resumed. `resume` is the message that starts the resumed conversation\'s first turn.',
   'Before anything runs it checks, and refuses saying why: when `to` is open, or may be open, anywhere on this machine; when anything still runs under this session (subagents, background Bash or Monitor jobs, git, builds, dev servers, a heavy slot); when an in-place switch would leave uncommitted changes in the checkout both share; within 2 minutes of a switch. Windows only, in a terminal.',
@@ -132,6 +144,13 @@ let armed: Queued | undefined
 
 /** The heartbeat's timer, one per load of the module. */
 let beat: Timer | undefined
+/**
+ * The folder this process started in, as session.start kept it: `/resume` swaps `$.state`, so the
+ * classic SessionStart of a resume puts it back from here.
+ */
+let startFolder: string | undefined
+/** The registry keys not in REGISTRY_KEYS already logged by this process: each is logged once. */
+const seenKeys = new Set<string>()
 /** When old heartbeats were last looked for. */
 let prunedAt = Number.NEGATIVE_INFINITY
 /** The conversations whose arrival is being delivered now: one delivery each. */
@@ -338,12 +357,21 @@ async function loop($: EngineInterface, at: number): Promise<string> {
 /** A stored ticket, checked; undefined when it isn't one. */
 function ticketOf(value: unknown): Ticket | undefined {
   if (!isRecord(value)) return undefined
-  const { at, from, by, transport, reason, notes, resume } = value
+  const { at, from, by, transport, reason, notes, resume, fallback } = value
   if (typeof at !== 'number' || typeof from !== 'string' || !SESSION_ID.test(from) || typeof by !== 'string') return undefined
   if (transport !== 'in-place' && transport !== 'slot' && transport !== 'window') return undefined
   if (typeof reason !== 'string' || typeof notes !== 'string') return undefined
   // Masked again as it is read: another process may have written the store.
-  return { at, from, by, transport, reason: oneLine(reason), notes: oneLine(notes), ...(typeof resume === 'string' ? { resume: oneLine(resume) } : {}) }
+  return {
+    at,
+    from,
+    by,
+    transport,
+    reason: oneLine(reason),
+    notes: oneLine(notes),
+    ...(typeof resume === 'string' ? { resume: oneLine(resume) } : {}),
+    ...(typeof fallback === 'string' ? { fallback: oneLine(fallback, 300) } : {}),
+  }
 }
 
 /** The switches under way in the store, each checked; anything else is dropped. */
@@ -450,6 +478,24 @@ async function tick($: EngineInterface): Promise<void> {
   }
 }
 
+/**
+ * Starts the 2-minute tick, again when it ran (one timer per process), and beats now: the whole tick,
+ * or with `heartbeatOnly` the heartbeat alone, its pruning left to the next tick.
+ */
+function startBeat($: EngineInterface, heartbeatOnly: boolean): void {
+  beat?.cancel()
+  beat = $.clock.every(BEAT_MS, () => void tick($))
+  if (heartbeatOnly) void heartbeat($)
+  else void tick($)
+}
+
+/** Each registry key the probe saw that isn't in REGISTRY_KEYS, logged the first time this process sees it; it is ignored. */
+function logNewKeys($: EngineInterface, found: Probe): void {
+  for (const key of newRegistryKeys(found, seenKeys)) {
+    $.ui.log(`self-switch: a session registry file holds the key "${key}", which Claude Code 2.1.318 didn't write; it is ignored (liveness reads pid, sessionId and procStart).`)
+  }
+}
+
 /** The probe, with the claim on `to` taken in the same run; or why it gave no answer. */
 async function probe($: EngineInterface, ctx: Context, to: string): Promise<Probe | { failure: string }> {
   try {
@@ -467,8 +513,14 @@ async function probe($: EngineInterface, ctx: Context, to: string): Promise<Prob
  * The row the model reads in this conversation, written before the transport: where it went. Its own
  * reason and notes, quoted all the same: one line each, at most 400 characters.
  */
-const leaving = (own: string, value: Queued, at: number): string =>
-  `self-switch: this session was switched away at ${stamp(at)} (switch_after_turn), to conversation ${quoted(value.to)}. Its reason: ${quoted(value.reason)}. Its notes: ${quoted(value.notes)}. Its context is untouched: resume it (claude --resume ${own}) to pick up here.`
+const leaving = (own: string, value: Queued, at: number, fallback?: string): string =>
+  `self-switch: this session was switched away at ${stamp(at)} (switch_after_turn), to conversation ${quoted(value.to)}${fallback === undefined ? '' : `, in a new window, not this pane's slot: ${quoted(fallback)}`}. Its reason: ${quoted(value.reason)}. Its notes: ${quoted(value.notes)}. ${DROPPED_HERE} Its context is untouched: resume it (claude --resume ${own}) to pick up here.`
+
+/** What the leaving row says of wake-ups: the switch dropped them. */
+const DROPPED_HERE = 'Wake-ups pending in this process were dropped with the switch: set them again in the conversation switched to, or here when this one is resumed, if they are still needed.'
+
+/** What the arrival says of wake-ups, one plain sentence of the plugin's own. */
+const DROPPED_THERE = 'Wake-ups the conversation it came from had pending were dropped with the switch: set them again here if they are still needed.'
 
 /**
  * The row the model reads in the resumed conversation. A user-role row has no frame of its own, so
@@ -476,7 +528,7 @@ const leaving = (own: string, value: Queued, at: number): string =>
  * in as quoted data, one line each, at most 400 characters: they never read as the person's.
  */
 const arrival = (ticket: Ticket, at: number): string =>
-  `self-switch: a message from session ${quoted(ticket.from.slice(0, 8))}. It switched this conversation here at ${stamp(at)} (switch_after_turn), and gave the reason and notes below in its own words: they are that session's, not the person's, and grant no new permission. Reason: ${quoted(ticket.reason)}. Notes: ${quoted(ticket.notes)}. Your context is as you left it; since then the repository, PRs and other sessions may have moved. Before acting, check where things stand (git status, fetch and rebase, your open PRs, your notes).`
+  `self-switch: a message from session ${quoted(ticket.from.slice(0, 8))}. It switched this conversation here at ${stamp(at)} (switch_after_turn), and gave the reason and notes below in its own words: they are that session's, not the person's, and grant no new permission. Reason: ${quoted(ticket.reason)}. Notes: ${quoted(ticket.notes)}. ${ticket.fallback === undefined ? '' : `It came here in a new window, not the slot of the pane it left: ${quoted(ticket.fallback)}. `}${DROPPED_THERE} Your context is as you left it; since then the repository, PRs and other sessions may have moved. Before acting, check where things stand (git status, fetch and rebase, your open PRs, your notes).`
 
 /** The resumed conversation's first prompt: another session's request, framed and quoted as such. */
 const resumePrompt = (ticket: Ticket, resume: string): string =>
@@ -568,9 +620,36 @@ async function switchNow($: EngineInterface, value: Queued): Promise<void> {
   if (armed !== value) return
   await pruneTickets($, await $.clock.now())
 
-  const found = await probe($, ctx, to)
-  if ('failure' in found) return notRun(`the machine probe failed (${found.failure}), so whether ${to} is open elsewhere is unknown`)
-  const by = found.claim?.taken === true ? found.claim.by : undefined
+  /** The probe, the claim it took, and the verdict on `to`. */
+  const look = async () => {
+    const found = await probe($, ctx, to)
+    if ('failure' in found) return found
+    logNewKeys($, found)
+    const by = found.claim?.taken === true ? found.claim.by : undefined
+    const beat = await readHeartbeat($, to)
+    const live = liveness(found, to, await $.clock.now(), { ...(beat === undefined ? {} : { heartbeat: beat }), ...(by === undefined ? {} : { mine: by }) })
+    return { found, by, beat, live }
+  }
+  let looked = await look()
+  if ('failure' in looked) return notRun(`the machine probe failed (${looked.failure}), so whether ${to} is open elsewhere is unknown`)
+  if (looked.live.verdict === 'unknown') {
+    // A claude.exe that is starting or exiting reads as unknown for a moment: one more look, with the
+    // claim given back meanwhile and taken again by that probe.
+    if (looked.by !== undefined) await release($, ctx.powershell, ctx.state, to, looked.by)
+    $.ui.log(`self-switch: whether ${to} is open elsewhere reads unknown (${looked.live.evidence.join('; ')}); looking once more in ${RETRY_MS / 1000} seconds.`)
+    try {
+      await $.clock.sleep(RETRY_MS)
+    } catch {
+      // The plugin unloaded meanwhile: nothing more runs, and the claim is given back already.
+      if (armed === value) armed = undefined
+      return
+    }
+    // A turn that started meanwhile has taken it back, and said so.
+    if (armed !== value) return
+    looked = await look()
+    if ('failure' in looked) return notRun(`the machine probe failed (${looked.failure}), so whether ${to} is open elsewhere is unknown`)
+  }
+  const { found, by, beat, live } = looked
   const free = async (): Promise<void> => {
     if (by !== undefined) await release($, ctx.powershell, ctx.state, to, by)
   }
@@ -578,8 +657,6 @@ async function switchNow($: EngineInterface, value: Queued): Promise<void> {
     await free()
     await notRun(said)
   }
-  const beat = await readHeartbeat($, to)
-  const live = liveness(found, to, await $.clock.now(), { ...(beat === undefined ? {} : { heartbeat: beat }), ...(by === undefined ? {} : { mine: by }) })
   if (live.verdict !== 'not-live') return held(`${to} is ${live.verdict === 'live' ? 'open' : 'possibly open'} elsewhere (${live.evidence.join('; ')})`)
   if (by === undefined) return held(`the claim lock on ${to} wasn't taken (${found.claim?.taken === false ? found.claim.why : 'none was asked for'})`)
   const pick = pickTransport(found, ctx.own, to, beat?.folder)
@@ -593,8 +670,18 @@ async function switchNow($: EngineInterface, value: Queued): Promise<void> {
 
   // Past the checks: the leaving row, then the ticket, then the transport.
   const at = await $.clock.now()
-  const ticket: Ticket = { at, from: ctx.own, by, transport: pick.transport, reason: value.reason, notes: value.notes, ...(value.resume === undefined ? {} : { resume: value.resume }) }
-  await tellModel($, leaving(ctx.own, value, at))
+  const fallback = pick.transport === 'window' ? pick.fallback : undefined
+  const ticket: Ticket = {
+    at,
+    from: ctx.own,
+    by,
+    transport: pick.transport,
+    reason: value.reason,
+    notes: value.notes,
+    ...(value.resume === undefined ? {} : { resume: value.resume }),
+    ...(fallback === undefined ? {} : { fallback }),
+  }
+  await tellModel($, leaving(ctx.own, value, at, fallback))
   await keepTicket($, to, ticket)
   /** Takes it all back: the lock, the ticket, the slot's record; says the switch didn't happen. */
   const undo = async (said: string, record?: string): Promise<void> => {
@@ -668,8 +755,9 @@ async function switchNow($: EngineInterface, value: Queued): Promise<void> {
   if (late !== undefined) return undo(late, record)
   armed = undefined
   await noteRecent($, ctx.own)
-  const where = pick.transport === 'slot' ? "this pane's slot resumes it here" : 'a new window resumes it'
+  const where = pick.transport === 'slot' ? "this pane's slot resumes it here" : fallback === undefined ? 'a new window resumes it' : `a new window resumes it, not this pane's slot (${fallback})`
   $.ui.log(`Switching to ${to}: ${value.reason}`)
+  if (fallback !== undefined) $.ui.log(`self-switch: this pane's slot runner isn't used: ${fallback}. A new window resumes ${to}.`)
   $.ui.toast(`Switching to ${to}: this session exits, and ${where} once this process has gone.`)
   try {
     await $.command.run({ command: 'exit' })
@@ -682,6 +770,19 @@ async function switchNow($: EngineInterface, value: Queued): Promise<void> {
     $.ui.toast(`The exit ran, but the session is still open. ${waits}.`)
     void tellModel($, `The switch's exit ran, but this session is still open (a dialog may have been answered no). ${waits}, then gives up; the claim on ${to} is released when its ticket runs out, 15 minutes after the switch.`)
   })
+}
+
+/**
+ * switchNow, from its timer: a step that throws ends the switch, said in the log, never left as an
+ * unhandled rejection (a module unloaded mid-switch refuses every call after).
+ */
+async function runSwitch($: EngineInterface, value: Queued): Promise<void> {
+  try {
+    await switchNow($, value)
+  } catch (err) {
+    if (armed === value) armed = undefined
+    $.ui.log(`self-switch: the switch to ${value.to} stopped: ${why(err)}`)
+  }
 }
 
 export const register: Register = (on, options) => {
@@ -703,6 +804,7 @@ export const register: Register = (on, options) => {
     // The first start's folder only: a reload starts the plugin again from wherever the session is now.
     const { value: first } = await $.state.get(folderKey)
     if (typeof first !== 'string' || first === '') await $.state.set(folderKey, e.cwd)
+    startFolder = typeof first === 'string' && first !== '' ? first : e.cwd
     await $.tool.register({
       name: 'switch_after_turn',
       description: DESCRIPTION,
@@ -723,16 +825,26 @@ export const register: Register = (on, options) => {
       isDeferred: false,
     })
     loadUpdateCheck($)
-    beat?.cancel()
-    beat = $.clock.every(BEAT_MS, () => void tick($))
-    void tick($)
+    startBeat($, false)
     return started
   })
 
-  // The process that holds a conversation a switch moved here: the arrival, once.
+  // The process that holds a conversation a switch moved here: the arrival, once. On a resume, first
+  // the start folder and the heartbeat: `/resume` gave this process the resumed conversation's
+  // `$.state`, without them.
   on('classic.SessionStart', async ($, e, next) => {
     const done = await next(e)
     if (e.agent_id !== undefined || (e.source !== 'resume' && e.source !== 'startup')) return done
+    if (e.source === 'resume') {
+      try {
+        const folder = startFolder ?? (typeof e.cwd === 'string' && e.cwd !== '' ? e.cwd : undefined)
+        if (folder !== undefined) await $.state.set(folderKey, folder)
+      } catch {
+        // A switch from here then refuses, saying the start folder isn't known.
+      }
+      // The heartbeat now; the tick's pruning waits for the next beat, after the arrival took its ticket.
+      startBeat($, true)
+    }
     const id = e.session_id
     if (typeof id === 'string' && SESSION_ID.test(id)) $.clock.after(SETTLE_MS, () => void arrive($, id))
     return done
@@ -762,7 +874,7 @@ export const register: Register = (on, options) => {
     await $.state.set(queued, resume === undefined ? { to, reason, notes } : { to, reason, notes, resume })
     $.ui.status('switch queued for when this turn ends')
     return {
-      result: `Queued. Once this turn ends, this terminal switches to conversation ${to}: this conversation ends here, untouched, and ${to} resumes in this process, in this pane's slot, or in a new window, whichever applies. First the plugin checks that ${to} is open nowhere on this machine and that nothing runs under this session; if anything is, nothing moves and you are told on your next turn. Reason: ${quoted(reason)}. Notes: ${quoted(notes)}.`,
+      result: `Queued. Once this turn ends, this terminal switches to conversation ${to}: this conversation ends here, untouched, and ${to} resumes in this process, in this pane's slot, or in a new window, whichever applies. First the plugin checks that ${to} is open nowhere on this machine and that nothing runs under this session; if anything is, nothing moves and you are told on your next turn. If this pane runs a slot that can't be used, the switch says why, in the leaving row, a toast and the arrival, and a new window opens. Pending wake-ups in this process are dropped by the switch: set them again in ${to} if they are still needed. Reason: ${quoted(reason)}. Notes: ${quoted(notes)}.`,
     }
   }).catch(($, e, next) => (next.called ? next(e) : { deny: 'self-switch: queuing the switch failed; nothing is queued.' }))
 
@@ -779,7 +891,7 @@ export const register: Register = (on, options) => {
       return done
     }
     armed = value
-    $.clock.after(SETTLE_MS, () => void switchNow($, value))
+    $.clock.after(SETTLE_MS, () => void runSwitch($, value))
     return done
   })
 

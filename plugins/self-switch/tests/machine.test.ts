@@ -5,10 +5,12 @@ import { describe, expect, test } from 'claude-code/testing'
 import {
   CLEAR_MARKERS,
   descendants,
+  FALLBACK,
   type GitState,
   isSafeFolder,
   launcherScript,
   liveness,
+  newRegistryKeys,
   oneLine,
   parseProbe,
   pickTransport,
@@ -19,7 +21,9 @@ import {
   quoted,
   RECHECK,
   readGate,
+  REGISTRY_FIELDS,
   REGISTRY_KEYS,
+  REGISTRY_VERSION_MARKERS,
   releaseScript,
   claimCheckScript,
   SESSION_MARKERS,
@@ -167,26 +171,56 @@ describe('liveness', () => {
   })
 })
 
-describe("the registry's shape is strict", () => {
+describe('the registry: what liveness reads is strict, any other key is ignored, a new format refuses', () => {
+  type Change = (r: Record<string, unknown>) => void
+  const drop = (key: string): Change => r => {
+    delete r[key]
+    r.keys = (r.keys as string[]).filter(k => k !== key)
+  }
+  /** claude.exe 200's file, changed. */
+  const file200 = (change: Change) => (p: RawProbe) => change(p.registry.find(x => x.file === 200) as Record<string, unknown>)
+
+  test('the shape Claude Code 2.1.318 writes: procStart a string of digits, compared exactly; a number is still taken', () => {
+    expect(entry(200, OTHER, ft(3)).procStart).toBe('134062345698901240')
+    expect(live().verdict).toBe('not-live')
+    // T held by claude.exe 200: L1, by its procStart as a string past 2^53, exact.
+    expect(live(file200(r => (r.sessionId = T))).evidence).toEqual(['L1: claude.exe 200 (started 2025-10-29 18:02 UTC) holds it'])
+    // The same as a number, as earlier versions wrote it.
+    expect(live(file200(r => ((r.sessionId = T), (r.procStart = Number(r.procStart))))).verdict).toBe('live')
+    // One tick off its process's start is still that process; a second off is another.
+    expect(live(file200(r => ((r.sessionId = T), (r.procStart = String(BigInt(ft(3)) + 1n))))).verdict).toBe('live')
+    expect(live(file200(r => ((r.sessionId = T), (r.procStart = ft(4))))).verdict).toBe('unknown')
+  })
+
+  // Guard 1: the fields liveness reads (REGISTRY_FIELDS), each strictly; missing or mistyped, unknown, naming it.
   for (const [name, change, said] of [
-    ['without procStart', (r: Record<string, unknown>) => {
-      delete r.procStart
-      r.keys = (r.keys as string[]).filter(k => k !== 'procStart')
-    }, 'has no procStart'],
-    ['with procStart as a string', (r: Record<string, unknown>) => (r.procStart = String(r.procStart)), 'has a procStart that is a string, not a number'],
-    ['with an extra key, surprise', (r: Record<string, unknown>) => (r.keys = [...(r.keys as string[]), 'surprise']), 'holds the key "surprise", which is not one of the 18 verified'],
-    ['without sessionId', (r: Record<string, unknown>) => {
-      delete r.sessionId
-      r.keys = (r.keys as string[]).filter(k => k !== 'sessionId')
-    }, 'has no sessionId'],
-    ['with pid as a string', (r: Record<string, unknown>) => (r.pid = '200'), 'has a pid that is a string, not a number'],
-    ['with status as a number', (r: Record<string, unknown>) => (r.status = 3), 'has a status that is not a word'],
-  ] as const) {
-    test(`a live pid's file ${name} is unknown, naming the pid`, () => {
-      const found = live(p => {
-        const r = p.registry.find(x => x.file === 200) as Record<string, unknown>
-        change(r)
-      })
+    ['without pid', drop('pid'), 'has no pid'],
+    ['without sessionId', drop('sessionId'), 'has no sessionId'],
+    ['without procStart', drop('procStart'), 'has no procStart'],
+    ['with pid as a string', r => (r.pid = '200'), 'has a pid that is a string, not a number'],
+    ['with sessionId as a number', r => (r.sessionId = 7), 'has a sessionId that is a number, not a string'],
+    ['with procStart as letters and digits', r => (r.procStart = '13406234569890124a'), 'has a procStart that is a string, but not of digits'],
+    ['with procStart signed', r => (r.procStart = `-${ft(3)}`), 'has a procStart that is a string, but not of digits'],
+    ['with procStart as a decimal fraction', r => (r.procStart = `${ft(3)}.5`), 'has a procStart that is a string, but not of digits'],
+    ['with procStart of 21 digits', r => (r.procStart = '1'.repeat(21)), 'has a procStart that is a string, but not of digits'],
+    ['with procStart empty', r => (r.procStart = ''), 'has a procStart that is a string, but not of digits'],
+    ['with procStart negative', r => (r.procStart = -5), 'has a procStart that is not a whole number'],
+    ['with procStart a fraction', r => (r.procStart = 1.5), 'has a procStart that is not a whole number'],
+    ['with procStart true', r => (r.procStart = true), 'has a procStart that is a boolean, not a number or a string of digits'],
+    ['with procStart null', r => (r.procStart = null), 'has a procStart that is a null, not a number or a string of digits'],
+    // Guard 3: a shape change that touches those fields, or a new format's marker, refuses and names it.
+    ['with procStart renamed procStartFt', r => (drop('procStart')(r), (r.keys = [...(r.keys as string[]), 'procStartFt'])), 'has no procStart'],
+    ['with sessionId a nested object', r => (r.sessionId = { nested: 'object' }), 'has a sessionId that is a nested object, not a string'],
+    ['with pid a list', r => (r.pid = { nested: 'list' }), 'has a pid that is a list, not a number'],
+    ['with procStart a nested object', r => (r.procStart = { nested: 'object' }), 'has a procStart that is a nested object, not a number or a string of digits'],
+    ['with a key v', r => (r.keys = [...(r.keys as string[]), 'v']), 'holds the key "v", which marks a new format'],
+    ['with a key schema', r => (r.keys = [...(r.keys as string[]), 'schema']), 'holds the key "schema", which marks a new format'],
+    ['with a key schemaVersion', r => (r.keys = [...(r.keys as string[]), 'schemaVersion']), 'holds the key "schemaVersion", which marks a new format'],
+    ['with version a number', r => (r.version = 2), "has a version that is a number, not Claude Code's version as a string"],
+    ['with version a nested object', r => (r.version = { nested: 'object' }), "has a version that is a nested object, not Claude Code's version as a string"],
+  ] as [string, Change, string][]) {
+    test(`a live pid's file ${name} is unknown, naming the pid and the field`, () => {
+      const found = live(file200(change))
       expect(found.verdict).toBe('unknown')
       // Named by its pid; and the claude.exe it belongs to is then accounted for by no registry.
       expect(found.evidence).toEqual([
@@ -196,7 +230,30 @@ describe("the registry's shape is strict", () => {
     })
   }
 
-  test('the known keys are the 18 seen on the machine, in one list', () => {
+  // Guard 2: any other key is ignored, and reported once each for the plugin to log.
+  test('a key Claude Code 2.1.318 did not write, or another type where nothing reads: not live, the key reported once', () => {
+    const probe = probeOf(p => {
+      for (const r of p.registry) r.keys = [...(r.keys as string[]), 'hostSessionId']
+      file200(r => ((r.keys = [...(r.keys as string[]), 'tmux']), (r.status = 3), (r.kind = { nested: 'object' }), (r.statusUpdatedAt = 'soon')))(p)
+    })
+    expect(liveness(probe, T, NOW, { mine: LAUNCH })).toEqual({ verdict: 'not-live', evidence: [] })
+    expect(probe.extraKeys).toEqual(['hostSessionId', 'tmux'])
+    // Once per process: a key already seen isn't returned again; a new one is.
+    const seen = new Set<string>()
+    expect(newRegistryKeys(probe, seen)).toEqual(['hostSessionId', 'tmux'])
+    expect(newRegistryKeys(probe, seen)).toEqual([])
+    expect(newRegistryKeys(probeOf(p => (p.registry[0] as { keys: string[] }).keys.push('tmux', 'jobId')), seen)).toEqual(['jobId'])
+    // A file that refuses reports nothing: its keys are not read as extra.
+    expect(probeOf(file200(r => ((r.keys = [...(r.keys as string[]), 'schema', 'later']))) ).extraKeys).toEqual([])
+  })
+
+  test('what liveness reads, and what marks a new format, each in one list', () => {
+    expect([...REGISTRY_FIELDS]).toEqual(['pid', 'sessionId', 'procStart'])
+    expect([...REGISTRY_VERSION_MARKERS]).toEqual(['v', 'schema', 'schemaVersion', 'formatVersion', 'registryVersion'])
+    for (const marker of REGISTRY_VERSION_MARKERS) expect(REGISTRY_KEYS as readonly string[]).not.toContain(marker)
+  })
+
+  test('the known keys are the 20 seen on Claude Code 2.1.318, in one list', () => {
     expect([...REGISTRY_KEYS]).toEqual([
       'pid',
       'sessionId',
@@ -216,11 +273,14 @@ describe("the registry's shape is strict", () => {
       'updatedAt',
       'statusUpdatedAt',
       'bridgeSessionId',
+      'asksForConvertedSkills',
+      'nameSince',
     ])
   })
 
   test("a wrong-shape file whose pid isn't running is ignored", () => {
-    expect(live(p => p.registry.push({ ...entry(888, T, ft(9)), keys: [...REGISTRY_KEYS, 'surprise'] })).verdict).toBe('not-live')
+    expect(live(p => p.registry.push({ ...entry(888, T, ft(9)), keys: [...REGISTRY_KEYS, 'schema'] })).verdict).toBe('not-live')
+    expect(live(p => p.registry.push({ ...entry(888, T, ft(9)), procStart: 'soon' })).verdict).toBe('not-live')
   })
 })
 
@@ -234,6 +294,7 @@ describe('the probe answer is checked field by field', () => {
     expect(bad(p => p.transcripts.push({ id: T, dir: 0, project: '..\\..\\x', mtime: 1 }))).toMatchObject({ error: expect.stringContaining('project') })
     expect(bad(p => (p.claim = { id: T, taken: true, by: 'launch:x; calc' }))).toMatchObject({ error: expect.stringContaining('claimant') })
     expect(bad(p => (p.slot = { pid: 1, created: '1', id: '1-1', path: "C:\\x'\\claude-slot.ps1", sha256: null }))).toMatchObject({ error: expect.stringContaining('plain path') })
+    expect(bad(p => (p.slot = { pid: 20, created: ft(1), id: `20-${ft(1)}`, path: 'C:\\x\\claude-slot.ps1', sha256: null, hashError: 3 as unknown as string }))).toMatchObject({ error: expect.stringContaining("slot's hash error") })
     expect(bad(p => p.errors.push('everything'))).toMatchObject({ error: expect.stringContaining('fixed list') })
     expect(parseProbe('')).toEqual({ error: 'the probe printed no answer' })
     expect(parseProbe('{not json')).toEqual({ error: "the probe's answer is not JSON" })
@@ -338,11 +399,21 @@ describe('transports', () => {
     expect(parseProbe(text.replace('"id":"20-134062345678901240"', '"id":"20-134062345678901250"'))).toMatchObject({ error: expect.stringContaining("slot's id") })
   })
 
-  test('across projects: the window, in its own folder; the slot only with the shipped hash', () => {
+  test('across projects: the window, in its own folder; the slot only with the shipped hash, and a slot not used says why', () => {
     expect(pickTransport(probeOf(elsewhere), W, T, ELSEWHERE)).toEqual({ transport: 'window', folder: ELSEWHERE })
     expect(pickTransport(probeOf(p => (elsewhere(p), inSlot(p))), W, T, ELSEWHERE)).toEqual({ transport: 'slot', slot: `20-${ft(1)}`, folder: ELSEWHERE })
-    expect(pickTransport(probeOf(p => (elsewhere(p), inSlot(p, 'f'.repeat(64)))), W, T, ELSEWHERE)).toEqual({ transport: 'window', folder: ELSEWHERE })
-    expect(pickTransport(probeOf(p => (elsewhere(p), inSlot(p, null))), W, T, ELSEWHERE)).toEqual({ transport: 'window', folder: ELSEWHERE })
+    expect(pickTransport(probeOf(p => (elsewhere(p), inSlot(p, 'f'.repeat(64)))), W, T, ELSEWHERE)).toEqual({
+      transport: 'window',
+      folder: ELSEWHERE,
+      fallback: "this pane's claude-slot.ps1 has another SHA-256 than the one shipped (an edited or older copy: copy the shipped script and restart the pane)",
+    })
+    const denied = 'Exception calling "ReadAllBytes" with "1" argument(s): "Access to the path is denied."'
+    expect(pickTransport(probeOf(p => (elsewhere(p), inSlot(p, null, denied))), W, T, ELSEWHERE)).toEqual({ transport: 'window', folder: ELSEWHERE, fallback: `slot hash unreadable: ${denied}` })
+    // The reason as one line, at most 200 characters.
+    const long = pickTransport(probeOf(p => (elsewhere(p), inSlot(p, null, `line one\r\nline two ${'x'.repeat(400)}`))), W, T, ELSEWHERE)
+    expect(long).toMatchObject({ fallback: expect.stringMatching(/^slot hash unreadable: line one line two x+\u2026$/) })
+    expect('fallback' in long && (long.fallback?.length ?? 0) <= 'slot hash unreadable: '.length + 200).toBe(true)
+    expect(pickTransport(probeOf(p => (elsewhere(p), inSlot(p, null))), W, T, ELSEWHERE)).toEqual({ transport: 'window', folder: ELSEWHERE, fallback: 'slot hash unreadable: no reason given' })
   })
 
   test('across projects, a folder that is unknown, or is not where its transcript is, refuses', () => {
@@ -453,7 +524,9 @@ describe('the scripts, as text', () => {
     // Command lines are matched inside the script, never printed: only names, classes and ids leave it.
     expect(probe).toContain('$o = [ordered]@{ pid = [long]$p.ProcessId; ppid = [long]$p.ParentProcessId; created = (Get-Created $p); name = "$($p.Name)" }')
     expect(probe).not.toMatch(/commandLine\s*=|cwd\s*=|\$o\["(cwd|name|messagingSocketPath)"\]/)
-    expect(probe).toContain('foreach ($key in "pid", "sessionId", "procStart", "status", "statusUpdatedAt", "kind")')
+    expect(probe).toContain('foreach ($key in "pid", "sessionId", "procStart", "status", "statusUpdatedAt", "kind", "version")')
+    // A nested value comes as what it is, never as null: a null would read as a missing field's type.
+    expect(probe).toContain('if ($v -is [Array]) { $v = [ordered]@{ nested = "list" } } else { $v = [ordered]@{ nested = "object" } }')
     expect(probe).not.toMatch(/\.jsonl"\)\s*-Raw|Get-Content[^\n]*\.jsonl/)
     expect(probe).not.toMatch(/\.key\b/)
     // The claim is taken after everything else is read, and before the locks are reported.
@@ -500,6 +573,30 @@ describe('the scripts, as text', () => {
     expect(window).toContain('if ($null -eq $lock -or $lock.by -cne $by) { "self-switch: the claim on this conversation does not name this launch')
   })
 
+  test('the slot is hashed by .NET, never by Get-FileHash, and a hash that fails keeps its reason', () => {
+    // Get-FileHash is missing where Windows PowerShell 5.1 loads PowerShell 7's Utility module (a
+    // Windows Terminal tab with 7's module folders first): .NET's SHA256 needs no module.
+    for (const script of [probe, restart]) {
+      expect(script).toContain('[Security.Cryptography.SHA256]::Create()')
+      expect(script).toContain('[BitConverter]::ToString($hasher.ComputeHash([IO.File]::ReadAllBytes($slotPath))).Replace("-", "").ToLowerInvariant()')
+      expect(script).toContain('catch { $slotHash = $null; $slotHashError = "$($_.Exception.Message)" }')
+      expect(script).toContain('if ($null -ne $slotHashError) { $slot["hashError"] = $slotHashError }')
+    }
+    for (const script of [probe, restart, window, release]) expect(script).not.toContain('Get-FileHash')
+  })
+
+  test('the restart launcher says why it passed over a slot runner, on a line of its own after the claim', () => {
+    expect(restart).toContain(
+      'if ($null -ne $slot -and -not $slotOk) { if ($null -ne $slotHashError) { $slotFallback = "slot hash unreadable: " + $slotHashError } else { $slotFallback = "this pane" + [char]39 + "s claude-slot.ps1 has another SHA-256 than the one shipped" } }',
+    )
+    const said = restart.indexOf('if ($null -ne $slotFallback) { "fallback " + ($slotFallback -split "\r?\n")[0] }')
+    expect(said).toBeGreaterThan(restart.indexOf('"claim $by"', restart.indexOf('Start-Process')))
+    // A switch's window prints none: its probe said it already.
+    expect(window).not.toContain('$slotFallback')
+    expect(FALLBACK.exec(`launched 100\r\nclaim ${LAUNCH}\r\nfallback slot hash unreadable: denied\r\n`)?.[1]).toBe('slot hash unreadable: denied')
+    expect(FALLBACK.exec(`launched 100\r\nclaim ${LAUNCH}\r\n`)).toBeNull()
+  })
+
   test("the restart launcher uses the slot only for a folder its runner takes: absolute, no quote, the conversation's own", () => {
     const check = restart.indexOf('  $projectName = [regex]::Replace($folder, "[^A-Za-z0-9]", "-")')
     expect(check).toBeGreaterThan(restart.indexOf('$slotOk = $slotHash -eq'))
@@ -507,7 +604,7 @@ describe('the scripts, as text', () => {
     expect(restart).toContain('(Join-Path $dir ("projects\\" + $projectName + "\\" + $id + ".jsonl"))')
     // The whole condition, line for line: the slot is given up unless all three hold.
     expect(restart.split(/\r?\n/)).toContain(
-      '  if (-not ($inProject -and $folder -cmatch "^[A-Za-z]:\\\\" -and $folder -notmatch "[\\x00-\\x1f\\x22\\x27\\u2018\\u2019\\u201a\\u201b\\u201c\\u201d\\u201e]")) { $slotOk = $false }',
+      '  if (-not ($inProject -and $folder -cmatch "^[A-Za-z]:\\\\" -and $folder -notmatch "[\\x00-\\x1f\\x22\\x27\\u2018\\u2019\\u201a\\u201b\\u201c\\u201d\\u201e]")) { $slotOk = $false; $slotFallback = "the folder this session started in isn" + [char]39 + "t one the slot runner takes" }',
     )
   })
 

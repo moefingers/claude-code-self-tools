@@ -19,6 +19,8 @@ export type Ticket = {
   reason: string
   notes: string
   resume?: string
+  /** Why this pane's slot runner wasn't used, when the switch went to a new window instead. */
+  fallback?: string
 }
 
 /**
