@@ -136,8 +136,14 @@ export const QUOTED_MAX = 400
 /** Line and paragraph breaks of every kind, and tabs: each run becomes one space. */
 const BREAKS = /[\t\n\u000b\u000c\r\u0085\u2028\u2029]+/g
 
-/** Control characters, and the invisible format characters (bidi controls, zero widths, the BOM): dropped. */
-const INVISIBLE = /[\u0000-\u001f\u007f-\u009f\u00ad\u061c\u180e\u200b-\u200f\u202a-\u202e\u2060-\u2064\u2066-\u206f\ufeff\ufff9-\ufffb]/g
+/**
+ * What a reader can't see, dropped: control characters (Cc), format characters (Cf: bidi controls,
+ * zero widths, the BOM, and the Unicode tag characters U+E0020-E007F, which carry text a model reads
+ * and a person doesn't), private-use (Co) and unassigned (Cn) code points, and every default-ignorable
+ * code point (variation selectors, the Hangul fillers, the combining grapheme joiner). By property,
+ * with the `u` flag, so the planes past the first are covered too.
+ */
+const INVISIBLE = /[\p{Cc}\p{Cf}\p{Co}\p{Cn}\p{Default_Ignorable_Code_Point}]/gu
 
 /** `text` cut to `max` characters, the last an ellipsis, never splitting a surrogate pair. */
 function cut(text: string, max: number): string {
