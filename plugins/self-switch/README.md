@@ -90,7 +90,7 @@ What the slot does:
 - A registry file it can't read is read twice more, 250 ms apart. When it still can't tell, or anything else stops it, it says why and gives the `claude --resume <id>` line to run once it is safe; the pane stays.
 - A record a switch or restart took back (overwritten with `{"v":1,"cancelled":true}`, since a plugin can't delete a file) is said as withdrawn: *The switch that left this record was withdrawn; nothing to do.*
 - With no record, it waits: Enter starts a new Claude Code in the pane, and a record that arrives meanwhile is honoured (it looks every 2 seconds). Ctrl+C leaves the slot at a PowerShell prompt.
-- It runs `claude` with no flags, or `claude --resume <id>`: no permission flag of any kind.
+- It runs `claude` with no flags, or `claude --resume <id>`: no permission flag of any kind. Before it does, it clears the markers of the session it came from and `NO_COLOR` (the pane keeps its own `WT_SESSION`), and sets `CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1`; a switch's new window does the same, and clears the old tab's `WT_SESSION` too.
 - Windows and panes are never closed for you.
 
 ## Settings
