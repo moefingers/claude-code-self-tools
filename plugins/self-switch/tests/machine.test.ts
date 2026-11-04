@@ -21,6 +21,7 @@ import {
   readGate,
   REGISTRY_KEYS,
   releaseScript,
+  claimCheckScript,
   SESSION_MARKERS,
   SLOT_SCRIPT_SHA256,
   safePoint,
@@ -429,7 +430,12 @@ describe('the scripts, as text', () => {
 
   test('the probe: the age-guarded walk, CreateNew, and what it never prints', () => {
     expect(probe).toContain('if ($null -ne $up -and $up.CreationDate -le $child.CreationDate) { return $up }')
-    expect(probe).toContain('[IO.File]::Open($path, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)')
+    expect(probe).toContain('[IO.File]::Open($path, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::Read)')
+    // A lock already there is taken over through one handle no one else may write: never a delete and a create.
+    expect(probe).toContain('[IO.File]::Open($path, [IO.FileMode]::Open, [IO.FileAccess]::ReadWrite, [IO.FileShare]::Read)')
+    expect(probe).toContain('$stream.SetLength(0)')
+    expect(probe).toContain('if (-not $taken) { $taken = Set-Claim $claimPath $claimText }')
+    expect(probe).not.toContain('[IO.File]::Delete($claimPath)')
     // Command lines are matched inside the script, never printed: only names, classes and ids leave it.
     expect(probe).toContain('$o = [ordered]@{ pid = [long]$p.ProcessId; ppid = [long]$p.ParentProcessId; created = (Get-Created $p); name = "$($p.Name)" }')
     expect(probe).not.toMatch(/commandLine\s*=|cwd\s*=|\$o\["(cwd|name|messagingSocketPath)"\]/)
@@ -490,7 +496,13 @@ describe('the scripts, as text', () => {
   })
 
   test('the release removes the lock only when it names the claimant', () => {
-    expect(release).toContain(`if ($null -eq $lock -or $lock.by -cne '${LAUNCH}') { 'not-ours'; exit 0 }`)
-    expect(release.indexOf('[IO.File]::Delete($path)')).toBeGreaterThan(release.indexOf("'not-ours'"))
+    expect(release).toContain(`if ($null -eq $lock -or $lock.by -cne '${LAUNCH}') { $answer = 'not-ours' } else { [IO.File]::Delete($path); $answer = 'released' }`)
+    // Read through a handle that keeps every writer out, and deleted while it is held.
+    expect(release).toContain("[IO.File]::Open($path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]'Read, Delete')")
+    expect(release.indexOf('[IO.File]::Delete($path)')).toBeLessThan(release.indexOf('} finally { $stream.Dispose() }'))
+    expect(release).not.toContain('Get-Content')
+    const check = claimCheckScript({ stateDir: STATE, id: T, by: LAUNCH })
+    expect(check).toContain(`if ($null -ne $lock -and $lock.by -ceq '${LAUNCH}') { 'ours' } else { 'not-ours' }`)
+    expect(check).not.toMatch(/Delete|Set-Content|WriteAll|Open\(/)
   })
 })

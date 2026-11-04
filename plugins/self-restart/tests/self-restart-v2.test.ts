@@ -75,7 +75,8 @@ const answered = { answer: 'done', durationMs: 1, turnId: 't1', isAborted: false
 test("the launcher v2 for this session's own id: the claim, the re-check after the wait, the scrub, and claude with no other flag", () => {
   const script = launcherScript(ID)
   // The claim on this conversation, taken in the launcher's own run, with CreateNew.
-  expect(script).toContain('[IO.File]::Open($path, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)')
+  expect(script).toContain('[IO.File]::Open($path, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::Read)')
+  expect(script).toContain('if (-not $taken) { $taken = Set-Claim $claimPath $claimText }')
   expect(script).toContain('$claimPath = Join-Path $state ("claims\\" + $id + ".lock")')
   expect(script).toContain('"self-restart: another switch or restart holds the claim on this conversation ($claimPath), so it is not resumed"; exit 5')
   // The window re-reads the registry and the process table after the wait, and checks the claim, before claude.

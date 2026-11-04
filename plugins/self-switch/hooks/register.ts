@@ -34,6 +34,8 @@ import type { Heartbeat, Queued, Ticket } from '../types'
 import type { AgentLike, Probe } from './machine'
 import {
   BUSY_AGENTS,
+  CLAIM_CHECKED,
+  claimCheckScript,
   gatePath,
   isSafeFolder,
   LAUNCHED,
@@ -371,6 +373,18 @@ async function release($: EngineInterface, powershell: string, state: string, id
   }
 }
 
+/** Why the claim on `to` no longer names `by`, or undefined when it still does. */
+async function claimStill($: EngineInterface, ctx: Context, to: string, by: string): Promise<string | undefined> {
+  try {
+    const run = await $.process.run(powershellArgv(ctx.powershell, claimCheckScript({ stateDir: ctx.state, id: to, by })), { timeoutMs: RELEASE_MS })
+    const said = run.exitCode === 0 ? CLAIM_CHECKED.exec(run.stdout)?.[1] : undefined
+    if (said === 'ours') return undefined
+    return said === undefined ? `the claim on ${to} couldn't be read again before the resume` : `the claim on ${to} no longer names this switch (${said})`
+  } catch (err) {
+    return `the claim on ${to} couldn't be read again before the resume: ${why(err)}`
+  }
+}
+
 /** Tickets older than 15 minutes: their switch is over one way or another, so their locks are released. */
 async function pruneTickets($: EngineInterface, now: number): Promise<void> {
   const all = await tickets($)
@@ -565,6 +579,10 @@ async function switchNow($: EngineInterface, value: Queued): Promise<void> {
   }
 
   if (pick.transport === 'in-place') {
+    // The last look: the claim must still name this switch. No window or slot checks it for an
+    // in-place move, so this does, right before the command.
+    const still = await claimStill($, ctx, to, by)
+    if (still !== undefined) return undo(still)
     if (armed !== value) return undo('a new turn started')
     armed = undefined
     await noteRecent($, ctx.own)

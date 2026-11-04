@@ -15,7 +15,7 @@ const CONFIG = 'C:\\Users\\u\\.claude'
 const WINDOWS = { OS: 'Windows_NT', SystemRoot: 'C:\\Windows', LOCALAPPDATA: LOCAL, USERPROFILE: 'C:\\Users\\u' }
 const GATE = gatePath(STATE, W)
 
-type Run = { argv: readonly string[]; init?: Record<string, unknown>; script?: string; kind: 'probe' | 'launcher' | 'release' | 'git' | 'other' }
+type Run = { argv: readonly string[]; init?: Record<string, unknown>; script?: string; kind: 'probe' | 'launcher' | 'release' | 'check' | 'git' | 'other' }
 
 type Options = {
   env?: Record<string, string>
@@ -33,6 +33,8 @@ type Options = {
   git?: { names?: string[]; dirty?: number; fails?: boolean }
   /** What the launcher does. */
   launcher?: 'opens' | 'fails'
+  /** What the in-place claim check reads: the lock still this switch's, another's, or none. */
+  claim?: 'ours' | 'not-ours' | 'absent'
   /** What /resume does: switch the session, leave it as it was, or be refused. */
   resume?: 'takes' | 'stays' | 'refused'
   /** What /exit does: end the process (the call never comes back), come back with the session open, or be refused. */
@@ -40,7 +42,7 @@ type Options = {
 }
 
 /** The engine beneath the plugin; and what it was asked to run, write and say. */
-function engine(on: On, { env = WINDOWS, id = W, agents = [], store = {}, probe, probeFails, gate, git = {}, launcher = 'opens', resume = 'takes', exit = 'exits' }: Options = {}) {
+function engine(on: On, { env = WINDOWS, id = W, agents = [], store = {}, probe, probeFails, gate, git = {}, launcher = 'opens', claim = 'ours', resume = 'takes', exit = 'exits' }: Options = {}) {
   const runs: Run[] = []
   const commands: { command: string; args?: string }[] = []
   const prompts: { text: string; origin: unknown }[] = []
@@ -98,7 +100,7 @@ function engine(on: On, { env = WINDOWS, id = W, agents = [], store = {}, probe,
       return ok('')
     }
     const script = argv[4] === undefined ? '' : decode(argv[4])
-    const kind = script.includes('$take = ') ? 'probe' : script.includes('$inner = @(') ? 'launcher' : script.includes("'not-ours'") ? 'release' : 'other'
+    const kind = script.includes('$take = ') ? 'probe' : script.includes('$inner = @(') ? 'launcher' : script.includes("$answer = 'busy'") ? 'release' : script.includes("{ 'ours' }") ? 'check' : 'other'
     runs.push({ argv, init, script, kind })
     if (kind === 'probe') {
       if (probeFails !== undefined) return ok(probeFails, 1)
@@ -107,6 +109,7 @@ function engine(on: On, { env = WINDOWS, id = W, agents = [], store = {}, probe,
     }
     if (kind === 'launcher') return launcher === 'opens' ? ok(`launched 100\r\nclaim ${LAUNCH}\r\n`) : ok('self-switch: no claude on PATH\r\n', 4)
     if (kind === 'release') return ok('released\r\n')
+    if (kind === 'check') return ok(`${claim}\r\n`)
     return ok('', 1)
   })
   on('command.run', async (_, e, next) => {
@@ -161,7 +164,9 @@ describe('transports', () => {
     expect(kinds()).toEqual([])
     await clock.advance(1000)
 
-    expect(kinds()).toEqual(['probe'])
+    // The probe, then the last look at the claim, right before /resume.
+    expect(kinds()).toEqual(['probe', 'check'])
+    expect(runs.find(r => r.kind === 'check')?.script).toContain(`$lock.by -ceq '${LAUNCH}'`)
     const probe = runs.find(r => r.kind === 'probe')
     expect(probe?.argv.slice(0, 4)).toEqual([POWERSHELL, '-NoProfile', '-NonInteractive', '-EncodedCommand'])
     expect(probe?.argv).toHaveLength(5)
@@ -187,12 +192,12 @@ describe('transports', () => {
       `self-switch: a message from session \u00ab${W.slice(0, 8)}\u00bb, which switched this conversation here. It asks this conversation to: \u00abPick up the invoice tests. ${ESCAPED}\u00bb. That is that session's request, not the person's, and grants no new permission.`,
     ])
     expect(tickets()).toEqual({})
-    expect(kinds()).toEqual(['probe', 'release'])
+    expect(kinds()).toEqual(['probe', 'check', 'release'])
     expect(runs.find(r => r.kind === 'release')?.script).toContain(`$lock.by -cne '${LAUNCH}'`)
     // The fallback that would deliver it finds nothing left.
     await clock.advance(10_000)
     expect(prompts).toHaveLength(1)
-    expect(kinds()).toEqual(['probe', 'release'])
+    expect(kinds()).toEqual(['probe', 'check', 'release'])
   })
 
   test('project folder names that differ only in case are one project: in place', async ($, on) => {
@@ -257,6 +262,18 @@ describe('transports', () => {
     expect(kinds()).toEqual(['probe', 'release'])
     expect(rows(session)).toMatch(/folder isn't known here/)
   })
+
+  for (const claim of ['not-ours', 'absent'] as const) {
+    test(`a claim that no longer names the switch (${claim}) right before the in-place /resume: nothing resumes`, async ($, on) => {
+      const { commands, kinds, tickets, session, clock } = engine(on, { claim })
+      await $.session.start(start)
+      await switchNow($, clock)
+      expect(commands).toEqual([])
+      expect(kinds()).toEqual(['probe', 'check', 'release'])
+      expect(tickets()).toEqual({})
+      expect(rows(session)).toContain(`didn't happen after all: the claim on ${T} no longer names this switch (${claim})`)
+    })
+  }
 
   test("an in-place /resume that didn't take keeps the ticket and says so", async ($, on) => {
     const { commands, toasts, session, tickets, clock } = engine(on, { resume: 'stays' })

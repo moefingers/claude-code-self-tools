@@ -307,35 +307,58 @@ const FIND_SLOT = [
   '}',
 ]
 
+/** Whether the error in a catch block is a sharing violation, a file already there, or another plain I/O failure. */
+const IS_IO = '($_.Exception -is [IO.IOException] -or $_.Exception.InnerException -is [IO.IOException])'
+
 /**
  * Takes the claim lock `$claimPath` for `$by`, with CreateNew, so of two that race one wins. A lock
  * already there is taken over only when it is this session's own (its creator is this claude.exe) or
  * stale (its creator isn't running and it is older than 15 minutes; one that can't be read, by its
- * file's age). Needs `$table`, `$session`, `$by`, `$transport`, `$claimPath`; sets `$taken`.
+ * file's age). The takeover is one exclusive handle, never a delete and a create: it opens the lock
+ * for writing with no one else allowed to write it, reads and judges it through that handle, and
+ * writes the new claim over it in place. A second taker can't open it meanwhile, and reports it held.
+ * Needs `$table`, `$session`, `$by`, `$transport`, `$claimPath`; sets `$taken`.
  */
 const TAKE_CLAIM = [
   'function New-Claim($path, $text) {',
   '  [void][IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($path))',
-  '  try { $stream = [IO.File]::Open($path, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None) }',
-  '  catch { if ($_.Exception -is [IO.IOException] -or $_.Exception.InnerException -is [IO.IOException]) { return $false } throw }',
+  '  try { $stream = [IO.File]::Open($path, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::Read) }',
+  `  catch { if ${IS_IO} { return $false } throw }`,
   '  try { $bytes = [Text.Encoding]::UTF8.GetBytes($text); $stream.Write($bytes, 0, $bytes.Length) } finally { $stream.Dispose() }',
   '  return $true',
+  '}',
+  'function Set-Claim($path, $text) {',
+  '  try { $stream = [IO.File]::Open($path, [IO.FileMode]::Open, [IO.FileAccess]::ReadWrite, [IO.FileShare]::Read) }',
+  '  catch {',
+  '    if ($_.Exception -is [IO.FileNotFoundException] -or $_.Exception.InnerException -is [IO.FileNotFoundException]) { return (New-Claim $path $text) }',
+  `    if ${IS_IO} { return $false }`,
+  '    throw',
+  '  }',
+  '  try {',
+  '    $reader = New-Object IO.StreamReader($stream, [Text.Encoding]::UTF8, $true, 4096, $true)',
+  '    $oldText = $reader.ReadToEnd()',
+  '    $reader.Dispose()',
+  '    $old = $null',
+  '    try { $old = $oldText | ConvertFrom-Json } catch { $old = $null }',
+  '    $age = $nowMs - ([DateTimeOffset]([IO.File]::GetLastWriteTimeUtc($path))).ToUnixTimeMilliseconds()',
+  '    $over = $false',
+  '    if ($null -ne $old -and $old.pid -is [ValueType] -and "$($old.created)" -match "^\\d{1,20}\\z" -and $old.at -is [ValueType]) {',
+  '      $creator = $table[[int]$old.pid]',
+  `      $running = $null -ne $creator -and $null -ne $creator.CreationDate -and [math]::Abs([long]$creator.CreationDate.ToFileTimeUtc() - [long]"$($old.created)") -le ${PROC_START_TOLERANCE}`,
+  `      $over = ($running -and [long]$old.pid -eq [long]$session.ProcessId) -or ((-not $running) -and ($nowMs - [double]$old.at) -gt ${CLAIM_STALE_MS})`,
+  `    } else { $over = $age -gt ${CLAIM_STALE_MS} }`,
+  '    if (-not $over) { return $false }',
+  '    $bytes = [Text.Encoding]::UTF8.GetBytes($text)',
+  '    $stream.SetLength(0)',
+  '    $stream.Write($bytes, 0, $bytes.Length)',
+  '    $stream.Flush()',
+  '    return $true',
+  '  } finally { $stream.Dispose() }',
   '}',
   '$nowMs = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()',
   '$claimText = [ordered]@{ v = 1; by = $by; pid = [long]$session.ProcessId; created = (Get-Created $session); at = $nowMs; transport = $transport } | ConvertTo-Json -Compress',
   '$taken = New-Claim $claimPath $claimText',
-  'if (-not $taken) {',
-  '  $old = $null',
-  '  try { $old = Get-Content -LiteralPath $claimPath -Raw -Encoding UTF8 | ConvertFrom-Json } catch { $old = $null }',
-  '  $age = $nowMs - ([DateTimeOffset](Get-Item -LiteralPath $claimPath -Force).LastWriteTimeUtc).ToUnixTimeMilliseconds()',
-  '  $over = $false',
-  '  if ($null -ne $old -and $old.pid -is [ValueType] -and "$($old.created)" -match "^\\d{1,20}\\z" -and $old.at -is [ValueType]) {',
-  '    $creator = $table[[int]$old.pid]',
-  `    $running = $null -ne $creator -and $null -ne $creator.CreationDate -and [math]::Abs([long]$creator.CreationDate.ToFileTimeUtc() - [long]"$($old.created)") -le ${PROC_START_TOLERANCE}`,
-  `    $over = ($running -and [long]$old.pid -eq [long]$session.ProcessId) -or ((-not $running) -and ($nowMs - [double]$old.at) -gt ${CLAIM_STALE_MS})`,
-  `  } else { $over = $age -gt ${CLAIM_STALE_MS} }`,
-  '  if ($over) { [IO.File]::Delete($claimPath); $taken = New-Claim $claimPath $claimText }',
-  '}',
+  'if (-not $taken) { $taken = Set-Claim $claimPath $claimText }',
 ]
 
 /**
@@ -1235,14 +1258,57 @@ export function launcherScript(id: string, options?: LaunchOptions): string {
   ].join('\r\n')
 }
 
-/** The release script's answer: the lock removed, none there, or one naming another. */
-export const RELEASED = /^(released|absent|not-ours)\s*$/m
+/** The release script's answer: the lock removed, none there, one naming another, or one held by a taker throughout. */
+export const RELEASED = /^(released|absent|not-ours|busy)\s*$/m
 
-/** Removes the claim lock on `id`, only when it names `by`. Throws on any input that isn't what it must be. */
-export function releaseScript(input: { readonly stateDir: string; readonly id: string; readonly by: string }): string {
+function checkClaim(input: { readonly stateDir: string; readonly id: string; readonly by: string }): { state: string; id: string; by: string } {
   const state = checkFolder('the state folder', input.stateDir)
   const id = checkId(input.id)
   if (!CLAIM_BY.test(input.by)) throw new Error(`not a claimant: ${JSON.stringify(input.by)}`)
+  return { state, id, by: input.by }
+}
+
+/**
+ * Removes the claim lock on `id`, only when it names `by`. It reads the lock through a handle that
+ * lets no one else write it, and deletes it while still holding that handle, so it can never remove
+ * a lock someone took over in between; a lock a taker holds is tried again twice, 200 ms apart.
+ * Throws on any input that isn't what it must be.
+ */
+export function releaseScript(input: { readonly stateDir: string; readonly id: string; readonly by: string }): string {
+  const { state, id, by } = checkClaim(input)
+  return [
+    "$ErrorActionPreference = 'Stop'",
+    "$ProgressPreference = 'SilentlyContinue'",
+    `$path = Join-Path ${literal(state)} 'claims\\${id}.lock'`,
+    "$answer = 'busy'",
+    "for ($try = 0; $try -lt 3 -and $answer -eq 'busy'; $try++) {",
+    '  if ($try -gt 0) { Start-Sleep -Milliseconds 200 }',
+    "  try { $stream = [IO.File]::Open($path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]'Read, Delete') }",
+    '  catch {',
+    "    if ($_.Exception -is [IO.FileNotFoundException] -or $_.Exception.InnerException -is [IO.FileNotFoundException] -or $_.Exception -is [IO.DirectoryNotFoundException] -or $_.Exception.InnerException -is [IO.DirectoryNotFoundException]) { $answer = 'absent'; continue }",
+    `    if ${IS_IO} { continue }`,
+    '    throw',
+    '  }',
+    '  try {',
+    '    $reader = New-Object IO.StreamReader($stream, [Text.Encoding]::UTF8, $true, 4096, $true)',
+    '    $text = $reader.ReadToEnd()',
+    '    $reader.Dispose()',
+    '    $lock = $null',
+    '    try { $lock = $text | ConvertFrom-Json } catch { $lock = $null }',
+    // Deleted while this handle, which shares delete, still keeps every writer out.
+    `    if ($null -eq $lock -or $lock.by -cne '${by}') { $answer = 'not-ours' } else { [IO.File]::Delete($path); $answer = 'released' }`,
+    '  } finally { $stream.Dispose() }',
+    '}',
+    '$answer',
+  ].join('\r\n')
+}
+
+/** The claim check's answer: the lock names the claimant, names another (or can't be read), or isn't there. */
+export const CLAIM_CHECKED = /^(ours|not-ours|absent)\s*$/m
+
+/** Reads the claim lock on `id` and says whether it names `by`; changes nothing. For the last look before an in-place /resume. */
+export function claimCheckScript(input: { readonly stateDir: string; readonly id: string; readonly by: string }): string {
+  const { state, id, by } = checkClaim(input)
   return [
     "$ErrorActionPreference = 'Stop'",
     "$ProgressPreference = 'SilentlyContinue'",
@@ -1250,9 +1316,7 @@ export function releaseScript(input: { readonly stateDir: string; readonly id: s
     "if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { 'absent'; exit 0 }",
     '$lock = $null',
     'try { $lock = Get-Content -LiteralPath $path -Raw -Encoding UTF8 | ConvertFrom-Json } catch { $lock = $null }',
-    `if ($null -eq $lock -or $lock.by -cne '${input.by}') { 'not-ours'; exit 0 }`,
-    '[IO.File]::Delete($path)',
-    "'released'",
+    `if ($null -ne $lock -and $lock.by -ceq '${by}') { 'ours' } else { 'not-ours' }`,
   ].join('\r\n')
 }
 
