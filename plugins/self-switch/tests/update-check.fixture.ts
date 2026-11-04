@@ -13,8 +13,8 @@ export const CALL = {
 
 /**
  * The call reads the session's subagents (none) and its store (no switch lately). With no
- * %LOCALAPPDATA% and a session id that is no UUID, the gate is left to the switch's own run, so the
- * call is queued. The shared test's classic events aren't raised.
+ * %LOCALAPPDATA%, the gate is left to the switch's own run, so the call is queued. The shared test's
+ * classic events aren't raised.
  */
 export function world(on: On): void {
   on('agent.list', () => ({ value: [] }))

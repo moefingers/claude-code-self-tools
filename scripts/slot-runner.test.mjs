@@ -70,6 +70,14 @@ test('right before claude runs, it reads the registry and the process table agai
   assert.ok(script.includes("Write-Host ('Once it is safe, resume it yourself: claude --resume ' + $record.resume)"))
 })
 
+test('a record a switch or restart withdrew (overwritten with cancelled: true) is said as withdrawn, and nothing runs', () => {
+  const withdrawn = "  if ($null -eq $why -and $null -ne $record -and $record.cancelled -is [bool] -and $record.cancelled) {\n    Write-Host 'The switch that left this record was withdrawn; nothing to do.'\n    return $null\n  }\n"
+  assert.ok(script.includes(withdrawn))
+  // After the record is read, before it is judged as one naming a conversation.
+  assert.ok(script.indexOf(withdrawn) > script.indexOf("try { $record = $text | ConvertFrom-Json } catch { $why = 'it is not JSON' }"))
+  assert.ok(script.indexOf(withdrawn) < script.indexOf("$why = 'it names no conversation by its id'"))
+})
+
 test('the record is deleted before anything is checked or run', () => {
   const read = script.indexOf('$text = Get-Content -LiteralPath $recordPath')
   const deleted = script.indexOf('[IO.File]::Delete($recordPath)')

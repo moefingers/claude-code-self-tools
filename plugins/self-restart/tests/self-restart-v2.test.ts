@@ -107,7 +107,7 @@ function engine(
         ? { value: { exitCode: 128, stdout: '', stderr: 'fatal: not a git repository', isStdoutTruncated: false, isStderrTruncated: false } }
         : { value: { exitCode: 128, stdout: '', stderr: 'fatal: detected dubious ownership in repository', isStdoutTruncated: false, isStderrTruncated: false } }
     }
-    const script = decode(String(e.argv[4]))
+    const script = String(e.init?.stdin ?? '')
     if (script.includes('$ids = @(')) {
       probes.push(script)
       return probe === 'fails'
@@ -168,6 +168,30 @@ test('a pane that is a verified slot: the launcher leaves the slot a record, no 
   expect(toasts.some(t => /Restarting: this pane's slot resumes this session once it has exited/.test(t))).toBe(true)
   expect(JSON.stringify(session.appended())).toContain('restarted at its own request (restart_after_turn). Reason: Switched accounts.')
   expect((held.get('restarts') as Record<string, { claim?: string }>)[ID]?.claim).toBe(`slot:${SLOT}`)
+})
+
+test("a slot runner the launcher passed over for a window: the restart says why, in the row, the toast and the log", async ($, on) => {
+  const why = 'slot hash unreadable: Exception calling "ReadAllBytes" with "1" argument(s): "Access to the path is denied."'
+  const { commands, toasts, logs, session, clock } = engine(on, { answer: { exitCode: 0, stdout: `launched 17716\r\nclaim ${LAUNCH}\r\nfallback ${why}\r\n` } })
+  await $.session.start(start)
+  await $.tool.call({ tool: TOOL, reason: 'Switched accounts.' })
+  await $.turn.complete(answered)
+  await clock.advance(1000)
+  expect(commands).toEqual(['exit'])
+  const rows = session.appended().flatMap(row => ((row as { message?: { content?: { text?: unknown }[] } }).message?.content ?? []).map(block => String(block.text)))
+  expect(rows).toContain(`This session restarted at its own request (restart_after_turn). Reason: Switched accounts. It restarted in a new window, not this pane's slot: \u00ab${why}\u00bb.`)
+  expect(toasts).toContain(`Restarting: a new window resumes this session once it has exited, not this pane's slot (${why}). Switched accounts.`)
+  expect(logs).toContain(`this pane's slot runner isn't used: ${why}. A new window resumes the session.`)
+})
+
+test('a window with no slot passed over, or the slot itself, says nothing of a fallback', async ($, on) => {
+  const { toasts, session, clock } = engine(on, { answer: { exitCode: 0, stdout: `launched 17716\r\nclaim ${LAUNCH}\r\n` } })
+  await $.session.start(start)
+  await $.tool.call({ tool: TOOL, reason: 'Switched accounts.' })
+  await $.turn.complete(answered)
+  await clock.advance(1000)
+  expect(JSON.stringify(session.appended())).not.toContain("not this pane's slot")
+  expect(toasts).toContain('Restarting: a new window resumes this session once it has exited. Switched accounts.')
 })
 
 test('the claim the window took is kept for the resumed session, which releases it once', async ($, on) => {
@@ -292,5 +316,5 @@ test('a release that finds the lock held open throughout is logged, never taken 
   await $.session.start(start)
   await $.classic.SessionStart({ source: 'resume', session_id: ID })
   await clock.advance(1000)
-  expect(logs).toContain(`self-restart: the claim lock on ${ID} wasn't released (another process had it open throughout); it is left in place, and goes stale 15 minutes after the old process exited.`)
+  expect(logs).toContain(`the claim lock on ${ID} wasn't released (another process had it open throughout); it is left in place, and goes stale 15 minutes after the old process exited.`)
 })

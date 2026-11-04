@@ -2,7 +2,8 @@
 // shared machine code (machine.ts, a copy of shared/hooks/machine.ts, which self-switch shares).
 //
 // The plugin runs Windows PowerShell by its known path under the Windows folder, with one fixed
-// script as an -EncodedCommand, launcherScript(<this session's id>). The id must be a UUID
+// script, launcherScript(<this session's id>), on its standard input under the fixed bootstrap of
+// powershellCall (a script on the command line passed Windows' limit on one). The id must be a UUID
 // (SESSION_ID) before it gets here: no text from the tool's input reaches the script, the argv or a
 // command line.
 //
@@ -33,6 +34,7 @@
 export {
   CLAIMED,
   encodeCommand,
+  FALLBACK,
   LAUNCHED,
   launcherScript,
   powershellPath,

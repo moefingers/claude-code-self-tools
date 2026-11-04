@@ -15,7 +15,8 @@ const T0 = Date.UTC(2026, 10, 1)
 const INSTALLED = '1.2.3'
 const REPOSITORY = 'https://github.com/moefingers/claude-code-self-tools'
 const URL = `https://raw.githubusercontent.com/moefingers/claude-code-self-tools/main/plugins/${PLUGIN}/.claude-plugin/plugin.json`
-const SESSION = 'session-1'
+/** Session ids as Claude Code makes them: UUIDs (self-switch queues nothing for another kind). */
+const SESSION = 'fe351ac5-c1fa-411e-a004-65d1f15b60bc'
 
 /** The notice and the toast, spelled out here so that a change to either template shows. */
 const NOTICE = (latest: string) =>
@@ -297,7 +298,8 @@ test('the opt-out stops it: no request, no store, no notice, no toast', { option
   }
   expect(plain).not.toMatch(/out of date/)
   expect(requests).toEqual([])
-  expect(writes).toEqual([])
+  // Nothing under the update check's own keys; a plugin keeps others of its own (self-switch's heartbeat).
+  expect(writes.filter(w => w.key === 'updateCheck' || w.key === 'updateSeen')).toEqual([])
   expect(reads).toEqual([])
   expect(toasts).toEqual([])
 })
@@ -461,7 +463,7 @@ test('a new session in the same load (/clear, a resume) is told, once', async ($
   await clock.settle()
   expect(await call($)).toBe(plain)
   // A new session is.
-  becomeSession('session-2')
+  becomeSession('250daf92-e765-49ee-ad1f-21d07b2089f0')
   await $.session.start(start)
   await clock.settle()
   expect(await call($)).toBe(`${plain}\n\n${NOTICE('1.3.0')}`)

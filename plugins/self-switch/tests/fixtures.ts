@@ -7,6 +7,8 @@ import { REGISTRY_KEYS, SLOT_SCRIPT_SHA256 } from '../hooks/machine'
 export const W = '3f6a2c1e-8b4d-4e9a-a7c2-5d1b9e0f4a6c'
 /** The conversation it switches to. */
 export const T = '9d2e7b4a-1c6f-4a3e-b8d5-0e7c2a9f1b3d'
+/** A third conversation in the same project, for a switch on from an arrived one. */
+export const X = '6f99096c-131e-42f4-ac89-702712ef1faf'
 /** Another session's conversation, running in another pane. */
 export const OTHER = 'c4b8e1d7-2a9f-4c6e-9b3a-7f0d5e2c8a1b'
 /** The claim a window launch takes. */
@@ -27,13 +29,14 @@ export const PROJECT = 'C--work-repo'
 export const ELSEWHERE = 'C:\\work\\other'
 export const ELSEWHERE_PROJECT = 'C--work-other'
 
-export type RawProcess = { pid: number; ppid: number; created: string; name: string; cls?: string; ids?: string[] }
+export type RawProcess = { pid: number; ppid: number; created: string; name: string; cls?: string; ids?: string[]; cli?: true }
 export type RawRegistry = { dir: number; file: number; ok: boolean; keys?: string[]; [key: string]: unknown }
 export type RawProbe = {
   v: 1
   self: number
   session: { pid: number; created: string } | null
-  slot: { pid: number; created: string; id: string; path: string; sha256: string | null } | null
+  slot: { pid: number; created: string; id: string; path: string; sha256: string | null; hashError?: string } | null
+  slotSeen?: true
   procs: RawProcess[]
   registry: RawRegistry[]
   transcripts: { id: string; dir: number; project: string; mtime: number }[]
@@ -44,7 +47,11 @@ export type RawProbe = {
   errors: string[]
 }
 
-/** A registry file of the shape verified on the machine: every one of its keys, and six of their values. procStart is a number, as Claude Code writes it. */
+/**
+ * A registry file of the shape Claude Code 2.1.318 writes: every key it was seen with, and the seven
+ * values the probe copies. procStart is a string of digits, the FILETIME exact, as 2.1.318 writes it
+ * (a number is still taken); version is Claude Code's version, a string.
+ */
 export const entry = (pid: number, sessionId: string, procStart: string | number, dir = 0): RawRegistry => ({
   dir,
   file: pid,
@@ -52,10 +59,11 @@ export const entry = (pid: number, sessionId: string, procStart: string | number
   keys: [...REGISTRY_KEYS],
   pid,
   sessionId,
-  procStart: Number(procStart),
+  procStart,
   status: 'idle',
   statusUpdatedAt: NOW - 60_000,
   kind: 'interactive',
+  version: '2.1.318',
 })
 
 /**
@@ -97,9 +105,19 @@ export function machine(change?: (probe: RawProbe) => void): RawProbe {
   return probe
 }
 
-/** The pane's parent as a slot runner whose script has the shipped hash; the claim then names it. */
-export function inSlot(probe: RawProbe, sha256: string | null = SLOT_SCRIPT_SHA256): void {
-  probe.slot = { pid: 20, created: ft(1), id: `20-${ft(1)}`, path: 'C:\\Users\\u\\AppData\\Local\\claude-self-tools\\claude-slot.ps1', sha256 }
+/**
+ * The pane's parent as a slot runner whose script has the shipped hash; the claim then names it. With
+ * `hashError`, the probe couldn't hash it, and says why.
+ */
+export function inSlot(probe: RawProbe, sha256: string | null = SLOT_SCRIPT_SHA256, hashError?: string): void {
+  probe.slot = {
+    pid: 20,
+    created: ft(1),
+    id: `20-${ft(1)}`,
+    path: 'C:\\Users\\u\\AppData\\Local\\claude-self-tools\\claude-slot.ps1',
+    sha256,
+    ...(hashError === undefined ? {} : { hashError }),
+  }
   if (sha256 === SLOT_SCRIPT_SHA256) {
     const by = `slot:20-${ft(1)}`
     probe.claim = { id: T, taken: true, by }

@@ -34,9 +34,9 @@
 // left waiting, and the person and the model are told so.
 import type { EngineInterface, Register } from 'claude-code'
 import type { Queued, Restart } from '../types'
-import { CLAIMED, encodeCommand, LAUNCHED, launcherScript, powershellPath, RELEASED, releaseScript, SESSION_ID, SLOTTED, stateFolder, SYSTEM_ROOT, WAIT_SECONDS } from './launcher'
+import { CLAIMED, FALLBACK, LAUNCHED, launcherScript, powershellPath, RELEASED, releaseScript, SESSION_ID, SLOTTED, stateFolder, SYSTEM_ROOT, WAIT_SECONDS } from './launcher'
 import type { AgentLike } from './machine'
-import { isSafeFolder, parseProbe, powershellArgv, probeScript, readGit, safePoint } from './machine'
+import { isSafeFolder, oneLine, parseProbe, powershellCall, probeScript, quoted, readGit, safePoint } from './machine'
 import { configureUpdateCheck, loadUpdateCheck, withUpdateNotice } from './update-check'
 
 const queued = { plugin: 'self-restart', key: 'queued' } as const
@@ -171,7 +171,8 @@ const PROBE_MS = 60_000
 async function notSafe($: EngineInterface, launch: { powershell: string; id: string; cwd: string }): Promise<string | undefined> {
   let probe: ReturnType<typeof parseProbe> | string
   try {
-    const run = await $.process.run(powershellArgv(launch.powershell, probeScript({ ids: [launch.id], configDirs: [] })), { cwd: launch.cwd, timeoutMs: PROBE_MS })
+    const call = powershellCall(launch.powershell, probeScript({ ids: [launch.id], configDirs: [] }))
+    const run = await $.process.run(call.argv, { stdin: call.stdin, cwd: launch.cwd, timeoutMs: PROBE_MS })
     probe = run.exitCode === 0 ? parseProbe(run.stdout) : `it exited ${run.exitCode}${brief(run.stderr) === '' ? '' : `: ${brief(run.stderr)}`}`
   } catch (err) {
     probe = `it didn't run: ${why(err)}`
@@ -274,8 +275,12 @@ async function refuse($: EngineInterface, toast: string, note: string): Promise<
   await tellModel($, note)
 }
 
-/** The row the model reads in the restarted session: why it restarted. */
-const record = ({ reason }: Queued): string => `This session restarted at its own request (restart_after_turn). Reason: ${reason}`
+/**
+ * The row the model reads in the restarted session: why it restarted, and, when this pane's slot
+ * runner was passed over for a new window, why (the launcher's own words, quoted).
+ */
+const record = ({ reason }: Queued, fallback?: string): string =>
+  `This session restarted at its own request (restart_after_turn). Reason: ${reason}${fallback === undefined ? '' : ` It restarted in a new window, not this pane's slot: ${quoted(fallback)}.`}`
 
 /**
  * A queued restart that a new turn took back, told to the model in a plugin row, never lost silently;
@@ -339,8 +344,11 @@ async function restartNow($: EngineInterface, value: Queued): Promise<void> {
   await keep($, launch.id, kept)
   let opened: string | undefined
   let slot: string | undefined
+  let fallback: string | undefined
   try {
-    const run = await $.process.run([launch.powershell, '-NoProfile', '-NonInteractive', '-EncodedCommand', encodeCommand(launcherScript(launch.id))], {
+    const call = powershellCall(launch.powershell, launcherScript(launch.id))
+    const run = await $.process.run(call.argv, {
+      stdin: call.stdin,
       cwd: launch.cwd,
       timeoutMs: LAUNCH_MS,
     })
@@ -352,6 +360,9 @@ async function restartNow($: EngineInterface, value: Queued): Promise<void> {
       // The claim the launcher took: the resumed session's copy of this plugin releases it.
       const claim = CLAIMED.exec(run.stdout)?.[1]
       if (claim !== undefined) await keep($, launch.id, { ...kept, claim })
+      // A slot runner found but not used: the launcher says why, and so does the restart.
+      const passed = slot === undefined ? FALLBACK.exec(run.stdout)?.[1] : undefined
+      if (passed !== undefined) fallback = oneLine(passed, 300)
     }
   } catch (err) {
     opened = `the launcher didn't run: ${why(err)}`
@@ -385,9 +396,11 @@ async function restartNow($: EngineInterface, value: Queued): Promise<void> {
     return
   }
   armed = undefined
-  await tellModel($, record(value))
+  await tellModel($, record(value, fallback))
   $.ui.log(`Restarting at the session's own request: ${value.reason}`)
-  $.ui.toast(`Restarting: ${slot === undefined ? 'a new window' : "this pane's slot"} resumes this session once it has exited. ${value.reason}`)
+  if (fallback !== undefined) $.ui.log(`this pane's slot runner isn't used: ${fallback}. A new window resumes the session.`)
+  const where = slot !== undefined ? "this pane's slot" : 'a new window'
+  $.ui.toast(`Restarting: ${where} resumes this session once it has exited${fallback === undefined ? '' : `, not this pane's slot (${fallback})`}. ${value.reason}`)
   try {
     await $.command.run({ command: 'exit' })
   } catch (err) {
@@ -417,14 +430,15 @@ async function release($: EngineInterface, id: string, claim: string): Promise<v
     const root = await $.env.get('SystemRoot')
     const local = await $.env.get('LOCALAPPDATA')
     if (root === undefined || !SYSTEM_ROOT.test(root) || !isSafeFolder(local)) return
-    const run = await $.process.run(powershellArgv(powershellPath(root), releaseScript({ stateDir: stateFolder(local), id, by: claim })), { timeoutMs: RELEASE_MS })
+    const call = powershellCall(powershellPath(root), releaseScript({ stateDir: stateFolder(local), id, by: claim }))
+    const run = await $.process.run(call.argv, { stdin: call.stdin, timeoutMs: RELEASE_MS })
     const said = run.exitCode === 0 ? RELEASED.exec(run.stdout)?.[1] : undefined
     if (said !== 'released' && said !== 'absent' && said !== 'not-ours') {
       const what = said === 'busy' ? 'another process had it open throughout' : `exit ${run.exitCode}`
-      $.ui.log(`self-restart: the claim lock on ${id} wasn't released (${what}); it is left in place, and goes stale 15 minutes after the old process exited.`)
+      $.ui.log(`the claim lock on ${id} wasn't released (${what}); it is left in place, and goes stale 15 minutes after the old process exited.`)
     }
   } catch (err) {
-    $.ui.log(`self-restart: the claim lock on ${id} wasn't released (${why(err)}); it goes stale 15 minutes after the old process exited.`)
+    $.ui.log(`the claim lock on ${id} wasn't released (${why(err)}); it goes stale 15 minutes after the old process exited.`)
   }
 }
 
@@ -516,7 +530,7 @@ export const register: Register = (on, options) => {
     $.ui.status('restart queued for when this turn ends')
     const then = resume === undefined ? 'then waits for the next message' : `then resumes with: ${resume}`
     return {
-      result: `Queued. Once this turn ends, a new terminal window opens in the folder this session started in, this session exits, and the window resumes it once this process has gone; the reason is recorded in the transcript: ${reason}. The restarted session ${then}. On anything but Windows nothing runs, and you are told on your next turn.`,
+      result: `Queued. Once this turn ends, a new terminal window opens in the folder this session started in, this session exits, and the window resumes it once this process has gone; the reason is recorded in the transcript: ${reason}. The restarted session ${then}. In a pane running self-switch's slot runner, the pane resumes it instead; when that slot can't be used, the restart says why. On anything but Windows nothing runs, and you are told on your next turn.`,
     }
   }).catch(($, e, next) => (next.called ? next(e) : { deny: 'self-restart: queuing the restart failed; nothing is queued.' }))
 

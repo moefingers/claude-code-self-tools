@@ -50,7 +50,8 @@ function Get-Live($id, $configDirs) {
   $live = $null
   $procs = @{}
   foreach ($p in (Get-CimInstance -ClassName Win32_Process -Property ProcessId, Name, CreationDate, CommandLine)) { $procs[[int]$p.ProcessId] = $p }
-  foreach ($p in $procs.Values) { if ($null -eq $live -and $p.ProcessId -ne $PID -and "$($p.CommandLine)" -match "(^|[\s\x22])(--resume|--session-id|-r)(\s+|=)[\x22\x27]?$id") { $live = "it is open elsewhere: process $($p.ProcessId) names it on its command line (L2)" } }
+  $snapshotFt = [DateTime]::UtcNow.ToFileTimeUtc()
+  $elsewhere = @{}
   foreach ($dir in $configDirs) {
     $reg = Join-Path $dir "sessions"
     if ($null -ne $live -or -not (Test-Path -LiteralPath $reg -PathType Container)) { continue }
@@ -65,9 +66,21 @@ function Get-Live($id, $configDirs) {
         if ($null -eq $e -and $try -lt 3) { Start-Sleep -Milliseconds 250 }
       }
       if ($null -eq $e) { $live = "whether it is open elsewhere is unknown: the registry file of Claude Code $($f.BaseName) could not be read, three times, or has another shape"; break }
-      if ($e.sessionId -ceq $id -and [math]::Abs([double]$p.CreationDate.ToFileTimeUtc() - [double]$e.procStart) -le 10000) { $live = "it is open elsewhere: Claude Code $($f.BaseName) holds it (L1)"; break }
+      $near = $false
+      try { $near = [math]::Abs([double]$p.CreationDate.ToFileTimeUtc() - [double]$e.procStart) -le 10000 } catch { $near = $false }
+      if ($e.sessionId -eq $id) {
+        if ($near) { $live = "it is open elsewhere: Claude Code $($f.BaseName) holds it (L1)" } else { $live = "it may be open elsewhere: the registry file of running Claude Code $($f.BaseName) names it, though its procStart is not that process start time (a stale file, or a format this check does not know)" }
+        break
+      }
+      $named = $false
+      foreach ($prop in $e.PSObject.Properties) { if ($prop.Name -cne "sessionId" -and $prop.Name -cne "cwd" -and $prop.Name -cne "name" -and "$(ConvertTo-Json -InputObject $prop.Value -Compress -Depth 8)".IndexOf($id, [StringComparison]::OrdinalIgnoreCase) -ge 0) { $named = $true } }
+      if ($named) { $live = "it may be open elsewhere: the registry file of running Claude Code $($f.BaseName) names it outside its sessionId"; break }
+      $pidOk = $false
+      try { $pidOk = [long]$e.pid -eq [long]$p.ProcessId } catch { $pidOk = $false }
+      if ($near -and $pidOk -and ($snapshotFt - [long]$p.CreationDate.ToFileTimeUtc()) -gt 600000000 -and $e.sessionId -match "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\z") { $elsewhere[[int]$p.ProcessId] = $true }
     }
   }
+  if ($null -eq $live) { foreach ($p in $procs.Values) { if ($null -eq $live -and $p.ProcessId -ne $PID -and -not $elsewhere.ContainsKey([int]$p.ProcessId) -and "$($p.CommandLine)" -match "(^|[\s\x22])(--resume|--session-id|-r)(\s+|=)[\x22\x27]?$id") { $live = "it is open elsewhere: process $($p.ProcessId) names it on its command line (L2)" } } }
   return $live
 }
 
@@ -93,6 +106,11 @@ function Get-Next {
   $why = $null
   $record = $null
   try { $record = $text | ConvertFrom-Json } catch { $why = 'it is not JSON' }
+  # A switch or restart that took its record back overwrote it so (a plugin can't delete a file).
+  if ($null -eq $why -and $null -ne $record -and $record.cancelled -is [bool] -and $record.cancelled) {
+    Write-Host 'The switch that left this record was withdrawn; nothing to do.'
+    return $null
+  }
   $now = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
   if ($null -eq $why -and ($null -eq $record -or $record.v -ne 1 -or $record.resume -isnot [string] -or $record.resume -cnotmatch $SessionId)) { $why = 'it names no conversation by its id' }
   if ($null -eq $why -and ($record.at -isnot [ValueType] -or ($now - [double]$record.at) -gt $MaxAgeMs -or ($now - [double]$record.at) -lt -5000 -or ([datetime]::UtcNow - $written).TotalMilliseconds -gt $MaxAgeMs)) { $why = 'it is more than 120 seconds old' }
