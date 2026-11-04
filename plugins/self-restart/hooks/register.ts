@@ -18,7 +18,12 @@
 // dropped: the window had given up, and the session was resumed later by hand.
 //
 // It refuses while a subagent is running, whose work would end with this process; checked at the
-// call and again right before the launch.
+// call, again right before the launch, and again right before the exit.
+//
+// The exit waits for the session to be idle, so a message that arrives between the turn's end and the
+// exit would start a turn the exit then cuts off. A main-loop turn that starts before the exit has
+// started cancels the restart, as an interrupted turn does. If the window has opened by then, it is
+// left waiting, and the person and the model are told so.
 import type { EngineInterface, Register } from 'claude-code'
 import type { Queued, Restart } from '../types'
 import { encodeCommand, LAUNCHED, launcherScript, powershellPath, SESSION_ID, SYSTEM_ROOT, WAIT_SECONDS } from './launcher'
@@ -57,6 +62,12 @@ const SUBAGENT =
 
 /** Whether this session runs in a terminal with a person at its prompt; read at each session.start. */
 let isTerminal = true
+
+/**
+ * The restart the last turn's end armed, until its exit starts; a main-loop turn that starts first
+ * takes it back. Module state, as the timer that runs it is.
+ */
+let armed: Queued | undefined
 
 /** Trimmed text, or undefined when it is not a string or is blank. */
 function text(raw: unknown): string | undefined {
@@ -175,17 +186,22 @@ const record = ({ reason }: Queued): string => `This session restarted at its ow
 
 /** Opens the window, then exits; says so at each step that didn't go ahead. */
 async function restartNow($: EngineInterface, value: Queued): Promise<void> {
+  if (armed !== value) return
   $.ui.status(undefined)
   const stop = blocked(await busyAgents($))
   if (stop !== undefined) {
+    armed = undefined
     await refuse($, `Restart cancelled: ${stop}.`, `The restart you queued didn't run: ${stop}. The session goes on; call restart_after_turn again once they have reported.`)
     return
   }
   const launch = await plan($)
   if ('refusal' in launch) {
+    armed = undefined
     await refuse($, `Restart didn't run: ${launch.refusal}.`, `The restart you queued didn't run: ${launch.refusal}. The session goes on.`)
     return
   }
+  // A turn that started while the checks above ran has taken it back, and said so.
+  if (armed !== value) return
   // Kept before the window opens: the process it starts reads it once this one has exited.
   const kept: Restart = { at: await $.clock.now(), ...value }
   await keep($, launch.id, kept)
@@ -202,10 +218,25 @@ async function restartNow($: EngineInterface, value: Queued): Promise<void> {
     opened = `the launcher didn't run: ${why(err)}`
   }
   if (opened !== undefined) {
+    if (armed === value) armed = undefined
     await keep($, launch.id, null)
     await refuse($, `Restart didn't run: ${opened}`, `The restart you queued didn't run, and no window opened (${opened}). The session goes on.`)
     return
   }
+  // Right before the exit: a turn that started meanwhile, or a subagent, leaves the window waiting.
+  const late = armed !== value ? 'a new turn started' : blocked(await busyAgents($))
+  if (late !== undefined || armed !== value) {
+    armed = undefined
+    await keep($, launch.id, null)
+    const minutes = WAIT_SECONDS / 60
+    await refuse(
+      $,
+      `Restart stopped before the exit: ${late ?? 'a new turn started'}. Its window waits up to ${minutes} minutes for this session to exit, then gives up; close it, or exit (/exit) to resume there.`,
+      `The restart's window opened, but this session didn't exit: ${late ?? 'a new turn started'}. The session goes on. The window waits up to ${minutes} minutes for this process to exit, then resumes the session there, or gives up and says so; the person can close it.`,
+    )
+    return
+  }
+  armed = undefined
   await tellModel($, record(value))
   $.ui.log(`Restarting at the session's own request: ${value.reason}`)
   $.ui.toast(`Restarting: a new window resumes this session once it has exited. ${value.reason}`)
@@ -320,7 +351,19 @@ export const register: Register = (on, options) => {
       $.ui.toast("Restart cancelled: the turn didn't finish.")
       return done
     }
+    armed = value
     $.clock.after(SETTLE_MS, () => void restartNow($, value))
     return done
+  })
+
+  // A message that starts a turn before the restart's exit has started takes the restart back.
+  on('turn.start', async ($, e, next) => {
+    const started = await next(e)
+    if (e.agentId !== undefined || armed === undefined) return started
+    armed = undefined
+    $.ui.status(undefined)
+    $.ui.toast('Restart cancelled: a new turn started before this session exited.')
+    void tellModel($, "The restart you queued didn't go ahead: a new turn started before this session exited. The session goes on; call restart_after_turn again at the next break.")
+    return started
   })
 }

@@ -12,6 +12,10 @@
 //
 // It refuses while a subagent is running: its result would come back to a conversation that no
 // longer knows why it asked. That is checked at the call and again right before the command runs.
+//
+// The command waits for the session to be idle, so a message that arrives between the turn's end and
+// the command would start a turn the clear then wipes. A main-loop turn that starts before the
+// command has started cancels the clear, as an interrupted turn does.
 import type { EngineInterface, Register } from 'claude-code'
 import type { Queued } from '../types'
 import { configureUpdateCheck, loadUpdateCheck, withUpdateNotice } from './update-check'
@@ -35,6 +39,12 @@ const DESCRIPTION = [
 
 const SUBAGENT =
   "A subagent can't clear the session's conversation. Finish your piece and return its result, saying the next piece can start from a cleared context: the main session can clear."
+
+/**
+ * The clear the last turn's end armed, until its command starts; a main-loop turn that starts first
+ * takes it back. Module state, as the timer that runs it is.
+ */
+let armed: Queued | undefined
 
 /** Trimmed text, or undefined when it is not a string or is blank. */
 function text(raw: unknown): string | undefined {
@@ -83,7 +93,9 @@ async function sessionId($: EngineInterface): Promise<string | undefined> {
 }
 
 /** Runs the clear, then sends the handoff as the cleared conversation's first prompt. */
-async function clearNow($: EngineInterface, { handoff }: Queued): Promise<void> {
+async function clearNow($: EngineInterface, value: Queued): Promise<void> {
+  if (armed !== value) return
+  const { handoff } = value
   $.ui.status(undefined)
   const stop = blocked(await busyAgents($))
   if (stop !== undefined) {
@@ -92,6 +104,9 @@ async function clearNow($: EngineInterface, { handoff }: Queued): Promise<void> 
     return
   }
   const before = await sessionId($)
+  // A turn that started while the checks above ran has taken it back, and said so.
+  if (armed !== value) return
+  armed = undefined
   try {
     await $.command.run({ command: 'clear' })
   } catch (err) {
@@ -174,7 +189,19 @@ export const register: Register = (on, options) => {
       $.ui.toast("Clear cancelled: the turn didn't finish.")
       return done
     }
+    armed = value
     $.clock.after(SETTLE_MS, () => void clearNow($, value))
     return done
+  })
+
+  // A message that starts a turn before the clear's command has started takes the clear back.
+  on('turn.start', async ($, e, next) => {
+    const started = await next(e)
+    if (e.agentId !== undefined || armed === undefined) return started
+    armed = undefined
+    $.ui.status(undefined)
+    $.ui.toast('Clear cancelled: a new turn started before it ran.')
+    void tellModel($, "The clear you queued didn't run: a new turn started before it could. The conversation is as it was; call clear_after_turn again at the next break.")
+    return started
   })
 }

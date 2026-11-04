@@ -41,6 +41,7 @@ function engine(on: On, { exit = 'exits', agents = [] }: Options = {}) {
     prompts.push(e.text)
     return { text: e.text }
   })
+  on('turn.start', (_, e) => ({ turnId: e.turnId }))
   on('turn.complete', () => ({ text: 'done' }))
   on('command.run', async (_, e, next) => {
     commands.push(e.command)
@@ -142,6 +143,39 @@ test('a session no one is at the prompt of is refused', async ($, on) => {
   await $.turn.complete(answered)
   await clock.advance(1000)
   expect(commands).toEqual([])
+})
+
+test('a message that starts a turn before the exit has run cancels it, and says so', async ($, on) => {
+  const { commands, toasts, session, clock } = engine(on)
+  await $.session.start(start)
+
+  await $.tool.call({ tool: TOOL, reason: 'Done.' })
+  await $.turn.complete(answered)
+  // The person's next message starts its turn before the queued command has run.
+  await $.turn.start({ text: 'one more thing', turnId: 't2' })
+  await clock.advance(60_000)
+  expect(commands).toEqual([])
+  expect(toasts.some(t => /Exit cancelled: a new turn started/.test(t))).toBe(true)
+  const rows = JSON.stringify(session.appended())
+  expect(rows).toMatch(/exit you queued didn't run: a new turn started/)
+  expect(rows).not.toMatch(/ended at its own request/)
+})
+
+test("a subagent's turn, starting or ending, leaves the queued exit alone", async ($, on) => {
+  const { commands, toasts, clock } = engine(on)
+  await $.session.start(start)
+
+  await $.tool.call({ tool: TOOL, reason: 'Done.' })
+  // A subagent's turn ends before the main one: the exit stays queued, and doesn't run yet.
+  await $.turn.complete({ ...answered, turnId: 'a-t1', agentId: 'a1' })
+  await clock.advance(60_000)
+  expect(commands).toEqual([])
+  // The main turn ends; a subagent's turn that starts then doesn't take the exit back.
+  await $.turn.complete(answered)
+  await $.turn.start({ text: '', turnId: 'a-t2', agentId: 'a1' })
+  await clock.advance(1000)
+  expect(commands).toEqual(['exit'])
+  expect(toasts.some(t => /cancelled/.test(t))).toBe(false)
 })
 
 test('an interrupted turn cancels the exit', async ($, on) => {

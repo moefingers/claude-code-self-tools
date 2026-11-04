@@ -23,6 +23,8 @@ type Options = {
   agents?: { description: string; status: AgentStatus }[]
   /** What the plugin's store holds at the start. */
   store?: Record<string, unknown>
+  /** How long the launcher takes to open the window, in milliseconds. */
+  launchMs?: number
 }
 
 /** Base64 back to text, as PowerShell reads an -EncodedCommand: UTF-16LE. */
@@ -41,7 +43,7 @@ function decode(encoded: string): string {
 }
 
 /** The engine beneath the plugin: its environment, session id, store and agents; and what it was asked to run. */
-function engine(on: On, { env = WINDOWS, id = ID, launcher = 'opens', exit = 'exits', agents = [], store = {} }: Options = {}) {
+function engine(on: On, { env = WINDOWS, id = ID, launcher = 'opens', exit = 'exits', agents = [], store = {}, launchMs = 0 }: Options = {}) {
   const runs: Run[] = []
   const commands: string[] = []
   const prompts: string[] = []
@@ -82,9 +84,11 @@ function engine(on: On, { env = WINDOWS, id = ID, launcher = 'opens', exit = 'ex
     prompts.push(e.text)
     return { text: e.text }
   })
+  on('turn.start', (_, e) => ({ turnId: e.turnId }))
   on('turn.complete', () => ({ text: 'done' }))
-  on('process.run', (_, e) => {
+  on('process.run', async (_, e) => {
     runs.push({ argv: [...e.argv], init: e.init === undefined ? undefined : { ...e.init } })
+    if (launchMs > 0) await clock.sleep(launchMs)
     if (launcher === 'throws') return { deny: 'spawn EPERM' }
     if (launcher === 'fails') return { value: { exitCode: 3, stdout: 'self-restart: no claude.exe above this launcher\r\n', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
     return { value: { exitCode: 0, stdout: 'launched 17716\r\n', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
@@ -299,6 +303,71 @@ test('a session not run in a terminal is refused', async ($, on) => {
   await $.turn.complete(answered)
   await clock.advance(1000)
   expect(runs).toEqual([])
+})
+
+test('a message that starts a turn before the restart has begun cancels it, and says so', async ($, on) => {
+  const { runs, commands, toasts, session, held, clock } = engine(on)
+  await $.session.start(start)
+
+  await $.tool.call({ tool: TOOL, reason: 'Switched accounts.', resume: 'Go on.' })
+  await $.turn.complete(answered)
+  await $.turn.start({ text: 'one more thing', turnId: 't2' })
+  await clock.advance(60_000)
+  expect(runs).toEqual([])
+  expect(commands).toEqual([])
+  expect(toasts.some(t => /Restart cancelled: a new turn started/.test(t))).toBe(true)
+  expect(JSON.stringify(session.appended())).toMatch(/restart you queued didn't go ahead: a new turn started/)
+  expect(held.get('restarts')).toBeUndefined()
+})
+
+test('a message that starts a turn while the window opens stops the exit, and the window is said to wait', async ($, on) => {
+  const { runs, commands, toasts, session, held, clock } = engine(on, { launchMs: 2000 })
+  await $.session.start(start)
+
+  await $.tool.call({ tool: TOOL, reason: 'Switched accounts.', resume: 'Go on.' })
+  await $.turn.complete(answered)
+  await clock.advance(1000)
+  expect(runs).toHaveLength(1)
+  await $.turn.start({ text: 'one more thing', turnId: 't2' })
+  await clock.advance(60_000)
+  expect(commands).toEqual([])
+  expect(toasts.some(t => /Restart stopped before the exit: a new turn started/.test(t))).toBe(true)
+  const rows = JSON.stringify(session.appended())
+  expect(rows).toMatch(/window opened, but this session didn't exit: a new turn started/)
+  expect(rows).not.toMatch(/restarted at its own request/)
+  // The first prompt is taken back: the window may still resume the session if the person exits.
+  expect(held.get('restarts')).toEqual({})
+})
+
+test('a subagent that starts while the window opens stops the exit', async ($, on) => {
+  const { commands, toasts, world, clock } = engine(on, { launchMs: 2000 })
+  await $.session.start(start)
+
+  await $.tool.call({ tool: TOOL, reason: 'Switched accounts.' })
+  await $.turn.complete(answered)
+  await clock.advance(1000)
+  world.agents = [{ description: 'Lint', status: 'running' }]
+  await clock.advance(60_000)
+  expect(commands).toEqual([])
+  expect(toasts.some(t => /Restart stopped before the exit: a subagent is still running \(Lint\)/.test(t))).toBe(true)
+})
+
+test("a subagent's turn, starting or ending, leaves the queued restart alone", async ($, on) => {
+  const { runs, commands, toasts, clock } = engine(on)
+  await $.session.start(start)
+
+  await $.tool.call({ tool: TOOL, reason: 'Switched accounts.' })
+  // A subagent's turn ends before the main one: the restart stays queued, and doesn't run yet.
+  await $.turn.complete({ ...answered, turnId: 'a-t1', agentId: 'a1' })
+  await clock.advance(60_000)
+  expect(runs).toEqual([])
+  // The main turn ends; a subagent's turn that starts then doesn't take the restart back.
+  await $.turn.complete(answered)
+  await $.turn.start({ text: '', turnId: 'a-t2', agentId: 'a1' })
+  await clock.advance(1000)
+  expect(runs).toHaveLength(1)
+  expect(commands).toEqual(['exit'])
+  expect(toasts.some(t => /cancelled|stopped/.test(t))).toBe(false)
 })
 
 test('an interrupted turn cancels the restart', async ($, on) => {

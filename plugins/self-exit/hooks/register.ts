@@ -12,6 +12,10 @@
 // It refuses while a subagent is running, whose work would end with the session; checked at the
 // call and again right before the command runs. Background tasks can't be listed, so the
 // description warns about them.
+//
+// The command waits for the session to be idle, so a message that arrives between the turn's end and
+// the command would start a turn the exit then cuts off. A main-loop turn that starts before the
+// command has started cancels the exit, as an interrupted turn does.
 import type { EngineInterface, Register } from 'claude-code'
 import type { Queued } from '../types'
 import { configureUpdateCheck, loadUpdateCheck, withUpdateNotice } from './update-check'
@@ -39,6 +43,12 @@ const SUBAGENT =
 
 /** Whether a person is at this session's prompt; read at each session.start. */
 let isInteractive = true
+
+/**
+ * The exit the last turn's end armed, until its command starts; a main-loop turn that starts first
+ * takes it back. Module state, as the timer that runs it is.
+ */
+let armed: Queued | undefined
 
 /** Trimmed text, or undefined when it is not a string or is blank. */
 function text(raw: unknown): string | undefined {
@@ -86,13 +96,18 @@ const record = ({ reason, note }: Queued): string =>
 
 /** Logs the reason, then runs the exit; says so when it didn't run, or the session is still here after it. */
 async function exitNow($: EngineInterface, value: Queued): Promise<void> {
+  if (armed !== value) return
   $.ui.status(undefined)
   const stop = blocked(await busyAgents($))
   if (stop !== undefined) {
+    armed = undefined
     $.ui.toast(`Exit cancelled: ${stop}.`)
     await tellModel($, `The exit you queued didn't run: ${stop}. The session goes on; call exit_after_turn again once they have reported.`)
     return
   }
+  // A turn that started while the check above ran has taken it back, and said so.
+  if (armed !== value) return
+  armed = undefined
   await tellModel($, record(value))
   $.ui.log(`Exiting at the session's own request: ${value.reason}`)
   $.ui.toast(`Exiting: ${value.reason}`)
@@ -169,7 +184,19 @@ export const register: Register = (on, options) => {
       $.ui.toast("Exit cancelled: the turn didn't finish.")
       return done
     }
+    armed = value
     $.clock.after(SETTLE_MS, () => void exitNow($, value))
     return done
+  })
+
+  // A message that starts a turn before the exit's command has started takes the exit back.
+  on('turn.start', async ($, e, next) => {
+    const started = await next(e)
+    if (e.agentId !== undefined || armed === undefined) return started
+    armed = undefined
+    $.ui.status(undefined)
+    $.ui.toast('Exit cancelled: a new turn started before it ran.')
+    void tellModel($, "The exit you queued didn't run: a new turn started before it could. The session goes on; call exit_after_turn again when the work is done.")
+    return started
   })
 }
