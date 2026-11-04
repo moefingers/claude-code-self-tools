@@ -44,7 +44,7 @@ function Get-Live($id, $configDirs) {
   $live = $null
   $procs = @{}
   foreach ($p in (Get-CimInstance -ClassName Win32_Process -Property ProcessId, Name, CreationDate, CommandLine)) { $procs[[int]$p.ProcessId] = $p }
-  foreach ($p in $procs.Values) { if ($null -eq $live -and $p.ProcessId -ne $PID -and "$($p.CommandLine)" -match "(^|[\s\x22])(--resume|--session-id|-r)(\s+|=)[\x22\x27]?$id") { $live = "process $($p.ProcessId) names it on its command line (L2)" } }
+  foreach ($p in $procs.Values) { if ($null -eq $live -and $p.ProcessId -ne $PID -and "$($p.CommandLine)" -match "(^|[\s\x22])(--resume|--session-id|-r)(\s+|=)[\x22\x27]?$id") { $live = "it is open elsewhere: process $($p.ProcessId) names it on its command line (L2)" } }
   foreach ($dir in $configDirs) {
     $reg = Join-Path $dir "sessions"
     if ($null -ne $live -or -not (Test-Path -LiteralPath $reg -PathType Container)) { continue }
@@ -52,9 +52,14 @@ function Get-Live($id, $configDirs) {
       $p = $null
       if ($f.BaseName -match "^\d{1,10}\z") { $p = $procs[[int]$f.BaseName] }
       if ($null -eq $p -or $p.Name -ne "claude.exe") { continue }
-      $e = Get-Content -LiteralPath $f.FullName -Raw -Encoding UTF8 | ConvertFrom-Json
-      if ($e.sessionId -isnot [string] -or $null -eq $e.procStart) { $live = "the registry file of Claude Code $($f.BaseName) has another shape"; break }
-      if ($e.sessionId -ceq $id -and [math]::Abs([double]$p.CreationDate.ToFileTimeUtc() - [double]$e.procStart) -le 10000) { $live = "Claude Code $($f.BaseName) holds it (L1)"; break }
+      $e = $null
+      for ($try = 1; $try -le 3 -and $null -eq $e; $try++) {
+        try { $e = Get-Content -LiteralPath $f.FullName -Raw -Encoding UTF8 | ConvertFrom-Json } catch { $e = $null }
+        if ($null -ne $e -and ($e.sessionId -isnot [string] -or $null -eq $e.procStart)) { $e = $null }
+        if ($null -eq $e -and $try -lt 3) { Start-Sleep -Milliseconds 250 }
+      }
+      if ($null -eq $e) { $live = "whether it is open elsewhere is unknown: the registry file of Claude Code $($f.BaseName) could not be read, three times, or has another shape"; break }
+      if ($e.sessionId -ceq $id -and [math]::Abs([double]$p.CreationDate.ToFileTimeUtc() - [double]$e.procStart) -le 10000) { $live = "it is open elsewhere: Claude Code $($f.BaseName) holds it (L1)"; break }
     }
   }
   return $live
@@ -95,11 +100,12 @@ function Get-Next {
     $dirs = @()
     if ($env:CLAUDE_CONFIG_DIR) { $dirs += $env:CLAUDE_CONFIG_DIR } else { $dirs += (Join-Path $HOME '.claude') }
     foreach ($d in @($record.configDirs)) { if (Test-Folder $d) { $dirs += $d } }
-    try { $live = Get-Live $record.resume $dirs } catch { $live = 'the registry or the process table could not be read (' + $_.Exception.Message + ')' }
-    if ($null -ne $live) { $why = 'it is open elsewhere: ' + $live }
+    try { $live = Get-Live $record.resume $dirs } catch { $live = 'whether it is open elsewhere is unknown: the registry or the process table could not be read (' + $_.Exception.Message + ')' }
+    if ($null -ne $live) { $why = $live }
   }
   if ($null -ne $why) {
     Write-Host ('A record to resume a conversation in this pane was not used: ' + $why + '.')
+    if ($null -ne $record -and $record.resume -is [string] -and $record.resume -cmatch $SessionId) { Write-Host ('Once it is safe, resume it yourself: claude --resume ' + $record.resume) }
     return $null
   }
   return $record

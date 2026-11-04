@@ -232,7 +232,7 @@ export const REGISTRY_KEYS = [
 ] as const
 
 /** The SHA-256 of plugins/self-switch/slot/claude-slot.ps1, as it is committed. */
-export const SLOT_SCRIPT_SHA256 = '6ec7c6ef94de64c1a4581ab44f78deb6edbd29d1d39e3924d335fca86d9356f2'
+export const SLOT_SCRIPT_SHA256 = 'f23eabd892f4b1bfedada224a8dbb27b82f2da97a8dc64b01bedfe5cadbf1f18'
 
 /**
  * The variables Claude Code sets in the processes it starts, which a top-level claude must not inherit:
@@ -364,15 +364,17 @@ const TAKE_CLAIM = [
 /**
  * The last-moment re-check, in the launcher's window and the slot runner: whether a running Claude
  * Code holds conversation `$id` now, read from `$configDirs`' registries (L1) and every process's
- * command line (L2). Sets `$live`, null when nothing holds it. A registry file of a running claude.exe
- * that can't be read throws, and a caller that catches it resumes nothing. No single quote in these
- * lines: the launcher carries each inside one.
+ * command line (L2). Sets `$live`, null when nothing holds it, else a line saying why it isn't resumed.
+ * A registry file of a running claude.exe that can't be read, or reads in another shape, is read again
+ * twice, 250 ms apart (Claude Code may be rewriting it), and then counts as unknown, which resumes
+ * nothing. Anything else that can't be read throws, and a caller that catches it resumes nothing. No
+ * single quote in these lines: the launcher carries each inside one.
  */
 export const RECHECK = [
   '$live = $null',
   '$procs = @{}',
   'foreach ($p in (Get-CimInstance -ClassName Win32_Process -Property ProcessId, Name, CreationDate, CommandLine)) { $procs[[int]$p.ProcessId] = $p }',
-  String.raw`foreach ($p in $procs.Values) { if ($null -eq $live -and $p.ProcessId -ne $PID -and "$($p.CommandLine)" -match "(^|[\s\x22])(--resume|--session-id|-r)(\s+|=)[\x22\x27]?$id") { $live = "process $($p.ProcessId) names it on its command line (L2)" } }`,
+  String.raw`foreach ($p in $procs.Values) { if ($null -eq $live -and $p.ProcessId -ne $PID -and "$($p.CommandLine)" -match "(^|[\s\x22])(--resume|--session-id|-r)(\s+|=)[\x22\x27]?$id") { $live = "it is open elsewhere: process $($p.ProcessId) names it on its command line (L2)" } }`,
   'foreach ($dir in $configDirs) {',
   '  $reg = Join-Path $dir "sessions"',
   '  if ($null -ne $live -or -not (Test-Path -LiteralPath $reg -PathType Container)) { continue }',
@@ -380,9 +382,14 @@ export const RECHECK = [
   '    $p = $null',
   String.raw`    if ($f.BaseName -match "^\d{1,10}\z") { $p = $procs[[int]$f.BaseName] }`,
   '    if ($null -eq $p -or $p.Name -ne "claude.exe") { continue }',
-  '    $e = Get-Content -LiteralPath $f.FullName -Raw -Encoding UTF8 | ConvertFrom-Json',
-  '    if ($e.sessionId -isnot [string] -or $null -eq $e.procStart) { $live = "the registry file of Claude Code $($f.BaseName) has another shape"; break }',
-  `    if ($e.sessionId -ceq $id -and [math]::Abs([double]$p.CreationDate.ToFileTimeUtc() - [double]$e.procStart) -le ${PROC_START_TOLERANCE}) { $live = "Claude Code $($f.BaseName) holds it (L1)"; break }`,
+  '    $e = $null',
+  '    for ($try = 1; $try -le 3 -and $null -eq $e; $try++) {',
+  '      try { $e = Get-Content -LiteralPath $f.FullName -Raw -Encoding UTF8 | ConvertFrom-Json } catch { $e = $null }',
+  '      if ($null -ne $e -and ($e.sessionId -isnot [string] -or $null -eq $e.procStart)) { $e = $null }',
+  '      if ($null -eq $e -and $try -lt 3) { Start-Sleep -Milliseconds 250 }',
+  '    }',
+  '    if ($null -eq $e) { $live = "whether it is open elsewhere is unknown: the registry file of Claude Code $($f.BaseName) could not be read, three times, or has another shape"; break }',
+  `    if ($e.sessionId -ceq $id -and [math]::Abs([double]$p.CreationDate.ToFileTimeUtc() - [double]$e.procStart) -le ${PROC_START_TOLERANCE}) { $live = "it is open elsewhere: Claude Code $($f.BaseName) holds it (L1)"; break }`,
   '  }',
   '}',
 ] as const
@@ -507,7 +514,11 @@ export function probeScript(input: ProbeInput): string {
     String.raw`      if ($f.BaseName -notmatch "^\d{1,10}\z") { continue }`,
     '      $o = [ordered]@{ dir = $k; file = [long]$f.BaseName; ok = $false }',
     '      $e = $null',
-    '      try { $e = Get-Content -LiteralPath $f.FullName -Raw -Encoding UTF8 | ConvertFrom-Json } catch { $e = $null }',
+    // Read again twice, 250 ms apart, when it doesn't parse: Claude Code may be rewriting it.
+    '      for ($try = 1; $try -le 3 -and $e -isnot [Management.Automation.PSCustomObject]; $try++) {',
+    '        if ($try -gt 1) { Start-Sleep -Milliseconds 250 }',
+    '        try { $e = Get-Content -LiteralPath $f.FullName -Raw -Encoding UTF8 | ConvertFrom-Json } catch { $e = $null }',
+    '      }',
     '      if ($e -is [Management.Automation.PSCustomObject]) {',
     '        $o["ok"] = $true',
     '        $o["keys"] = [object[]]@($e.PSObject.Properties | ForEach-Object { $_.Name })',
@@ -1221,8 +1232,8 @@ export function launcherScript(id: string, options?: LaunchOptions): string {
     "  '  $live = $null',",
     "  '  try {',",
     ...RECHECK.map(line => `  '    ${line}',`),
-    "  '  } catch { $live = \"the registry or the process table could not be read (\" + $_.Exception.Message + \")\" }',",
-    "  '  if ($null -ne $live) { $refusal = \"The session is not resumed here: it is open elsewhere, \" + $live + \".\" }',",
+    "  '  } catch { $live = \"whether it is open elsewhere is unknown: the registry or the process table could not be read (\" + $_.Exception.Message + \")\" }',",
+    "  '  if ($null -ne $live) { $refusal = \"The session is not resumed here, so that two copies never write it: \" + $live + \".\" }',",
     "  '}',",
     // The claim must still name this window: another switch or restart that took it over wins.
     "  'if ($null -eq $refusal) {',",

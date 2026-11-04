@@ -36,7 +36,13 @@ test('right before claude runs, it reads the registry and the process table agai
   assert.ok(at > 0)
   for (const line of machine.RECHECK) assert.ok(script.includes(`  ${line}\n`), `missing from the slot runner's re-check: ${line}`)
   // Called in the record's checks, inside a catch that resumes nothing when they can't be read.
-  assert.ok(script.includes("try { $live = Get-Live $record.resume $dirs } catch { $live = 'the registry or the process table could not be read ("))
+  assert.ok(script.includes("try { $live = Get-Live $record.resume $dirs } catch { $live = 'whether it is open elsewhere is unknown: the registry or the process table could not be read ("))
+  // A registry file that doesn't read is read again twice, 250 ms apart, before it counts as unknown.
+  assert.ok(script.includes('      for ($try = 1; $try -le 3 -and $null -eq $e; $try++) {\n'))
+  assert.ok(script.includes('        if ($null -eq $e -and $try -lt 3) { Start-Sleep -Milliseconds 250 }\n'))
+  // A record not used says why, and how to resume it by hand; the pane waits, it never closes.
+  assert.ok(script.includes("Write-Host ('A record to resume a conversation in this pane was not used: ' + $why + '.')"))
+  assert.ok(script.includes("Write-Host ('Once it is safe, resume it yourself: claude --resume ' + $record.resume)"))
 })
 
 test('the record is deleted before anything is checked or run', () => {

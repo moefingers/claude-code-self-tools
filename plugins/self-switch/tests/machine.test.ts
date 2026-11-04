@@ -465,6 +465,12 @@ describe('the scripts, as text', () => {
       expect(folder).toBeGreaterThan(script.indexOf(clears[0] ?? ''))
       expect(claude).toBeGreaterThan(folder)
       for (const line of RECHECK) expect(script).toContain(`'    ${line}'`)
+      // A registry file that doesn't read is read again twice, 250 ms apart, before it counts as unknown;
+      // unknown, the window says so, gives the line to resume by hand, and waits for Enter.
+      expect(RECHECK).toContain('    for ($try = 1; $try -le 3 -and $null -eq $e; $try++) {')
+      expect(RECHECK).toContain('      if ($null -eq $e -and $try -lt 3) { Start-Sleep -Milliseconds 250 }')
+      expect(script).toContain('$refusal = \\"The session is not resumed here, so that two copies never write it: \\" + $live + \\".\\"'.split('\\"').join('"'))
+      expect(script).toContain("Write-Host 'Once it is safe, resume it yourself: claude --resume $id'")
       // The window stops on a failed read, so the re-check's catch refuses: a new PowerShell would go on.
       const stops = script.indexOf(`  '$ErrorActionPreference = "Stop"',`)
       expect(stops).toBeGreaterThan(wait)
