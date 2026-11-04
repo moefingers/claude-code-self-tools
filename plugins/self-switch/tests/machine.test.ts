@@ -28,6 +28,7 @@ import {
   claimCheckScript,
   CLAIM_CHECK_LIVE,
   SESSION_MARKERS,
+  SLOT_NOT_RECOGNISED,
   SLOT_SCRIPT_SHA256,
   safePoint,
 } from '../hooks/machine'
@@ -432,6 +433,12 @@ describe('transports', () => {
     expect(long).toMatchObject({ fallback: expect.stringMatching(/^slot hash unreadable: line one line two x+\u2026$/) })
     expect('fallback' in long && (long.fallback?.length ?? 0) <= 'slot hash unreadable: '.length + 200).toBe(true)
     expect(pickTransport(probeOf(p => (elsewhere(p), inSlot(p, null))), W, T, ELSEWHERE)).toEqual({ transport: 'window', folder: ELSEWHERE, fallback: 'slot hash unreadable: no reason given' })
+    // A parent that runs claude-slot.ps1 some other way (pwsh.exe, -f): no slot, and said.
+    expect(pickTransport(probeOf(p => (elsewhere(p), (p.slotSeen = true))), W, T, ELSEWHERE)).toEqual({ transport: 'window', folder: ELSEWHERE, fallback: SLOT_NOT_RECOGNISED })
+    expect(SLOT_NOT_RECOGNISED).toContain('runs claude-slot.ps1 some other way than the slot runner the plugin recognises')
+    // Only as true, and never beside a recognised slot.
+    expect(parseProbe(JSON.stringify(machine(p => (inSlot(p), (p.slotSeen = true)))))).toMatchObject({ error: expect.stringContaining('a slot runner was seen, but not as one') })
+    expect(parseProbe(JSON.stringify({ ...machine(), slotSeen: false }))).toMatchObject({ error: expect.stringContaining('a slot runner was seen, but not as one') })
   })
 
   test('across projects, a folder that is unknown, or is not where its transcript is, refuses', () => {
@@ -623,6 +630,18 @@ describe('the scripts, as text', () => {
       expect(script).toContain('if ($null -ne $slotHashError) { $slot["hashError"] = $slotHashError }')
     }
     for (const script of [probe, restart, window, release]) expect(script).not.toContain('Get-FileHash')
+    // A file over 64 KB isn't read, and its hash error says why.
+    for (const script of [probe, restart]) expect(script).toContain('try { if ([IO.FileInfo]::new($slotPath).Length -gt 65536) { throw "the file is over 64 KB, so it is not the slot runner" }; $hasher = ')
+  })
+
+  test('a parent that runs claude-slot.ps1 some other way is seen, said, and never used as a slot', () => {
+    const seen = String.raw`} elseif ($null -ne $session -and $null -ne $up -and ($up.Name -eq "powershell.exe" -or $up.Name -eq "pwsh.exe") -and "$($up.CommandLine)" -match "claude-slot\.ps1") { $slotSeen = true }`.replace('= true', '= $true')
+    for (const script of [probe, restart]) {
+      expect(script).toContain('$slotSeen = $false')
+      expect(script).toContain(seen)
+    }
+    expect(probe).toContain('if ($slotSeen) { $result["slotSeen"] = $true }')
+    expect(restart).toContain('if ($slotSeen) { $slotFallback = "this pane runs claude-slot.ps1 some other way than the slot runner the plugin recognises (Windows PowerShell, powershell.exe -File with the script" + [char]39 + "s absolute path), so it is no slot" }')
   })
 
   test('the restart launcher says why it passed over a slot runner, on a line of its own after the claim', () => {

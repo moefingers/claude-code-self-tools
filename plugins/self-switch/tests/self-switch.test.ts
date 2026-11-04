@@ -2,7 +2,7 @@
 // from fixtures; /resume and /exit are recorded, never run. Nothing here starts a process.
 import { describe, expect, mock, test } from 'claude-code/testing'
 import type { AgentStatus, On } from 'claude-code'
-import { claimPath, gatePath, launcherScript, quoted, SLOT_SCRIPT_SHA256, slotRecordPath } from '../hooks/machine'
+import { claimPath, gatePath, launcherScript, quoted, SLOT_NOT_RECOGNISED, SLOT_SCRIPT_SHA256, slotRecordPath } from '../hooks/machine'
 import { decode, ELSEWHERE, elsewhere, entry, ft, inSlot, LAUNCH, machine, NOW, OTHER, PERMISSION_FLAGS, PROJECT, type RawProbe, REPO, T, under, W, X } from './fixtures'
 
 const TOOL = 'mcp__self-switch__switch_after_turn'
@@ -349,6 +349,19 @@ describe('transports', () => {
     await clock.advance(1000)
     expect(texts(session).at(-1)).toContain(`It came here in a new window, not the slot of the pane it left: ${quoted(said)}. ${DROPPED_THERE} Your context is as you left it`)
     expect(prompts).toHaveLength(1)
+  })
+
+  test('a parent that runs claude-slot.ps1 some other way: the window, and the leaving row and the toast say why', async ($, on) => {
+    const { writes, kinds, session, toasts, clock } = engine(on, {
+      probe: machine(p => (elsewhere(p), (p.slotSeen = true))),
+      store: { [`alive:${T}`]: { at: NOW - HOUR, folder: ELSEWHERE, project: 'C--work-other' } },
+    })
+    await $.session.start(start)
+    await switchNow($, clock)
+    expect(writes).toEqual([])
+    expect(kinds()).toEqual(['probe', 'launcher'])
+    expect(texts(session).at(-1)).toContain(`, in a new window, not this pane's slot: ${quoted(SLOT_NOT_RECOGNISED)}. Its reason:`)
+    expect(toasts.some(t => t.includes(SLOT_NOT_RECOGNISED))).toBe(true)
   })
 
   test('a slot that is used, or none at all, says nothing of a slot', async ($, on) => {

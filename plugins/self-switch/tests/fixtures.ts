@@ -36,6 +36,7 @@ export type RawProbe = {
   self: number
   session: { pid: number; created: string } | null
   slot: { pid: number; created: string; id: string; path: string; sha256: string | null; hashError?: string } | null
+  slotSeen?: true
   procs: RawProcess[]
   registry: RawRegistry[]
   transcripts: { id: string; dir: number; project: string; mtime: number }[]

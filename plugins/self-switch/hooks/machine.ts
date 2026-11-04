@@ -255,7 +255,7 @@ export const REGISTRY_FIELDS = ['pid', 'sessionId', 'procStart'] as const
 export const REGISTRY_VERSION_MARKERS = ['v', 'schema', 'schemaVersion', 'formatVersion', 'registryVersion'] as const
 
 /** The SHA-256 of plugins/self-switch/slot/claude-slot.ps1, as it is committed. */
-export const SLOT_SCRIPT_SHA256 = 'ace5d3acdb177beba905dd7694f0c7277ee01674fdcc2a904f6be1277e637c8f'
+export const SLOT_SCRIPT_SHA256 = 'b8afc0961c1190fd1320771e630826294353de19f5d1ff9ec0e5e44de280ad06'
 
 /**
  * The variables Claude Code sets in the processes it starts, which a top-level claude must not inherit:
@@ -319,21 +319,25 @@ const GET_CREATED = ['function Get-Created($p) { if ($null -eq $p.CreationDate) 
  * Sets `$slot` (pid, created, id = `<pid>-<created>`, path, sha256, and hashError when it couldn't be
  * hashed; created and id strings) and `$slotOk` (its script has the shipped hash). The hash is .NET's,
  * never Get-FileHash: in a Windows Terminal tab whose PSModulePath puts PowerShell 7's folders first,
- * Windows PowerShell 5.1 loads 7's Utility module, which has no Get-FileHash.
+ * Windows PowerShell 5.1 loads 7's Utility module, which has no Get-FileHash. A file over 64 KB isn't
+ * read: it is no slot runner, and its hash error says so. `$slotSeen`: the parent runs claude-slot.ps1
+ * some other way (pwsh.exe, -f, a path the match doesn't take), so it is no slot this code uses, and the
+ * fallback says so.
  */
 const FIND_SLOT = [
   '$slot = $null',
   '$slotOk = $false',
+  '$slotSeen = $false',
   String.raw`if ($null -ne $session -and $null -ne $up -and $up.Name -eq "powershell.exe" -and "$($up.CommandLine)" -match "-File\s+(\x22?)(?<path>[A-Za-z]:\\[^\x22]*?\\claude-slot\.ps1)\1(\s|\z)") {`,
   '  $slotPath = $Matches["path"]',
   '  $slotHash = $null',
   '  $slotHashError = $null',
-  '  try { $hasher = [Security.Cryptography.SHA256]::Create(); try { $slotHash = [BitConverter]::ToString($hasher.ComputeHash([IO.File]::ReadAllBytes($slotPath))).Replace("-", "").ToLowerInvariant() } finally { $hasher.Dispose() } } catch { $slotHash = $null; $slotHashError = "$($_.Exception.Message)" }',
+  '  try { if ([IO.FileInfo]::new($slotPath).Length -gt 65536) { throw "the file is over 64 KB, so it is not the slot runner" }; $hasher = [Security.Cryptography.SHA256]::Create(); try { $slotHash = [BitConverter]::ToString($hasher.ComputeHash([IO.File]::ReadAllBytes($slotPath))).Replace("-", "").ToLowerInvariant() } finally { $hasher.Dispose() } } catch { $slotHash = $null; $slotHashError = "$($_.Exception.Message)" }',
   '  $slotCreated = Get-Created $up',
   '  $slot = [ordered]@{ pid = [long]$up.ProcessId; created = $slotCreated; id = "$($up.ProcessId)-$slotCreated"; path = $slotPath; sha256 = $slotHash }',
   '  if ($null -ne $slotHashError) { $slot["hashError"] = $slotHashError }',
   `  $slotOk = $slotHash -eq '${SLOT_SCRIPT_SHA256}'`,
-  '}',
+  String.raw`} elseif ($null -ne $session -and $null -ne $up -and ($up.Name -eq "powershell.exe" -or $up.Name -eq "pwsh.exe") -and "$($up.CommandLine)" -match "claude-slot\.ps1") { $slotSeen = $true }`,
 ]
 
 /** Whether the error in a catch block is a sharing violation, a file already there, or another plain I/O failure. */
@@ -642,6 +646,7 @@ export function probeScript(input: ProbeInput): string {
     '$sessionOut = $null',
     'if ($null -ne $session) { $sessionOut = [ordered]@{ pid = [long]$session.ProcessId; created = (Get-Created $session) } }',
     '$result = [ordered]@{ v = 1; self = [long]$PID; session = $sessionOut; slot = $slot; procs = $procs; registry = $registry; transcripts = $transcripts; locks = $locks; claim = $claim; heavy = $heavy; freeKb = $freeKb; errors = $errors }',
+    'if ($slotSeen) { $result["slotSeen"] = $true }',
     '$result | ConvertTo-Json -Compress -Depth 6',
   ].join('\r\n')
 }
@@ -689,6 +694,8 @@ export type Probe = {
   readonly self: number
   readonly session: { readonly pid: number; readonly created: string } | null
   readonly slot: SlotParent | null
+  /** The parent runs claude-slot.ps1 some other way than the slot runner this code recognises. */
+  readonly slotSeen: boolean
   readonly procs: readonly ProcessEntry[]
   readonly registry: readonly RegistryEntry[]
   readonly transcripts: readonly Transcript[]
@@ -783,7 +790,8 @@ export function parseProbe(stdout: string): Probe | { error: string } {
     return { error: "the probe's answer is not JSON" }
   }
   try {
-    const top = fields(raw, 'the answer', ['v', 'self', 'session', 'slot', 'procs', 'registry', 'transcripts', 'locks', 'claim', 'heavy', 'freeKb', 'errors'])
+    const top = fields(raw, 'the answer', ['v', 'self', 'session', 'slot', 'procs', 'registry', 'transcripts', 'locks', 'claim', 'heavy', 'freeKb', 'errors'], ['slotSeen'])
+    if ('slotSeen' in top && (top.slotSeen !== true || top.slot !== null)) bad('the answer says a slot runner was seen, but not as one')
     if (top.v !== 1) bad('the answer is not version 1')
     if (!isPid(top.self)) bad("the probe's own pid is not a pid")
     let session: Probe['session'] = null
@@ -885,7 +893,7 @@ export function parseProbe(stdout: string): Probe | { error: string } {
       return m[2] === '' ? { source: m[1] as ProbeError } : { source: m[1] as ProbeError, dir: Number(m[2]) }
     })
     const extraKeys = [...new Set(registry.flatMap(entry => (entry.shape === 'ok' ? entry.extra : [])))]
-    return { self: top.self as number, session, slot, procs, registry, transcripts, locks, claim, heavy, freeKb: top.freeKb as number | null, errors, extraKeys }
+    return { self: top.self as number, session, slot, slotSeen: top.slotSeen === true, procs, registry, transcripts, locks, claim, heavy, freeKb: top.freeKb as number | null, errors, extraKeys }
   } catch (err) {
     if (err instanceof Bad) return { error: `the probe's answer is not what it must be: ${err.message}` }
     throw err
@@ -1168,6 +1176,10 @@ export type Transport =
   | { readonly transport: 'slot'; readonly slot: string; readonly folder: string }
   | { readonly transport: 'window'; readonly folder: string; readonly fallback?: string }
 
+/** Why a parent that runs claude-slot.ps1 some other way isn't used as a slot. */
+export const SLOT_NOT_RECOGNISED =
+  "this pane runs claude-slot.ps1 some other way than the slot runner the plugin recognises (Windows PowerShell, powershell.exe -File with the script's absolute path), so it is no slot"
+
 /** Why a slot runner found under this session isn't used, as the leaving row and the toast say it. */
 export function slotFallback(slot: SlotParent): string {
   if (slot.sha256 === null) return `slot hash unreadable: ${slot.hashError === undefined ? 'no reason given' : oneLine(slot.hashError, 200)}`
@@ -1200,6 +1212,7 @@ export function pickTransport(probe: Probe, from: string, to: string, folder: st
   // The slot's id as the probe printed it: a FILETIME through a JavaScript number would not round-trip.
   if (slot !== null && slot.sha256 === SLOT_SCRIPT_SHA256) return { transport: 'slot', slot: slot.id, folder }
   if (slot !== null) return { transport: 'window', folder, fallback: slotFallback(slot) }
+  if (probe.slotSeen) return { transport: 'window', folder, fallback: SLOT_NOT_RECOGNISED }
   return { transport: 'window', folder }
 }
 
@@ -1261,6 +1274,7 @@ export function launcherScript(id: string, options?: LaunchOptions): string {
       // A slot runner found but not used is said, never passed over in silence.
       '$slotFallback = $null',
       'if ($null -ne $slot -and -not $slotOk) { if ($null -ne $slotHashError) { $slotFallback = "slot hash unreadable: " + $slotHashError } else { $slotFallback = "this pane" + [char]39 + "s claude-slot.ps1 has another SHA-256 than the one shipped" } }',
+      'if ($slotSeen) { $slotFallback = "this pane runs claude-slot.ps1 some other way than the slot runner the plugin recognises (Windows PowerShell, powershell.exe -File with the script" + [char]39 + "s absolute path), so it is no slot" }',
       'if ($slotOk) {',
       '  $projectName = [regex]::Replace($folder, "[^A-Za-z0-9]", "-")',
       '  $inProject = $false',

@@ -98,6 +98,11 @@ function Get-Next {
   $why = $null
   $record = $null
   try { $record = $text | ConvertFrom-Json } catch { $why = 'it is not JSON' }
+  # A switch or restart that took its record back overwrote it so (a plugin can't delete a file).
+  if ($null -eq $why -and $null -ne $record -and $record.cancelled -is [bool] -and $record.cancelled) {
+    Write-Host 'The switch that left this record was withdrawn; nothing to do.'
+    return $null
+  }
   $now = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
   if ($null -eq $why -and ($null -eq $record -or $record.v -ne 1 -or $record.resume -isnot [string] -or $record.resume -cnotmatch $SessionId)) { $why = 'it names no conversation by its id' }
   if ($null -eq $why -and ($record.at -isnot [ValueType] -or ($now - [double]$record.at) -gt $MaxAgeMs -or ($now - [double]$record.at) -lt -5000 -or ([datetime]::UtcNow - $written).TotalMilliseconds -gt $MaxAgeMs)) { $why = 'it is more than 120 seconds old' }
