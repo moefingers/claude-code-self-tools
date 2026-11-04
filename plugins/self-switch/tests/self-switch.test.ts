@@ -385,6 +385,15 @@ describe('transports', () => {
     expect(rows(session)).toMatch(/folder isn't known here/)
   })
 
+  test('a pane started as --resume T that switched in place to W can switch back to T: its own command line is history', async ($, on) => {
+    const { commands, clock } = engine(on, {
+      probe: machine(p => void ((p.procs.find(x => x.pid === 100) as RawProbe['procs'][number]).ids = [T])),
+    })
+    await $.session.start(start)
+    await switchNow($, clock)
+    expect(commands).toEqual([{ command: 'resume', args: T }])
+  })
+
   test('held by another process at the last look before the in-place /resume (L1 or L2 read again): nothing resumes', async ($, on) => {
     const { commands, kinds, tickets, session, clock } = engine(on, { checkLive: 'it is open elsewhere: process 4242 names it on its command line (L2)' })
     await $.session.start(start)

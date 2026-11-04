@@ -72,6 +72,31 @@ describe('liveness', () => {
     expect(found).toEqual({ verdict: 'not-live', evidence: [] })
   })
 
+  test("L2 passes over a claude.exe started as --resume T that switched in place since: its own current entry names another conversation", () => {
+    // The review's reproduction: claude.exe 100 was started as `claude --resume T` (a slot, a window, a
+    // restart), then switched in place to W; its entry names W, its command line still names T.
+    const resumedOnce = (p: RawProbe) => void ((p.procs.find(x => x.pid === 100) as RawProbe['procs'][number]).ids = [T])
+    expect(live(resumedOnce)).toEqual({ verdict: 'not-live', evidence: [] })
+    // Its entry missing: L2 holds, and the claude.exe is unaccounted.
+    expect(live(p => (resumedOnce(p), (p.registry = p.registry.filter(r => r.file !== 100)))).evidence).toEqual([
+      'L2: claude.exe 100 names it on its command line',
+      "unknown: claude.exe 100 isn't in any registry this plugin knows (another config folder, or a version without one)",
+    ])
+    // Its entry unreadable: L2 holds.
+    expect(live(p => (resumedOnce(p), (p.registry = p.registry.map(r => (r.file === 100 ? { dir: 0, file: 100, ok: false } : r))))).verdict).toBe('live')
+    // Its entry not its own (procStart 1 s off, another process's pid): L2 holds.
+    expect(live(p => (resumedOnce(p), ((p.registry.find(r => r.file === 100) as Record<string, unknown>).procStart = ft(3)))).evidence).toContain(
+      'L2: claude.exe 100 names it on its command line',
+    )
+    // Its entry naming T: L1 and L2.
+    expect(live(p => (resumedOnce(p), ((p.registry.find(r => r.file === 100) as Record<string, unknown>).sessionId = T))).evidence).toEqual([
+      'L1: claude.exe 100 (started 2025-10-29 18:02 UTC) holds it',
+      'L2: claude.exe 100 names it on its command line',
+    ])
+    // Any other process naming it, with no entry of its own: L2.
+    expect(live(p => p.procs.push({ pid: 450, ppid: 100, created: ft(45), name: 'bash.exe', ids: [T] })).evidence).toEqual(['L2: bash.exe 450 names it on its command line'])
+  })
+
   test('L2: a process names it on its command line', () => {
     const found = live(p => {
       p.procs.push({ pid: 600, ppid: 10, created: ft(60), name: 'powershell.exe', ids: [T] })
@@ -588,10 +613,12 @@ describe('the scripts, as text', () => {
     expect(probe).not.toMatch(/commandLine\s*=|cwd\s*=|\$o\["(cwd|name|messagingSocketPath)"\]/)
     expect(probe).toContain('foreach ($key in "pid", "sessionId", "procStart", "status", "statusUpdatedAt", "kind", "version")')
     // Which asked-about ids a registry file's text names: the ids, never the text.
-    expect(probe).toContain("try { $text = Get-Content -LiteralPath $f.FullName -Raw -Encoding UTF8; $e = $text | ConvertFrom-Json } catch { $e = $null }")
-    expect(probe).toContain('$mentioned = @($ids | Where-Object { "$text".IndexOf($_, [StringComparison]::OrdinalIgnoreCase) -ge 0 })')
+    // Per key, past sessionId, cwd and name: free text, where a folder may be named for another conversation.
+    expect(probe).toContain('          if ($prop.Name -ceq "sessionId" -or $prop.Name -ceq "cwd" -or $prop.Name -ceq "name") { continue }')
+    expect(probe).toContain('          $valueText = "$(ConvertTo-Json -InputObject $prop.Value -Compress -Depth 8)"')
+    expect(probe).toContain('          foreach ($a in $ids) { if (-not $mentioned.Contains($a) -and $valueText.IndexOf($a, [StringComparison]::OrdinalIgnoreCase) -ge 0) { [void]$mentioned.Add($a) } }')
     expect(probe).toContain('if ($mentioned.Count -gt 0) { $o["mentions"] = [object[]]$mentioned }')
-    expect(probe).not.toMatch(/\$o\["text"\]|text = \$text/)
+    expect(probe).not.toMatch(/\$o\["(text|valueText|cwd|name)"\]/)
     // A nested value comes as what it is, never as null: a null would read as a missing field's type.
     expect(probe).toContain('if ($v -is [Array]) { $v = [ordered]@{ nested = "list" } } else { $v = [ordered]@{ nested = "object" } }')
     expect(probe).not.toMatch(/\.jsonl"\)\s*-Raw|Get-Content[^\n]*\.jsonl/)
@@ -640,21 +667,43 @@ describe('the scripts, as text', () => {
     expect(window).toContain('if ($null -eq $lock -or $lock.by -cne $by) { "self-switch: the claim on this conversation does not name this launch')
   })
 
+  test('the last-moment re-check reads the registry as the probe does: sessionId without regard to case, named in another key, and L2 past a process that moved on', () => {
+    // sessionId compared without regard to case.
+    expect(RECHECK).toContain('    if ($e.sessionId -eq $id) {')
+    expect(RECHECK.some(line => line.includes('-ceq $id'))).toBe(false)
+    // Named in any key but sessionId, cwd and name: refused.
+    expect(RECHECK).toContain(
+      '    foreach ($prop in $e.PSObject.Properties) { if ($prop.Name -cne "sessionId" -and $prop.Name -cne "cwd" -and $prop.Name -cne "name" -and "$(ConvertTo-Json -InputObject $prop.Value -Compress -Depth 8)".IndexOf($id, [StringComparison]::OrdinalIgnoreCase) -ge 0) { $named = $true } }',
+    )
+    expect(RECHECK).toContain('    if ($named) { $live = "it may be open elsewhere: the registry file of running Claude Code $($f.BaseName) names it outside its sessionId"; break }')
+    // L2 after the registry, past only a claude.exe whose own file is current (its pid, its start time),
+    // well formed, and names another conversation.
+    expect(RECHECK).toContain(
+      String.raw`    if ($near -and $pidOk -and $e.sessionId -match "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\z") { $elsewhere[[int]$p.ProcessId] = $true }`,
+    )
+    expect(RECHECK).toContain('    try { $pidOk = [long]$e.pid -eq [long]$p.ProcessId } catch { $pidOk = $false }')
+    const l2 = RECHECK.findIndex(line => line.includes('(L2)'))
+    expect(l2).toBe(RECHECK.length - 1)
+    expect(RECHECK[l2]).toContain('-not $elsewhere.ContainsKey([int]$p.ProcessId)')
+    expect(RECHECK.indexOf('$elsewhere = @{}')).toBeLessThan(RECHECK.indexOf('foreach ($dir in $configDirs) {'))
+  })
+
   test("the last-moment re-check refuses whenever a running claude.exe's file names the id, whatever its procStart", () => {
     // The start time only words the line: a procStart in another unit, or one that moved to another
     // field (procStartFt), must never read as free.
-    const at = RECHECK.indexOf('    if ($e.sessionId -ceq $id) {')
-    expect(at).toBeGreaterThan(0)
-    expect(RECHECK.slice(at + 1, at + 6)).toEqual([
-      '      $near = $false',
-      '      try { $near = [math]::Abs([double]$p.CreationDate.ToFileTimeUtc() - [double]$e.procStart) -le 10000 } catch { $near = $false }',
+    const at = RECHECK.indexOf('    if ($e.sessionId -eq $id) {')
+    expect(at).toBeGreaterThan(1)
+    expect(RECHECK.slice(at - 2, at + 4)).toEqual([
+      '    $near = $false',
+      '    try { $near = [math]::Abs([double]$p.CreationDate.ToFileTimeUtc() - [double]$e.procStart) -le 10000 } catch { $near = $false }',
+      '    if ($e.sessionId -eq $id) {',
       '      if ($near) { $live = "it is open elsewhere: Claude Code $($f.BaseName) holds it (L1)" } else { $live = "it may be open elsewhere: the registry file of running Claude Code $($f.BaseName) names it, though its procStart is not that process start time (a stale file, or a format this check does not know)" }',
       '      break',
       '    }',
     ])
-    expect(RECHECK.some(line => line.includes('sessionId -ceq $id -and'))).toBe(false)
+    expect(RECHECK.some(line => line.includes('sessionId -eq $id -and'))).toBe(false)
     // The window carries it after the wait, and the restart's launcher too.
-    for (const script of [restart, window]) for (const line of RECHECK.slice(at, at + 6)) expect(script).toContain(`'    ${line}'`)
+    for (const script of [restart, window]) for (const line of RECHECK.slice(at - 2, at + 4)) expect(script).toContain(`'    ${line}'`)
   })
 
   test('the slot is hashed by .NET, never by Get-FileHash, and a hash that fails keeps its reason', () => {

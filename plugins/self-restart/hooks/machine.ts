@@ -255,7 +255,7 @@ export const REGISTRY_FIELDS = ['pid', 'sessionId', 'procStart'] as const
 export const REGISTRY_VERSION_MARKERS = ['v', 'schema', 'schemaVersion', 'formatVersion', 'registryVersion'] as const
 
 /** The SHA-256 of plugins/self-switch/slot/claude-slot.ps1, as it is committed. */
-export const SLOT_SCRIPT_SHA256 = 'b8afc0961c1190fd1320771e630826294353de19f5d1ff9ec0e5e44de280ad06'
+export const SLOT_SCRIPT_SHA256 = '3d5569f0ddd02324ac9b0e5c094d2ff095400bb79b431ea60f182c04f5b5bfd6'
 
 /**
  * The variables Claude Code sets in the processes it starts, which a top-level claude must not inherit:
@@ -400,7 +400,11 @@ const TAKE_CLAIM = [
  * command line (L2). Sets `$live`, null when nothing holds it, else a line saying why it isn't resumed.
  * A registry file of a running claude.exe that can't be read, or reads in another shape, is read again
  * twice, 250 ms apart (Claude Code may be rewriting it), and then counts as unknown, which resumes
- * nothing. Anything else that can't be read throws, and a caller that catches it resumes nothing. No
+ * nothing. The same rules as the probe's liveness: sessionId compared without regard to case; a file
+ * that names `$id` in any key but sessionId, cwd and name refuses; and a command line naming `$id`
+ * (L2) is passed over only for a claude.exe whose own registry file is current (its pid, and its
+ * procStart within 1 ms of its start), well formed, and names another conversation: a process
+ * started as `claude --resume <id>` keeps that line after it switched in place to another. Anything else that can't be read throws, and a caller that catches it resumes nothing. No
  * single quote in these lines: the launcher carries each inside one. A running claude.exe whose file
  * names $id refuses whatever its procStart; the start time only words the line. procStart compares as a [double]:
  * a string of digits, as Claude Code 2.1.318 writes it, converts as a number does, and at today's
@@ -410,7 +414,8 @@ export const RECHECK = [
   '$live = $null',
   '$procs = @{}',
   'foreach ($p in (Get-CimInstance -ClassName Win32_Process -Property ProcessId, Name, CreationDate, CommandLine)) { $procs[[int]$p.ProcessId] = $p }',
-  String.raw`foreach ($p in $procs.Values) { if ($null -eq $live -and $p.ProcessId -ne $PID -and "$($p.CommandLine)" -match "(^|[\s\x22])(--resume|--session-id|-r)(\s+|=)[\x22\x27]?$id") { $live = "it is open elsewhere: process $($p.ProcessId) names it on its command line (L2)" } }`,
+  // The claude.exe whose own registry file is current, well formed and names another conversation.
+  '$elsewhere = @{}',
   'foreach ($dir in $configDirs) {',
   '  $reg = Join-Path $dir "sessions"',
   '  if ($null -ne $live -or -not (Test-Path -LiteralPath $reg -PathType Container)) { continue }',
@@ -427,14 +432,23 @@ export const RECHECK = [
   '    if ($null -eq $e) { $live = "whether it is open elsewhere is unknown: the registry file of Claude Code $($f.BaseName) could not be read, three times, or has another shape"; break }',
   // A running claude.exe whose file names the id holds it, whatever its procStart: the start time only
   // words the line (a unit or a field that moved, procStartFt, must never read as free).
-  '    if ($e.sessionId -ceq $id) {',
-  '      $near = $false',
-  `      try { $near = [math]::Abs([double]$p.CreationDate.ToFileTimeUtc() - [double]$e.procStart) -le ${PROC_START_TOLERANCE} } catch { $near = $false }`,
+  '    $near = $false',
+  `    try { $near = [math]::Abs([double]$p.CreationDate.ToFileTimeUtc() - [double]$e.procStart) -le ${PROC_START_TOLERANCE} } catch { $near = $false }`,
+  '    if ($e.sessionId -eq $id) {',
   '      if ($near) { $live = "it is open elsewhere: Claude Code $($f.BaseName) holds it (L1)" } else { $live = "it may be open elsewhere: the registry file of running Claude Code $($f.BaseName) names it, though its procStart is not that process start time (a stale file, or a format this check does not know)" }',
   '      break',
   '    }',
+  // Named in another key (cwd and name are free text): what that process holds is unclear.
+  '    $named = $false',
+  '    foreach ($prop in $e.PSObject.Properties) { if ($prop.Name -cne "sessionId" -and $prop.Name -cne "cwd" -and $prop.Name -cne "name" -and "$(ConvertTo-Json -InputObject $prop.Value -Compress -Depth 8)".IndexOf($id, [StringComparison]::OrdinalIgnoreCase) -ge 0) { $named = $true } }',
+  '    if ($named) { $live = "it may be open elsewhere: the registry file of running Claude Code $($f.BaseName) names it outside its sessionId"; break }',
+  '    $pidOk = $false',
+  '    try { $pidOk = [long]$e.pid -eq [long]$p.ProcessId } catch { $pidOk = $false }',
+  String.raw`    if ($near -and $pidOk -and $e.sessionId -match "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\z") { $elsewhere[[int]$p.ProcessId] = $true }`,
   '  }',
   '}',
+  // L2: a command line naming it, past a claude.exe whose own current entry names another conversation.
+  String.raw`if ($null -eq $live) { foreach ($p in $procs.Values) { if ($null -eq $live -and $p.ProcessId -ne $PID -and -not $elsewhere.ContainsKey([int]$p.ProcessId) -and "$($p.CommandLine)" -match "(^|[\s\x22])(--resume|--session-id|-r)(\s+|=)[\x22\x27]?$id") { $live = "it is open elsewhere: process $($p.ProcessId) names it on its command line (L2)" } } }`,
 ] as const
 
 /**
@@ -571,7 +585,8 @@ export function probeScript(input: ProbeInput): string {
     '}',
     // The registry: per file, whether it parses, its key names, and seven values as their JSON types; a
     // value that is a list or an object comes as { nested = "list" } or { nested = "object" }, never as null.
-    // And which of the asked-about ids its text names anywhere (`mentions`): the ids, never the text.
+    // And which of the asked-about ids it names in any key but sessionId, cwd and name (free text: a
+    // session can work under a folder named for another conversation) (`mentions`): the ids, never a value.
     '$registry = New-Object System.Collections.ArrayList',
     'for ($k = 0; $k -lt $configDirs.Count; $k++) {',
     '  $reg = Join-Path $configDirs[$k] "sessions"',
@@ -581,11 +596,10 @@ export function probeScript(input: ProbeInput): string {
     String.raw`      if ($f.BaseName -notmatch "^\d{1,10}\z") { continue }`,
     '      $o = [ordered]@{ dir = $k; file = [long]$f.BaseName; ok = $false }',
     '      $e = $null',
-    '      $text = $null',
     // Read again twice, 250 ms apart, when it doesn't parse: Claude Code may be rewriting it.
     '      for ($try = 1; $try -le 3 -and $e -isnot [Management.Automation.PSCustomObject]; $try++) {',
     '        if ($try -gt 1) { Start-Sleep -Milliseconds 250 }',
-    '        try { $text = Get-Content -LiteralPath $f.FullName -Raw -Encoding UTF8; $e = $text | ConvertFrom-Json } catch { $e = $null }',
+    '        try { $e = Get-Content -LiteralPath $f.FullName -Raw -Encoding UTF8 | ConvertFrom-Json } catch { $e = $null }',
     '      }',
     '      if ($e -is [Management.Automation.PSCustomObject]) {',
     '        $o["ok"] = $true',
@@ -594,7 +608,12 @@ export function probeScript(input: ProbeInput): string {
     '          $prop = $e.PSObject.Properties | Where-Object { $_.Name -ceq $key } | Select-Object -First 1',
     '          if ($null -ne $prop) { $v = $prop.Value; if ($null -ne $v -and -not ($v -is [string] -or $v -is [ValueType])) { if ($v -is [Array]) { $v = [ordered]@{ nested = "list" } } else { $v = [ordered]@{ nested = "object" } } }; $o[$key] = $v }',
     '        }',
-    '        $mentioned = @($ids | Where-Object { "$text".IndexOf($_, [StringComparison]::OrdinalIgnoreCase) -ge 0 })',
+    '        $mentioned = New-Object System.Collections.ArrayList',
+    '        foreach ($prop in $e.PSObject.Properties) {',
+    '          if ($prop.Name -ceq "sessionId" -or $prop.Name -ceq "cwd" -or $prop.Name -ceq "name") { continue }',
+    '          $valueText = "$(ConvertTo-Json -InputObject $prop.Value -Compress -Depth 8)"',
+    '          foreach ($a in $ids) { if (-not $mentioned.Contains($a) -and $valueText.IndexOf($a, [StringComparison]::OrdinalIgnoreCase) -ge 0) { [void]$mentioned.Add($a) } }',
+    '        }',
     '        if ($mentioned.Count -gt 0) { $o["mentions"] = [object[]]$mentioned }',
     '      }',
     '      [void]$registry.Add($o)',
@@ -699,7 +718,7 @@ export type RegistryEntry =
       readonly procStart: number | string
       /** Keys not in REGISTRY_KEYS: ignored, and logged once per process by the plugin. */
       readonly extra: readonly string[]
-      /** The asked-about conversations its text names anywhere, its sessionId included. */
+      /** The asked-about conversations it names in any key but sessionId, cwd and name. */
       readonly mentions: readonly string[]
     }
   | { readonly dir: number; readonly file: number; readonly shape: 'bad'; readonly why: string }
@@ -778,8 +797,8 @@ const kindOf = (value: unknown): string => {
  * digits. Missing or of another type, the file is `bad`, naming the field. A key of
  * REGISTRY_VERSION_MARKERS, or a `version` that isn't a string, is a new format: `bad` too, naming it.
  * Any other key is ignored, and listed in `extra` when it isn't in REGISTRY_KEYS. `mentions` are the
- * asked-about ids its text names anywhere, which liveness reads (a conversation named outside
- * sessionId is unknown).
+ * asked-about ids it names in any key but sessionId, cwd and name, which liveness reads (a
+ * conversation named there is unknown).
  */
 function registryShape(raw: Record<string, unknown>, dir: number, file: number): RegistryEntry {
   const no = (why: string): RegistryEntry => ({ dir, file, shape: 'bad', why })
@@ -1035,7 +1054,8 @@ export function newRegistryKeys(probe: Probe, seen: Set<string>): string[] {
  * Whether conversation `id` is live on this machine, from one probe (\u00a73.2 of the design):
  * - L1: a current registry entry (its pid a running claude.exe started within 1 ms of its procStart)
  *   holds it; an entry whose process has gone, or whose pid another process took, is ignored;
- * - L2: a process names it on its command line;
+ * - L2: a process names it on its command line, unless it is a claude.exe whose own current registry
+ *   entry names another conversation (it was started with --resume <id>, and switched in place since);
  * - L3: its transcript was written less than 10 minutes ago;
  * - L4: the coordinator says its lane is live, or a claim of its names another (coordinated mode);
  * - L5: its heartbeat is younger than 5 minutes;
@@ -1067,6 +1087,8 @@ export function liveness(probe: Probe, id: string, now: number, opts: { lane?: L
     if (e.source === 'locks') unknown.push("unknown: the claim locks can't be read")
   }
   const current = new Set<number>()
+  /** The conversations each claude.exe's own current, well-formed registry entries name. */
+  const holds = new Map<number, string[]>()
   for (const entry of probe.registry) {
     const owner = table.get(entry.file)
     const isLiveClaude = owner !== undefined && isClaude(owner)
@@ -1080,9 +1102,17 @@ export function liveness(probe: Probe, id: string, now: number, opts: { lane?: L
     }
     if (!isLiveClaude || !near(owner.created, entry.procStart)) continue
     current.add(entry.pid)
+    holds.set(entry.pid, [...(holds.get(entry.pid) ?? []), entry.sessionId])
     if (entry.sessionId === id) live.push(`L1: claude.exe ${entry.pid} (started ${when(entry.procStart)} UTC) holds it`)
   }
-  for (const p of probe.procs) if (p.ids?.includes(id)) live.push(`L2: ${p.name} ${p.pid} names it on its command line`)
+  for (const p of probe.procs) {
+    if (!p.ids?.includes(id)) continue
+    // A claude.exe started as `claude --resume <id>` keeps that line after it switched in place: its own
+    // current entry naming another conversation says it moved on. With none, or a bad one, L2 holds.
+    const held = holds.get(p.pid)
+    if (held !== undefined && held.length > 0 && held.every(other => other !== id)) continue
+    live.push(`L2: ${p.name} ${p.pid} names it on its command line`)
+  }
   for (const p of probe.procs) {
     if (!isClaude(p)) continue
     // A Claude Code command (claude plugin ..., --version), or a claude.exe it started: no conversation,
