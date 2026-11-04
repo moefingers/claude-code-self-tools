@@ -166,6 +166,41 @@ test('the window opens in the folder the session started in, though the session 
   expect(runs[0]?.init?.cwd).toBe('C:\\work\\repo')
 })
 
+test('a second restart within 2 minutes of the first is refused: no restart loop', async ($, on) => {
+  const { runs, held, clock } = engine(on)
+  await $.session.start(start)
+
+  await $.tool.call({ tool: TOOL, reason: 'Switched accounts.' })
+  await $.turn.complete(answered)
+  await clock.advance(1000)
+  expect(runs).toHaveLength(1)
+  expect((held.get('recentRestarts') as Record<string, number>)[ID]).toBe(1_000_000 + 500)
+
+  // The resumed session, a minute later, asks again: refused at the call.
+  await clock.advance(60_000)
+  const refused = await $.tool.call({ tool: TOOL, reason: 'Still broken.' })
+  expect(refused.deny).toMatch(/restarted 6\d seconds ago.+within 2 minutes is refused/)
+
+  // Past 2 minutes it may restart again.
+  await clock.advance(60_000)
+  expect((await $.tool.call({ tool: TOOL, reason: 'Still broken.' })).deny).toBeUndefined()
+})
+
+test('a restart that comes due within 2 minutes of the last opens no window', async ($, on) => {
+  const { runs, commands, toasts, session, held, clock } = engine(on)
+  await $.session.start(start)
+
+  await $.tool.call({ tool: TOOL, reason: 'Switched accounts.' })
+  // Another copy of the session restarted it meanwhile.
+  held.set('recentRestarts', { [ID]: 1_000_000 })
+  await $.turn.complete(answered)
+  await clock.advance(1000)
+  expect(runs).toEqual([])
+  expect(commands).toEqual([])
+  expect(toasts.some(t => /within 2 minutes is refused/.test(t))).toBe(true)
+  expect(JSON.stringify(session.appended())).toMatch(/restart you queued didn't run: this session restarted/)
+})
+
 test('a call without a reason is refused, and nothing is queued', async ($, on) => {
   const { runs, commands, clock } = engine(on)
   await $.session.start(start)

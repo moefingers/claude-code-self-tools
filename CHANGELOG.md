@@ -22,6 +22,7 @@ Each also requires the parameter that makes its action safe to take unattended (
   - **The wait.** The window waits for the session's own `claude.exe` to exit, then runs `claude --resume <id>` from PATH in the folder the session started in. After 10 minutes it gives up and says so.
   - **The process walk** takes a parent only while it is older than its child, so a process that reused a gone parent's id is never taken for the session.
   - **A failed resume.** A Claude Code that ends with an error, or within 10 seconds, leaves the window open on the manual `claude --resume <id>` until Enter.
+  - **No restart loop.** A second restart of a session within 2 minutes of the last is refused.
   - **The first prompt.** `resume` waits in the plugin's store under the session's id, and the resumed session's copy of the plugin sends it once. One older than 15 minutes is dropped.
 - **The update check's list of names** gains the three. The other plugins' copies of the shared file change by that line alone and behave as before, so their versions stand.
 

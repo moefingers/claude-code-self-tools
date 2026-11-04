@@ -19,7 +19,9 @@
 // dropped: the window had given up, and the session was resumed later by hand.
 //
 // It refuses while a subagent is running, whose work would end with this process; checked at the
-// call, again right before the launch, and again right before the exit.
+// call, again right before the launch, and again right before the exit. And no restart loop: a
+// session whose restart opened its window less than 2 minutes ago is refused another, at the call
+// and right before the launch (the plugin's store keeps when, by session id).
 //
 // The exit waits for the session to be idle, so a message that arrives between the turn's end and the
 // exit would start a turn the exit then cuts off. A main-loop turn that starts before the exit has
@@ -35,6 +37,8 @@ const folder = { plugin: 'self-restart', key: 'folder' } as const
 
 /** The plugin's store key for restarts under way, by session id. */
 const RESTARTS = 'restarts'
+/** The plugin's store key for when each session last opened a restart's window, by session id. */
+const RECENT = 'recentRestarts'
 
 /** A beat after the turn's end, so the turn is no longer running when the restart starts. */
 const SETTLE_MS = 500
@@ -46,6 +50,8 @@ const LAUNCH_MS = 30_000
 const STALE_MS = 15 * 60 * 1000
 /** The most restarts under way the store keeps. */
 const MAX_KEPT = 50
+/** A second restart of one session sooner than this after the first is refused: no restart loop. */
+const LOOP_MS = 2 * 60 * 1000
 
 /** An agent in one of these is still to report. */
 const BUSY: readonly string[] = ['pending', 'running', 'waiting']
@@ -55,7 +61,7 @@ const DESCRIPTION = [
   'Call it when a restart is the fix: the person switched accounts, changed a setting that takes effect at startup, or a plugin won\'t reload (try reload_plugins_after_turn first, if it is available). Never on your own to clear a problem a restart doesn\'t fix.',
   'Windows only, in a session run in a terminal.',
   '`reason` (required) says why; it is recorded in the transcript. `resume` is the message that starts your first turn in the restarted session: what to check or do next. Give it whenever you have a next step of your own; leave it out only when the next step waits on someone else.',
-  'Everything this process runs ends with it: wake-ups, background tasks, Remote Control (with Remote Control on for all sessions, the resumed session connects again). It refuses while subagents you started are still running.',
+  'Everything this process runs ends with it: wake-ups, background tasks, Remote Control (with Remote Control on for all sessions, the resumed session connects again). It refuses while subagents you started are still running, and refuses a second restart within 2 minutes of the last.',
   'End the turn after calling it; the restart starts once your answer is shown.',
 ].join(' ')
 
@@ -181,6 +187,32 @@ async function keep($: EngineInterface, id: string, value: Restart | null): Prom
 }
 
 /** Says a restart didn't go ahead: a toast for the person, a note for the model. */
+/** When the window of this session's last restart opened, if that was less than 2 minutes ago. */
+async function lastRestart($: EngineInterface, id: string): Promise<number | undefined> {
+  const [stored, now] = await Promise.all([$.store.get(RECENT), $.clock.now()])
+  const at = isRecord(stored) ? stored[id] : undefined
+  return typeof at === 'number' && now >= at && now - at < LOOP_MS ? at : undefined
+}
+
+/** Notes that this session's restart opened its window now; drops the notes 2 minutes old. */
+async function noteRestart($: EngineInterface, id: string): Promise<void> {
+  const [stored, now] = await Promise.all([$.store.get(RECENT), $.clock.now()])
+  const kept: Record<string, number> = {}
+  if (isRecord(stored)) {
+    for (const [other, at] of Object.entries(stored)) {
+      if (SESSION_ID.test(other) && typeof at === 'number' && now >= at && now - at < LOOP_MS) kept[other] = at
+    }
+  }
+  kept[id] = now
+  await $.store.set(RECENT, kept)
+}
+
+/** Why a restart this soon after the last is refused. */
+async function loop($: EngineInterface, at: number): Promise<string> {
+  const seconds = Math.max(1, Math.round(((await $.clock.now()) - at) / 1000))
+  return `this session restarted ${seconds} seconds ago, and a second restart within 2 minutes is refused, so that restarts can't loop unattended`
+}
+
 async function refuse($: EngineInterface, toast: string, note: string): Promise<void> {
   $.ui.toast(toast)
   await tellModel($, note)
@@ -205,6 +237,13 @@ async function restartNow($: EngineInterface, value: Queued): Promise<void> {
     await refuse($, `Restart didn't run: ${launch.refusal}.`, `The restart you queued didn't run: ${launch.refusal}. The session goes on.`)
     return
   }
+  const lately = await lastRestart($, launch.id)
+  if (lately !== undefined) {
+    armed = undefined
+    const said = await loop($, lately)
+    await refuse($, `Restart didn't run: ${said}.`, `The restart you queued didn't run: ${said}. The session goes on; if a restart is still the fix, tell the person, who can restart by hand.`)
+    return
+  }
   // A turn that started while the checks above ran has taken it back, and said so.
   if (armed !== value) return
   // Kept before the window opens: the process it starts reads it once this one has exited.
@@ -223,6 +262,7 @@ async function restartNow($: EngineInterface, value: Queued): Promise<void> {
   } catch (err) {
     opened = `the launcher didn't run: ${why(err)}`
   }
+  if (opened === undefined) await noteRestart($, launch.id)
   if (opened !== undefined) {
     if (armed === value) armed = undefined
     await keep($, launch.id, null)
@@ -340,6 +380,10 @@ export const register: Register = (on, options) => {
     }
     const stop = blocked(await busyAgents($))
     if (stop !== undefined) return { deny: `Not queued: ${stop}. Wait for them to report, or stop them, then call again.` }
+    // No restart loop: a session that restarted less than 2 minutes ago is refused another.
+    const id = await $.session.id().catch(() => undefined)
+    const lately = id !== undefined && SESSION_ID.test(id) ? await lastRestart($, id) : undefined
+    if (lately !== undefined) return { deny: `Not queued: ${await loop($, lately)}. If a restart is still the fix, tell the person, who can restart by hand.` }
     const resume = text(input.resume)
     await $.state.set(queued, entry(reason, resume))
     $.ui.status('restart queued for when this turn ends')

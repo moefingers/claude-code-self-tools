@@ -23,6 +23,7 @@ Lets a session restart itself on Windows. Once the current turn ends, it opens a
 - **Remote Control.** With "Enable Remote Control for all sessions" on, the resumed session connects again, under the same conversation. A copy started while the old one was still connected would leave Remote Control off, which is one more reason the window waits.
 - **Everything else this process runs ends with it:** wake-ups and background tasks.
 - **Not while subagents are running.** Their work would end with the process. The call is refused while a subagent is pending, running or waiting, and a restart queued earlier in the turn is cancelled if one has started by the time it would run.
+- **No restart loop.** A session whose restart opened its window less than 2 minutes ago is refused another, at the call and again right before the launch.
 - **Windows only, in a terminal.** Elsewhere nothing runs, and Claude is told on its next turn. A session in an app, an SDK host or a `-p` run is refused at the call.
 - **It says when a step didn't work.** If the window doesn't open, nothing exits. If the exit doesn't run, the window keeps waiting for you to exit (`/exit`), up to 10 minutes.
 - **An interrupted turn cancels it**, with a notice.
