@@ -117,7 +117,10 @@ async function clearNow($: EngineInterface, value: Queued): Promise<void> {
   const after = await sessionId($)
   if (before !== undefined && after === before) {
     $.ui.toast("Clear didn't take: the session is still the same one.")
-    await tellModel($, "The clear you queued ran but didn't take (the session's id is unchanged), so the conversation is as it was, and the handoff was not sent.")
+    await tellModel(
+      $,
+      `The clear you queued ran but didn't take (the session's id is unchanged), so the conversation is as it was, and the handoff was not sent. It was: ${handoff}`,
+    )
     return
   }
   $.ui.toast('Conversation cleared; the handoff is its first prompt.')

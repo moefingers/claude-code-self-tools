@@ -98,7 +98,8 @@ test('a clear that leaves the session as it was sends no handoff, and says so', 
   expect(commands).toEqual(['clear'])
   expect(prompts).toEqual([])
   expect(toasts.some(t => /didn't take/.test(t))).toBe(true)
-  expect(JSON.stringify(session.appended())).toMatch(/ran but didn't take/)
+  // The handoff is not lost: the note carries it.
+  expect(JSON.stringify(session.appended())).toMatch(/ran but didn't take.+It was: Go on\./)
 })
 
 test('a refused clear sends no handoff, and tells the model the conversation stands', async ($, on) => {
