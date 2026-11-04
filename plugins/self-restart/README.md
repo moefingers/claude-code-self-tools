@@ -13,7 +13,7 @@ Lets a session restart itself on Windows. Once the current turn ends, it opens a
 
 - **Only at a finished break.** A session calls it once a piece of work is finished, never mid-merge, mid-push or mid-task: the same rule as compacting with [self-compact](../self-compact). The tool's description says so.
 - **The restart waits for the turn to end.** The call queues it, and it starts once the turn ends with Claude's answer.
-- **One new window, by a fixed path.** The plugin runs Windows PowerShell by its known path under the Windows folder (`%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe`), with one fixed script whose only variable is the session's id, which must be a UUID. Nothing Claude passes reaches that script or its command line.
+- **One new window, by a fixed path.** The plugin runs Windows PowerShell by its known path under the Windows folder (`%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe`), with one fixed script whose only variable is the session's id, which must be a UUID, on PowerShell's standard input (the command line is a fixed few hundred characters; the new window's carries its script compressed). Nothing Claude passes reaches that script or its command line.
   - The script finds the session's own `claude.exe` above it.
   - It opens a new console window with `Start-Process`. When Windows Terminal is your default terminal, the window opens there.
   - That window waits for the old `claude.exe` to exit, then runs `claude --resume <id>` from your PATH, in the folder the session started in (where `--resume` finds it, even after the session moved into a worktree or another folder).
