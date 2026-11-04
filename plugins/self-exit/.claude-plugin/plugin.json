@@ -1,0 +1,20 @@
+{
+  "name": "self-exit",
+  "version": "0.1.0",
+  "description": "Lets a session end itself once the current turn ends, as /exit does, with a stated reason recorded in its transcript for whoever resumes it: a tool queues the exit, and it runs as the turn ends.",
+  "author": { "name": "moefingers", "url": "https://github.com/moefingers" },
+  "homepage": "https://github.com/moefingers/claude-code-self-tools/tree/main/plugins/self-exit#readme",
+  "repository": "https://github.com/moefingers/claude-code-self-tools",
+  "license": "MIT",
+  "keywords": ["exit", "session", "mod"],
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "updateCheck": {
+      "type": "string",
+      "title": "Update check",
+      "description": "on: when a tool of this plugin is called and the last check is 30 minutes old, fetch this plugin's published plugin.json from GitHub (a plain GET of a public file) and say when a newer version is out. off: never check.",
+      "default": "on",
+      "options": ["on", "off"]
+    }
+  }
+}

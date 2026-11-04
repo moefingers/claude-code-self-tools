@@ -1,0 +1,20 @@
+{
+  "name": "self-restart",
+  "version": "0.1.0",
+  "description": "Lets a session restart itself on Windows once the current turn ends: it opens a new terminal window in the folder the session started in, exits, and the new window resumes the same conversation (claude --resume) once the old process has gone, then can resume work on its own.",
+  "author": { "name": "moefingers", "url": "https://github.com/moefingers" },
+  "homepage": "https://github.com/moefingers/claude-code-self-tools/tree/main/plugins/self-restart#readme",
+  "repository": "https://github.com/moefingers/claude-code-self-tools",
+  "license": "MIT",
+  "keywords": ["restart", "resume", "session", "mod"],
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "updateCheck": {
+      "type": "string",
+      "title": "Update check",
+      "description": "on: when a tool of this plugin is called and the last check is 30 minutes old, fetch this plugin's published plugin.json from GitHub (a plain GET of a public file) and say when a newer version is out. off: never check.",
+      "default": "on",
+      "options": ["on", "off"]
+    }
+  }
+}

@@ -1,6 +1,6 @@
 {
   "name": "claude-code-self-tools",
-  "description": "Small Claude Code plugins that let a session act on itself: compact, reload its plugins, reconnect an MCP server, read its context window, wake itself later, and turn on Remote Control under a title. Install only the ones you want.",
+  "description": "Small Claude Code plugins that let a session act on itself: compact or clear its conversation, reload its plugins, reconnect an MCP server, read its context window, wake itself later, turn on Remote Control under a title, and exit or restart. Install only the ones you want.",
   "owner": {
     "name": "moefingers",
     "url": "https://github.com/moefingers"
@@ -10,6 +10,11 @@
       "name": "self-compact",
       "source": "./plugins/self-compact",
       "description": "Compacts the conversation once the turn ends, at the break between two pieces of work, then resumes on its own."
+    },
+    {
+      "name": "self-clear",
+      "source": "./plugins/self-clear",
+      "description": "Clears the conversation once the turn ends, between two independent pieces of work, and starts the next piece from a handoff it writes."
     },
     {
       "name": "self-reload",
@@ -35,6 +40,16 @@
       "name": "self-remote-control",
       "source": "./plugins/self-remote-control",
       "description": "Reports on the session's Remote Control, connects it under a title, and renames the session. It runs /remote-control only while the session is not connected."
+    },
+    {
+      "name": "self-exit",
+      "source": "./plugins/self-exit",
+      "description": "Ends the session once the turn ends, as /exit does, with a stated reason recorded in its transcript for whoever resumes it."
+    },
+    {
+      "name": "self-restart",
+      "source": "./plugins/self-restart",
+      "description": "Restarts the session on Windows once the turn ends: a new window resumes the same conversation once the old process has exited, then resumes work on its own."
     }
   ]
 }
