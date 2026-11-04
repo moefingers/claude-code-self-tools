@@ -3,11 +3,11 @@
 // so they can't drift. Run with `node --test "scripts/*.test.mjs"`; `node scripts/sync-shared.mjs`
 // rewrites the copies and removes the stale ones.
 import assert from 'node:assert/strict'
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { test } from 'node:test'
-import { copies, copiesOf, plugins, stale } from './sync-shared.mjs'
+import { copies, copiesOf, plugins, ROOT, stale } from './sync-shared.mjs'
 
 test('every plugin has every shared file meant for it, unchanged', () => {
   const all = copies()
@@ -25,6 +25,13 @@ test('every plugin has every shared file meant for it, unchanged', () => {
 test('no plugin keeps a copy of a file that is not in shared/, or not meant for it', () => {
   const left = stale().map(c => `plugins/${c.plugin}/${c.file}`)
   assert.deepEqual(left, [], 'run `node scripts/sync-shared.mjs` to remove them, then commit')
+})
+
+test('the machine code goes to self-restart and self-switch only', () => {
+  const machine = copies().filter(c => c.file === 'hooks/machine.ts')
+  assert.deepEqual(machine.map(c => c.plugin).sort(), ['self-restart', 'self-switch'])
+  // The update check, which names no plugins, still goes to every one.
+  assert.deepEqual(copies().filter(c => c.file === 'hooks/update-check.ts').map(c => c.plugin), plugins())
 })
 
 test('a Copies: line limits a file to the plugins it names; without one, a file goes to every plugin', () => {
@@ -67,4 +74,15 @@ test('a Copies: line limits a file to the plugins it names; without one, a file 
   } finally {
     rmSync(root, { recursive: true, force: true })
   }
+})
+
+test('the machine code imports nothing but the engine\'s types, so it can be vendored byte for byte', () => {
+  const text = readFileSync(join(ROOT, 'shared', 'hooks', 'machine.ts'), 'utf8')
+  const imports = text
+    .split(/\r?\n/)
+    .filter(line => /^\s*import\b/.test(line) || /^\s*export\b.*\bfrom\s*['"]/.test(line) || /\bimport\s*\(/.test(line) || /\brequire\s*\(/.test(line))
+  assert.ok(imports.length >= 1)
+  for (const line of imports) assert.match(line, /^import type \{[^}]*\} from 'claude-code'$/, `not a type-only import of claude-code: ${line}`)
+  assert.match(text, /Canonical copy: shared\/hooks\/machine\.ts/)
+  assert.match(text, /pinned by this file's SHA-256/)
 })

@@ -34,7 +34,7 @@
 import type { EngineInterface, PluginOptions, Timer } from 'claude-code'
 
 /** The plugins of this marketplace: the only names a notice carries. */
-export const PLUGINS = ['self-clear', 'self-compact', 'self-context', 'self-exit', 'self-mcp', 'self-reload', 'self-remote-control', 'self-restart', 'self-wake'] as const
+export const PLUGINS = ['self-clear', 'self-compact', 'self-context', 'self-exit', 'self-mcp', 'self-reload', 'self-remote-control', 'self-restart', 'self-switch', 'self-wake'] as const
 export type PluginName = (typeof PLUGINS)[number]
 
 const MARKETPLACE = 'claude-code-self-tools'

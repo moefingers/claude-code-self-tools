@@ -1,0 +1,134 @@
+# claude-slot.ps1: a Windows Terminal pane that runs Claude Code, and runs it again here when told to.
+#
+# Part of self-switch (claude-code-self-tools, plugins/self-switch/slot/claude-slot.ps1). Copy it,
+# unchanged, to %LOCALAPPDATA%\claude-self-tools\claude-slot.ps1, and give a Windows Terminal profile
+# this command line:
+#
+#   powershell.exe -NoExit -NoProfile -ExecutionPolicy Bypass -File "%LOCALAPPDATA%\claude-self-tools\claude-slot.ps1"
+#
+# self-switch and self-restart use a pane as a slot only when the script it runs has the SHA-256 they
+# ship, so a copy that was edited is never used as one: that pane then works as a plain pane does.
+#
+# What it does:
+# - It runs claude, with no flags, in the folder the pane opened in.
+# - When Claude Code exits, it looks for the record a switch or a restart left for this pane:
+#   %LOCALAPPDATA%\claude-self-tools\slots\<pid>-<created>.next.json, where <pid> is this script's
+#   process id and <created> its creation time (a FILETIME), so a record names one run of one pane.
+# - It deletes the record before anything else, so a record is used once. It honours it only when it
+#   is at most 120 seconds old, names a conversation by its id (a UUID) and an existing folder, the
+#   claim lock on that conversation names this slot, and no running Claude Code holds the conversation
+#   (read again right then: the session registry and every process's command line). Then it runs
+#   claude --resume <id> in that folder, in this same pane.
+# - With no record it waits: Enter starts a new Claude Code here, and a record that arrives meanwhile
+#   is honoured (it looks every 2 seconds). Ctrl+C leaves the slot, at a PowerShell prompt.
+#
+# It runs claude with no other argument: no permission flag of any kind. A resumed session starts in
+# the mode a new session would.
+
+$ErrorActionPreference = 'Stop'
+$ProgressPreference = 'SilentlyContinue'
+
+$SessionId = '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+$MaxAgeMs = 120000
+# The variables Claude Code sets in the processes it starts: a claude that inherits them is nested.
+$Markers = 'CLAUDE_CODE_CHILD_SESSION', 'CLAUDECODE', 'CLAUDE_CODE_SESSION_ID', 'CLAUDE_PID', 'CLAUDE_EFFORT', 'CLAUDE_CODE_BRIDGE_SESSION_ID', 'CLAUDE_CODE_MESSAGING_SOCKET', 'CLAUDE_CODE_MESSAGING_TOKEN', 'CLAUDE_CODE_REMOTE', 'CLAUDE_CODE_REMOTE_SESSION_ID', 'CLAUDE_JOB_DIR', 'AI_AGENT', 'CLAUDE_CODE_ENTRYPOINT', 'CLAUDE_CODE_EXECPATH', 'CLAUDE_CODE_SESSION_ATTENDED'
+
+# This slot's id: its process id and creation time, as the probe reads them from its child's parent.
+$me = Get-CimInstance -ClassName Win32_Process -Filter "ProcessId = $PID" -Property ProcessId, CreationDate
+$slotId = '{0}-{1}' -f $PID, $me.CreationDate.ToFileTimeUtc()
+$state = Join-Path $env:LOCALAPPDATA 'claude-self-tools'
+$recordPath = Join-Path $state ('slots\' + $slotId + '.next.json')
+
+# Whether a running Claude Code holds conversation $id now: $null when none does, else which.
+function Get-Live($id, $configDirs) {
+  $live = $null
+  $procs = @{}
+  foreach ($p in (Get-CimInstance -ClassName Win32_Process -Property ProcessId, Name, CreationDate, CommandLine)) { $procs[[int]$p.ProcessId] = $p }
+  foreach ($p in $procs.Values) { if ($null -eq $live -and $p.ProcessId -ne $PID -and "$($p.CommandLine)" -match "(^|[\s\x22])(--resume|--session-id|-r)(\s+|=)[\x22\x27]?$id") { $live = "process $($p.ProcessId) names it on its command line (L2)" } }
+  foreach ($dir in $configDirs) {
+    $reg = Join-Path $dir "sessions"
+    if ($null -ne $live -or -not (Test-Path -LiteralPath $reg -PathType Container)) { continue }
+    foreach ($f in @(Get-ChildItem -LiteralPath $reg -Filter "*.json" -File -Force)) {
+      $p = $null
+      if ($f.BaseName -match "^\d{1,10}\z") { $p = $procs[[int]$f.BaseName] }
+      if ($null -eq $p -or $p.Name -ne "claude.exe") { continue }
+      $e = Get-Content -LiteralPath $f.FullName -Raw -Encoding UTF8 | ConvertFrom-Json
+      if ($e.sessionId -isnot [string] -or $null -eq $e.procStart) { $live = "the registry file of Claude Code $($f.BaseName) has another shape"; break }
+      if ($e.sessionId -ceq $id -and [math]::Abs([double]$p.CreationDate.ToFileTimeUtc() - [double]$e.procStart) -le 10000) { $live = "Claude Code $($f.BaseName) holds it (L1)"; break }
+    }
+  }
+  return $live
+}
+
+# An absolute folder with no quote or control character, that is there.
+function Test-Folder($path) {
+  if ($path -isnot [string] -or $path -cnotmatch '^[A-Za-z]:\\') { return $false }
+  if ($path -match '[\x00-\x1f"''\u2018\u2019\u201a\u201b\u201c\u201d\u201e]') { return $false }
+  return (Test-Path -LiteralPath $path -PathType Container)
+}
+
+# The record left for this pane, used once: $null, or the conversation and the folder to resume it in.
+function Get-Next {
+  if (-not (Test-Path -LiteralPath $recordPath -PathType Leaf)) { return $null }
+  $text = $null
+  $written = [datetime]::MinValue
+  try {
+    $written = (Get-Item -LiteralPath $recordPath -Force).LastWriteTimeUtc
+    $text = Get-Content -LiteralPath $recordPath -Raw -Encoding UTF8
+  } finally {
+    # Gone before anything is checked or run: a record is used once.
+    [IO.File]::Delete($recordPath)
+  }
+  $why = $null
+  $record = $null
+  try { $record = $text | ConvertFrom-Json } catch { $why = 'it is not JSON' }
+  $now = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+  if ($null -eq $why -and ($null -eq $record -or $record.v -ne 1 -or $record.resume -isnot [string] -or $record.resume -cnotmatch $SessionId)) { $why = 'it names no conversation by its id' }
+  if ($null -eq $why -and ($record.at -isnot [ValueType] -or ($now - [double]$record.at) -gt $MaxAgeMs -or ($now - [double]$record.at) -lt -5000 -or ([datetime]::UtcNow - $written).TotalMilliseconds -gt $MaxAgeMs)) { $why = 'it is more than 120 seconds old' }
+  if ($null -eq $why -and -not (Test-Folder $record.folder)) { $why = 'its folder is not an existing folder' }
+  if ($null -eq $why) {
+    $lock = $null
+    try { $lock = Get-Content -LiteralPath (Join-Path $state ('claims\' + $record.resume + '.lock')) -Raw -Encoding UTF8 | ConvertFrom-Json } catch { $lock = $null }
+    if ($null -eq $lock -or $lock.by -cne ('slot:' + $slotId)) { $why = 'the claim lock on that conversation does not name this slot' }
+  }
+  if ($null -eq $why) {
+    $dirs = @()
+    if ($env:CLAUDE_CONFIG_DIR) { $dirs += $env:CLAUDE_CONFIG_DIR } else { $dirs += (Join-Path $HOME '.claude') }
+    foreach ($d in @($record.configDirs)) { if (Test-Folder $d) { $dirs += $d } }
+    try { $live = Get-Live $record.resume $dirs } catch { $live = 'the registry or the process table could not be read (' + $_.Exception.Message + ')' }
+    if ($null -ne $live) { $why = 'it is open elsewhere: ' + $live }
+  }
+  if ($null -ne $why) {
+    Write-Host ('A record to resume a conversation in this pane was not used: ' + $why + '.')
+    return $null
+  }
+  return $record
+}
+
+# Runs claude from PATH with these arguments, its environment clear of the markers.
+function Start-Claude([string[]]$arguments) {
+  foreach ($name in $Markers) { [Environment]::SetEnvironmentVariable($name, $null, [EnvironmentVariableTarget]::Process) }
+  $claude = Get-Command -Name 'claude' -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+  if ($null -eq $claude) { Write-Host 'No claude on PATH.'; return }
+  & $claude.Source @arguments
+}
+
+Start-Claude @()
+while ($true) {
+  $next = Get-Next
+  if ($null -ne $next) {
+    Set-Location -LiteralPath $next.folder
+    Write-Host ('Resuming conversation ' + $next.resume + ' here.')
+    Start-Claude @('--resume', $next.resume)
+    continue
+  }
+  Write-Host 'Claude Code ended. Enter starts a new session here; Ctrl+C leaves this slot.'
+  $enter = $false
+  while (-not $enter -and -not (Test-Path -LiteralPath $recordPath -PathType Leaf)) {
+    for ($i = 0; $i -lt 10 -and -not $enter; $i++) {
+      while ([Console]::KeyAvailable) { if ([Console]::ReadKey($true).Key -eq 'Enter') { $enter = $true } }
+      if (-not $enter) { Start-Sleep -Milliseconds 200 }
+    }
+  }
+  if ($enter) { Start-Claude @() }
+}
