@@ -513,6 +513,19 @@ describe('the safe point', () => {
       expect(s11([{ ...named, dirty: 0 }])).toEqual([])
     })
 
+    test("the session's own folder in another repository holds on any dirt, as v1 did: no baseline applies", () => {
+      const cwd = tree({ path: 'D:\\other\\repo', role: 'cwd', branch: 'main', dirty: 2 })
+      expect(s11([cwd], { ...BASE, folder: 'D:\\other\\repo' })).toEqual([
+        "S11: 2 files are uncommitted in D:\\other\\repo, the folder this session works in, dirty, no baseline: commit or stash them, or the merger's anyway",
+      ])
+      expect(s11([{ ...cwd, dirty: 0 }])).toEqual([])
+    })
+
+    test('a broken named worktree (git finds no repository there) holds as S11', () => {
+      const why = "C:\\work\\wt-a is listed as a worktree of the start folder's repository, but git finds no repository there (a broken worktree), so what it holds can't be read"
+      expect(safePoint(probeOf(), { isReadable: false, why, check: 'S11' }, []).reasons).toEqual([`S11: ${why}`])
+    })
+
     test('a named tree that is not a worktree of the start folder\'s repository holds as S11, naming it', () => {
       expect(safePoint(probeOf(), { isReadable: false, why: 'C:\\x is not a worktree of the repository at C:\\work\\repo, the start folder', check: 'S11' }, []).reasons).toEqual([
         'S11: C:\\x is not a worktree of the repository at C:\\work\\repo, the start folder',
@@ -521,10 +534,12 @@ describe('the safe point', () => {
     })
 
     test('the fingerprint reads what the coordinator\'s S5 reads; a status names a file per entry, a rename one', () => {
+      // Each with the repository's fsmonitor off, the diff with no textconv: no setting of the
+      // repository's own hides a change.
       expect(FINGERPRINT_READS).toEqual({
-        status: ['status', '--porcelain=v1', '-z', '--untracked-files=all'],
-        diff: ['diff', 'HEAD', '--no-ext-diff', '--no-color', '--binary'],
-        untracked: ['ls-files', '--others', '--exclude-standard', '-z'],
+        status: ['-c', 'core.fsmonitor=false', 'status', '--porcelain=v1', '-z', '--untracked-files=all'],
+        diff: ['-c', 'core.fsmonitor=false', 'diff', 'HEAD', '--no-ext-diff', '--no-textconv', '--no-color', '--binary'],
+        untracked: ['-c', 'core.fsmonitor=false', 'ls-files', '--others', '--exclude-standard', '-z'],
       })
       expect(countStatus(' M a.ts\0?? b.ts\0R  new.ts\0old.ts\0')).toBe(3)
       expect(countStatus('')).toBe(0)

@@ -42,7 +42,13 @@ type Options = {
    * repository's worktrees (paths; the start folder is the first), each other tree's dirty count, or a
    * failure. A tree's diff is `world.diffs`, which a test changes to edit a dirty file further.
    */
-  git?: { names?: string[]; dirty?: number; fails?: boolean; worktrees?: string[]; dirtyIn?: Record<string, number>; untracked?: number }
+  git?: { names?: string[]; dirty?: number; fails?: boolean; worktrees?: string[]; dirtyIn?: Record<string, number>; untracked?: number; broken?: string[]; outside?: string[] }
+  /**
+   * What `$.session.cwd()` reads: the start folder by default. Git takes a folder's top to be the
+   * longest worktree it is in, or the folder itself; `git.outside` folders are in no repository, and
+   * `git.broken` ones are listed worktrees git finds no repository in.
+   */
+  cwd?: string
   /** What the launcher does. */
   launcher?: 'opens' | 'fails'
   /** What the in-place claim check reads: the lock still this switch's, another's, or none. */
@@ -85,6 +91,7 @@ function engine(
     perConversation = false,
     liveResume,
     checkLive,
+    cwd = REPO,
   }: Options = {},
 ) {
   const runs: Run[] = []
@@ -94,7 +101,7 @@ function engine(
   const logs: string[] = []
   const writes: { path: string; text: string }[] = []
   const described: string[] = []
-  const world = { id, agents, probe: probe ?? machine(), gate, worktrees: git.worktrees ?? [REPO], diffs: {} as Record<string, string>, untrackedTime: NOW - HOUR }
+  const world = { id, agents, probe: probe ?? machine(), gate, worktrees: git.worktrees ?? [REPO], diffs: {} as Record<string, string>, untrackedTime: NOW - HOUR, cwd }
   const key = (path: string) => path.replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase()
   const held = new Map<string, unknown>(Object.entries(store))
   const clock = mock.clock(on, { now: NOW })
@@ -128,7 +135,7 @@ function engine(
   }
   on('session.start', (_, e) => ({ cwd: e.cwd }))
   on('session.id', () => ({ value: world.id }))
-  on('session.cwd', () => ({ value: REPO }))
+  on('session.cwd', () => ({ value: world.cwd }))
   on('tool.register', (_, e) => {
     described.push(String(e.description))
     return { value: { tool: TOOL } }
@@ -166,6 +173,13 @@ function engine(
       runs.push({ argv, init, kind: 'git' })
       if (git.fails) return ok('', 128)
       const folder = argv[argv.indexOf('-C') + 1] ?? ''
+      if ([...(git.broken ?? []), ...(git.outside ?? [])].some(f => key(f) === key(folder))) {
+        return { value: { exitCode: 128, stdout: '', stderr: 'fatal: not a git repository (or any of the parent directories): .git', isStdoutTruncated: false, isStderrTruncated: false } }
+      }
+      if (argv.includes('--show-toplevel')) {
+        const top = world.worktrees.filter(w => key(folder) === key(w) || key(folder).startsWith(`${key(w)}/`)).sort((a, b) => b.length - a.length)[0] ?? folder
+        return ok(`${top.replace(/\\/g, '/')}\n`)
+      }
       const dirty = key(folder) === key(REPO) ? (git.dirty ?? 0) : (git.dirtyIn?.[folder] ?? 0)
       if (argv.includes('--git-common-dir')) return ok('C:/work/repo/.git\n')
       if (argv.includes('rev-parse')) return ok(`${'c'.repeat(40)}\n`)
@@ -261,7 +275,7 @@ describe('transports', () => {
     expect(probe?.script).toContain(`$take = '${T}'`)
     expect(probe?.script).toContain(`$configDirs = @('${CONFIG}')`)
     // In place: the dirty count was read, in the session's folder.
-    expect(runs.some(r => r.kind === 'git' && r.argv.join(' ') === 'git --no-optional-locks -C C:\\work\\repo status --porcelain=v1 -z --untracked-files=all')).toBe(true)
+    expect(runs.some(r => r.kind === 'git' && r.argv.join(' ') === 'git --no-optional-locks -C C:\\work\\repo -c core.fsmonitor=false status --porcelain=v1 -z --untracked-files=all')).toBe(true)
     expect(commands).toEqual([{ command: 'resume', args: T }])
     for (const part of ['Remove-Item', 'billing', 'invoice']) expect(JSON.stringify(runs)).not.toContain(part)
     expect(texts(session)).toContain(
@@ -936,17 +950,79 @@ describe('refusals, before and at the run', () => {
     expect(rows(session)).toMatch(/S11: 51 files are uncommitted in .+, the start folder, dirty, no baseline/)
   })
 
-  test('a resume keeps the first baseline: changes made since still hold after it', async ($, on) => {
-    const { commands, session, world, clock } = engine(on, { git: { dirty: 14 } })
+  test('a resume keeps the first baseline as it was: changes made since still hold after it', async ($, on) => {
+    const { commands, held, session, world, clock } = engine(on, { git: { dirty: 14 } })
     await $.session.start(start)
     await $.classic.SessionStart({ source: 'startup', session_id: W })
     await clock.advance(1000)
+    const first = held.get(`baseline:${W}`)
+    expect(first).toMatchObject({ folder: REPO, fingerprint: expect.stringMatching(/^[0-9a-f]{64}$/) })
     world.diffs['c:/work/repo'] = 'edited further, then the conversation resumed'
     await $.classic.SessionStart({ source: 'resume', session_id: W })
     await clock.advance(1000)
+    expect(held.get(`baseline:${W}`)).toEqual(first)
     await switchNow($, clock)
     expect(commands).toEqual([])
     expect(rows(session)).toMatch(/dirty since this conversation started/)
+  })
+
+  test("a resume with no baseline takes none: the conversation's own dirt would be in it, so the start folder's dirt holds", async ($, on) => {
+    const { commands, held, session, clock } = engine(on, { git: { dirty: 14 } })
+    await $.session.start(start)
+    await $.classic.SessionStart({ source: 'resume', session_id: W })
+    await clock.advance(1000)
+    expect([...held.keys()].filter(k => k.startsWith('baseline:'))).toEqual([])
+    await switchNow($, clock)
+    expect(commands).toEqual([])
+    expect(rows(session)).toMatch(/S11: 14 files are uncommitted in C:\\\\work\\\\repo, the start folder, dirty, no baseline/)
+    expect([...held.keys()].filter(k => k.startsWith('baseline:'))).toEqual([])
+  })
+
+  test("a resume over a baseline that can't be read leaves it as it is, and the start folder's dirt holds", async ($, on) => {
+    const corrupt = { folder: REPO, fingerprint: 'not a hash', at: NOW - HOUR }
+    const { commands, held, session, clock } = engine(on, { git: { dirty: 3 }, store: { [`baseline:${W}`]: corrupt } })
+    await $.session.start(start)
+    await $.classic.SessionStart({ source: 'resume', session_id: W })
+    await clock.advance(1000)
+    expect(held.get(`baseline:${W}`)).toEqual(corrupt)
+    await switchNow($, clock)
+    expect(commands).toEqual([])
+    expect(rows(session)).toMatch(/S11: 3 files are uncommitted in .+, the start folder, dirty, no baseline/)
+  })
+
+  test('a /clear starts a new conversation: its baseline is taken, by its own id', async ($, on) => {
+    const { held, clock } = engine(on, { git: { dirty: 2 } })
+    await $.session.start(start)
+    await $.classic.SessionStart({ source: 'clear', session_id: T })
+    await clock.advance(1000)
+    const kept = held.get(`baseline:${T}`) as { at: number; usedAt: number }
+    expect(kept).toMatchObject({ folder: REPO, fingerprint: expect.stringMatching(/^[0-9a-f]{64}$/) })
+    expect(kept.usedAt).toBe(kept.at)
+  })
+
+  test('a baseline is pruned 30 days after its last use, never by its age; a switch and the heartbeat mark it used', async ($, on) => {
+    const FP = 'f'.repeat(64)
+    const DAY = 24 * HOUR
+    const { held, clock } = engine(on, {
+      store: {
+        // Taken 40 days ago, used yesterday: kept.
+        [`baseline:${T}`]: { folder: REPO, fingerprint: FP, at: NOW - 40 * DAY, usedAt: NOW - DAY },
+        // Last used 31 days ago, or never since it was taken then: dropped.
+        [`baseline:${OTHER}`]: { folder: REPO, fingerprint: FP, at: NOW - 40 * DAY, usedAt: NOW - 31 * DAY },
+        [`baseline:${X}`]: { folder: REPO, fingerprint: FP, at: NOW - 31 * DAY },
+        // This conversation's, last used 2 days ago: the heartbeat marks it used.
+        [`baseline:${W}`]: { folder: REPO, fingerprint: FP, at: NOW - 40 * DAY, usedAt: NOW - 2 * DAY },
+      },
+    })
+    await $.session.start(start)
+    await clock.settle()
+    expect([...held.keys()].filter(k => k.startsWith('baseline:')).sort()).toEqual([`baseline:${T}`, `baseline:${W}`].sort())
+    expect(held.get(`baseline:${T}`)).toEqual({ folder: REPO, fingerprint: FP, at: NOW - 40 * DAY, usedAt: NOW - DAY })
+    expect(held.get(`baseline:${W}`)).toEqual({ folder: REPO, fingerprint: FP, at: NOW - 40 * DAY, usedAt: NOW })
+    // Read at a switch: marked used then.
+    await clock.advance(5 * MINUTE)
+    await switchNow($, clock)
+    expect((held.get(`baseline:${W}`) as { usedAt: number }).usedAt).toBeGreaterThanOrEqual(NOW + 5 * MINUTE)
   })
 
   test('a baseline that can\'t be read is none: the start folder\'s dirt holds', async ($, on) => {
@@ -964,6 +1040,66 @@ describe('refusals, before and at the run', () => {
     await switchNow($, clock, { trees: [WT] })
     expect(commands).toEqual([])
     expect(rows(session)).toContain('S11: 2 files are uncommitted in C:\\\\work\\\\wt-a, dirty, no baseline: a named worktree must be clean (commit or stash them)')
+  })
+
+  test('a dirty worktree the session works in holds the switch, though the call names no tree', async ($, on) => {
+    const WT = 'C:\\work\\wt-a'
+    const { commands, session, clock } = engine(on, { cwd: `${WT}\\src`, git: { worktrees: [REPO, WT], dirtyIn: { [WT]: 2 } } })
+    await $.session.start(start)
+    await switchNow($, clock)
+    expect(commands).toEqual([])
+    expect(rows(session)).toContain('S11: 2 files are uncommitted in C:\\\\work\\\\wt-a, dirty, no baseline: a named worktree must be clean (commit or stash them)')
+  })
+
+  test('a dirty folder of another repository the session works in holds the switch, as v1 did', async ($, on) => {
+    const OWN = 'D:\\other\\repo'
+    const { commands, session, clock } = engine(on, { cwd: OWN, git: { worktrees: [REPO, 'C:\\work\\wt-a'], dirtyIn: { [OWN]: 3 } } })
+    await $.session.start(start)
+    await switchNow($, clock)
+    expect(commands).toEqual([])
+    expect(rows(session)).toContain("S11: 3 files are uncommitted in D:\\\\other\\\\repo, the folder this session works in, dirty, no baseline: commit or stash them, or the merger's anyway")
+  })
+
+  test("a clean worktree the session works in: read as a named tree, the switch goes", async ($, on) => {
+    const WT = 'C:\\work\\wt-a'
+    const { commands, runs, clock } = engine(on, { cwd: WT, git: { worktrees: [REPO, WT] } })
+    await $.session.start(start)
+    await switchNow($, clock)
+    expect(commands).toEqual([{ command: 'resume', args: T }])
+    expect(runs.some(r => r.kind === 'git' && r.argv.join(' ') === `git --no-optional-locks -C ${WT} -c core.fsmonitor=false status --porcelain=v1 -z --untracked-files=all`)).toBe(true)
+  })
+
+  test("the session working in a folder of the start folder's own tree: that tree is the start folder's, read only as such", async ($, on) => {
+    const { commands, runs, clock } = engine(on, { cwd: `${REPO}\\src`, git: { dirtyIn: { [`${REPO}\\src`]: 4 } } })
+    await $.session.start(start)
+    await switchNow($, clock)
+    expect(commands).toEqual([{ command: 'resume', args: T }])
+    expect(runs.some(r => r.kind === 'git' && r.argv.includes(`${REPO}\\src`) && r.argv.includes('status'))).toBe(false)
+  })
+
+  test('the session working in a folder outside any repository: nothing there to read, as v1 did', async ($, on) => {
+    const { commands, clock } = engine(on, { cwd: 'D:\\scratch', git: { outside: ['D:\\scratch'] } })
+    await $.session.start(start)
+    await switchNow($, clock)
+    expect(commands).toEqual([{ command: 'resume', args: T }])
+  })
+
+  test("a broken named worktree, listed but with no repository git can find, holds the switch (S11)", async ($, on) => {
+    const WT = 'C:\\work\\wt-a'
+    const { commands, session, clock } = engine(on, { git: { worktrees: [REPO, WT], broken: [WT] } })
+    await $.session.start(start)
+    await switchNow($, clock, { trees: [WT] })
+    expect(commands).toEqual([])
+    expect(rows(session)).toContain("S11: C:\\\\work\\\\wt-a is listed as a worktree of the start folder's repository, but git finds no repository there (a broken worktree), so what it holds can't be read")
+  })
+
+  test('a broken worktree the session works in holds the switch too, though the call names no tree', async ($, on) => {
+    const WT = 'C:\\work\\wt-a'
+    const { commands, session, clock } = engine(on, { cwd: WT, git: { worktrees: [REPO, WT], broken: [WT] } })
+    await $.session.start(start)
+    await switchNow($, clock)
+    expect(commands).toEqual([])
+    expect(rows(session)).toMatch(/S11: C:\\\\work\\\\wt-a is listed as a worktree of the start folder's repository, but git finds no repository there/)
   })
 
   test('a clean named worktree, and the start folder clean: the switch goes', async ($, on) => {

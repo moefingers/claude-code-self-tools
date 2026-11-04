@@ -1206,14 +1206,15 @@ export function liveness(probe: Probe, id: string, now: number, opts: { lane?: L
 // The safe point.
 
 /**
- * One tree the safe point reads for S11: the session's start folder (`start`), or a worktree of the
- * same repository the caller named (`named`). Its branch (null when detached, or no repository), its
- * head commit (null when there is none yet), how many files are uncommitted, and the fingerprint of
- * that dirty state (fingerprintOf; null when it can't be read whole).
+ * One tree the safe point reads for S11: the session's start folder (`start`); a worktree of the same
+ * repository the caller named, or the session's own folder when it is one (`named`); or the session's
+ * own folder when it is in another repository (`cwd`). Its branch (null when detached, or no
+ * repository), its head commit (null when there is none yet), how many files are uncommitted, and the
+ * fingerprint of that dirty state (fingerprintOf; null when it can't be read whole).
  */
 export type TreeState = {
   readonly path: string
-  readonly role: 'start' | 'named'
+  readonly role: 'start' | 'named' | 'cwd'
   readonly branch: string | null
   readonly head: string | null
   readonly dirty: number
@@ -1233,7 +1234,7 @@ export type GitState =
  * The start folder's dirty state when the conversation started (S11's baseline): the folder, its
  * fingerprint then, and when it was taken. Its dirt then holds only once the fingerprint has changed.
  */
-export type Baseline = { readonly folder: string; readonly fingerprint: string; readonly at: number }
+export type Baseline = { readonly folder: string; readonly fingerprint: string; readonly at: number; readonly usedAt?: number }
 
 export type AgentLike = { readonly status: string; readonly description?: string; readonly type?: string }
 
@@ -1255,10 +1256,10 @@ const CHECK: Record<ProcessClass, (p: ProcessEntry) => string> = {
  * - S3: a heavy slot whose job's Windows pid runs under the session, or a heavy-slot job under it;
  * - S4: a dev server, Playwright or a debugged browser under it;
  * - S6: a build, test or lint under it, and any shell under it: a background job;
- * - S11: uncommitted changes in a tree `git` read: in a named worktree, any (a worker's own tree must be
- *   clean); in the start folder, only once its fingerprint differs from `baseline`, taken when the
- *   conversation started (a shared checkout may carry changes that aren't this session's). With no
- *   baseline for that folder, its dirt holds, saying so.
+ * - S11: uncommitted changes in a tree `git` read: in a named worktree, or the session's own folder,
+ *   any (a worker's own tree must be clean); in the start folder, only once its fingerprint differs
+ *   from `baseline`, taken when the conversation started (a shared checkout may carry changes that
+ *   aren't this session's). With no baseline for that folder, its dirt holds, saying so.
  * `probe` is a string when the probe failed: why.
  */
 export function safePoint(probe: Probe | string, git: GitState, agents: readonly AgentLike[] | string, baseline?: Baseline): SafePoint {
@@ -1302,6 +1303,7 @@ function s11(tree: TreeState, baseline: Baseline | undefined): string | undefine
   if (tree.dirty === 0) return undefined
   const files = tree.dirty === 1 ? '1 file is' : `${tree.dirty} files are`
   if (tree.role === 'named') return `S11: ${files} uncommitted in ${tree.path}, dirty, no baseline: a named worktree must be clean (commit or stash them)`
+  if (tree.role === 'cwd') return `S11: ${files} uncommitted in ${tree.path}, the folder this session works in, dirty, no baseline: commit or stash them, or the merger's anyway`
   if (baseline === undefined || !sameFolder(baseline.folder, tree.path)) {
     return `S11: ${files} uncommitted in ${tree.path}, the start folder, dirty, no baseline (this conversation started before one was kept, or it can't be read): commit or stash them, or the merger's anyway`
   }
@@ -1348,11 +1350,15 @@ export async function checkTrees($: EngineInterface, start: string, trees: reado
   }
 }
 
-/** The git reads that fingerprint a tree's dirty state: the coordinator's (S5) exactly. */
+/**
+ * The git reads that fingerprint a tree's dirty state: the coordinator's (S5), each with the
+ * repository's fsmonitor off, and the diff with no textconv, so that no setting of the repository's
+ * own can hide a change from it.
+ */
 export const FINGERPRINT_READS = {
-  status: ['status', '--porcelain=v1', '-z', '--untracked-files=all'],
-  diff: ['diff', 'HEAD', '--no-ext-diff', '--no-color', '--binary'],
-  untracked: ['ls-files', '--others', '--exclude-standard', '-z'],
+  status: ['-c', 'core.fsmonitor=false', 'status', '--porcelain=v1', '-z', '--untracked-files=all'],
+  diff: ['-c', 'core.fsmonitor=false', 'diff', 'HEAD', '--no-ext-diff', '--no-textconv', '--no-color', '--binary'],
+  untracked: ['-c', 'core.fsmonitor=false', 'ls-files', '--others', '--exclude-standard', '-z'],
 } as const
 
 /** The most untracked files a fingerprint stats; past it, the fingerprint can't be read whole. */
@@ -1404,13 +1410,18 @@ export function countStatus(z: string): number {
 }
 
 /**
- * One tree's state for S11: its status (porcelain, -z), branch, head and fingerprint. A folder outside
- * any repository reads clean, with no branch or head. Undefined, with `why`, when it can't be read.
+ * One tree's state for S11: its status (porcelain, -z), branch, head and fingerprint. A start folder
+ * outside any repository reads clean, with no branch or head; a named tree there, which checkTrees
+ * found listed, is a broken worktree, and can't be read (S11). `why` when it can't be read.
  */
-async function treeState($: EngineInterface, path: string, role: TreeState['role']): Promise<TreeState | { readonly why: string }> {
+async function treeState($: EngineInterface, path: string, role: TreeState['role']): Promise<TreeState | { readonly why: string; readonly check?: 'S11' }> {
   const status = await gitIn($, path, FINGERPRINT_READS.status)
   if (status.exitCode !== 0) {
-    if (/not a git repository/i.test(status.stderr)) return { path, role, branch: null, head: null, dirty: 0, fingerprint: null }
+    if (/not a git repository/i.test(status.stderr)) {
+      if (role === 'start') return { path, role, branch: null, head: null, dirty: 0, fingerprint: null }
+      const what = role === 'named' ? `${path} is listed as a worktree of the start folder's repository, but git finds no repository there (a broken worktree)` : `git finds no repository in ${path}, the folder this session works in, though it found one a moment before`
+      return { why: `${what}, so what it holds can't be read`, check: 'S11' }
+    }
     return { why: `git status in ${path} exited ${status.exitCode}` }
   }
   if (status.isStdoutTruncated) return { why: `git status in ${path} printed more than can be read` }
@@ -1431,15 +1442,18 @@ async function treeState($: EngineInterface, path: string, role: TreeState['role
  * Git's state for the safe point, each read by fixed argv with a 5-second bound:
  * - in every worktree of the repos of `start`, the named `trees` and `folders`, an operation in
  *   flight (S2);
- * - each tree's state for S11 (TreeState): the start folder's when `dirty`, and every named tree's,
- *   always. A tree named that isn't a worktree of the start folder's repository makes the state
- *   unreadable for S11 (checkTrees); a named tree that is the start folder reads as named.
+ * - each tree's state for S11 (TreeState): the start folder's when `dirty`, every named tree's, and
+ *   `cwd`'s, the session's own folder, always, when it is in another worktree than the start folder's
+ *   (its top, by `git rev-parse --show-toplevel`): a worktree of the start folder's repository reads as
+ *   named, one of another repository as `cwd`; outside any repository, nothing. A tree named that
+ *   isn't a worktree of the start folder's repository makes the state unreadable for S11 (checkTrees);
+ *   a named tree that is the start folder reads as named.
  * A folder outside any repo has nothing in flight and nothing dirty. Anything that can't be read
  * makes the state unreadable, which holds.
  */
 export async function readGit(
   $: EngineInterface,
-  opts: { readonly start: string; readonly trees?: readonly string[]; readonly folders?: readonly string[]; readonly dirty: boolean },
+  opts: { readonly start: string; readonly trees?: readonly string[]; readonly cwd?: string; readonly folders?: readonly string[]; readonly dirty: boolean },
 ): Promise<GitState> {
   const git = (folder: string, args: readonly string[]) => gitIn($, folder, args)
   const markers: string[] = []
@@ -1468,10 +1482,27 @@ export async function readGit(
     const reads: { path: string; role: TreeState['role'] }[] = []
     if (opts.dirty && !checked.trees.some(tree => sameFolder(tree, opts.start))) reads.push({ path: opts.start, role: 'start' })
     for (const tree of checked.trees) reads.push({ path: tree, role: 'named' })
+    // The session's own folder: when it is in another worktree than the start folder's, that tree too,
+    // named or not. Not model input, so never refused: of another repository, it reads as `cwd`.
+    // Outside any repository, nothing, unless it is a worktree the start folder's repository lists (a
+    // broken one), which reads as named, and so holds.
+    if (opts.cwd !== undefined && !sameFolder(opts.cwd, opts.start)) {
+      const own = await git(opts.cwd, ['rev-parse', '--show-toplevel'])
+      const outside = own.exitCode !== 0 && /not a git repository/i.test(own.stderr)
+      if (own.exitCode !== 0 && !outside) return { isReadable: false, why: `git rev-parse in ${opts.cwd} exited ${own.exitCode}` }
+      const top = outside ? opts.cwd : own.stdout.trim().replace(/\//g, '\\')
+      const startTop = outside ? undefined : await git(opts.start, ['rev-parse', '--show-toplevel'])
+      const isStart = startTop !== undefined && startTop.exitCode === 0 && sameFolder(startTop.stdout.trim(), top)
+      if (!isStart && !reads.some(read => sameFolder(read.path, top))) {
+        const listed = isSafeFolder(top) && !('refusal' in (await checkTrees($, opts.start, [top])))
+        if (listed) reads.push({ path: top, role: 'named' })
+        else if (!outside) reads.push({ path: top, role: 'cwd' })
+      }
+    }
     const trees: TreeState[] = []
     for (const read of reads) {
       const state = await treeState($, read.path, read.role)
-      if ('why' in state) return { isReadable: false, why: state.why }
+      if ('why' in state) return { isReadable: false, why: state.why, ...(state.check === undefined ? {} : { check: state.check }) }
       trees.push(state)
     }
     return { isReadable: true, markers, trees }
