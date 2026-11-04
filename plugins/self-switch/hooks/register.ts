@@ -40,10 +40,12 @@
 // S11, uncommitted changes: in each worktree the call names (`trees`, each checked to be a worktree of
 // the start folder's repository) and in the session's own folder when it is another tree, any hold; in
 // the start folder (for an in-place switch), only changes made since the conversation started: the
-// classic SessionStart of a new conversation (startup or clear, never a resume) keeps a fingerprint of
-// the start folder's dirty state (`baseline:<id>` in the plugin's store), and the start folder's dirt
-// holds only once that fingerprint has changed, or when there is none. A baseline is pruned 30 days
-// after it was last used (read at a switch, or touched by the heartbeat), never by its age.
+// classic SessionStart of a startup keeps a fingerprint of the start folder's dirty state
+// (`baseline:<id>` in the plugin's store), a `/clear` carries the baseline of the conversation it
+// ends to the one it starts (none when that one had none, or one of another folder), and a resume or
+// a fork takes none; the start folder's dirt holds only once that fingerprint has changed, or when
+// there is none. A baseline is pruned 30 days after it was last used (read at a switch, or touched by
+// the heartbeat), never by its age.
 // `/resume` swaps `$.state` for the conversation resumed, start folder included, and at the classic
 // SessionStart of the resume `$.session.id()` and `$.state` may still be the conversation that left
 // (seen live on 2.1.318). So the start folder is read from the module first, where session.start keeps
@@ -76,6 +78,7 @@ import {
   quoted,
   readGate,
   readGit,
+  sameFolder,
   RELEASED,
   releaseScript,
   SESSION_ID,
@@ -172,6 +175,12 @@ let beat: Timer | undefined
  * is read first (startFolderOf). A reload of the module sets it again from `$.state`.
  */
 let startFolder: string | undefined
+/**
+ * The conversation this process holds now: from each main-loop classic SessionStart's own id (the
+ * event's: `$.session.id()` may still read the one before), and at session.start when none is known
+ * yet. A `/clear` carries the S11 baseline of this conversation to the one it starts.
+ */
+let current: string | undefined
 /** The registry keys not in REGISTRY_KEYS already logged by this process: each is logged once. */
 const seenKeys = new Set<string>()
 /** When old heartbeats were last looked for. */
@@ -516,10 +525,10 @@ async function touchBaseline($: EngineInterface, id: string, now: number): Promi
 }
 
 /**
- * Keeps a new conversation's S11 baseline: the fingerprint of `folder`'s dirty state now. Only when
- * nothing is stored under its key, a value that can't be read included: a baseline is never replaced.
- * Nothing when the folder can't be read whole: S11 then holds the start folder's dirt, saying there is
- * no baseline.
+ * Keeps a started conversation's S11 baseline: the fingerprint of `folder`'s dirty state now. Only
+ * when nothing is stored under its key, a value that can't be read included: a baseline is never
+ * replaced. Nothing when the folder can't be read whole: S11 then holds the start folder's dirt,
+ * saying there is no baseline.
  */
 async function keepBaseline($: EngineInterface, id: string, folder: string): Promise<void> {
   try {
@@ -529,6 +538,26 @@ async function keepBaseline($: EngineInterface, id: string, folder: string): Pro
     const at = await $.clock.now()
     const value: Baseline = { folder, fingerprint, at, usedAt: at }
     await $.store.set(`${BASELINE}${id}`, value)
+  } catch {
+    // No baseline: the start folder's dirt holds, and says why.
+  }
+}
+
+/**
+ * At a `/clear`: carries the S11 baseline of `from`, the conversation it ended, to `to`, the one it
+ * started, when it is of `folder`: its fingerprint and `at` as they were, used now. Never a fresh
+ * fingerprint: by now the folder holds `from`'s own changes, and one taken now would let them
+ * through. Nothing when `from` had none, or one of another folder, or `to` has one already: S11
+ * then holds the start folder's dirt, saying there is no baseline.
+ */
+async function carryBaseline($: EngineInterface, from: string | undefined, to: string, folder: string): Promise<void> {
+  try {
+    if (from === undefined || from === to) return
+    if ((await $.store.get(`${BASELINE}${to}`)) !== undefined) return
+    const kept = baselineOf(await $.store.get(`${BASELINE}${from}`))
+    if (kept === undefined || !sameFolder(kept.folder, folder)) return
+    const value: Baseline = { folder: kept.folder, fingerprint: kept.fingerprint, at: kept.at, usedAt: await $.clock.now() }
+    await $.store.set(`${BASELINE}${to}`, value)
   } catch {
     // No baseline: the start folder's dirt holds, and says why.
   }
@@ -933,6 +962,10 @@ export const register: Register = (on, options) => {
     const { value: first } = await $.state.get(folderKey)
     if (typeof first !== 'string' || first === '') await $.state.set(folderKey, e.cwd)
     startFolder = typeof first === 'string' && first !== '' ? first : e.cwd
+    if (current === undefined) {
+      const own = await sessionId($)
+      if (own !== undefined && SESSION_ID.test(own)) current = own
+    }
     await $.tool.register({
       name: 'switch_after_turn',
       description: DESCRIPTION,
@@ -975,18 +1008,23 @@ export const register: Register = (on, options) => {
       $.ui.status(undefined)
       $.ui.toast('Switch cancelled: this session became another conversation before it ran.')
     }
-    if (e.agent_id !== undefined || (e.source !== 'resume' && e.source !== 'startup' && e.source !== 'clear')) return done
     const id = e.session_id
+    // The conversation this process held until now, and the one it holds from here, by the event's id.
+    const previous = current
+    if (e.agent_id === undefined && typeof id === 'string' && SESSION_ID.test(id)) current = id
+    if (e.agent_id !== undefined || (e.source !== 'resume' && e.source !== 'startup' && e.source !== 'clear')) return done
     if (typeof id !== 'string' || !SESSION_ID.test(id)) return done
     // The heartbeat now; the tick's pruning waits for the next beat, after the arrival took its ticket.
     if (e.source === 'resume') startBeat($, id)
     // A clear starts a new conversation with nothing to deliver: its baseline only.
     if (e.source !== 'clear') $.clock.after(SETTLE_MS, () => void arrive($, id))
-    // S11's baseline: the start folder's dirty state as a NEW conversation starts (startup, clear), by
-    // the event's id. Never at a resume: by then the folder may hold the conversation's own changes, and
-    // a baseline taken then would let them through. A resumed conversation without one holds.
+    // S11's baseline, by the event's id: a startup fingerprints the start folder's dirty state; a /clear
+    // carries the baseline of the conversation it ends (the folder holds that one's changes by now: a
+    // fresh fingerprint would let them through), or takes none. A resume takes none, nor a fork (its
+    // source is `fork`, filtered out above), for the same reason: without one, the dirt holds.
     const folder = startFolder ?? (typeof e.cwd === 'string' && isSafeFolder(e.cwd) ? e.cwd : undefined)
-    if (folder !== undefined && e.source !== 'resume') $.clock.after(SETTLE_MS, () => void keepBaseline($, id, folder))
+    if (folder !== undefined && e.source === 'startup') $.clock.after(SETTLE_MS, () => void keepBaseline($, id, folder))
+    if (folder !== undefined && e.source === 'clear') await carryBaseline($, previous, id, folder)
     return done
   })
 
