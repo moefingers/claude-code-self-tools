@@ -128,6 +128,51 @@ export const slotRecordPath = (state: string, slot: string): string => `${state}
 export const gatePath = (state: string, id: string): string => `${state}\\gate\\${id}.json`
 
 // ---------------------------------------------------------------------------------------------
+// Another session's words, as data.
+
+/** The most characters of another session's text a row carries, inside its quotes. */
+export const QUOTED_MAX = 400
+
+/** Line and paragraph breaks of every kind, and tabs: each run becomes one space. */
+const BREAKS = /[\t\n\u000b\u000c\r\u0085\u2028\u2029]+/g
+
+/** Control characters, and the invisible format characters (bidi controls, zero widths, the BOM): dropped. */
+const INVISIBLE = /[\u0000-\u001f\u007f-\u009f\u00ad\u061c\u180e\u200b-\u200f\u202a-\u202e\u2060-\u2064\u2066-\u206f\ufeff\ufff9-\ufffb]/g
+
+/** `text` cut to `max` characters, the last an ellipsis, never splitting a surrogate pair. */
+function cut(text: string, max: number): string {
+  if (text.length <= max) return text
+  let kept = text.slice(0, max - 1)
+  if (/[\ud800-\udbff]$/.test(kept)) kept = kept.slice(0, -1)
+  return `${kept}\u2026`
+}
+
+/**
+ * Another session's text as one line: every line break and tab a space, control and format
+ * characters dropped, runs of spaces one, trimmed, at most `max` characters (an ellipsis last).
+ */
+export function oneLine(text: string, max = QUOTED_MAX): string {
+  return cut(text.replace(BREAKS, ' ').replace(INVISIBLE, '').replace(/\s+/g, ' ').trim(), max)
+}
+
+/**
+ * Another session's text quoted as data: \u00abone line\u00bb, each \u00ab and \u00bb inside, and the backslash, escaped
+ * with a backslash, so the quote can't be closed early. At most QUOTED_MAX characters inside the
+ * quotes, escapes included; an escape is never cut in half.
+ */
+export function quoted(text: string): string {
+  let inside = oneLine(text, Number.MAX_SAFE_INTEGER).replace(/[\\\u00ab\u00bb]/g, c => `\\${c}`)
+  if (inside.length > QUOTED_MAX) {
+    inside = inside.slice(0, QUOTED_MAX - 1)
+    const tail = /\\+$/.exec(inside)?.[0].length ?? 0
+    if (tail % 2 === 1) inside = inside.slice(0, -1)
+    if (/[\ud800-\udbff]$/.test(inside)) inside = inside.slice(0, -1)
+    inside += '\u2026'
+  }
+  return `\u00ab${inside}\u00bb`
+}
+
+// ---------------------------------------------------------------------------------------------
 // The fixed values the rules use.
 
 /** How long the new window waits for the old process to exit, in seconds. */
