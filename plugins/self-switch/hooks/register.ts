@@ -35,9 +35,11 @@
 // Every conversation this plugin runs in keeps a heartbeat (`alive:<id>`: when, its start folder and
 // project) at each turn's start and end and every 2 minutes; liveness reads it (L5), and a switch to a
 // conversation of another project reads its folder from it. Heartbeats 30 days old are dropped.
-// `/resume` swaps `$.state` for the conversation resumed, start folder included: the classic
-// SessionStart of a resume puts the process's start folder back and starts the heartbeat again, so an
-// arrived conversation can switch on.
+// `/resume` swaps `$.state` for the conversation resumed, start folder included, and at the classic
+// SessionStart of the resume `$.session.id()` and `$.state` may still be the conversation that left
+// (seen live on 2.1.318). So the start folder is read from the module first, where session.start keeps
+// it for the life of the process, and the resume beats the resumed conversation by the id its event
+// names, never by `$.session.id()`.
 import type { EngineInterface, Register, Timer } from 'claude-code'
 import type { Heartbeat, Queued, Ticket } from '../types'
 import type { AgentLike, Probe } from './machine'
@@ -145,8 +147,8 @@ let armed: Queued | undefined
 /** The heartbeat's timer, one per load of the module. */
 let beat: Timer | undefined
 /**
- * The folder this process started in, as session.start kept it: `/resume` swaps `$.state`, so the
- * classic SessionStart of a resume puts it back from here.
+ * The folder this process started in, as session.start kept it: `/resume` swaps `$.state`, so this
+ * is read first (startFolderOf). A reload of the module sets it again from `$.state`.
  */
 let startFolder: string | undefined
 /** The registry keys not in REGISTRY_KEYS already logged by this process: each is logged once. */
@@ -267,7 +269,7 @@ async function context($: EngineInterface): Promise<Context | { refusal: string 
   if ('refusal' in found) return found
   const own = await sessionId($)
   if (own === undefined || !SESSION_ID.test(own)) return { refusal: `this session's id (${JSON.stringify(own ?? '')}) is not a session id` }
-  const { value: folder } = await $.state.get(folderKey)
+  const folder = await startFolderOf($)
   if (!isSafeFolder(folder)) return { refusal: "the folder this session started in isn't known, or isn't an absolute folder without quotes" }
   let cwd: string
   try {
@@ -433,13 +435,23 @@ async function pruneTickets($: EngineInterface, now: number): Promise<void> {
   }
 }
 
-/** This conversation's heartbeat: when, the folder its process started in, and that folder's project. */
-async function heartbeat($: EngineInterface): Promise<void> {
+/** The folder this process started in: the module's, else the one `$.state` kept; undefined when neither knows it. */
+async function startFolderOf($: EngineInterface): Promise<string | undefined> {
+  if (startFolder !== undefined && startFolder !== '') return startFolder
+  const { value } = await $.state.get(folderKey)
+  return typeof value === 'string' && value !== '' ? value : undefined
+}
+
+/**
+ * A conversation's heartbeat: when, the folder its process started in, and that folder's project.
+ * `resumed`, at a resume, names the conversation: `$.session.id()` may still read the one that left.
+ */
+async function heartbeat($: EngineInterface, resumed?: string): Promise<void> {
   try {
-    const id = await sessionId($)
+    const id = resumed ?? (await sessionId($))
     if (id === undefined || !SESSION_ID.test(id)) return
-    const { value: folder } = await $.state.get(folderKey)
-    if (typeof folder !== 'string' || folder === '') return
+    const folder = await startFolderOf($)
+    if (folder === undefined) return
     const value: Heartbeat = { at: await $.clock.now(), folder, project: projectName(folder) ?? '' }
     await $.store.set(`${ALIVE}${id}`, value)
   } catch {
@@ -480,12 +492,12 @@ async function tick($: EngineInterface): Promise<void> {
 
 /**
  * Starts the 2-minute tick, again when it ran (one timer per process), and beats now: the whole tick,
- * or with `heartbeatOnly` the heartbeat alone, its pruning left to the next tick.
+ * or at a resume the heartbeat of `resumed` alone, its pruning left to the next tick.
  */
-function startBeat($: EngineInterface, heartbeatOnly: boolean): void {
+function startBeat($: EngineInterface, resumed?: string): void {
   beat?.cancel()
   beat = $.clock.every(BEAT_MS, () => void tick($))
-  if (heartbeatOnly) void heartbeat($)
+  if (resumed !== undefined) void heartbeat($, resumed)
   else void tick($)
 }
 
@@ -825,28 +837,21 @@ export const register: Register = (on, options) => {
       isDeferred: false,
     })
     loadUpdateCheck($)
-    startBeat($, false)
+    startBeat($)
     return started
   })
 
   // The process that holds a conversation a switch moved here: the arrival, once. On a resume, first
-  // the start folder and the heartbeat: `/resume` gave this process the resumed conversation's
-  // `$.state`, without them.
+  // the heartbeat, of the conversation the event names: `$.session.id()` may still read the one that
+  // left, and its `$.state` may still be in place (the start folder comes from the module).
   on('classic.SessionStart', async ($, e, next) => {
     const done = await next(e)
     if (e.agent_id !== undefined || (e.source !== 'resume' && e.source !== 'startup')) return done
-    if (e.source === 'resume') {
-      try {
-        const folder = startFolder ?? (typeof e.cwd === 'string' && e.cwd !== '' ? e.cwd : undefined)
-        if (folder !== undefined) await $.state.set(folderKey, folder)
-      } catch {
-        // A switch from here then refuses, saying the start folder isn't known.
-      }
-      // The heartbeat now; the tick's pruning waits for the next beat, after the arrival took its ticket.
-      startBeat($, true)
-    }
     const id = e.session_id
-    if (typeof id === 'string' && SESSION_ID.test(id)) $.clock.after(SETTLE_MS, () => void arrive($, id))
+    if (typeof id !== 'string' || !SESSION_ID.test(id)) return done
+    // The heartbeat now; the tick's pruning waits for the next beat, after the arrival took its ticket.
+    if (e.source === 'resume') startBeat($, id)
+    $.clock.after(SETTLE_MS, () => void arrive($, id))
     return done
   })
 

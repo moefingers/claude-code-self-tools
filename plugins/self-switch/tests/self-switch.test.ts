@@ -22,6 +22,9 @@ const starting = (p: RawProbe): void => void p.procs.push({ pid: 600, ppid: 10, 
 
 type Run = { argv: readonly string[]; init?: Record<string, unknown>; script?: string; kind: 'probe' | 'launcher' | 'release' | 'check' | 'git' | 'other' }
 
+/** The test's own `$`, through which the engine fake dispatches what the engine would. */
+type TestDollar = Parameters<Parameters<typeof test>[1]>[0]
+
 type Options = {
   env?: Record<string, string>
   /** What `$.session.id()` reads at the start. */
@@ -48,12 +51,34 @@ type Options = {
   exit?: 'exits' | 'stays' | 'refused'
   /** `$.state` kept per conversation, as the engine keeps it: a /resume that takes swaps it for the resumed one's. */
   perConversation?: boolean
+  /**
+   * A /resume that takes in the order seen live on Claude Code 2.1.318: the resumed conversation's
+   * classic SessionStart runs first, while `$.session.id()` and `$.state` are still the one that
+   * left; only once its hooks have returned do they become the resumed one's, and the command returns.
+   */
+  liveResume?: TestDollar
 }
 
 /** The engine beneath the plugin; and what it was asked to run, write and say. */
 function engine(
   on: On,
-  { env = WINDOWS, id = W, agents = [], store = {}, probe, probeFails, gate, git = {}, launcher = 'opens', claim = 'ours', released = 'released', resume = 'takes', exit = 'exits', perConversation = false }: Options = {},
+  {
+    env = WINDOWS,
+    id = W,
+    agents = [],
+    store = {},
+    probe,
+    probeFails,
+    gate,
+    git = {},
+    launcher = 'opens',
+    claim = 'ours',
+    released = 'released',
+    resume = 'takes',
+    exit = 'exits',
+    perConversation = false,
+    liveResume,
+  }: Options = {},
 ) {
   const runs: Run[] = []
   const commands: { command: string; args?: string }[] = []
@@ -152,6 +177,7 @@ function engine(
     commands.push({ command: e.command, ...(e.args ? { args: e.args } : {}) })
     if (e.command === 'resume') {
       if (resume === 'refused') return next(e)
+      if (resume === 'takes' && liveResume !== undefined) await liveResume.classic.SessionStart({ source: 'resume', session_id: e.args })
       if (resume === 'takes') world.id = e.args
       return {}
     }
@@ -913,16 +939,18 @@ describe('the heartbeat', () => {
     expect([...held.keys()].filter(k => k.startsWith('alive:')).sort()).toEqual([`alive:${T}`, `alive:${W}`].sort())
   })
 
-  test('an arrived conversation switches on: the resume puts the start folder and the heartbeat back in its own $.state', async ($, on) => {
-    const { commands, held, world, session, clock } = engine(on, { perConversation: true })
+  test('an arrived conversation switches on, in the order seen live: the resume beats it by its own id, never the one that left, and the start folder comes from the process', async ($, on) => {
+    const { commands, held, world, session, clock } = engine(on, { perConversation: true, liveResume: $ })
     await $.session.start(start)
+    await clock.settle()
+    expect(held.get(`alive:${W}`)).toEqual({ at: NOW, folder: REPO, project: PROJECT })
     await switchNow($, clock)
     expect(commands).toEqual([{ command: 'resume', args: T }])
-    // The resume's SessionStart, in T's own $.state, where W's start folder isn't.
-    await $.classic.SessionStart({ source: 'resume', session_id: T })
-    await clock.settle()
-    // T's heartbeat at once, with the folder: not 2 minutes later.
-    expect(held.get(`alive:${T}`)).toEqual({ at: NOW + 1000, folder: REPO, project: PROJECT })
+    expect(world.id).toBe(T)
+    // T's heartbeat at once, from the resume's SessionStart, with the folder: not 2 minutes later. W's,
+    // the conversation that left, isn't refreshed, though $.session.id() still read W then.
+    expect(held.get(`alive:${T}`)).toEqual({ at: NOW + 500, folder: REPO, project: PROJECT })
+    expect(held.get(`alive:${W}`)).toEqual({ at: NOW, folder: REPO, project: PROJECT })
     await clock.advance(1000)
     expect(texts(session).at(-1)).toContain(DROPPED_THERE)
 
@@ -934,7 +962,9 @@ describe('the heartbeat', () => {
       p.locks = [{ id: X, mtime: NOW, ok: true, by: LAUNCH, pid: 100, created: ft(2), at: NOW, transport: 'window' }]
     })
     await clock.advance(3 * MINUTE)
+    // The 2-minute tick beats T now, with the process's start folder, which T's $.state never held.
     expect((held.get(`alive:${T}`) as { at: number }).at).toBeGreaterThan(NOW + 2 * MINUTE)
+    expect((held.get(`alive:${W}`) as { at: number }).at).toBe(NOW)
     await switchNow($, clock, { to: X })
     expect(rows(session)).not.toMatch(/the folder this session started in isn't known/)
     expect(commands).toEqual([
