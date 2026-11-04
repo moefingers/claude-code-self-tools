@@ -227,12 +227,12 @@ describe('the probe answer is checked field by field', () => {
   test('anything not of its shape is refused, naming what', () => {
     const bad = (change: (p: RawProbe & Record<string, unknown>) => void) => parseProbe(JSON.stringify(machine(p => change(p as RawProbe & Record<string, unknown>))))
     expect(bad(p => (p.extra = 1))).toEqual({ error: 'the probe\'s answer is not what it must be: the answer has an unknown field "extra"' })
-    expect(bad(p => p.procs.push({ pid: -1, ppid: 0, created: 0, name: 'x' }))).toMatchObject({ error: expect.stringContaining('a process has no pid') })
-    expect(bad(p => p.procs.push({ pid: 9, ppid: 0, created: 0, name: 'x', cls: 'rootkit' }))).toMatchObject({ error: expect.stringContaining('fixed list') })
-    expect(bad(p => p.procs.push({ pid: 9, ppid: 0, created: 0, name: 'x', ids: ['not-a-uuid'] }))).toMatchObject({ error: expect.stringContaining('session ids') })
+    expect(bad(p => p.procs.push({ pid: -1, ppid: 0, created: '0', name: 'x' }))).toMatchObject({ error: expect.stringContaining('a process has no pid') })
+    expect(bad(p => p.procs.push({ pid: 9, ppid: 0, created: '0', name: 'x', cls: 'rootkit' }))).toMatchObject({ error: expect.stringContaining('fixed list') })
+    expect(bad(p => p.procs.push({ pid: 9, ppid: 0, created: '0', name: 'x', ids: ['not-a-uuid'] }))).toMatchObject({ error: expect.stringContaining('session ids') })
     expect(bad(p => p.transcripts.push({ id: T, dir: 0, project: '..\\..\\x', mtime: 1 }))).toMatchObject({ error: expect.stringContaining('project') })
     expect(bad(p => (p.claim = { id: T, taken: true, by: 'launch:x; calc' }))).toMatchObject({ error: expect.stringContaining('claimant') })
-    expect(bad(p => (p.slot = { pid: 1, created: 1, path: "C:\\x'\\claude-slot.ps1", sha256: null }))).toMatchObject({ error: expect.stringContaining('plain path') })
+    expect(bad(p => (p.slot = { pid: 1, created: '1', id: '1-1', path: "C:\\x'\\claude-slot.ps1", sha256: null }))).toMatchObject({ error: expect.stringContaining('plain path') })
     expect(bad(p => p.errors.push('everything'))).toMatchObject({ error: expect.stringContaining('fixed list') })
     expect(parseProbe('')).toEqual({ error: 'the probe printed no answer' })
     expect(parseProbe('{not json')).toEqual({ error: "the probe's answer is not JSON" })
@@ -320,6 +320,21 @@ describe('transports', () => {
     expect(pickTransport(probeOf(), W, T, undefined)).toEqual({ transport: 'in-place' })
     const cased = probeOf(p => (p.transcripts = p.transcripts.map(t => (t.id === T ? { ...t, project: PROJECT.toLowerCase() } : t))))
     expect(pickTransport(cased, W, T, undefined)).toEqual({ transport: 'in-place' })
+  })
+
+  test("the slot's id is the probe's string, exact: a FILETIME past 2^53 that no JavaScript number holds", () => {
+    // As Windows PowerShell prints it: the pane's creation time is not a multiple of 16.
+    const text = JSON.stringify(machine(p => (elsewhere(p), inSlot(p))))
+    expect(text).toContain('"created":"134062345678901240","id":"20-134062345678901240"')
+    expect(Number('134062345678901240').toString()).not.toBe('134062345678901240')
+    const probe = parseProbe(text)
+    if ('error' in probe) throw new Error(probe.error)
+    expect(probe.slot?.id).toBe('20-134062345678901240')
+    expect(pickTransport(probe, W, T, ELSEWHERE)).toEqual({ transport: 'slot', slot: '20-134062345678901240', folder: ELSEWHERE })
+    expect(probe.claim).toEqual({ id: T, taken: true, by: 'slot:20-134062345678901240' })
+    // A time, or an id, as a number is refused: it would have lost its last digits.
+    expect(parseProbe(text.replace('"created":"134062345678901240","id"', '"created":134062345678901240,"id"'))).toMatchObject({ error: expect.stringContaining('as a string') })
+    expect(parseProbe(text.replace('"id":"20-134062345678901240"', '"id":"20-134062345678901250"'))).toMatchObject({ error: expect.stringContaining("slot's id") })
   })
 
   test('across projects: the window, in its own folder; the slot only with the shipped hash', () => {
@@ -461,7 +476,10 @@ describe('the scripts, as text', () => {
 
   test('the restart launcher leaves a verified slot a record instead of a window', () => {
     expect(restart).toContain(`$slotOk = $slotHash -eq '${SLOT_SCRIPT_SHA256}'`)
-    expect(restart).toContain('$record = Join-Path $state ("slots\\" + $slot["pid"] + "-" + $slot["created"] + ".next.json")')
+    // Named by the slot's id as PowerShell writes it: the pid and the exact FILETIME, a string.
+    expect(restart).toContain('$record = Join-Path $state ("slots\\" + $slot["id"] + ".next.json")')
+    expect(restart).toContain('$slot = [ordered]@{ pid = [long]$up.ProcessId; created = $slotCreated; id = "$($up.ProcessId)-$slotCreated"; path = $slotPath; sha256 = $slotHash }')
+    expect(restart).toContain('return [string][long]$p.CreationDate.ToFileTimeUtc()')
     expect(restart.indexOf('if ($slotOk) {\r\n  $record')).toBeLessThan(restart.indexOf('Start-Process'))
   })
 

@@ -10,7 +10,7 @@ const TOOL = 'mcp__self-restart__restart_after_turn'
 const HOUR = 60 * 60 * 1000
 const ID = '0f8fad5b-d9cb-469f-a165-70867728950e'
 const WINDOWS = { OS: 'Windows_NT', SystemRoot: 'C:\\Windows', LOCALAPPDATA: 'C:\\Users\\u\\AppData\\Local' }
-const SLOT = '20-133000000010000000'
+const SLOT = '20-134062345678901240'
 const LAUNCH = 'launch:5e1a9c3b-7d2f-4b8e-a6c4-1f9d3e7b2a5c'
 
 /** Base64 back to text, as PowerShell reads an -EncodedCommand: UTF-16LE. */

@@ -281,13 +281,18 @@ const GET_PARENT = [
   '}',
 ]
 
-/** A process's creation time as a FILETIME, 0 when the table has none (the idle and system processes). */
-const GET_CREATED = ['function Get-Created($p) { if ($null -eq $p.CreationDate) { return [long]0 } return [long]$p.CreationDate.ToFileTimeUtc() }']
+/**
+ * A process's creation time as a FILETIME, 0 when the table has none (the idle and system processes),
+ * as a decimal string: FILETIMEs pass 2^53, where a JavaScript number keeps multiples of 16 only, so
+ * the answer never carries one as a number.
+ */
+const GET_CREATED = ['function Get-Created($p) { if ($null -eq $p.CreationDate) { return "0" } return [string][long]$p.CreationDate.ToFileTimeUtc() }']
 
 /**
  * The slot runner this session's claude.exe runs under, when its parent is one: `$up` is that parent
  * (from the walk), and it counts only when it is Windows PowerShell running `-File ...\claude-slot.ps1`.
- * Sets `$slot` (pid, created, path, sha256) and `$slotOk` (its script has the shipped hash).
+ * Sets `$slot` (pid, created, id = `<pid>-<created>`, path, sha256; created and id strings) and `$slotOk`
+ * (its script has the shipped hash).
  */
 const FIND_SLOT = [
   '$slot = $null',
@@ -296,7 +301,8 @@ const FIND_SLOT = [
   '  $slotPath = $Matches["path"]',
   '  $slotHash = $null',
   '  try { $slotHash = (Get-FileHash -LiteralPath $slotPath -Algorithm SHA256).Hash.ToLowerInvariant() } catch { $slotHash = $null }',
-  '  $slot = [ordered]@{ pid = [long]$up.ProcessId; created = (Get-Created $up); path = $slotPath; sha256 = $slotHash }',
+  '  $slotCreated = Get-Created $up',
+  '  $slot = [ordered]@{ pid = [long]$up.ProcessId; created = $slotCreated; id = "$($up.ProcessId)-$slotCreated"; path = $slotPath; sha256 = $slotHash }',
   `  $slotOk = $slotHash -eq '${SLOT_SCRIPT_SHA256}'`,
   '}',
 ]
@@ -323,9 +329,9 @@ const TAKE_CLAIM = [
   '  try { $old = Get-Content -LiteralPath $claimPath -Raw -Encoding UTF8 | ConvertFrom-Json } catch { $old = $null }',
   '  $age = $nowMs - ([DateTimeOffset](Get-Item -LiteralPath $claimPath -Force).LastWriteTimeUtc).ToUnixTimeMilliseconds()',
   '  $over = $false',
-  '  if ($null -ne $old -and $old.pid -is [ValueType] -and $old.created -is [ValueType] -and $old.at -is [ValueType]) {',
+  '  if ($null -ne $old -and $old.pid -is [ValueType] -and "$($old.created)" -match "^\\d{1,20}\\z" -and $old.at -is [ValueType]) {',
   '    $creator = $table[[int]$old.pid]',
-  `    $running = $null -ne $creator -and $null -ne $creator.CreationDate -and [math]::Abs([double]$creator.CreationDate.ToFileTimeUtc() - [double]$old.created) -le ${PROC_START_TOLERANCE}`,
+  `    $running = $null -ne $creator -and $null -ne $creator.CreationDate -and [math]::Abs([long]$creator.CreationDate.ToFileTimeUtc() - [long]"$($old.created)") -le ${PROC_START_TOLERANCE}`,
   `    $over = ($running -and [long]$old.pid -eq [long]$session.ProcessId) -or ((-not $running) -and ($nowMs - [double]$old.at) -gt ${CLAIM_STALE_MS})`,
   `  } else { $over = $age -gt ${CLAIM_STALE_MS} }`,
   '  if ($over) { [IO.File]::Delete($claimPath); $taken = New-Claim $claimPath $claimText }',
@@ -532,7 +538,7 @@ export function probeScript(input: ProbeInput): string {
     'if ($null -ne $take) {',
     '  if ($null -eq $session) { $claim = [ordered]@{ id = $take; taken = $false; why = "no-session" } }',
     '  else {',
-    '    if ($slotOk) { $by = "slot:" + $slot["pid"] + "-" + $slot["created"]; $transport = "slot" } else { $by = "launch:" + [guid]::NewGuid().ToString(); $transport = "window" }',
+    '    if ($slotOk) { $by = "slot:" + $slot["id"]; $transport = "slot" } else { $by = "launch:" + [guid]::NewGuid().ToString(); $transport = "window" }',
     '    $claimPath = Join-Path $state ("claims\\" + $take + ".lock")',
     ...TAKE_CLAIM.map(line => `    ${line}`),
     '    if ($taken) { $claim = [ordered]@{ id = $take; taken = $true; by = $by } } else { $claim = [ordered]@{ id = $take; taken = $false; why = "held" } }',
@@ -564,7 +570,8 @@ export function probeScript(input: ProbeInput): string {
 // ---------------------------------------------------------------------------------------------
 // The probe's answer, every field checked.
 
-export type ProcessEntry = { readonly pid: number; readonly ppid: number; readonly created: number; readonly name: string; readonly cls?: ProcessClass; readonly ids?: readonly string[] }
+/** `created` is a FILETIME as a decimal string, exact: compare it with ticks() and ticksApart(), never as a number. */
+export type ProcessEntry = { readonly pid: number; readonly ppid: number; readonly created: string; readonly name: string; readonly cls?: ProcessClass; readonly ids?: readonly string[] }
 
 /** A registry file, as its shape was judged: `ok` holds what L1 reads; `bad` says what's wrong with it. */
 export type RegistryEntry =
@@ -574,12 +581,13 @@ export type RegistryEntry =
 export type Transcript = { readonly id: string; readonly dir: number; readonly project: string; readonly mtime: number }
 
 export type LockEntry =
-  | { readonly id: string; readonly mtime: number; readonly ok: true; readonly by: string; readonly pid: number; readonly created: number; readonly at: number; readonly transport: string }
+  | { readonly id: string; readonly mtime: number; readonly ok: true; readonly by: string; readonly pid: number; readonly created: string; readonly at: number; readonly transport: string }
   | { readonly id: string; readonly mtime: number; readonly ok: false }
 
 export type ClaimResult = { readonly id: string; readonly taken: true; readonly by: string } | { readonly id: string; readonly taken: false; readonly why: string }
 
-export type SlotParent = { readonly pid: number; readonly created: number; readonly path: string; readonly sha256: string | null }
+/** The slot runner: its pid, its creation FILETIME and its id (`<pid>-<created>`) as exact strings, its script and that script's hash. */
+export type SlotParent = { readonly pid: number; readonly created: string; readonly id: string; readonly path: string; readonly sha256: string | null }
 
 export type HeavySlot = { readonly slot: '.gate-lock' | '.gate-lock-2'; readonly winpid: number | null }
 
@@ -588,7 +596,7 @@ export type ProbeError = 'registry' | 'transcripts' | 'locks' | 'heavy' | 'memor
 
 export type Probe = {
   readonly self: number
-  readonly session: { readonly pid: number; readonly created: number } | null
+  readonly session: { readonly pid: number; readonly created: string } | null
   readonly slot: SlotParent | null
   readonly procs: readonly ProcessEntry[]
   readonly registry: readonly RegistryEntry[]
@@ -603,6 +611,8 @@ export type Probe = {
 const isRecord = (value: unknown): value is Record<string, unknown> => typeof value === 'object' && value !== null && !Array.isArray(value)
 const isCount = (value: unknown, max = 2 ** 53): value is number => typeof value === 'number' && Number.isInteger(value) && value >= 0 && value <= max
 const isPid = (value: unknown): value is number => isCount(value, 0xffffffff)
+/** A FILETIME as the probe prints it: a decimal string, so it stays exact past 2^53. */
+const isTicks = (value: unknown): value is string => typeof value === 'string' && /^(0|[1-9]\d{0,19})$/.test(value)
 const NAME = /^[^\u0000-\u001f\u007f]{1,260}$/
 const PROJECT = /^[A-Za-z0-9-]{1,200}$/
 const KEY = /^[A-Za-z_$][A-Za-z0-9_$]{0,63}$/
@@ -673,20 +683,21 @@ export function parseProbe(stdout: string): Probe | { error: string } {
     let session: Probe['session'] = null
     if (top.session !== null) {
       const s = fields(top.session, 'the session', ['pid', 'created'])
-      if (!isPid(s.pid) || !isCount(s.created, Number.MAX_VALUE)) bad('the session is not a pid and a time')
-      session = { pid: s.pid as number, created: s.created as number }
+      if (!isPid(s.pid) || !isTicks(s.created)) bad('the session is not a pid and a time as a string')
+      session = { pid: s.pid as number, created: s.created as string }
     }
     let slot: SlotParent | null = null
     if (top.slot !== null) {
-      const s = fields(top.slot, 'the slot', ['pid', 'created', 'path', 'sha256'])
-      if (!isPid(s.pid) || !isCount(s.created, Number.MAX_VALUE)) bad('the slot is not a pid and a time')
+      const s = fields(top.slot, 'the slot', ['pid', 'created', 'id', 'path', 'sha256'])
+      if (!isPid(s.pid) || !isTicks(s.created)) bad('the slot is not a pid and a time as a string')
+      if (s.id !== `${s.pid}-${s.created}`) bad("the slot's id is not its pid and time")
       if (!isSafeFolder(s.path) || !/\\claude-slot\.ps1$/i.test(s.path as string)) bad("the slot's script is not a plain path")
       if (s.sha256 !== null && (typeof s.sha256 !== 'string' || !SHA256.test(s.sha256))) bad("the slot's hash is not a SHA-256")
-      slot = { pid: s.pid as number, created: s.created as number, path: s.path as string, sha256: s.sha256 as string | null }
+      slot = { pid: s.pid as number, created: s.created as string, id: s.id as string, path: s.path as string, sha256: s.sha256 as string | null }
     }
     const procs = list(top.procs, 'the processes').map((value): ProcessEntry => {
       const p = fields(value, 'a process', ['pid', 'ppid', 'created', 'name'], ['cls', 'ids'])
-      if (!isPid(p.pid) || !isPid(p.ppid) || !isCount(p.created, Number.MAX_VALUE)) bad('a process has no pid, parent or time')
+      if (!isPid(p.pid) || !isPid(p.ppid) || !isTicks(p.created)) bad('a process has no pid, parent or time as a string')
       if (typeof p.name !== 'string' || (p.name !== '' && !NAME.test(p.name))) bad("a process's name is not a plain name")
       if ('cls' in p && !(PROCESS_CLASSES as readonly unknown[]).includes(p.cls)) bad("a process's class is not one of the fixed list")
       const ids = 'ids' in p ? list(p.ids, "a process's ids") : undefined
@@ -694,7 +705,7 @@ export function parseProbe(stdout: string): Probe | { error: string } {
       return {
         pid: p.pid as number,
         ppid: p.ppid as number,
-        created: p.created as number,
+        created: p.created as string,
         name: p.name as string,
         ...('cls' in p ? { cls: p.cls as ProcessClass } : {}),
         ...(ids !== undefined ? { ids: ids as string[] } : {}),
@@ -722,12 +733,12 @@ export function parseProbe(stdout: string): Probe | { error: string } {
         typeof l.by === 'string' &&
         CLAIM_BY.test(l.by) &&
         isPid(l.pid) &&
-        isCount(l.created, Number.MAX_VALUE) &&
+        isTicks(l.created) &&
         isCount(l.at) &&
         typeof l.transport === 'string' &&
         STATUS.test(l.transport)
       if (!isWhole) return { id, mtime, ok: false }
-      return { id, mtime, ok: true, by: l.by as string, pid: l.pid as number, created: l.created as number, at: l.at as number, transport: l.transport as string }
+      return { id, mtime, ok: true, by: l.by as string, pid: l.pid as number, created: l.created as string, at: l.at as number, transport: l.transport as string }
     })
     let claim: ClaimResult | null = null
     if (top.claim !== null) {
@@ -768,12 +779,24 @@ export function parseProbe(stdout: string): Probe | { error: string } {
 
 const isClaude = (p: ProcessEntry): boolean => p.name.toLowerCase() === 'claude.exe'
 
+/** A FILETIME, exact: from the probe's string, or from a registry number (a double already). */
+export const ticks = (value: string | number): bigint => BigInt(typeof value === 'number' ? Math.trunc(value) : value)
+
+/** How far apart two FILETIMEs are, in ticks, exactly. */
+export function ticksApart(a: string | number, b: string | number): bigint {
+  const d = ticks(a) - ticks(b)
+  return d < BigInt(0) ? -d : d
+}
+
+/** Whether two FILETIMEs are within PROC_START_TOLERANCE (1 ms) of each other. */
+const near = (a: string | number, b: string | number): boolean => ticksApart(a, b) <= BigInt(PROC_START_TOLERANCE)
+
 const byPid = (probe: Probe): Map<number, ProcessEntry> => new Map(probe.procs.map(p => [p.pid, p]))
 
 /** A process's parent, while it is older than its child; a process that took a gone parent's id is none. */
 function parentOf(table: Map<number, ProcessEntry>, p: ProcessEntry): ProcessEntry | undefined {
   const up = table.get(p.ppid)
-  return up !== undefined && up.pid !== p.pid && up.created <= p.created ? up : undefined
+  return up !== undefined && up.pid !== p.pid && ticks(up.created) <= ticks(p.created) ? up : undefined
 }
 
 /** A FILETIME as a time a person reads: UTC, to the minute. */
@@ -836,7 +859,7 @@ export type Liveness = { readonly verdict: 'live' | 'not-live' | 'unknown'; read
 function isStale(lock: LockEntry, table: Map<number, ProcessEntry>, now: number): boolean {
   if (!lock.ok) return now - lock.mtime > CLAIM_STALE_MS
   const creator = table.get(lock.pid)
-  const isRunning = creator !== undefined && Math.abs(creator.created - lock.created) <= PROC_START_TOLERANCE
+  const isRunning = creator !== undefined && near(creator.created, lock.created)
   return !isRunning && now - lock.at > CLAIM_STALE_MS
 }
 
@@ -871,7 +894,7 @@ export function liveness(probe: Probe, id: string, now: number, opts: { lane?: L
       if (isLiveClaude) unknown.push(`unknown: the registry file of running claude.exe ${entry.file} ${entry.why}`)
       continue
     }
-    if (!isLiveClaude || Math.abs(owner.created - entry.procStart) > PROC_START_TOLERANCE) continue
+    if (!isLiveClaude || !near(owner.created, entry.procStart)) continue
     current.add(entry.pid)
     if (entry.sessionId === id) live.push(`L1: claude.exe ${entry.pid} (started ${when(entry.procStart)} UTC) holds it`)
   }
@@ -1030,7 +1053,8 @@ export function pickTransport(probe: Probe, from: string, to: string, folder: st
   const name = projectName(folder)
   if (name === undefined || !sameProject(name, there.project)) return { refusal: `${to}'s folder ${folder} is not where its transcript's project is (${there.project})` }
   const slot = probe.slot
-  if (slot !== null && slot.sha256 === SLOT_SCRIPT_SHA256) return { transport: 'slot', slot: `${slot.pid}-${slot.created}`, folder }
+  // The slot's id as the probe printed it: a FILETIME through a JavaScript number would not round-trip.
+  if (slot !== null && slot.sha256 === SLOT_SCRIPT_SHA256) return { transport: 'slot', slot: slot.id, folder }
   return { transport: 'window', folder }
 }
 
@@ -1084,17 +1108,17 @@ export function launcherScript(id: string, options?: LaunchOptions): string {
       "$configDirs = @(if ($env:CLAUDE_CONFIG_DIR) { $env:CLAUDE_CONFIG_DIR } else { Join-Path $HOME '.claude' })",
       ...FIND_SLOT,
       // The claim: the slot by its id, or this window by a fresh UUID; taken here, in this run.
-      'if ($slotOk) { $by = "slot:" + $slot["pid"] + "-" + $slot["created"]; $transport = "slot" } else { $by = "launch:" + [guid]::NewGuid().ToString(); $transport = "window" }',
+      'if ($slotOk) { $by = "slot:" + $slot["id"]; $transport = "slot" } else { $by = "launch:" + [guid]::NewGuid().ToString(); $transport = "window" }',
       '$claimPath = Join-Path $state ("claims\\" + $id + ".lock")',
       ...TAKE_CLAIM,
       `if (-not $taken) { "${tool}: another switch or restart holds the claim on this conversation ($claimPath), so it is not resumed"; exit 5 }`,
       // A slot resumes the conversation in this same pane once this process exits: a record, no window.
       'if ($slotOk) {',
-      '  $record = Join-Path $state ("slots\\" + $slot["pid"] + "-" + $slot["created"] + ".next.json")',
+      '  $record = Join-Path $state ("slots\\" + $slot["id"] + ".next.json")',
       '  [void][IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($record))',
       '  $text = [ordered]@{ v = 1; resume = $id; folder = $folder; at = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds(); configDirs = [object[]]$configDirs } | ConvertTo-Json -Compress',
       '  [IO.File]::WriteAllText($record, $text)',
-      '  "slot $($slot["pid"])-$($slot["created"])"',
+      '  "slot $($slot["id"])"',
       '  "claim $by"',
       '  exit 0',
       '}',

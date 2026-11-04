@@ -14,8 +14,12 @@ export const LAUNCH = 'launch:5e1a9c3b-7d2f-4b8e-a6c4-1f9d3e7b2a5c'
 
 /** The time the tests run at: milliseconds since the epoch. */
 export const NOW = Date.UTC(2026, 10, 3, 12, 0, 0)
-/** A FILETIME some seconds after a fixed start: FILETIMEs are 100-ns ticks. */
-export const ft = (seconds: number): number => 133_000_000_000_000_000 + seconds * 10_000_000
+/**
+ * A FILETIME some seconds after a fixed start, as the probe prints it: an exact decimal string.
+ * FILETIMEs are 100-ns ticks, past 2^53, where a JavaScript number keeps multiples of 16 only; the
+ * start isn't one, so neither is any time here. ft(1), the slot pane's, is 134062345678901240.
+ */
+export const ft = (seconds: number): string => String(BigInt('134062345668901240') + BigInt(seconds) * BigInt(10_000_000))
 
 /** The folders: the repo both conversations share by default, and another project. */
 export const REPO = 'C:\\work\\repo'
@@ -23,13 +27,13 @@ export const PROJECT = 'C--work-repo'
 export const ELSEWHERE = 'C:\\work\\other'
 export const ELSEWHERE_PROJECT = 'C--work-other'
 
-export type RawProcess = { pid: number; ppid: number; created: number; name: string; cls?: string; ids?: string[] }
+export type RawProcess = { pid: number; ppid: number; created: string; name: string; cls?: string; ids?: string[] }
 export type RawRegistry = { dir: number; file: number; ok: boolean; keys?: string[]; [key: string]: unknown }
 export type RawProbe = {
   v: 1
   self: number
-  session: { pid: number; created: number } | null
-  slot: { pid: number; created: number; path: string; sha256: string | null } | null
+  session: { pid: number; created: string } | null
+  slot: { pid: number; created: string; id: string; path: string; sha256: string | null } | null
   procs: RawProcess[]
   registry: RawRegistry[]
   transcripts: { id: string; dir: number; project: string; mtime: number }[]
@@ -40,15 +44,15 @@ export type RawProbe = {
   errors: string[]
 }
 
-/** A registry file of the shape verified on the machine: every one of its keys, and six of their values. */
-export const entry = (pid: number, sessionId: string, procStart: number, dir = 0): RawRegistry => ({
+/** A registry file of the shape verified on the machine: every one of its keys, and six of their values. procStart is a number, as Claude Code writes it. */
+export const entry = (pid: number, sessionId: string, procStart: string | number, dir = 0): RawRegistry => ({
   dir,
   file: pid,
   ok: true,
   keys: [...REGISTRY_KEYS],
   pid,
   sessionId,
-  procStart,
+  procStart: Number(procStart),
   status: 'idle',
   statusUpdatedAt: NOW - 60_000,
   kind: 'interactive',
@@ -95,7 +99,7 @@ export function machine(change?: (probe: RawProbe) => void): RawProbe {
 
 /** The pane's parent as a slot runner whose script has the shipped hash; the claim then names it. */
 export function inSlot(probe: RawProbe, sha256: string | null = SLOT_SCRIPT_SHA256): void {
-  probe.slot = { pid: 20, created: ft(1), path: 'C:\\Users\\u\\AppData\\Local\\claude-self-tools\\claude-slot.ps1', sha256 }
+  probe.slot = { pid: 20, created: ft(1), id: `20-${ft(1)}`, path: 'C:\\Users\\u\\AppData\\Local\\claude-self-tools\\claude-slot.ps1', sha256 }
   if (sha256 === SLOT_SCRIPT_SHA256) {
     const by = `slot:20-${ft(1)}`
     probe.claim = { id: T, taken: true, by }
