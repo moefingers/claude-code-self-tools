@@ -936,6 +936,19 @@ describe('refusals, before and at the run', () => {
     expect(rows(session)).toMatch(/S11: 51 files are uncommitted in .+, the start folder, dirty, no baseline/)
   })
 
+  test('a resume keeps the first baseline: changes made since still hold after it', async ($, on) => {
+    const { commands, session, world, clock } = engine(on, { git: { dirty: 14 } })
+    await $.session.start(start)
+    await $.classic.SessionStart({ source: 'startup', session_id: W })
+    await clock.advance(1000)
+    world.diffs['c:/work/repo'] = 'edited further, then the conversation resumed'
+    await $.classic.SessionStart({ source: 'resume', session_id: W })
+    await clock.advance(1000)
+    await switchNow($, clock)
+    expect(commands).toEqual([])
+    expect(rows(session)).toMatch(/dirty since this conversation started/)
+  })
+
   test('a baseline that can\'t be read is none: the start folder\'s dirt holds', async ($, on) => {
     const { commands, session, clock } = engine(on, { git: { dirty: 3 }, store: { [`baseline:${W}`]: { folder: REPO, fingerprint: 'not a hash', at: NOW } } })
     await $.session.start(start)
