@@ -62,7 +62,9 @@ test('the exit runs only once the turn has ended, after the reason and note are 
   expect(queued.deny).toBeUndefined()
   expect(queued.result).toMatch(/The brief is done and the PR is open\./)
   expect(queued.result).toMatch(/Remote Control/)
-  // Nothing runs while the turn does: not at the call, not at the turn's end, only after it.
+  // Nothing runs while the turn does, however long it goes on: not at the call, not at the turn's
+  // end, only after it.
+  await clock.advance(60_000)
   expect(commands).toEqual([])
   await $.turn.complete(answered)
   expect(commands).toEqual([])

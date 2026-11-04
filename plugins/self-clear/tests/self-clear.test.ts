@@ -56,7 +56,9 @@ test('the clear runs only once the turn has ended, and the handoff is the first 
   const queued = await $.tool.call({ tool: TOOL, handoff: ' Start ticket 42; notes in docs/42.md. ' })
   expect(queued.deny).toBeUndefined()
   expect(queued.result).toMatch(/Start ticket 42; notes in docs\/42\.md\.$/)
-  // Nothing runs while the turn does: not at the call, not at the turn's end, only after it.
+  // Nothing runs while the turn does, however long it goes on: not at the call, not at the turn's
+  // end, only after it.
+  await clock.advance(60_000)
   expect(commands).toEqual([])
   await $.turn.complete(answered)
   expect(commands).toEqual([])

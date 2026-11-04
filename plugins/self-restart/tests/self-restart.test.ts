@@ -118,7 +118,9 @@ test('the window opens only once the turn has ended, by the fixed path with noth
     cwd: 'C:\\evil',
   })
   expect(queued.deny).toBeUndefined()
-  // Nothing runs while the turn does: not at the call, not at the turn's end, only after it.
+  // Nothing runs while the turn does, however long it goes on: not at the call, not at the turn's
+  // end, only after it.
+  await clock.advance(60_000)
   expect(runs).toEqual([])
   expect(commands).toEqual([])
   await $.turn.complete(answered)
