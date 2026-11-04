@@ -58,7 +58,7 @@ const BUSY: readonly string[] = ['pending', 'running', 'waiting']
 
 const DESCRIPTION = [
   "Restarts this session once the current turn ends: it opens a new terminal window in the folder this session started in, this session exits, and the window resumes it (claude --resume <this session's id>) once this process has gone. The conversation carries on there.",
-  'Call it when a restart is the fix: the person switched accounts, changed a setting that takes effect at startup, or a plugin won\'t reload (try reload_plugins_after_turn first, if it is available). Never on your own to clear a problem a restart doesn\'t fix.',
+  'Call it when a restart is the fix: the person switched accounts, changed a setting that takes effect at startup, or a plugin won\'t reload (try reload_plugins_after_turn first, if it is available). Only at a finished break: never mid-merge, mid-push or mid-task. Never on your own to clear a problem a restart doesn\'t fix.',
   'Windows only, in a session run in a terminal.',
   '`reason` (required) says why; it is recorded in the transcript. `resume` is the message that starts your first turn in the restarted session: what to check or do next. Give it whenever you have a next step of your own; leave it out only when the next step waits on someone else.',
   'Everything this process runs ends with it: wake-ups, background tasks, Remote Control (with Remote Control on for all sessions, the resumed session connects again). It refuses while subagents you started are still running, and refuses a second restart within 2 minutes of the last.',

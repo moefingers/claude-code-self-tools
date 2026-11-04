@@ -11,6 +11,7 @@ Lets a session restart itself on Windows. Once the current turn ends, it opens a
 
 ## How it behaves
 
+- **Only at a finished break.** A session calls it once a piece of work is finished, never mid-merge, mid-push or mid-task: the same rule as compacting with [self-compact](../self-compact). The tool's description says so.
 - **The restart waits for the turn to end.** The call queues it, and it starts once the turn ends with Claude's answer.
 - **One new window, by a fixed path.** The plugin runs Windows PowerShell by its known path under the Windows folder (`%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe`), with one fixed script whose only variable is the session's id, which must be a UUID. Nothing Claude passes reaches that script or its command line.
   - The script finds the session's own `claude.exe` above it.
@@ -40,7 +41,7 @@ When Claude calls this plugin's tool, and the last check is 30 minutes old or th
 - **It never holds up the tool.** The check runs beside the call, which never waits on it. Offline, refused by policy, a 404, a rate limit, no answer within 5 seconds, or anything but a plain version such as `0.2.0` all mean no notice.
 - **When a newer version is out**, a toast tells you, and the result of one of Claude's next calls ends with a line like this:
 
-  > self-restart 0.1.0 is out of date (0.2.0 is published). To update, the person runs: claude plugin marketplace update claude-code-self-tools, then claude plugin update self-restart@claude-code-self-tools, then /reload-plugins in each open session (a new session loads the update on its own). Don't run these yourself unless the person asks.
+  > self-restart 0.1.1 is out of date (0.2.0 is published). To update, the person runs: claude plugin marketplace update claude-code-self-tools, then claude plugin update self-restart@claude-code-self-tools, then /reload-plugins in each open session (a new session loads the update on its own). Don't run these yourself unless the person asks.
 
   The line is fixed text. Only the two version numbers vary, and each must be three plain numbers. Nothing else from the fetched file reaches Claude. A session is told of each check once, and at most once every 30 minutes, not on every call, and the toast follows the same rule. A call carries only what an earlier check found: the call that starts a check doesn't wait for its answer.
 - **Turn it off** with the plugin's `updateCheck` setting: `off` never checks. Set it in `/config`, or from your shell:
