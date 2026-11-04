@@ -486,6 +486,14 @@ describe('the scripts, as text', () => {
     expect(window).toContain('if ($null -eq $lock -or $lock.by -cne $by) { "self-switch: the claim on this conversation does not name this launch')
   })
 
+  test("the restart launcher uses the slot only for a folder its runner takes: absolute, no quote, the conversation's own", () => {
+    const check = restart.indexOf('  $projectName = [regex]::Replace($folder, "[^A-Za-z0-9]", "-")')
+    expect(check).toBeGreaterThan(restart.indexOf('$slotOk = $slotHash -eq'))
+    expect(check).toBeLessThan(restart.indexOf('if ($slotOk) { $by = "slot:"'))
+    expect(restart).toContain('(Join-Path $dir ("projects\\" + $projectName + "\\" + $id + ".jsonl"))')
+    expect(restart).toContain('$folder -notmatch "[\\x00-\\x1f\\x22\\x27\\u2018\\u2019\\u201a\\u201b\\u201c\\u201d\\u201e]")) { $slotOk = $false }')
+  })
+
   test('the restart launcher leaves a verified slot a record instead of a window', () => {
     expect(restart).toContain(`$slotOk = $slotHash -eq '${SLOT_SCRIPT_SHA256}'`)
     // Named by the slot's id as PowerShell writes it: the pid and the exact FILETIME, a string.

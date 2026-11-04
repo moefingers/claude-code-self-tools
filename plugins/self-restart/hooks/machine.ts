@@ -232,7 +232,7 @@ export const REGISTRY_KEYS = [
 ] as const
 
 /** The SHA-256 of plugins/self-switch/slot/claude-slot.ps1, as it is committed. */
-export const SLOT_SCRIPT_SHA256 = 'f23eabd892f4b1bfedada224a8dbb27b82f2da97a8dc64b01bedfe5cadbf1f18'
+export const SLOT_SCRIPT_SHA256 = '588a799edb65660466cd626197e0fe04f7a0aa17e4ddb05989c419e99b907e7f'
 
 /**
  * The variables Claude Code sets in the processes it starts, which a top-level claude must not inherit:
@@ -1141,6 +1141,15 @@ export function launcherScript(id: string, options?: LaunchOptions): string {
       "$state = Join-Path $env:LOCALAPPDATA 'claude-self-tools'",
       "$configDirs = @(if ($env:CLAUDE_CONFIG_DIR) { $env:CLAUDE_CONFIG_DIR } else { Join-Path $HOME '.claude' })",
       ...FIND_SLOT,
+      // The slot only for a folder its runner takes, checked now, before this session exits: absolute,
+      // no quote or control character, and the conversation's own (its project holds the transcript).
+      // Otherwise the window, which escapes the folder itself.
+      'if ($slotOk) {',
+      '  $projectName = [regex]::Replace($folder, "[^A-Za-z0-9]", "-")',
+      '  $inProject = $false',
+      '  foreach ($dir in $configDirs) { if ($projectName.Length -le 200 -and (Test-Path -LiteralPath (Join-Path $dir ("projects\\" + $projectName + "\\" + $id + ".jsonl")) -PathType Leaf)) { $inProject = $true } }',
+      String.raw`  if (-not ($inProject -and $folder -cmatch "^[A-Za-z]:\\" -and $folder -notmatch "[\x00-\x1f\x22\x27\u2018\u2019\u201a\u201b\u201c\u201d\u201e]")) { $slotOk = $false }`,
+      '}',
       // The claim: the slot by its id, or this window by a fresh UUID; taken here, in this run.
       'if ($slotOk) { $by = "slot:" + $slot["id"]; $transport = "slot" } else { $by = "launch:" + [guid]::NewGuid().ToString(); $transport = "window" }',
       '$claimPath = Join-Path $state ("claims\\" + $id + ".lock")',

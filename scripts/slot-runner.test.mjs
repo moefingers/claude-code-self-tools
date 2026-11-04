@@ -31,6 +31,26 @@ test('a record is honoured only when it is a UUID, at most 120 seconds old, of a
   assert.ok(script.includes("$slotId = '{0}-{1}' -f $PID, $me.CreationDate.ToFileTimeUtc()"))
 })
 
+test("a record's folder must be its conversation's own: the folder's project holds the conversation's transcript", () => {
+  assert.ok(script.includes("$name = $record.folder -replace '[^A-Za-z0-9]', '-'"))
+  assert.ok(script.includes("foreach ($d in $dirs) { if ($name.Length -le 200 -and (Test-Path -LiteralPath (Join-Path $d ('projects\\' + $name + '\\' + $record.resume + '.jsonl')) -PathType Leaf)) { $inProject = $true } }"))
+  assert.ok(script.includes("if (-not $inProject) { $why = 'its folder is not that conversation''s own"))
+  // Before the claim and the re-check, and so before claude.
+  assert.ok(script.indexOf('$inProject = $false') < script.indexOf("$lock.by -cne ('slot:' + $slotId)"))
+})
+
+test('the pane\'s -ExecutionPolicy is for the runner alone: it is cleared before claude starts, and the README asks for RemoteSigned', () => {
+  const clear = "[Environment]::SetEnvironmentVariable('PSExecutionPolicyPreference', $null, [EnvironmentVariableTarget]::Process)"
+  assert.ok(script.includes(clear))
+  assert.ok(script.indexOf(clear) < script.indexOf('& $claude.Source @arguments'))
+  assert.ok(script.indexOf(clear) > script.indexOf('function Start-Claude'))
+  assert.ok(script.includes('-ExecutionPolicy RemoteSigned -File'))
+  assert.ok(!script.includes('Bypass'))
+  const readme = readFileSync(join(ROOT, 'plugins', 'self-switch', 'README.md'), 'utf8')
+  assert.ok(readme.includes('-ExecutionPolicy RemoteSigned -File "%LOCALAPPDATA%\\claude-self-tools\\claude-slot.ps1"'))
+  assert.ok(!readme.includes('Bypass'))
+})
+
 test('right before claude runs, it reads the registry and the process table again: the same lines as the window', () => {
   const at = script.indexOf('function Get-Live')
   assert.ok(at > 0)

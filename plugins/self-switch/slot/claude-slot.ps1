@@ -4,10 +4,15 @@
 # unchanged, to %LOCALAPPDATA%\claude-self-tools\claude-slot.ps1, and give a Windows Terminal profile
 # this command line:
 #
-#   powershell.exe -NoExit -NoProfile -ExecutionPolicy Bypass -File "%LOCALAPPDATA%\claude-self-tools\claude-slot.ps1"
+#   powershell.exe -NoExit -NoProfile -ExecutionPolicy RemoteSigned -File "%LOCALAPPDATA%\claude-self-tools\claude-slot.ps1"
+#
+# -ExecutionPolicy RemoteSigned lets this unsigned local script run where the policy is Restricted,
+# Windows' default; the script then clears it again before claude starts, so claude and every
+# PowerShell it starts get the machine's own policy.
 #
 # self-switch and self-restart use a pane as a slot only when the script it runs has the SHA-256 they
 # ship, so a copy that was edited is never used as one: that pane then works as a plain pane does.
+# After copying a new version, restart the slot panes: a pane keeps running the script it started with.
 #
 # What it does:
 # - It runs claude, with no flags, in the folder the pane opened in.
@@ -15,10 +20,11 @@
 #   %LOCALAPPDATA%\claude-self-tools\slots\<pid>-<created>.next.json, where <pid> is this script's
 #   process id and <created> its creation time (a FILETIME), so a record names one run of one pane.
 # - It deletes the record before anything else, so a record is used once. It honours it only when it
-#   is at most 120 seconds old, names a conversation by its id (a UUID) and an existing folder, the
-#   claim lock on that conversation names this slot, and no running Claude Code holds the conversation
-#   (read again right then: the session registry and every process's command line). Then it runs
-#   claude --resume <id> in that folder, in this same pane.
+#   is at most 120 seconds old, names a conversation by its id (a UUID) and an existing folder that is
+#   the conversation's own (its project holds the conversation's transcript), the claim lock on that
+#   conversation names this slot, and no running Claude Code holds the conversation (read again right
+#   then: the session registry and every process's command line). Then it runs claude --resume <id>
+#   in that folder, in this same pane.
 # - With no record it waits: Enter starts a new Claude Code here, and a record that arrives meanwhile
 #   is honoured (it looks every 2 seconds). Ctrl+C leaves the slot, at a PowerShell prompt.
 #
@@ -91,15 +97,23 @@ function Get-Next {
   if ($null -eq $why -and ($null -eq $record -or $record.v -ne 1 -or $record.resume -isnot [string] -or $record.resume -cnotmatch $SessionId)) { $why = 'it names no conversation by its id' }
   if ($null -eq $why -and ($record.at -isnot [ValueType] -or ($now - [double]$record.at) -gt $MaxAgeMs -or ($now - [double]$record.at) -lt -5000 -or ([datetime]::UtcNow - $written).TotalMilliseconds -gt $MaxAgeMs)) { $why = 'it is more than 120 seconds old' }
   if ($null -eq $why -and -not (Test-Folder $record.folder)) { $why = 'its folder is not an existing folder' }
+  $dirs = @()
+  if ($env:CLAUDE_CONFIG_DIR) { $dirs += $env:CLAUDE_CONFIG_DIR } else { $dirs += (Join-Path $HOME '.claude') }
+  if ($null -ne $record) { foreach ($d in @($record.configDirs)) { if (Test-Folder $d) { $dirs += $d } } }
+  if ($null -eq $why) {
+    # The folder must be the conversation's own: its project (the folder with every character but a
+    # letter or digit made a dash, as Claude Code names it) holds the conversation's transcript.
+    $name = $record.folder -replace '[^A-Za-z0-9]', '-'
+    $inProject = $false
+    foreach ($d in $dirs) { if ($name.Length -le 200 -and (Test-Path -LiteralPath (Join-Path $d ('projects\' + $name + '\' + $record.resume + '.jsonl')) -PathType Leaf)) { $inProject = $true } }
+    if (-not $inProject) { $why = 'its folder is not that conversation''s own: no transcript of it under the folder''s project' }
+  }
   if ($null -eq $why) {
     $lock = $null
     try { $lock = Get-Content -LiteralPath (Join-Path $state ('claims\' + $record.resume + '.lock')) -Raw -Encoding UTF8 | ConvertFrom-Json } catch { $lock = $null }
     if ($null -eq $lock -or $lock.by -cne ('slot:' + $slotId)) { $why = 'the claim lock on that conversation does not name this slot' }
   }
   if ($null -eq $why) {
-    $dirs = @()
-    if ($env:CLAUDE_CONFIG_DIR) { $dirs += $env:CLAUDE_CONFIG_DIR } else { $dirs += (Join-Path $HOME '.claude') }
-    foreach ($d in @($record.configDirs)) { if (Test-Folder $d) { $dirs += $d } }
     try { $live = Get-Live $record.resume $dirs } catch { $live = 'whether it is open elsewhere is unknown: the registry or the process table could not be read (' + $_.Exception.Message + ')' }
     if ($null -ne $live) { $why = $live }
   }
@@ -113,6 +127,9 @@ function Get-Next {
 
 # Runs claude from PATH with these arguments, its environment clear of the markers.
 function Start-Claude([string[]]$arguments) {
+  # -ExecutionPolicy on the pane's command line was for this script alone: claude, and every PowerShell
+  # it starts, gets the machine's own policy back.
+  [Environment]::SetEnvironmentVariable('PSExecutionPolicyPreference', $null, [EnvironmentVariableTarget]::Process)
   foreach ($name in $Markers) { [Environment]::SetEnvironmentVariable($name, $null, [EnvironmentVariableTarget]::Process) }
   $claude = Get-Command -Name 'claude' -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
   if ($null -eq $claude) { Write-Host 'No claude on PATH.'; return }

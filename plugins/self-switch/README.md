@@ -63,17 +63,20 @@ Windows Terminal can't list its panes or swap the process in one, so a new windo
    Copy-Item <this plugin's folder>\slot\claude-slot.ps1 "$env:LOCALAPPDATA\claude-self-tools\claude-slot.ps1"
    ```
 
-   The plugin checks the copy's SHA-256 before it uses a pane as a slot (the hash is `SLOT_SCRIPT_SHA256` in `hooks/machine.ts`). An edited copy, or one from an older version, is never used as a slot: that pane then gets a new window, as a plain pane does. After an update, copy it again.
+   The plugin checks the copy's SHA-256 before it uses a pane as a slot (the hash is `SLOT_SCRIPT_SHA256` in `hooks/machine.ts`). An edited copy, or one from an older version, is never used as a slot: that pane then gets a new window, as a plain pane does. After an update, copy it again, and restart the slot panes: a pane keeps running the script it started with, and the hash is checked on the file.
 
 2. Give your Windows Terminal profile (or a new "Claude slot" profile) this command line:
 
    ```
-   powershell.exe -NoExit -NoProfile -ExecutionPolicy Bypass -File "%LOCALAPPDATA%\claude-self-tools\claude-slot.ps1"
+   powershell.exe -NoExit -NoProfile -ExecutionPolicy RemoteSigned -File "%LOCALAPPDATA%\claude-self-tools\claude-slot.ps1"
    ```
+
+   `-ExecutionPolicy RemoteSigned` is there so this unsigned local script runs where the policy is `Restricted`, Windows' default; a copy made with `Copy-Item` from the plugin's folder isn't marked as downloaded, so `RemoteSigned` runs it. The script clears it again before it starts `claude`, so Claude Code and every PowerShell it starts get your machine's own policy.
 
 What the slot does:
 
-- It honours a record only when it is at most 120 seconds old, names a conversation by its id and an existing folder, the claim lock on that conversation names this slot, and no running Claude Code holds the conversation. It deletes the record first, so a record is used once.
+- It honours a record only when it is at most 120 seconds old, names a conversation by its id and an existing folder that is that conversation's own (the folder's project holds the conversation's transcript), the claim lock on that conversation names this slot, and no running Claude Code holds the conversation. It deletes the record first, so a record is used once.
+- A registry file it can't read is read twice more, 250 ms apart. When it still can't tell, or anything else stops it, it says why and gives the `claude --resume <id>` line to run once it is safe; the pane stays.
 - With no record, it waits: Enter starts a new Claude Code in the pane, and a record that arrives meanwhile is honoured (it looks every 2 seconds). Ctrl+C leaves the slot at a PowerShell prompt.
 - It runs `claude` with no flags, or `claude --resume <id>`: no permission flag of any kind.
 - Windows and panes are never closed for you.
