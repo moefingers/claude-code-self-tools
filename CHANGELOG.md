@@ -2,9 +2,9 @@
 
 Each entry names a plugin and its version, as `version` in `plugins/<name>/.claude-plugin/plugin.json` has it.
 
-## 2026-11-04: self-switch 0.1.1 and self-restart 0.1.4, from the live checks
+## 2026-11-04: self-switch and self-restart, from the live checks
 
-- **self-switch 0.1.1**:
+- **self-switch**:
   - **Claude Code 2.1.318's session registry is read again.** 2.1.318 writes two keys more (`asksForConvertedSkills`, `nameSince`) and `procStart` as a string of digits, so every switch was refused. What liveness reads stays strict: `pid` a whole number, the file's own; `sessionId` a session id; `procStart` a whole number or a string of digits, compared exactly. Missing or of another type, it refuses, naming the field; so does a key that marks a new format (`v`, `schema`, `schemaVersion`, `formatVersion`, `registryVersion`, or a `version` that isn't Claude Code's version as a string). Any other key is ignored, and logged once per process by its name.
   - **One more look when it can't tell.** A `claude.exe` that is starting or exiting reads as unknown for a moment (5 of 370 samples on a busy machine). An unknown verdict now gets a second probe 2.5 seconds later, the claim lock given back meanwhile, and refuses only if that one is unknown too.
   - **The slot is found from a Windows Terminal tab.** The probe hashed the slot runner with `Get-FileHash`, which Windows PowerShell 5.1 doesn't have when the tab's module path lists PowerShell 7's folders first; it hashes with .NET now.
@@ -12,7 +12,7 @@ Each entry names a plugin and its version, as `version` in `plugins/<name>/.clau
   - **Pending wake-ups are dropped, and it says so.** A self-wake wake-up pending in the process doesn't fire after a switch, in either conversation, whichever way the switch goes. The tool's description and result, the leaving row and the arrival row say so, so they can be set again where needed. The description no longer says an in-place switch carries the timers over.
   - **A conversation that arrived in place switches on.** `/resume` gives the process the resumed conversation's own plugin state, without the start folder, so its next switch was refused and its heartbeat stopped. The resume puts the start folder back and beats at once.
   - The README quotes the rows as the plugin writes them.
-- **self-restart 0.1.4**: its launcher hashes the slot runner with .NET too, and when it opens a window although this pane runs a slot runner, it says why, in the row the restarted session reads, a toast and the log.
+- **self-restart**: its launcher hashes the slot runner with .NET too, and when it opens a window although this pane runs a slot runner, it says why, in the row the restarted session reads, a toast and the log.
 - **The shared machine code**: the registry rule above (`REGISTRY_FIELDS`, `REGISTRY_VERSION_MARKERS`, the extra keys in the probe's answer), the slot's hash by .NET with the reason a hash failed, and the transport's `fallback`. `SLOT_SCRIPT_SHA256` is unchanged: the slot runner isn't.
 
 ## 2026-11-03: self-switch 0.1.0, and self-restart 0.1.3 on the shared machine code
