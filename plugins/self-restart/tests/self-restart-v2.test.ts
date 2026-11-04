@@ -170,6 +170,30 @@ test('a pane that is a verified slot: the launcher leaves the slot a record, no 
   expect((held.get('restarts') as Record<string, { claim?: string }>)[ID]?.claim).toBe(`slot:${SLOT}`)
 })
 
+test("a slot runner the launcher passed over for a window: the restart says why, in the row, the toast and the log", async ($, on) => {
+  const why = 'slot hash unreadable: Exception calling "ReadAllBytes" with "1" argument(s): "Access to the path is denied."'
+  const { commands, toasts, logs, session, clock } = engine(on, { answer: { exitCode: 0, stdout: `launched 17716\r\nclaim ${LAUNCH}\r\nfallback ${why}\r\n` } })
+  await $.session.start(start)
+  await $.tool.call({ tool: TOOL, reason: 'Switched accounts.' })
+  await $.turn.complete(answered)
+  await clock.advance(1000)
+  expect(commands).toEqual(['exit'])
+  const rows = session.appended().flatMap(row => ((row as { message?: { content?: { text?: unknown }[] } }).message?.content ?? []).map(block => String(block.text)))
+  expect(rows).toContain(`This session restarted at its own request (restart_after_turn). Reason: Switched accounts. It restarted in a new window, not this pane's slot: \u00ab${why}\u00bb.`)
+  expect(toasts).toContain(`Restarting: a new window resumes this session once it has exited, not this pane's slot (${why}). Switched accounts.`)
+  expect(logs).toContain(`self-restart: this pane's slot runner isn't used: ${why}. A new window resumes the session.`)
+})
+
+test('a window with no slot passed over, or the slot itself, says nothing of a fallback', async ($, on) => {
+  const { toasts, session, clock } = engine(on, { answer: { exitCode: 0, stdout: `launched 17716\r\nclaim ${LAUNCH}\r\n` } })
+  await $.session.start(start)
+  await $.tool.call({ tool: TOOL, reason: 'Switched accounts.' })
+  await $.turn.complete(answered)
+  await clock.advance(1000)
+  expect(JSON.stringify(session.appended())).not.toContain("not this pane's slot")
+  expect(toasts).toContain('Restarting: a new window resumes this session once it has exited. Switched accounts.')
+})
+
 test('the claim the window took is kept for the resumed session, which releases it once', async ($, on) => {
   const opened = engine(on, { answer: { exitCode: 0, stdout: `launched 17716\r\nclaim ${LAUNCH}\r\n` } })
   await $.session.start(start)

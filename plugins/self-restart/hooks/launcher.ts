@@ -33,6 +33,7 @@
 export {
   CLAIMED,
   encodeCommand,
+  FALLBACK,
   LAUNCHED,
   launcherScript,
   powershellPath,
