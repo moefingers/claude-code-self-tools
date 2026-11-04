@@ -527,10 +527,14 @@ describe('the scripts, as text', () => {
   })
 
   test('the release removes the lock only when it names the claimant', () => {
-    expect(release).toContain(`if ($null -eq $lock -or $lock.by -cne '${LAUNCH}') { $answer = 'not-ours' } else { [IO.File]::Delete($path); $answer = 'released' }`)
+    expect(release).toContain(`if ($null -eq $lock -or $lock.by -cne '${LAUNCH}') { $answer = 'not-ours' } else { try { [IO.File]::Delete($path); $answer = 'released' }`)
     // Read through a handle that keeps every writer out, and deleted while it is held.
     expect(release).toContain("[IO.File]::Open($path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]'Read, Delete')")
     expect(release.indexOf('[IO.File]::Delete($path)')).toBeLessThan(release.indexOf('} finally { $stream.Dispose() }'))
+    // A reader holding it open makes the delete fail: busy, tried again (3 tries, 250 ms apart), then left.
+    expect(release).toContain("try { [IO.File]::Delete($path); $answer = 'released' } catch { if ($_.Exception -is [IO.IOException] -or $_.Exception.InnerException -is [IO.IOException]) { $answer = 'busy' } else { throw } }")
+    expect(release).toContain("for ($try = 0; $try -lt 3 -and $answer -eq 'busy'; $try++) {")
+    expect(release).toContain('  if ($try -gt 0) { Start-Sleep -Milliseconds 250 }')
     expect(release).not.toContain('Get-Content')
     const check = claimCheckScript({ stateDir: STATE, id: T, by: LAUNCH })
     expect(check).toContain(`if ($null -ne $lock -and $lock.by -ceq '${LAUNCH}') { 'ours' } else { 'not-ours' }`)

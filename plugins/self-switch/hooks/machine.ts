@@ -1300,7 +1300,9 @@ function checkClaim(input: { readonly stateDir: string; readonly id: string; rea
 /**
  * Removes the claim lock on `id`, only when it names `by`. It reads the lock through a handle that
  * lets no one else write it, and deletes it while still holding that handle, so it can never remove
- * a lock someone took over in between; a lock a taker holds is tried again twice, 200 ms apart.
+ * a lock someone took over in between. A lock a taker holds, or one a reader has open so that it can't
+ * be deleted yet, is tried again twice, 250 ms apart; then it is left in place (`busy`), which refuses
+ * every other move until it goes stale, 15 minutes after its creator exits.
  * Throws on any input that isn't what it must be.
  */
 export function releaseScript(input: { readonly stateDir: string; readonly id: string; readonly by: string }): string {
@@ -1311,7 +1313,7 @@ export function releaseScript(input: { readonly stateDir: string; readonly id: s
     `$path = Join-Path ${literal(state)} 'claims\\${id}.lock'`,
     "$answer = 'busy'",
     "for ($try = 0; $try -lt 3 -and $answer -eq 'busy'; $try++) {",
-    '  if ($try -gt 0) { Start-Sleep -Milliseconds 200 }',
+    '  if ($try -gt 0) { Start-Sleep -Milliseconds 250 }',
     "  try { $stream = [IO.File]::Open($path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]'Read, Delete') }",
     '  catch {',
     "    if ($_.Exception -is [IO.FileNotFoundException] -or $_.Exception.InnerException -is [IO.FileNotFoundException] -or $_.Exception -is [IO.DirectoryNotFoundException] -or $_.Exception.InnerException -is [IO.DirectoryNotFoundException]) { $answer = 'absent'; continue }",
@@ -1325,7 +1327,8 @@ export function releaseScript(input: { readonly stateDir: string; readonly id: s
     '    $lock = $null',
     '    try { $lock = $text | ConvertFrom-Json } catch { $lock = $null }',
     // Deleted while this handle, which shares delete, still keeps every writer out.
-    `    if ($null -eq $lock -or $lock.by -cne '${by}') { $answer = 'not-ours' } else { [IO.File]::Delete($path); $answer = 'released' }`,
+    // A reader that has it open without sharing delete makes the delete fail: try again, then leave it.
+    `    if ($null -eq $lock -or $lock.by -cne '${by}') { $answer = 'not-ours' } else { try { [IO.File]::Delete($path); $answer = 'released' } catch { if ${IS_IO} { $answer = 'busy' } else { throw } } }`,
     '  } finally { $stream.Dispose() }',
     '}',
     '$answer',

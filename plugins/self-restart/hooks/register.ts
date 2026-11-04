@@ -418,7 +418,11 @@ async function release($: EngineInterface, id: string, claim: string): Promise<v
     const local = await $.env.get('LOCALAPPDATA')
     if (root === undefined || !SYSTEM_ROOT.test(root) || !isSafeFolder(local)) return
     const run = await $.process.run(powershellArgv(powershellPath(root), releaseScript({ stateDir: stateFolder(local), id, by: claim })), { timeoutMs: RELEASE_MS })
-    if (run.exitCode !== 0 || !RELEASED.test(run.stdout)) $.ui.log(`self-restart: the claim lock on ${id} wasn't released (exit ${run.exitCode}); it goes stale 15 minutes after the old process exited.`)
+    const said = run.exitCode === 0 ? RELEASED.exec(run.stdout)?.[1] : undefined
+    if (said !== 'released' && said !== 'absent' && said !== 'not-ours') {
+      const what = said === 'busy' ? 'another process had it open throughout' : `exit ${run.exitCode}`
+      $.ui.log(`self-restart: the claim lock on ${id} wasn't released (${what}); it is left in place, and goes stale 15 minutes after the old process exited.`)
+    }
   } catch (err) {
     $.ui.log(`self-restart: the claim lock on ${id} wasn't released (${why(err)}); it goes stale 15 minutes after the old process exited.`)
   }

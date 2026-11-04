@@ -63,13 +63,14 @@ type Machine = {
 /** The engine beneath the plugin, its launcher answering `answer`; and what it was asked to run. */
 function engine(
   on: On,
-  { answer, store = {}, probe = probeOf(), git = 'no-repo', cwd = 'reads' }: { answer: { exitCode: number; stdout: string }; store?: Record<string, unknown> } & Machine,
+  { answer, store = {}, probe = probeOf(), git = 'no-repo', cwd = 'reads', released = 'released' }: { answer: { exitCode: number; stdout: string }; store?: Record<string, unknown>; released?: 'released' | 'busy' } & Machine,
 ) {
   const probes: string[] = []
   const described: string[] = []
   const scripts: string[] = []
   const commands: string[] = []
   const toasts: string[] = []
+  const logs: string[] = []
   const held = new Map<string, unknown>(Object.entries(store))
   const clock = mock.clock(on, { now: 1_000_000 })
   const session = mock.session(on)
@@ -91,7 +92,10 @@ function engine(
     toasts.push(String(e.text))
     return { value: undefined }
   })
-  on('ui.log', () => ({ value: undefined }))
+  on('ui.log', (_, e) => {
+    logs.push(String(e.text))
+    return { value: undefined }
+  })
   on('agent.list', () => ({ value: [] }))
   on('classic.SessionStart', () => ({}))
   on('prompt.submit', (_, e) => ({ text: e.text }))
@@ -111,7 +115,7 @@ function engine(
         : { value: { exitCode: 0, stdout: probe, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
     }
     scripts.push(script)
-    if (script.includes("'not-ours'")) return { value: { exitCode: 0, stdout: 'released\r\n', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+    if (script.includes("'not-ours'")) return { value: { exitCode: 0, stdout: `${released}\r\n`, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
     return { value: { ...answer, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
   })
   on('command.run', async (_, e) => {
@@ -119,7 +123,7 @@ function engine(
     await clock.sleep(HOUR)
     return {}
   })
-  return { probes, described, scripts, commands, toasts, held, clock, session }
+  return { probes, described, scripts, commands, toasts, logs, held, clock, session }
 }
 
 const start = { cwd: 'C:\\work\\repo', surface: 'terminal', isInteractive: true } as const
@@ -277,4 +281,16 @@ test("the tool's description says it holds on the full safe point, and what stil
   expect(text).toContain('while anything runs under this session (a background Bash, PowerShell or Monitor job, git, a build, test or lint, a dev server or Playwright, a heavy-slot job)')
   expect(text).toContain("while any of that can't be read")
   expect(text).toContain("What still ends with this process: wake-ups, background tasks it can't see")
+})
+
+test('a release that finds the lock held open throughout is logged, never taken as released', async ($, on) => {
+  const { logs, clock } = engine(on, {
+    answer: { exitCode: 0, stdout: '' },
+    released: 'busy',
+    store: { restarts: { [ID]: { at: 1_000_000 - 60_000, reason: 'Switched accounts.', claim: LAUNCH } } },
+  })
+  await $.session.start(start)
+  await $.classic.SessionStart({ source: 'resume', session_id: ID })
+  await clock.advance(1000)
+  expect(logs).toContain(`self-restart: the claim lock on ${ID} wasn't released (another process had it open throughout); it is left in place, and goes stale 15 minutes after the old process exited.`)
 })

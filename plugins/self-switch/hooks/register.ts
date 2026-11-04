@@ -370,8 +370,12 @@ async function keepTicket($: EngineInterface, id: string, value: Ticket | null):
 async function release($: EngineInterface, powershell: string, state: string, id: string, by: string): Promise<void> {
   try {
     const run = await $.process.run(powershellArgv(powershell, releaseScript({ stateDir: state, id, by })), { timeoutMs: RELEASE_MS })
-    if (run.exitCode === 0 && RELEASED.test(run.stdout)) return
-    $.ui.log(`self-switch: the claim lock on ${id} wasn't released (exit ${run.exitCode}); it goes stale 15 minutes after its creator exits.`)
+    const said = run.exitCode === 0 ? RELEASED.exec(run.stdout)?.[1] : undefined
+    if (said === 'released' || said === 'absent' || said === 'not-ours') return
+    // `busy`: another process had it open throughout. Left in place, it refuses every other move on
+    // that conversation until it goes stale, which is the safe side; said so, never taken as released.
+    const what = said === 'busy' ? 'another process had it open throughout' : `exit ${run.exitCode}`
+    $.ui.log(`self-switch: the claim lock on ${id} wasn't released (${what}); it is left in place, and goes stale 15 minutes after its creator exits.`)
   } catch (err) {
     $.ui.log(`self-switch: the claim lock on ${id} wasn't released (${why(err)}); it goes stale 15 minutes after its creator exits.`)
   }
