@@ -96,9 +96,12 @@ test('it runs claude with no flag but --resume, clears the markers first, and ne
   assert.deepEqual(runs.map(line => line.trim()), ['Start-Claude @()', "Start-Claude @('--resume', $next.resume)", 'if ($enter) { Start-Claude @() }'])
   assert.ok(script.includes('& $claude.Source @arguments'))
   assert.ok(script.includes(`$Markers = ${machine.SESSION_MARKERS.map(name => `'${name}'`).join(', ')}`))
-  // NO_COLOR among them; not WT_SESSION (the pane's own), never the REAP setting.
+  // NO_COLOR among them; never WT_SESSION or WT_PROFILE_ID (the pane's own: Claude Code reads
+  // WT_SESSION to draw its Unicode prompt and its links), never the REAP setting.
   assert.ok(machine.SESSION_MARKERS.includes('NO_COLOR'))
-  assert.ok(!script.includes("'WT_SESSION'"))
+  assert.ok(!machine.SESSION_MARKERS.includes('WT_SESSION') && !machine.SESSION_MARKERS.includes('WT_PROFILE_ID'))
+  assert.ok(!script.includes('WT_SESSION'))
+  assert.ok(!script.includes('WT_PROFILE_ID'))
   assert.ok(!script.includes('CLAUDE_CODE_DISABLE_BG_SHELL_PRESSURE_REAP'))
   // Transcripts on, after the clear and before claude.
   const force = script.indexOf("  $env:CLAUDE_CODE_FORCE_SESSION_PERSISTENCE = '1'\n")

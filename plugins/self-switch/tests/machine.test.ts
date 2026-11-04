@@ -7,7 +7,6 @@ import {
   CLEAR_MARKERS,
   countStatus,
   FORCE_PERSISTENCE,
-  LAUNCH_CLEARS,
   descendants,
   FINGERPRINT_READS,
   FALLBACK,
@@ -723,7 +722,7 @@ describe('the scripts, as text', () => {
     expect(probe.indexOf('New-Claim $claimPath $claimText')).toBeLessThan(probe.indexOf('$locks = New-Object'))
   })
 
-  test("a launched claude's environment: every session marker cleared, NO_COLOR and the old tab's WT_SESSION too, transcripts forced on, the REAP setting kept", () => {
+  test("a launched claude's environment: every session marker cleared, NO_COLOR too, WT_SESSION and WT_PROFILE_ID untouched, transcripts forced on, the REAP setting kept", () => {
     for (const name of [
       'AI_AGENT',
       'CLAUDECODE',
@@ -742,15 +741,19 @@ describe('the scripts, as text', () => {
     ]) {
       expect(SESSION_MARKERS as readonly string[]).toContain(name)
     }
-    // The window also clears the old tab's WT_SESSION; the slot runner, whose pane's own it is, doesn't.
-    expect([...LAUNCH_CLEARS]).toEqual([...SESSION_MARKERS, 'WT_SESSION'])
-    expect(SESSION_MARKERS as readonly string[]).not.toContain('WT_SESSION')
-    // Never cleared: the person's choice.
-    expect(LAUNCH_CLEARS as readonly string[]).not.toContain('CLAUDE_CODE_DISABLE_BG_SHELL_PRESSURE_REAP')
-    expect(LAUNCH_CLEARS as readonly string[]).not.toContain('CLAUDE_CODE_FORCE_SESSION_PERSISTENCE')
+    // Never cleared: the person's choice, and the terminal's (Claude Code reads WT_SESSION on Windows to
+    // draw its Unicode prompt and its links).
+    for (const name of ['CLAUDE_CODE_DISABLE_BG_SHELL_PRESSURE_REAP', 'CLAUDE_CODE_FORCE_SESSION_PERSISTENCE', 'WT_SESSION', 'WT_PROFILE_ID']) {
+      expect(SESSION_MARKERS as readonly string[]).not.toContain(name)
+      expect(CLEAR_MARKERS).not.toContain(name)
+    }
+    expect(CLEAR_MARKERS.match(/"[A-Za-z_]+"/g)).toEqual(SESSION_MARKERS.map(name => `"${name}"`))
     expect(FORCE_PERSISTENCE).toBe('$env:CLAUDE_CODE_FORCE_SESSION_PERSISTENCE = "1"')
     for (const script of [restart, window]) {
       expect(script).not.toContain('CLAUDE_CODE_DISABLE_BG_SHELL_PRESSURE_REAP')
+      // The new tab's or window's own, exactly as it has them: nothing names them.
+      expect(script).not.toContain('WT_SESSION')
+      expect(script).not.toContain('WT_PROFILE_ID')
       expect(script.indexOf(`  '${FORCE_PERSISTENCE}',`)).toBe(script.indexOf(`  '${CLEAR_MARKERS}',`) + `  '${CLEAR_MARKERS}',`.length + 2)
     }
   })
@@ -760,7 +763,7 @@ describe('the scripts, as text', () => {
       const clears = script.split(/\r?\n/).filter(line => line.includes('SetEnvironmentVariable'))
       expect(clears).toHaveLength(1)
       expect(clears[0]).toContain(CLEAR_MARKERS)
-      expect(clears[0]?.match(/"[A-Za-z_]+"/g)).toEqual(LAUNCH_CLEARS.map(name => `"${name}"`))
+      expect(clears[0]?.match(/"[A-Za-z_]+"/g)).toEqual(SESSION_MARKERS.map(name => `"${name}"`))
       expect(script).toContain(`  '${FORCE_PERSISTENCE}',`)
       const wait = script.indexOf('Wait-Process')
       const recheck = script.indexOf(RECHECK[2])

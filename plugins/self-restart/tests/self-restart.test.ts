@@ -320,8 +320,11 @@ test("the window clears the old session's markers before claude --resume, and no
   expect(clears).toHaveLength(1)
   const clear = clears[0] ?? ''
   // Exactly the listed names, each quoted, CLAUDE_CODE_CHILD_SESSION (nested: no transcript) first.
-  // And WT_SESSION, the old tab's, so the new one gets its own.
-  expect(clear.match(/"[A-Za-z_]+"/g)).toEqual([...SESSION_MARKERS, 'WT_SESSION'].map(name => `"${name}"`))
+  expect(clear.match(/"[A-Za-z_]+"/g)).toEqual(SESSION_MARKERS.map(name => `"${name}"`))
+  // WT_SESSION and WT_PROFILE_ID stay as the new window has them: Claude Code reads WT_SESSION to draw
+  // its Unicode prompt and its links. Nothing in the script names either.
+  expect(script).not.toContain('WT_SESSION')
+  expect(script).not.toContain('WT_PROFILE_ID')
   expect(clear).toContain('[Environment]::SetEnvironmentVariable($name, $null, [EnvironmentVariableTarget]::Process)')
   // Never a variable a person sets.
   for (const name of ['CLAUDE_CODE_FORCE_SESSION_PERSISTENCE', 'CLAUDE_CODE_DISABLE_BG_SHELL_PRESSURE_REAP', 'CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC', 'ANTHROPIC_API_KEY', 'PATH']) {
