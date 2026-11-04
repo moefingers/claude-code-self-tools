@@ -97,17 +97,20 @@ function Get-Next {
   if ($null -eq $why -and ($null -eq $record -or $record.v -ne 1 -or $record.resume -isnot [string] -or $record.resume -cnotmatch $SessionId)) { $why = 'it names no conversation by its id' }
   if ($null -eq $why -and ($record.at -isnot [ValueType] -or ($now - [double]$record.at) -gt $MaxAgeMs -or ($now - [double]$record.at) -lt -5000 -or ([datetime]::UtcNow - $written).TotalMilliseconds -gt $MaxAgeMs)) { $why = 'it is more than 120 seconds old' }
   if ($null -eq $why -and -not (Test-Folder $record.folder)) { $why = 'its folder is not an existing folder' }
-  $dirs = @()
-  if ($env:CLAUDE_CONFIG_DIR) { $dirs += $env:CLAUDE_CONFIG_DIR } else { $dirs += (Join-Path $HOME '.claude') }
-  if ($null -ne $record) { foreach ($d in @($record.configDirs)) { if (Test-Folder $d) { $dirs += $d } } }
+  # This runner's own config folder: the one the claude it starts uses.
+  $own = if ($env:CLAUDE_CONFIG_DIR) { $env:CLAUDE_CONFIG_DIR } else { Join-Path $HOME '.claude' }
   if ($null -eq $why) {
     # The folder must be the conversation's own: its project (the folder with every character but a
-    # letter or digit made a dash, as Claude Code names it) holds the conversation's transcript.
+    # letter or digit made a dash, as Claude Code names it) holds the conversation's transcript, in
+    # this runner's own config folder. Never in one the record names: a record can't vouch for itself.
     $name = $record.folder -replace '[^A-Za-z0-9]', '-'
-    $inProject = $false
-    foreach ($d in $dirs) { if ($name.Length -le 200 -and (Test-Path -LiteralPath (Join-Path $d ('projects\' + $name + '\' + $record.resume + '.jsonl')) -PathType Leaf)) { $inProject = $true } }
+    $inProject = $name.Length -le 200 -and (Test-Path -LiteralPath (Join-Path $own ('projects\' + $name + '\' + $record.resume + '.jsonl')) -PathType Leaf)
     if (-not $inProject) { $why = 'its folder is not that conversation''s own: no transcript of it under the folder''s project' }
   }
+  # The config folders the re-check reads: this runner's own, and those the record names, since
+  # reading more registries can only find the conversation held, never free it.
+  $dirs = @($own)
+  if ($null -ne $record) { foreach ($d in @($record.configDirs)) { if (Test-Folder $d) { $dirs += $d } } }
   if ($null -eq $why) {
     $lock = $null
     try { $lock = Get-Content -LiteralPath (Join-Path $state ('claims\' + $record.resume + '.lock')) -Raw -Encoding UTF8 | ConvertFrom-Json } catch { $lock = $null }

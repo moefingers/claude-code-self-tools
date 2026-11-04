@@ -33,10 +33,15 @@ test('a record is honoured only when it is a UUID, at most 120 seconds old, of a
 
 test("a record's folder must be its conversation's own: the folder's project holds the conversation's transcript", () => {
   assert.ok(script.includes("$name = $record.folder -replace '[^A-Za-z0-9]', '-'"))
-  assert.ok(script.includes("foreach ($d in $dirs) { if ($name.Length -le 200 -and (Test-Path -LiteralPath (Join-Path $d ('projects\\' + $name + '\\' + $record.resume + '.jsonl')) -PathType Leaf)) { $inProject = $true } }"))
+  // Only in the runner's own config folder: never in one the record names, which can't vouch for itself.
+  assert.ok(script.includes("$own = if ($env:CLAUDE_CONFIG_DIR) { $env:CLAUDE_CONFIG_DIR } else { Join-Path $HOME '.claude' }"))
+  const check = "    $inProject = $name.Length -le 200 -and (Test-Path -LiteralPath (Join-Path $own ('projects\\' + $name + '\\' + $record.resume + '.jsonl')) -PathType Leaf)\n"
+  assert.ok(script.includes(check))
+  assert.equal(script.split('$inProject =').length - 1, 1)
+  assert.ok(script.indexOf('$record.configDirs') > script.indexOf(check), "the record's config folders are read only after the project check, for the re-check")
   assert.ok(script.includes("if (-not $inProject) { $why = 'its folder is not that conversation''s own"))
   // Before the claim and the re-check, and so before claude.
-  assert.ok(script.indexOf('$inProject = $false') < script.indexOf("$lock.by -cne ('slot:' + $slotId)"))
+  assert.ok(script.indexOf(check) < script.indexOf("$lock.by -cne ('slot:' + $slotId)"))
 })
 
 test('the pane\'s -ExecutionPolicy is for the runner alone: it is cleared before claude starts, and the README asks for RemoteSigned', () => {

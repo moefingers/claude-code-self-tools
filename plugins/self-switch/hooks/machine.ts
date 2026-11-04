@@ -238,7 +238,7 @@ export const REGISTRY_KEYS = [
 ] as const
 
 /** The SHA-256 of plugins/self-switch/slot/claude-slot.ps1, as it is committed. */
-export const SLOT_SCRIPT_SHA256 = '5ce4364d0aca9290b7693235e2eb15dc43b17c8a10874e8dd36bb5de6e33fd12'
+export const SLOT_SCRIPT_SHA256 = '97afd4f28bc8cb4b5dbe080161845fb81bcb5e9e4fade5b074460740dd03d252'
 
 /**
  * The variables Claude Code sets in the processes it starts, which a top-level claude must not inherit:
