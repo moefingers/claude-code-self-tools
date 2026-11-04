@@ -340,7 +340,7 @@ describe('transports', () => {
     expect(kinds()).toEqual(['probe', 'launcher'])
     expect(texts(session).at(-1)).toContain(`to conversation \u00ab${T}\u00bb, in a new window, not this pane's slot: ${quoted(said)}. Its reason:`)
     expect(toasts).toContain(`Switching to ${T}: this session exits, and a new window resumes it, not this pane's slot (${said}) once this process has gone.`)
-    expect(logs).toContain(`self-switch: this pane's slot runner isn't used: ${said}. A new window resumes ${T}.`)
+    expect(logs).toContain(`this pane's slot runner isn't used: ${said}. A new window resumes ${T}.`)
     expect(tickets()[T]).toMatchObject({ transport: 'window', fallback: said })
 
     // The new window's process: the arrival says it too, before the wake-ups.
@@ -629,19 +629,32 @@ describe('refusals, before and at the run', () => {
     ['with procStart not of digits', (r: Record<string, unknown>) => (r.procStart = `${String(r.procStart)}a`), 'has a procStart that is a string, but not of digits'],
     ['with a key that marks a new format, schema', (r: Record<string, unknown>) => (r.keys = [...(r.keys as string[]), 'schema']), 'holds the key "schema", which marks a new format'],
   ] as const) {
-    test(`a running claude.exe's registry file ${name}: the switch refuses after one more look, naming the pid`, async ($, on) => {
+    test(`a running claude.exe's registry file ${name}: the switch refuses after 3 more looks, naming the pid`, async ($, on) => {
       const { commands, kinds, session, clock } = engine(on, { probe: machine(p => change(p.registry.find(r => r.file === 200) as Record<string, unknown>)) })
       await $.session.start(start)
       await switchNow($, clock)
-      await clock.advance(3000)
+      await clock.advance(10_000)
       expect(commands).toEqual([])
-      expect(kinds()).toEqual(['probe', 'release', 'probe', 'release'])
+      expect(kinds()).toEqual(['probe', 'release', 'probe', 'release', 'probe', 'release', 'probe', 'release'])
       // As the rows hold it: JSON, its quotes escaped.
       expect(rows(session)).toContain(JSON.stringify(`unknown: the registry file of running claude.exe 200 ${said}`).slice(1, -1))
     })
   }
 
-  test('a running claude.exe whose registry file names T outside its sessionId: the switch refuses after one more look', async ($, on) => {
+  test("another lane's Claude Code command (claude plugin ..., two claude.exe children), no registry entry: not live, it switches at once", async ($, on) => {
+    const { commands, kinds, clock } = engine(on, {
+      probe: machine(p => {
+        p.procs.push({ pid: 700, ppid: 21, created: ft(70), name: 'claude.exe', cli: true } as RawProbe['procs'][number])
+        p.procs.push({ pid: 701, ppid: 700, created: ft(71), name: 'claude.exe' }, { pid: 702, ppid: 700, created: ft(72), name: 'claude.exe' })
+      }),
+    })
+    await $.session.start(start)
+    await switchNow($, clock)
+    expect(kinds()).toEqual(['probe', 'check'])
+    expect(commands).toEqual([{ command: 'resume', args: T }])
+  })
+
+  test('a running claude.exe whose registry file names T outside its sessionId: the switch refuses after 3 more looks', async ($, on) => {
     const { commands, kinds, session, clock } = engine(on, {
       probe: machine(p => {
         const r = p.registry.find(x => x.file === 200) as Record<string, unknown>
@@ -651,9 +664,9 @@ describe('refusals, before and at the run', () => {
     })
     await $.session.start(start)
     await switchNow($, clock)
-    await clock.advance(3000)
+    await clock.advance(10_000)
     expect(commands).toEqual([])
-    expect(kinds()).toEqual(['probe', 'release', 'probe', 'release'])
+    expect(kinds()).toEqual(['probe', 'release', 'probe', 'release', 'probe', 'release', 'probe', 'release'])
     expect(rows(session)).toContain('unknown: the registry file of running claude.exe 200 names it outside its sessionId')
   })
 
@@ -668,7 +681,7 @@ describe('refusals, before and at the run', () => {
     expect(commands).toEqual([{ command: 'resume', args: T }])
     expect(kinds()).toEqual(['probe', 'check'])
     expect(logs.filter(l => l.includes('hostSessionId'))).toEqual([
-      'self-switch: a session registry file holds the key "hostSessionId", which Claude Code 2.1.318 didn\'t write; it is ignored (liveness reads pid, sessionId and procStart).',
+      'a session registry file holds the key "hostSessionId", which Claude Code 2.1.318 didn\'t write; it is ignored (liveness reads pid, sessionId and procStart).',
     ])
   })
 
@@ -688,9 +701,11 @@ describe('refusals, before and at the run', () => {
     // The first look: unknown. The claim is given back, and the wait says why.
     expect(kinds()).toEqual(['probe', 'release'])
     expect(commands).toEqual([])
+    // The engine draws a log line under the plugin's name: the text doesn't repeat it.
     expect(logs).toContain(
-      `self-switch: whether ${T} is open elsewhere reads unknown (unknown: claude.exe 600 isn't in any registry this plugin knows (another config folder, or a version without one)); looking once more in 2.5 seconds.`,
+      `whether ${T} is open elsewhere reads unknown (unknown: claude.exe 600 isn't in any registry this plugin knows (another config folder, or a version without one)); looking again in 2.5 seconds (1 of 3).`,
     )
+    expect(logs.some(l => l.startsWith('self-switch:'))).toBe(false)
     expect(rows(session)).not.toMatch(/possibly open/)
     await clock.advance(2500)
     expect(kinds()).toEqual(['probe', 'release', 'probe', 'check'])
@@ -698,15 +713,38 @@ describe('refusals, before and at the run', () => {
     expect(logs.filter(l => l.includes('"tmux"'))).toHaveLength(1)
   })
 
-  test('unknown twice: it refuses with the second look, and gives the claim back each time', async ($, on) => {
-    const { commands, kinds, session, toasts, clock } = engine(on, { probe: machine(starting) })
+  test('unknown at every look: it refuses after the fourth, about 10 seconds on, and gives the claim back each time', async ($, on) => {
+    const { commands, kinds, session, toasts, logs, clock } = engine(on, { probe: machine(starting) })
     await $.session.start(start)
     await switchNow($, clock)
     expect(toasts.some(t => /Switch didn't run/.test(t))).toBe(false)
+    // Looks at 0.5 s, 3 s, 6.5 s and 10.5 s after the turn's end.
     await clock.advance(2500)
     expect(kinds()).toEqual(['probe', 'release', 'probe', 'release'])
+    await clock.advance(3500)
+    expect(kinds()).toEqual(['probe', 'release', 'probe', 'release', 'probe', 'release'])
+    expect(toasts.some(t => /Switch didn't run/.test(t))).toBe(false)
+    await clock.advance(4000)
+    expect(kinds()).toEqual(['probe', 'release', 'probe', 'release', 'probe', 'release', 'probe', 'release'])
     expect(commands).toEqual([])
     expect(rows(session)).toMatch(/is possibly open elsewhere \(unknown: claude.exe 600 isn't in any registry/)
+    expect(logs.filter(l => l.includes('looking again'))).toHaveLength(3)
+    expect(logs.at(-1)).toContain('looking again in 4 seconds (3 of 3).')
+  })
+
+  test('unknown three times, then not live: the fourth look switches', async ($, on) => {
+    let looks = 0
+    const { commands, kinds, clock } = engine(on, {
+      probe: () => {
+        looks += 1
+        return machine(p => (looks <= 3 ? starting(p) : undefined))
+      },
+    })
+    await $.session.start(start)
+    await switchNow($, clock)
+    await clock.advance(10_000)
+    expect(kinds()).toEqual(['probe', 'release', 'probe', 'release', 'probe', 'release', 'probe', 'check'])
+    expect(commands).toEqual([{ command: 'resume', args: T }])
   })
 
   test('a turn that starts during the wait takes the switch back: no second look', async ($, on) => {
@@ -978,7 +1016,7 @@ describe('arrival', () => {
     await $.classic.SessionStart({ source: 'resume', session_id: T })
     await clock.advance(1000)
     expect(kinds()).toEqual(['release'])
-    expect(logs).toContain(`self-switch: the claim lock on ${T} wasn't released (another process had it open throughout); it is left in place, and goes stale 15 minutes after its creator exits.`)
+    expect(logs).toContain(`the claim lock on ${T} wasn't released (another process had it open throughout); it is left in place, and goes stale 15 minutes after its creator exits.`)
     // The arrival itself still goes ahead.
     expect(prompts).toHaveLength(1)
   })

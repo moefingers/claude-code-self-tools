@@ -6,6 +6,7 @@ import {
   CLEAR_MARKERS,
   descendants,
   FALLBACK,
+  GET_CLI,
   type GitState,
   isSafeFolder,
   launcherScript,
@@ -137,6 +138,42 @@ describe('liveness', () => {
         p.registry = p.registry.map(r => (r.file === 200 ? entry(200, OTHER, ft(4)) : r))
       }).verdict,
     ).toBe('unknown')
+  })
+
+  test('a Claude Code command (claude plugin ..., marked cli by the probe) and the claude.exe it starts are accounted; L2 still reads them', () => {
+    const plugin = (p: RawProbe) => {
+      p.procs.push({ pid: 700, ppid: 21, created: ft(70), name: 'claude.exe', cli: true })
+      p.procs.push({ pid: 701, ppid: 700, created: ft(71), name: 'claude.exe' }, { pid: 702, ppid: 700, created: ft(72), name: 'claude.exe' })
+    }
+    expect(live(plugin)).toEqual({ verdict: 'not-live', evidence: [] })
+    // A claude.exe the probe didn't mark (claude -p --resume <id>, an interactive one) is never accounted so.
+    expect(live(p => p.procs.push({ pid: 710, ppid: 21, created: ft(80), name: 'claude.exe' })).verdict).toBe('unknown')
+    // Only through an unbroken run of claude.exe parents: one under a node.exe under the command isn't.
+    expect(live(p => (plugin(p), p.procs.push({ pid: 703, ppid: 700, created: ft(73), name: 'node.exe' }, { pid: 704, ppid: 703, created: ft(74), name: 'claude.exe' }))).evidence).toEqual([
+      "unknown: claude.exe 704 isn't in any registry this plugin knows (another config folder, or a version without one)",
+    ])
+    // A command naming the conversation on its command line is L2 all the same.
+    expect(live(p => p.procs.push({ pid: 705, ppid: 21, created: ft(75), name: 'claude.exe', cli: true, ids: [T] })).evidence).toEqual(['L2: claude.exe 705 names it on its command line'])
+    // Only a claude.exe, and only as true.
+    const bad = (proc: Record<string, unknown>) => parseProbe(JSON.stringify(machine(p => p.procs.push(proc as RawProbe['procs'][number]))))
+    expect(bad({ pid: 706, ppid: 21, created: ft(76), name: 'node.exe', cli: true })).toMatchObject({ error: expect.stringContaining('a Claude Code command but not a claude.exe') })
+    expect(bad({ pid: 706, ppid: 21, created: ft(76), name: 'claude.exe', cli: false })).toMatchObject({ error: expect.stringContaining('a Claude Code command but not a claude.exe') })
+  })
+
+  test('the probe marks a Claude Code command by its arguments, never one that names a conversation', () => {
+    expect(GET_CLI).toEqual([
+      'function Get-Cli($p) {',
+      '  if ("$($p.Name)".ToLowerInvariant() -ne "claude.exe") { return $false }',
+      String.raw`  if ("$($p.CommandLine)" -notmatch '^\s*("[^"]*"|\S+)\s*(?<rest>.*)$') { return $false }`,
+      '  $rest = $Matches["rest"]',
+      String.raw`  if ($rest -notmatch '^(plugin|mcp|doctor|update|install|config|auth|--version|-v|--help|-h)(\s|$)') { return $false }`,
+      String.raw`  if ($rest -match '(^|\s)(--resume|-r|--session-id|--continue|-c|-p|--print)(\s|=|$)') { return $false }`,
+      '  return $true',
+      '}',
+    ])
+    const probe = probeScript({ ids: [W, T], configDirs: [CONFIG], stateDir: STATE })
+    for (const line of GET_CLI) expect(probe).toContain(line)
+    expect(probe).toContain('  if (Get-Cli $p) { $o["cli"] = $true }')
   })
 
   test('a nested claude.exe under an accounted session is not unknown, but under a younger "parent" it is', () => {

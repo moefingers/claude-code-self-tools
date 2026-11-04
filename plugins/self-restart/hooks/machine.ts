@@ -447,6 +447,24 @@ export const RECHECK = [
 export const PROCESS_CLASSES = ['git', 'heavy-slot', 'dev', 'build', 'shell'] as const
 export type ProcessClass = (typeof PROCESS_CLASSES)[number]
 
+/**
+ * Whether a process is a claude.exe running a Claude Code command (`claude plugin ...`, `mcp`,
+ * `doctor`, `update`, `install`, `config`, `auth`, `--version`, `--help`): its arguments start
+ * with one, and name no conversation anywhere (no --resume, -r, --session-id, --continue, -c, -p or
+ * --print). Such a run holds no conversation and has no registry entry: liveness counts it, and the
+ * claude.exe it starts, as accounted. Only the answer leaves the script, never the command line.
+ */
+export const GET_CLI = [
+  'function Get-Cli($p) {',
+  '  if ("$($p.Name)".ToLowerInvariant() -ne "claude.exe") { return $false }',
+  String.raw`  if ("$($p.CommandLine)" -notmatch '^\s*("[^"]*"|\S+)\s*(?<rest>.*)$') { return $false }`,
+  '  $rest = $Matches["rest"]',
+  String.raw`  if ($rest -notmatch '^(plugin|mcp|doctor|update|install|config|auth|--version|-v|--help|-h)(\s|$)') { return $false }`,
+  String.raw`  if ($rest -match '(^|\s)(--resume|-r|--session-id|--continue|-c|-p|--print)(\s|=|$)') { return $false }`,
+  '  return $true',
+  '}',
+]
+
 const GET_CLASS = [
   'function Get-Class($p) {',
   '  $n = "$($p.Name)".ToLowerInvariant()',
@@ -519,6 +537,7 @@ export function probeScript(input: ProbeInput): string {
     ...GET_PARENT,
     ...GET_CREATED,
     ...GET_CLASS,
+    ...GET_CLI,
     // This session's claude.exe: the nearest above the probe, then the top of an unbroken run of
     // claude.exe parents, so a helper process of the session's own is never taken for the session.
     '$session = $null',
@@ -536,14 +555,16 @@ export function probeScript(input: ProbeInput): string {
     '  }',
     '}',
     ...FIND_SLOT,
-    // Each process: its id, parent, creation time, name, class, and which asked-about ids its command
-    // line names after --resume, -r or --session-id. The command line itself stays here.
+    // Each process: its id, parent, creation time, name, class, whether it is a Claude Code command
+    // (Get-Cli), and which asked-about ids its command line names after --resume, -r or --session-id.
+    // The command line itself stays here.
     String.raw`$named = "(^|[\s\x22])(--resume|--session-id|-r)(\s+|=)[\x22\x27]?(${ids.join('|')})"`,
     '$procs = New-Object System.Collections.ArrayList',
     'foreach ($p in $table.Values) {',
     '  $o = [ordered]@{ pid = [long]$p.ProcessId; ppid = [long]$p.ParentProcessId; created = (Get-Created $p); name = "$($p.Name)" }',
     '  $cls = Get-Class $p',
     '  if ($null -ne $cls) { $o["cls"] = $cls }',
+    '  if (Get-Cli $p) { $o["cli"] = $true }',
     '  $found = @([regex]::Matches("$($p.CommandLine)", $named, "IgnoreCase") | ForEach-Object { $_.Groups[4].Value.ToLowerInvariant() } | Select-Object -Unique)',
     '  if ($found.Count -gt 0) { $o["ids"] = [object[]]$found }',
     '  [void]$procs.Add($o)',
@@ -655,7 +676,16 @@ export function probeScript(input: ProbeInput): string {
 // The probe's answer, every field checked.
 
 /** `created` is a FILETIME as a decimal string, exact: compare it with ticks() and ticksApart(), never as a number. */
-export type ProcessEntry = { readonly pid: number; readonly ppid: number; readonly created: string; readonly name: string; readonly cls?: ProcessClass; readonly ids?: readonly string[] }
+/** `cli`: a claude.exe running a Claude Code command (`claude plugin ...`), holding no conversation (Get-Cli). */
+export type ProcessEntry = {
+  readonly pid: number
+  readonly ppid: number
+  readonly created: string
+  readonly name: string
+  readonly cls?: ProcessClass
+  readonly ids?: readonly string[]
+  readonly cli?: true
+}
 
 /** A registry file, as its shape was judged: `ok` holds what L1 reads; `bad` says what's wrong with it. */
 export type RegistryEntry =
@@ -818,7 +848,8 @@ export function parseProbe(stdout: string): Probe | { error: string } {
       }
     }
     const procs = list(top.procs, 'the processes').map((value): ProcessEntry => {
-      const p = fields(value, 'a process', ['pid', 'ppid', 'created', 'name'], ['cls', 'ids'])
+      const p = fields(value, 'a process', ['pid', 'ppid', 'created', 'name'], ['cls', 'ids', 'cli'])
+      if ('cli' in p && (p.cli !== true || typeof p.name !== 'string' || p.name.toLowerCase() !== 'claude.exe')) bad('a process is a Claude Code command but not a claude.exe')
       if (!isPid(p.pid) || !isPid(p.ppid) || !isTicks(p.created)) bad('a process has no pid, parent or time as a string')
       if (typeof p.name !== 'string' || (p.name !== '' && !NAME.test(p.name))) bad("a process's name is not a plain name")
       if ('cls' in p && !(PROCESS_CLASSES as readonly unknown[]).includes(p.cls)) bad("a process's class is not one of the fixed list")
@@ -831,6 +862,7 @@ export function parseProbe(stdout: string): Probe | { error: string } {
         name: p.name as string,
         ...('cls' in p ? { cls: p.cls as ProcessClass } : {}),
         ...(ids !== undefined ? { ids: ids as string[] } : {}),
+        ...(p.cli === true ? { cli: true as const } : {}),
       }
     })
     const registry = list(top.registry, 'the registry').map((value): RegistryEntry => {
@@ -1010,10 +1042,21 @@ export function newRegistryKeys(probe: Probe, seen: Set<string>): string[] {
  * - L6: a claim lock on it that isn't `mine` and isn't stale.
  * Unknown, which refuses too: a source the probe couldn't read; a registry file of a running
  * claude.exe that can't be parsed, whose REGISTRY_FIELDS are missing or of another type, or that
- * marks a new format (registryShape), or that names `id` anywhere but its sessionId; a claude.exe no current entry accounts for,
- * itself or through an older ancestor; the coordinator unreachable; no transcript of it on this
+ * marks a new format (registryShape), or that names `id` anywhere but its sessionId; a claude.exe
+ * no current entry accounts for, itself or through an older ancestor, unless it runs a Claude Code
+ * command or a claude.exe running one started it (`cli`); the coordinator unreachable; no transcript of it on this
  * machine, or more than one.
  */
+/** Whether `p`, or a claude.exe in the unbroken run of claude.exe parents above it, runs a Claude Code command. */
+function underCli(table: Map<number, ProcessEntry>, p: ProcessEntry): boolean {
+  let at: ProcessEntry | undefined = p
+  for (let i = 0; i < 8 && at !== undefined && isClaude(at); i += 1) {
+    if (at.cli === true) return true
+    at = parentOf(table, at)
+  }
+  return false
+}
+
 export function liveness(probe: Probe, id: string, now: number, opts: { lane?: LaneEvidence; heartbeat?: { readonly at: number }; mine?: string } = {}): Liveness {
   const live: string[] = []
   const unknown: string[] = []
@@ -1042,6 +1085,9 @@ export function liveness(probe: Probe, id: string, now: number, opts: { lane?: L
   for (const p of probe.procs) if (p.ids?.includes(id)) live.push(`L2: ${p.name} ${p.pid} names it on its command line`)
   for (const p of probe.procs) {
     if (!isClaude(p)) continue
+    // A Claude Code command (claude plugin ..., --version), or a claude.exe it started: no conversation,
+    // and no registry entry. L2 above still reads its command line.
+    if (underCli(table, p)) continue
     let at: ProcessEntry | undefined = p
     let isAccounted = false
     for (let i = 0; i < 32 && at !== undefined && !isAccounted; i += 1) {

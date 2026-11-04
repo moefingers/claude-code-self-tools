@@ -11,13 +11,13 @@
 //
 // Before anything moves, one probe of the machine (machine.ts) reads every running claude.exe, the
 // engine's session registry, the transcripts' project folders and the claim locks, and takes the
-// claim lock on `to` in the same run. A verdict of unknown gets one more probe 2.5 seconds later (a
-// claude.exe starting or exiting reads as unknown for a moment), the claim given back meanwhile. The
-// switch goes ahead only when `to` is NOT LIVE (liveness) and this session is at a safe point
-// (safePoint: no subagent, nothing busy under its claude.exe, git at rest, and for an in-place switch
-// a clean checkout); anything that can't be read refuses, saying what. Then the leaving row goes into
-// this conversation, the ticket into the plugin's store, keyed by `to`, and one transport runs
-// (pickTransport):
+// claim lock on `to` in the same run. A verdict of unknown gets up to 3 more probes over about 10
+// seconds (a claude.exe starting or exiting reads as unknown for a moment), the claim given back
+// meanwhile. The switch goes ahead only when `to` is NOT LIVE (liveness) and this session is at a
+// safe point (safePoint: no subagent, nothing busy under its claude.exe, git at rest, and for an
+// in-place switch a clean checkout); anything that can't be read refuses, saying what. Then the
+// leaving row goes into this conversation, the ticket into the plugin's store, keyed by `to`, and one
+// transport runs (pickTransport):
 // - in place, `/resume <to>`, when both conversations' transcripts sit in one project folder; the
 //   session id must then read `to`, or the switch didn't take and is said not to have;
 // - the slot, when this claude.exe runs in a pane's claude-slot.ps1 of the shipped hash: a record for
@@ -92,8 +92,11 @@ const RECENT = 'recentSwitches'
 /** The plugin's store keys for heartbeats: `alive:<session id>`. */
 const ALIVE = 'alive:'
 
-/** How long to wait before the one more look, when the first says unknown. */
-const RETRY_MS = 2500
+/**
+ * The waits before each look again while the verdict is unknown: a claude.exe that is starting or
+ * exiting, or a Claude Code command run from a shell (alive 5 to 7 s), reads that way for a moment.
+ */
+const RETRY_MS = [2500, 3500, 4000] as const
 /** A beat after the turn's end, so the turn is no longer running when the switch starts. */
 const SETTLE_MS = 500
 /** How long after the exit command to look whether the session is still here. */
@@ -408,9 +411,9 @@ async function release($: EngineInterface, powershell: string, state: string, id
     // `busy`: another process had it open throughout. Left in place, it refuses every other move on
     // that conversation until it goes stale, which is the safe side; said so, never taken as released.
     const what = said === 'busy' ? 'another process had it open throughout' : `exit ${run.exitCode}`
-    $.ui.log(`self-switch: the claim lock on ${id} wasn't released (${what}); it is left in place, and goes stale 15 minutes after its creator exits.`)
+    $.ui.log(`the claim lock on ${id} wasn't released (${what}); it is left in place, and goes stale 15 minutes after its creator exits.`)
   } catch (err) {
-    $.ui.log(`self-switch: the claim lock on ${id} wasn't released (${why(err)}); it goes stale 15 minutes after its creator exits.`)
+    $.ui.log(`the claim lock on ${id} wasn't released (${why(err)}); it goes stale 15 minutes after its creator exits.`)
   }
 }
 
@@ -512,7 +515,7 @@ function startBeat($: EngineInterface, resumed?: string): void {
 /** Each registry key the probe saw that isn't in REGISTRY_KEYS, logged the first time this process sees it; it is ignored. */
 function logNewKeys($: EngineInterface, found: Probe): void {
   for (const key of newRegistryKeys(found, seenKeys)) {
-    $.ui.log(`self-switch: a session registry file holds the key "${key}", which Claude Code 2.1.318 didn't write; it is ignored (liveness reads pid, sessionId and procStart).`)
+    $.ui.log(`a session registry file holds the key "${key}", which Claude Code 2.1.318 didn't write; it is ignored (liveness reads pid, sessionId and procStart).`)
   }
 }
 
@@ -677,13 +680,14 @@ async function switchNow($: EngineInterface, value: Queued): Promise<void> {
   }
   let looked = await look()
   if ('failure' in looked) return notRun(`the machine probe failed (${looked.failure}), so whether ${to} is open elsewhere is unknown`)
-  if (looked.live.verdict === 'unknown') {
-    // A claude.exe that is starting or exiting reads as unknown for a moment: one more look, with the
+  for (const [n, wait] of RETRY_MS.entries()) {
+    if (looked.live.verdict !== 'unknown') break
+    // A claude.exe that is starting or exiting reads as unknown for a moment: another look, with the
     // claim given back meanwhile and taken again by that probe.
     if (looked.by !== undefined) await release($, ctx.powershell, ctx.state, to, looked.by)
-    $.ui.log(`self-switch: whether ${to} is open elsewhere reads unknown (${looked.live.evidence.join('; ')}); looking once more in ${RETRY_MS / 1000} seconds.`)
+    $.ui.log(`whether ${to} is open elsewhere reads unknown (${looked.live.evidence.join('; ')}); looking again in ${wait / 1000} seconds (${n + 1} of ${RETRY_MS.length}).`)
     try {
-      await $.clock.sleep(RETRY_MS)
+      await $.clock.sleep(wait)
     } catch {
       // The plugin unloaded meanwhile: nothing more runs, and the claim is given back already.
       if (armed === value) armed = undefined
@@ -811,7 +815,7 @@ async function switchNow($: EngineInterface, value: Queued): Promise<void> {
   if (armed !== value) return undo('a new turn started', record)
   armed = undefined
   $.ui.log(`Switching to ${to}: ${value.reason}`)
-  if (fallback !== undefined) $.ui.log(`self-switch: this pane's slot runner isn't used: ${fallback}. A new window resumes ${to}.`)
+  if (fallback !== undefined) $.ui.log(`this pane's slot runner isn't used: ${fallback}. A new window resumes ${to}.`)
   $.ui.toast(`Switching to ${to}: this session exits, and ${where} once this process has gone.`)
   try {
     await $.command.run({ command: 'exit' })
@@ -835,7 +839,7 @@ async function runSwitch($: EngineInterface, value: Queued): Promise<void> {
     await switchNow($, value)
   } catch (err) {
     if (armed === value) armed = undefined
-    $.ui.log(`self-switch: the switch to ${value.to} stopped: ${why(err)}`)
+    $.ui.log(`the switch to ${value.to} stopped: ${why(err)}`)
   }
 }
 

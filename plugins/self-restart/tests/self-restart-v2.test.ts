@@ -181,7 +181,7 @@ test("a slot runner the launcher passed over for a window: the restart says why,
   const rows = session.appended().flatMap(row => ((row as { message?: { content?: { text?: unknown }[] } }).message?.content ?? []).map(block => String(block.text)))
   expect(rows).toContain(`This session restarted at its own request (restart_after_turn). Reason: Switched accounts. It restarted in a new window, not this pane's slot: \u00ab${why}\u00bb.`)
   expect(toasts).toContain(`Restarting: a new window resumes this session once it has exited, not this pane's slot (${why}). Switched accounts.`)
-  expect(logs).toContain(`self-restart: this pane's slot runner isn't used: ${why}. A new window resumes the session.`)
+  expect(logs).toContain(`this pane's slot runner isn't used: ${why}. A new window resumes the session.`)
 })
 
 test('a window with no slot passed over, or the slot itself, says nothing of a fallback', async ($, on) => {
@@ -316,5 +316,5 @@ test('a release that finds the lock held open throughout is logged, never taken 
   await $.session.start(start)
   await $.classic.SessionStart({ source: 'resume', session_id: ID })
   await clock.advance(1000)
-  expect(logs).toContain(`self-restart: the claim lock on ${ID} wasn't released (another process had it open throughout); it is left in place, and goes stale 15 minutes after the old process exited.`)
+  expect(logs).toContain(`the claim lock on ${ID} wasn't released (another process had it open throughout); it is left in place, and goes stale 15 minutes after the old process exited.`)
 })

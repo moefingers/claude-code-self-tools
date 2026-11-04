@@ -395,7 +395,7 @@ async function restartNow($: EngineInterface, value: Queued): Promise<void> {
   armed = undefined
   await tellModel($, record(value, fallback))
   $.ui.log(`Restarting at the session's own request: ${value.reason}`)
-  if (fallback !== undefined) $.ui.log(`self-restart: this pane's slot runner isn't used: ${fallback}. A new window resumes the session.`)
+  if (fallback !== undefined) $.ui.log(`this pane's slot runner isn't used: ${fallback}. A new window resumes the session.`)
   const where = slot !== undefined ? "this pane's slot" : 'a new window'
   $.ui.toast(`Restarting: ${where} resumes this session once it has exited${fallback === undefined ? '' : `, not this pane's slot (${fallback})`}. ${value.reason}`)
   try {
@@ -431,10 +431,10 @@ async function release($: EngineInterface, id: string, claim: string): Promise<v
     const said = run.exitCode === 0 ? RELEASED.exec(run.stdout)?.[1] : undefined
     if (said !== 'released' && said !== 'absent' && said !== 'not-ours') {
       const what = said === 'busy' ? 'another process had it open throughout' : `exit ${run.exitCode}`
-      $.ui.log(`self-restart: the claim lock on ${id} wasn't released (${what}); it is left in place, and goes stale 15 minutes after the old process exited.`)
+      $.ui.log(`the claim lock on ${id} wasn't released (${what}); it is left in place, and goes stale 15 minutes after the old process exited.`)
     }
   } catch (err) {
-    $.ui.log(`self-restart: the claim lock on ${id} wasn't released (${why(err)}); it goes stale 15 minutes after the old process exited.`)
+    $.ui.log(`the claim lock on ${id} wasn't released (${why(err)}); it goes stale 15 minutes after the old process exited.`)
   }
 }
 

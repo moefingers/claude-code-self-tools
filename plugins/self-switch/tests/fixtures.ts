@@ -29,7 +29,7 @@ export const PROJECT = 'C--work-repo'
 export const ELSEWHERE = 'C:\\work\\other'
 export const ELSEWHERE_PROJECT = 'C--work-other'
 
-export type RawProcess = { pid: number; ppid: number; created: string; name: string; cls?: string; ids?: string[] }
+export type RawProcess = { pid: number; ppid: number; created: string; name: string; cls?: string; ids?: string[]; cli?: true }
 export type RawRegistry = { dir: number; file: number; ok: boolean; keys?: string[]; [key: string]: unknown }
 export type RawProbe = {
   v: 1
