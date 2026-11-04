@@ -50,6 +50,7 @@ function Get-Live($id, $configDirs) {
   $live = $null
   $procs = @{}
   foreach ($p in (Get-CimInstance -ClassName Win32_Process -Property ProcessId, Name, CreationDate, CommandLine)) { $procs[[int]$p.ProcessId] = $p }
+  $snapshotFt = [DateTime]::UtcNow.ToFileTimeUtc()
   $elsewhere = @{}
   foreach ($dir in $configDirs) {
     $reg = Join-Path $dir "sessions"
@@ -76,7 +77,7 @@ function Get-Live($id, $configDirs) {
       if ($named) { $live = "it may be open elsewhere: the registry file of running Claude Code $($f.BaseName) names it outside its sessionId"; break }
       $pidOk = $false
       try { $pidOk = [long]$e.pid -eq [long]$p.ProcessId } catch { $pidOk = $false }
-      if ($near -and $pidOk -and $e.sessionId -match "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\z") { $elsewhere[[int]$p.ProcessId] = $true }
+      if ($near -and $pidOk -and ($snapshotFt - [long]$p.CreationDate.ToFileTimeUtc()) -gt 600000000 -and $e.sessionId -match "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\z") { $elsewhere[[int]$p.ProcessId] = $true }
     }
   }
   if ($null -eq $live) { foreach ($p in $procs.Values) { if ($null -eq $live -and $p.ProcessId -ne $PID -and -not $elsewhere.ContainsKey([int]$p.ProcessId) -and "$($p.CommandLine)" -match "(^|[\s\x22])(--resume|--session-id|-r)(\s+|=)[\x22\x27]?$id") { $live = "it is open elsewhere: process $($p.ProcessId) names it on its command line (L2)" } } }

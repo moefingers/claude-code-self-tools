@@ -7,6 +7,7 @@ import {
   descendants,
   FALLBACK,
   GET_CLI,
+  LAUNCH_LINE_TRUSTED_AFTER_MS,
   READ_BLANK_AGAIN,
   type GitState,
   isSafeFolder,
@@ -34,7 +35,7 @@ import {
   SLOT_SCRIPT_SHA256,
   safePoint,
 } from '../hooks/machine'
-import { ELSEWHERE, elsewhere, entry, ft, inSlot, LAUNCH, machine, NOW, OTHER, PERMISSION_FLAGS, PROJECT, type RawProbe, REPO, T, under, W } from './fixtures'
+import { ELSEWHERE, elsewhere, entry, ft, inSlot, LAUNCH, machine, NOW, OTHER, PERMISSION_FLAGS, PROJECT, type RawProbe, REPO, T, under, W, X } from './fixtures'
 
 const STATE = 'C:\\Users\\u\\AppData\\Local\\claude-self-tools'
 const CONFIG = 'C:\\Users\\u\\.claude'
@@ -96,6 +97,26 @@ describe('liveness', () => {
     ])
     // Any other process naming it, with no entry of its own: L2.
     expect(live(p => p.procs.push({ pid: 450, ppid: 100, created: ft(45), name: 'bash.exe', ids: [T] })).evidence).toEqual(['L2: bash.exe 450 names it on its command line'])
+  })
+
+  test("L2 trusts a claude.exe's own entry over its launch line only once it ran more than 60 s before the probe", () => {
+    // claude.exe 500, started as `claude --resume T` some seconds before the probe (pid 300, whose
+    // start is the snapshot's), its current entry naming another conversation: a fresh one may not have
+    // written T yet.
+    const started = (seconds: number) => String(BigInt(ft(1000)) - BigInt(Math.round(seconds * 10_000_000)))
+    const launched = (seconds: number) => (p: RawProbe) => {
+      p.procs.push({ pid: 500, ppid: 21, created: started(seconds), name: 'claude.exe', ids: [T] })
+      p.registry.push(entry(500, X, started(seconds)))
+    }
+    // The review's case: 0.8 s old. Live, by its command line.
+    expect(live(launched(0.8))).toEqual({ verdict: 'live', evidence: ['L2: claude.exe 500 names it on its command line'] })
+    // Exactly 60 s: still live. A millisecond more, or 61 s: its entry is trusted, and T is not live.
+    expect(live(launched(60)).verdict).toBe('live')
+    expect(live(launched(60.001)).verdict).toBe('not-live')
+    expect(live(launched(61))).toEqual({ verdict: 'not-live', evidence: [] })
+    // With no probe process in the table to time it by, the command line holds.
+    expect(live(p => (launched(61)(p), (p.procs = p.procs.filter(x => x.pid !== 300)))).verdict).toBe('live')
+    expect(LAUNCH_LINE_TRUSTED_AFTER_MS).toBe(60_000)
   })
 
   test('L2: a process names it on its command line', () => {
@@ -697,13 +718,15 @@ describe('the scripts, as text', () => {
     // L2 after the registry, past only a claude.exe whose own file is current (its pid, its start time),
     // well formed, and names another conversation.
     expect(RECHECK).toContain(
-      String.raw`    if ($near -and $pidOk -and $e.sessionId -match "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\z") { $elsewhere[[int]$p.ProcessId] = $true }`,
+      String.raw`    if ($near -and $pidOk -and ($snapshotFt - [long]$p.CreationDate.ToFileTimeUtc()) -gt 600000000 -and $e.sessionId -match "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\z") { $elsewhere[[int]$p.ProcessId] = $true }`,
     )
     expect(RECHECK).toContain('    try { $pidOk = [long]$e.pid -eq [long]$p.ProcessId } catch { $pidOk = $false }')
     const l2 = RECHECK.findIndex(line => line.includes('(L2)'))
     expect(l2).toBe(RECHECK.length - 1)
     expect(RECHECK[l2]).toContain('-not $elsewhere.ContainsKey([int]$p.ProcessId)')
     expect(RECHECK.indexOf('$elsewhere = @{}')).toBeLessThan(RECHECK.indexOf('foreach ($dir in $configDirs) {'))
+    // The table's time, read as soon as it is, for the 60 s age guard: never a time from elsewhere.
+    expect(RECHECK.indexOf('$snapshotFt = [DateTime]::UtcNow.ToFileTimeUtc()')).toBe(RECHECK.findIndex(line => line.startsWith('foreach ($p in (Get-CimInstance')) + 1)
   })
 
   test("the last-moment re-check refuses whenever a running claude.exe's file names the id, whatever its procStart", () => {

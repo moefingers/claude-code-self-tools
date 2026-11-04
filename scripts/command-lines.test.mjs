@@ -2,6 +2,7 @@
 // 24,000 characters: Windows allows one 32,767, and past it the process never starts (every switch
 // was refused when the probe reached 33,041). Run with `node --test "scripts/*.test.mjs"`.
 import assert from 'node:assert/strict'
+import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { test } from 'node:test'
 import { pathToFileURL } from 'node:url'
@@ -97,5 +98,17 @@ test("the window's own command line: the inner script GZip-compressed in a fixed
     assert.ok(length < LIMIT, `${name}: ${length} characters (the inner script ${inner.length})`)
     // Left on the command line as it was, it would have been far longer.
     assert.ok(Buffer.from(inner, 'utf16le').toString('base64').length > length, name)
+  }
+})
+
+test("every run of a script passes it on standard input: the bootstrap never reads the engine's default stdin", () => {
+  for (const plugin of ['self-switch', 'self-restart']) {
+    const text = readFileSync(join(ROOT, 'plugins', plugin, 'hooks', 'register.ts'), 'utf8')
+    const calls = text.split('powershellCall(').length - 1
+    const runs = text.split('$.process.run(').length - 1
+    const withStdin = (text.match(/\$\.process\.run\(call\.argv, \{\s*stdin: call\.stdin,/g) ?? []).length
+    assert.ok(calls > 0, `${plugin} runs its scripts through powershellCall`)
+    assert.equal(runs, calls, `${plugin}: every $.process.run is of a powershellCall`)
+    assert.equal(withStdin, calls, `${plugin}: every run passes the call's stdin`)
   }
 })

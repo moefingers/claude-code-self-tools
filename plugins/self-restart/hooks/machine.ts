@@ -270,8 +270,15 @@ export const REGISTRY_FIELDS = ['pid', 'sessionId', 'procStart'] as const
  */
 export const REGISTRY_VERSION_MARKERS = ['v', 'schema', 'schemaVersion', 'formatVersion', 'registryVersion'] as const
 
+/**
+ * How long a claude.exe must have run, before the snapshot that reads it, for its own registry entry
+ * to outweigh its command line (L2): a fresh `claude --resume <id>` may write its first entry under
+ * another id before it has loaded the conversation, and in that moment only its command line says so.
+ */
+export const LAUNCH_LINE_TRUSTED_AFTER_MS = 60_000
+
 /** The SHA-256 of plugins/self-switch/slot/claude-slot.ps1, as it is committed. */
-export const SLOT_SCRIPT_SHA256 = '3d5569f0ddd02324ac9b0e5c094d2ff095400bb79b431ea60f182c04f5b5bfd6'
+export const SLOT_SCRIPT_SHA256 = 'f3d86d794130b60b4270776cf9f1238b02c1de659a543b794b8b015284f1354b'
 
 /**
  * The variables Claude Code sets in the processes it starts, which a top-level claude must not inherit:
@@ -419,8 +426,9 @@ const TAKE_CLAIM = [
  * nothing. The same rules as the probe's liveness: sessionId compared without regard to case; a file
  * that names `$id` in any key but sessionId, cwd and name refuses; and a command line naming `$id`
  * (L2) is passed over only for a claude.exe whose own registry file is current (its pid, and its
- * procStart within 1 ms of its start), well formed, and names another conversation: a process
- * started as `claude --resume <id>` keeps that line after it switched in place to another. Anything else that can't be read throws, and a caller that catches it resumes nothing. No
+ * procStart within 1 ms of its start), well formed, and names another conversation, and which started
+ * more than 60 s before the process table was read: a process started as `claude --resume <id>` keeps
+ * that line after it switched in place to another, and a fresh one may not have written it yet. Anything else that can't be read throws, and a caller that catches it resumes nothing. No
  * single quote in these lines: the launcher carries each inside one. A running claude.exe whose file
  * names $id refuses whatever its procStart; the start time only words the line. procStart compares as a [double]:
  * a string of digits, as Claude Code 2.1.318 writes it, converts as a number does, and at today's
@@ -430,6 +438,8 @@ export const RECHECK = [
   '$live = $null',
   '$procs = @{}',
   'foreach ($p in (Get-CimInstance -ClassName Win32_Process -Property ProcessId, Name, CreationDate, CommandLine)) { $procs[[int]$p.ProcessId] = $p }',
+  // The table's time, read as soon as it is: a process started less than 60 s before it keeps L2.
+  '$snapshotFt = [DateTime]::UtcNow.ToFileTimeUtc()',
   // The claude.exe whose own registry file is current, well formed and names another conversation.
   '$elsewhere = @{}',
   'foreach ($dir in $configDirs) {',
@@ -460,7 +470,7 @@ export const RECHECK = [
   '    if ($named) { $live = "it may be open elsewhere: the registry file of running Claude Code $($f.BaseName) names it outside its sessionId"; break }',
   '    $pidOk = $false',
   '    try { $pidOk = [long]$e.pid -eq [long]$p.ProcessId } catch { $pidOk = $false }',
-  String.raw`    if ($near -and $pidOk -and $e.sessionId -match "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\z") { $elsewhere[[int]$p.ProcessId] = $true }`,
+  String.raw`    if ($near -and $pidOk -and ($snapshotFt - [long]$p.CreationDate.ToFileTimeUtc()) -gt ` + `${LAUNCH_LINE_TRUSTED_AFTER_MS * 10_000}` + String.raw` -and $e.sessionId -match "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\z") { $elsewhere[[int]$p.ProcessId] = $true }`,
   '  }',
   '}',
   // L2: a command line naming it, past a claude.exe whose own current entry names another conversation.
@@ -1088,8 +1098,9 @@ export function newRegistryKeys(probe: Probe, seen: Set<string>): string[] {
  * Whether conversation `id` is live on this machine, from one probe (\u00a73.2 of the design):
  * - L1: a current registry entry (its pid a running claude.exe started within 1 ms of its procStart)
  *   holds it; an entry whose process has gone, or whose pid another process took, is ignored;
- * - L2: a process names it on its command line, unless it is a claude.exe whose own current registry
- *   entry names another conversation (it was started with --resume <id>, and switched in place since);
+ * - L2: a process names it on its command line, unless it is a claude.exe started more than 60 s
+ *   before the probe whose own current registry entry names another conversation (it was started with
+ *   --resume <id>, and switched in place since);
  * - L3: its transcript was written less than 10 minutes ago;
  * - L4: the coordinator says its lane is live, or a claim of its names another (coordinated mode);
  * - L5: its heartbeat is younger than 5 minutes;
@@ -1121,6 +1132,8 @@ export function liveness(probe: Probe, id: string, now: number, opts: { lane?: L
     if (e.source === 'locks') unknown.push("unknown: the claim locks can't be read")
   }
   const current = new Set<number>()
+  /** The probe's own process: its creation time is the snapshot's. */
+  const snapshot = table.get(probe.self)
   /** The conversations each claude.exe's own current, well-formed registry entries name. */
   const holds = new Map<number, string[]>()
   for (const entry of probe.registry) {
@@ -1143,8 +1156,11 @@ export function liveness(probe: Probe, id: string, now: number, opts: { lane?: L
     if (!p.ids?.includes(id)) continue
     // A claude.exe started as `claude --resume <id>` keeps that line after it switched in place: its own
     // current entry naming another conversation says it moved on. With none, or a bad one, L2 holds.
+    // Only for one started more than 60 s before this snapshot (the probe's own start, from the same
+    // process table): a fresh one may not have written the conversation it resumes yet.
     const held = holds.get(p.pid)
-    if (held !== undefined && held.length > 0 && held.every(other => other !== id)) continue
+    const settled = snapshot !== undefined && ticks(snapshot.created) - ticks(p.created) > BigInt(LAUNCH_LINE_TRUSTED_AFTER_MS) * BigInt(10_000)
+    if (settled && held !== undefined && held.length > 0 && held.every(other => other !== id)) continue
     live.push(`L2: ${p.name} ${p.pid} names it on its command line`)
   }
   for (const p of probe.procs) {
