@@ -32,7 +32,7 @@ const BUSY: readonly string[] = ['pending', 'running', 'waiting']
 
 const DESCRIPTION = [
   'Ends this session once the current turn ends, as /exit does: Claude Code closes, and nothing more happens here until someone resumes the session (claude --resume).',
-  'Call it only when the person asked you to end the session, or your instructions say to close it once its work is done or handed off. Never to get out of a task, and not to restart (restart_after_turn, if it is available, does that).',
+  'Call it only when the person asked you to end the session, or your instructions say to close it once its work is done or handed off. Only at a finished break: never mid-merge, mid-push or mid-task. Never to get out of a task, and not to restart (restart_after_turn, if it is available, does that).',
   '`reason` (required) says why; it is recorded in the transcript. `note` is for whoever resumes this session: what was left, and where its notes are. Write your notes down first.',
   'Everything the session runs ends with it: Remote Control (the phone and browser lose the session), wake-ups, background tasks. It refuses while subagents you started are still running.',
   'End the turn after calling it; the exit runs once your answer is shown.',

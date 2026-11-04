@@ -15,8 +15,8 @@ Each plugin is separate. Install only the ones you want.
 | [self-wake](plugins/self-wake) | `wake_after`, `cancel_wake` | Some minutes after the turn ends, sends the session a note that starts a turn of its own. | When it has to wait on something slow (a deploy, a long job) that won't report back by itself. |
 | [self-remote-control](plugins/self-remote-control) | `remote_control` | Reports whether this session's Remote Control is connected, connects it under a title, and renames the session. | When you ask whether you can reach the session from your phone, to make it reachable before you step away, or to give it a title you'll recognise in the app's session list. |
 | [self-clear](plugins/self-clear) | `clear_after_turn` | Runs `/clear` once the turn ends, then sends the handoff it was given as the cleared conversation's first prompt. | Between two independent pieces of work, when the next needs nothing of this conversation, its notes written down first. |
-| [self-exit](plugins/self-exit) | `exit_after_turn` | Runs `/exit` once the turn ends, its reason (and a note for whoever resumes it) recorded in the transcript first. | When you asked it to end the session, or its instructions say to close once its work is done or handed off. |
-| [self-restart](plugins/self-restart) | `restart_after_turn` | On Windows: opens a new terminal window, exits, and the window resumes the same conversation once the old process has gone, then can resume on its own. | After an account switch, a setting that takes effect at startup, or a plugin that won't reload. |
+| [self-exit](plugins/self-exit) | `exit_after_turn` | Runs `/exit` once the turn ends, its reason (and a note for whoever resumes it) recorded in the transcript first. | When you asked it to end the session, or its instructions say to close once its work is done or handed off. Only at a finished break, never mid-merge, mid-push or mid-task. |
+| [self-restart](plugins/self-restart) | `restart_after_turn` | On Windows: opens a new terminal window, exits, and the window resumes the same conversation once the old process has gone, then can resume on its own. | After an account switch, a setting that takes effect at startup, or a plugin that won't reload. Only at a finished break, never mid-merge, mid-push or mid-task. |
 
 Claude sees each tool as `mcp__<plugin>__<tool>`, for example `mcp__self-wake__wake_after`.
 
@@ -120,7 +120,7 @@ The tool descriptions say when to call each tool and when not to. To make it a h
 > - **Waiting on something slow:** when a deploy, a long job or a check will take a while and nothing will tell you it's done, call `wake_after` with the minutes and a note saying what to check, and end the turn. Cancel it with `cancel_wake` if the answer comes first.
 > - **Remote Control:** when I say I'm stepping away, call `remote_control` with `connect` and a `name` saying what this session is working on. When the work changes, retitle it with `rename`, with a `resume` naming your next step. Never try to disconnect it.
 > - **A fresh start between independent pieces:** when the next piece needs nothing of this conversation, write your notes, then call `clear_after_turn` with a `handoff` naming the piece and where its notes are. When it builds on this one, compact instead.
-> - **Ending or restarting:** call `exit_after_turn` only when I ask you to end the session or your brief says to close it when done, with the `reason`. After I switch accounts or change a setting that needs a restart, call `restart_after_turn` with the `reason` and a `resume` naming the next step.
+> - **Ending or restarting:** only at a finished break, never mid-merge, mid-push or mid-task. Call `exit_after_turn` only when I ask you to end the session or your brief says to close it when done, with the `reason`. After I switch accounts or change a setting that needs a restart, call `restart_after_turn` with the `reason` and a `resume` naming the next step.
 
 ## Develop
 

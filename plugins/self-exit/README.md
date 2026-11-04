@@ -11,6 +11,7 @@ Lets a session end itself once the current turn ends, as `/exit` does, with a st
 
 ## How it behaves
 
+- **Only at a finished break.** A session calls it once a piece of work is finished, never mid-merge, mid-push or mid-task: the same rule as compacting with [self-compact](../self-compact). The tool's description says so.
 - **The exit waits for the turn to end.** A command can't run while a turn is running, so the call queues it, and it runs once the turn ends with Claude's answer.
 - **The reason is logged.** Before `/exit` runs, the reason and the note go into the conversation as a row Claude reads when the session is resumed (`claude --resume`), and into a transcript line you see, which the debug log keeps too.
 - **Everything the session runs ends with it.** That means Remote Control (your phone and browser lose the session), wake-ups and background tasks. The tool description says so.
@@ -31,7 +32,7 @@ When Claude calls this plugin's tool, and the last check is 30 minutes old or th
 - **It never holds up the tool.** The check runs beside the call, which never waits on it. Offline, refused by policy, a 404, a rate limit, no answer within 5 seconds, or anything but a plain version such as `0.2.0` all mean no notice.
 - **When a newer version is out**, a toast tells you, and the result of one of Claude's next calls ends with a line like this:
 
-  > self-exit 0.1.0 is out of date (0.2.0 is published). To update, the person runs: claude plugin marketplace update claude-code-self-tools, then claude plugin update self-exit@claude-code-self-tools, then /reload-plugins in each open session (a new session loads the update on its own). Don't run these yourself unless the person asks.
+  > self-exit 0.1.1 is out of date (0.2.0 is published). To update, the person runs: claude plugin marketplace update claude-code-self-tools, then claude plugin update self-exit@claude-code-self-tools, then /reload-plugins in each open session (a new session loads the update on its own). Don't run these yourself unless the person asks.
 
   The line is fixed text. Only the two version numbers vary, and each must be three plain numbers. Nothing else from the fetched file reaches Claude. A session is told of each check once, and at most once every 30 minutes, not on every call, and the toast follows the same rule. A call carries only what an earlier check found: the call that starts a check doesn't wait for its answer.
 - **Turn it off** with the plugin's `updateCheck` setting: `off` never checks. Set it in `/config`, or from your shell:

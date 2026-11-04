@@ -2,6 +2,12 @@
 
 Each entry names a plugin and its version, as `version` in `plugins/<name>/.claude-plugin/plugin.json` has it.
 
+## 2026-11-03: exit and restart only at a finished break
+
+- **self-exit 0.1.1**: `exit_after_turn`'s description says to call it only at a finished break, never mid-merge, mid-push or mid-task, the same rule as compacting. Its behaviour is unchanged.
+- **self-restart 0.1.1**: the same line in `restart_after_turn`'s description. Its behaviour is unchanged.
+- The two plugins' READMEs and the top README's entries for them say the same.
+
 ## 2026-11-03: a session clears, exits and restarts itself
 
 Three new plugins. Each queues its action at the call and runs it once the turn ends with an answer. Each cancels it when the turn is interrupted, and refuses subagents, as the others do.
