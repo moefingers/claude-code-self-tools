@@ -278,7 +278,7 @@ export const REGISTRY_VERSION_MARKERS = ['v', 'schema', 'schemaVersion', 'format
 export const LAUNCH_LINE_TRUSTED_AFTER_MS = 60_000
 
 /** The SHA-256 of plugins/self-switch/slot/claude-slot.ps1, as it is committed. */
-export const SLOT_SCRIPT_SHA256 = 'f3d86d794130b60b4270776cf9f1238b02c1de659a543b794b8b015284f1354b'
+export const SLOT_SCRIPT_SHA256 = '9e8c984c89ea6d1503635a5280c6fc224406ef724767f7b5e31323d4e6be490e'
 
 /**
  * The variables Claude Code sets in the processes it starts, which a top-level claude must not inherit:
@@ -293,7 +293,9 @@ export const SLOT_SCRIPT_SHA256 = 'f3d86d794130b60b4270776cf9f1238b02c1de659a543
  * settings nor the Windows environment: AI_AGENT (`claude-code_<version>_agent`), CLAUDE_CODE_ENTRYPOINT,
  * CLAUDE_CODE_EXECPATH, CLAUDE_CODE_SESSION_ATTENDED. And CLAUDE_CODE_SSE_PORT, which an IDE's terminal sets:
  * a session restarted or switched out of one would hand the old process's IDE link to the new one.
- * Never one a person sets, such as CLAUDE_CODE_FORCE_SESSION_PERSISTENCE.
+ * And NO_COLOR, which Claude Code sets to 1 in its tool shells: a session started from one would draw
+ * no colour. The slot runner clears these too. Never one a person sets otherwise, and never
+ * CLAUDE_CODE_DISABLE_BG_SHELL_PRESSURE_REAP (kept as it is: the person's choice).
  */
 export const SESSION_MARKERS = [
   'CLAUDE_CODE_CHILD_SESSION',
@@ -312,10 +314,23 @@ export const SESSION_MARKERS = [
   'CLAUDE_CODE_EXECPATH',
   'CLAUDE_CODE_SESSION_ATTENDED',
   'CLAUDE_CODE_SSE_PORT',
+  'NO_COLOR',
 ] as const
 
-/** The line that clears SESSION_MARKERS from a script's own environment, which claude inherits. */
-export const CLEAR_MARKERS = `foreach ($name in ${SESSION_MARKERS.map(name => `"${name}"`).join(', ')}) { [Environment]::SetEnvironmentVariable($name, $null, [EnvironmentVariableTarget]::Process) }`
+/**
+ * What a launcher's window clears: SESSION_MARKERS, and WT_SESSION, the Windows Terminal tab id of the
+ * session it came from, so the new tab gets its own. Not the slot runner: its pane's WT_SESSION is its own.
+ */
+export const LAUNCH_CLEARS = [...SESSION_MARKERS, 'WT_SESSION'] as const
+
+/**
+ * Set in every process a launcher starts claude in (the window, and the slot runner's): transcripts on,
+ * whatever marker a later Claude Code adds that this list doesn't clear yet.
+ */
+export const FORCE_PERSISTENCE = '$env:CLAUDE_CODE_FORCE_SESSION_PERSISTENCE = "1"'
+
+/** The line that clears LAUNCH_CLEARS from a window's own environment, which claude inherits. */
+export const CLEAR_MARKERS = `foreach ($name in ${LAUNCH_CLEARS.map(name => `"${name}"`).join(', ')}) { [Environment]::SetEnvironmentVariable($name, $null, [EnvironmentVariableTarget]::Process) }`
 
 // ---------------------------------------------------------------------------------------------
 // PowerShell the scripts share. Each fragment is lines of Windows PowerShell 5.1.
@@ -1692,6 +1707,7 @@ export function launcherScript(id: string, options?: LaunchOptions): string {
     "  '}',",
     // The old session's markers, gone before claude starts: a claude that inherits them is nested.
     `  '${CLEAR_MARKERS}',`,
+    `  '${FORCE_PERSISTENCE}',`,
     "  'Set-Location -LiteralPath $folder',",
     "  '$started = Get-Date',",
     `  "& '$exe' --resume '$id'",`,

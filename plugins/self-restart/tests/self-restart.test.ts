@@ -313,21 +313,27 @@ test("the window clears the old session's markers before claude --resume, and no
     'CLAUDE_CODE_EXECPATH',
     'CLAUDE_CODE_SESSION_ATTENDED',
     'CLAUDE_CODE_SSE_PORT',
+    'NO_COLOR',
   ])
   const script = launcherScript(ID)
   const clears = script.split(/\r?\n/).filter(line => line.includes('SetEnvironmentVariable'))
   expect(clears).toHaveLength(1)
   const clear = clears[0] ?? ''
   // Exactly the listed names, each quoted, CLAUDE_CODE_CHILD_SESSION (nested: no transcript) first.
-  expect(clear.match(/"[A-Za-z_]+"/g)).toEqual(SESSION_MARKERS.map(name => `"${name}"`))
+  // And WT_SESSION, the old tab's, so the new one gets its own.
+  expect(clear.match(/"[A-Za-z_]+"/g)).toEqual([...SESSION_MARKERS, 'WT_SESSION'].map(name => `"${name}"`))
   expect(clear).toContain('[Environment]::SetEnvironmentVariable($name, $null, [EnvironmentVariableTarget]::Process)')
   // Never a variable a person sets.
-  for (const name of ['CLAUDE_CODE_FORCE_SESSION_PERSISTENCE', 'CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC', 'ANTHROPIC_API_KEY', 'PATH']) {
+  for (const name of ['CLAUDE_CODE_FORCE_SESSION_PERSISTENCE', 'CLAUDE_CODE_DISABLE_BG_SHELL_PRESSURE_REAP', 'CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC', 'ANTHROPIC_API_KEY', 'PATH']) {
     expect(clear).not.toContain(`"${name}"`)
   }
   // In the window, after the wait and before claude runs.
   expect(script.indexOf(clear)).toBeGreaterThan(script.indexOf('Wait-Process'))
   expect(script.indexOf(clear)).toBeLessThan(script.indexOf("--resume '$id'"))
+  // Transcripts on whatever a later Claude Code adds: set after the clear, before claude.
+  const force = script.indexOf(`'$env:CLAUDE_CODE_FORCE_SESSION_PERSISTENCE = "1"'`)
+  expect(force).toBeGreaterThan(script.indexOf(clear))
+  expect(force).toBeLessThan(script.indexOf("--resume '$id'"))
 })
 
 test('the encoded command is the script as UTF-16LE base64', () => {
