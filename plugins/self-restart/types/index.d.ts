@@ -11,8 +11,15 @@ export type Queued = { reason: string; resume?: string }
  */
 export type Restart = { at: number; reason: string; resume?: string }
 
+/**
+ * The folder the session started in, as the first session.start of this process gave it: where
+ * `claude --resume <id>` finds the session. Kept in session state, so a reload of the plugin, which
+ * starts it again from wherever the session has moved to (a worktree, /cd), doesn't replace it.
+ */
+export type Folder = string | null
+
 declare module 'claude-code' {
   interface PluginState {
-    'self-restart': { queued: Queued | null }
+    'self-restart': { queued: Queued | null; folder: Folder }
   }
 }

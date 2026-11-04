@@ -137,8 +137,8 @@ test('the window opens only once the turn has ended, by the fixed path with noth
   expect(run?.argv[0]).toBe(POWERSHELL)
   expect(run?.argv.slice(1, 4)).toEqual(['-NoProfile', '-NonInteractive', '-EncodedCommand'])
   expect(run?.argv).toHaveLength(5)
-  // The session's own folder: the engine's default, never one the input names.
-  expect(run?.init?.cwd).toBeUndefined()
+  // The folder the session started in, never one the input names.
+  expect(run?.init?.cwd).toBe('C:\\work\\repo')
   const script = decode(String(run?.argv[4]))
   expect(script).toBe(launcherScript(ID))
   expect(script).toContain(`$id = '${ID}'`)
@@ -151,6 +151,19 @@ test('the window opens only once the turn has ended, by the fixed path with noth
   // The first prompt waits in the store, under the session's id, for the process that resumes it.
   const kept = (held.get('restarts') as Record<string, { resume?: string; reason: string }>)[ID]
   expect(kept?.resume).toBe(`Re-run the deploy check. ${HOSTILE}`)
+})
+
+test('the window opens in the folder the session started in, though the session has moved since', async ($, on) => {
+  const { runs, clock } = engine(on)
+  await $.session.start(start)
+  // A worktree or /cd moves the session, and a plugin reload starts it again from there.
+  await $.session.start({ ...start, cwd: 'C:\\work\\repo\\.claude\\worktrees\\feature' })
+
+  await $.tool.call({ tool: TOOL, reason: 'Switched accounts.' })
+  await $.turn.complete(answered)
+  await clock.advance(1000)
+  expect(runs).toHaveLength(1)
+  expect(runs[0]?.init?.cwd).toBe('C:\\work\\repo')
 })
 
 test('a call without a reason is refused, and nothing is queued', async ($, on) => {

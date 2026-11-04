@@ -19,7 +19,7 @@ Each also requires the parameter that makes its action safe to take unattended (
   - A refused exit, or a session still open a few seconds after `/exit`, is told to the person and the model.
 - **self-restart 0.1.0**, new, Windows only:
   - **The launch.** `restart_after_turn` runs Windows PowerShell, by its known path under the Windows folder, on one fixed script whose only variable is the session's id, which must be a UUID. That script opens a new console window with `Start-Process`. Then the session runs `/exit`. Nothing from the tool's input reaches the launch.
-  - **The wait.** The window waits for the session's own `claude.exe` to exit, then runs `claude --resume <id>` from PATH in the session's folder. After 10 minutes it gives up and says so.
+  - **The wait.** The window waits for the session's own `claude.exe` to exit, then runs `claude --resume <id>` from PATH in the folder the session started in. After 10 minutes it gives up and says so.
   - **The first prompt.** `resume` waits in the plugin's store under the session's id, and the resumed session's copy of the plugin sends it once. One older than 15 minutes is dropped.
 - **The update check's list of names** gains the three. The other plugins' copies of the shared file change by that line alone and behave as before, so their versions stand.
 

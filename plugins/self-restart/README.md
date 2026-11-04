@@ -1,6 +1,6 @@
 # self-restart
 
-Lets a session restart itself on Windows. Once the current turn ends, it opens a new terminal window in the session's folder and exits; the new window resumes the same conversation (`claude --resume <id>`) once the old process has gone, and can start its first turn with a message the session left. It's useful after an account switch, a setting that takes effect at startup, or a plugin that won't reload. Part of [claude-code-self-tools](../../README.md).
+Lets a session restart itself on Windows. Once the current turn ends, it opens a new terminal window in the folder the session started in and exits; the new window resumes the same conversation (`claude --resume <id>`) once the old process has gone, and can start its first turn with a message the session left. It's useful after an account switch, a setting that takes effect at startup, or a plugin that won't reload. Part of [claude-code-self-tools](../../README.md).
 
 ## Tool
 
@@ -15,7 +15,7 @@ Lets a session restart itself on Windows. Once the current turn ends, it opens a
 - **One new window, by a fixed path.** The plugin runs Windows PowerShell by its known path under the Windows folder (`%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe`), with one fixed script whose only variable is the session's id, which must be a UUID. Nothing Claude passes reaches that script or its command line.
   - The script finds the session's own `claude.exe` above it.
   - It opens a new console window with `Start-Process`. When Windows Terminal is your default terminal, the window opens there.
-  - That window waits for the old `claude.exe` to exit, then runs `claude --resume <id>` from your PATH, in the session's folder.
+  - That window waits for the old `claude.exe` to exit, then runs `claude --resume <id>` from your PATH, in the folder the session started in (where `--resume` finds it, even after the session moved into a worktree or another folder).
 - **Never two copies of one session.** If the old process is still running after 10 minutes, the window says so and resumes nothing, because two copies would both write to one session. You can then run `claude --resume <id>` yourself.
 - **The first prompt never goes on a command line.** `resume` waits in the plugin's own store under the session's id. The copy of this plugin in the resumed session sends it once, when that session starts. One older than 15 minutes is dropped.
 - **Remote Control.** With "Enable Remote Control for all sessions" on, the resumed session connects again, under the same conversation. A copy started while the old one was still connected would leave Remote Control off, which is one more reason the window waits.

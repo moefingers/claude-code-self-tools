@@ -1,6 +1,7 @@
 // A session restarts itself on Windows: once the current turn ends, it opens a new terminal window in
-// the session's folder, exits, and the new window resumes the same conversation (`claude --resume
-// <id>`) once the old process has gone. Useful after an account switch, a setting that takes effect
+// the folder the session started in, exits, and the new window resumes the same conversation
+// (`claude --resume <id>`, which finds the session under that folder's project) once the old process
+// has gone. Useful after an account switch, a setting that takes effect
 // at startup, or a plugin that won't reload. The model calls restart_after_turn with `reason`,
 // required, since the exit is irreversible for this process; a command can't run while the turn the
 // model is in waits on it, so the call is queued and the restart runs once the turn has ended with
@@ -30,6 +31,7 @@ import { encodeCommand, LAUNCHED, launcherScript, powershellPath, SESSION_ID, SY
 import { configureUpdateCheck, loadUpdateCheck, withUpdateNotice } from './update-check'
 
 const queued = { plugin: 'self-restart', key: 'queued' } as const
+const folder = { plugin: 'self-restart', key: 'folder' } as const
 
 /** The plugin's store key for restarts under way, by session id. */
 const RESTARTS = 'restarts'
@@ -49,7 +51,7 @@ const MAX_KEPT = 50
 const BUSY: readonly string[] = ['pending', 'running', 'waiting']
 
 const DESCRIPTION = [
-  "Restarts this session once the current turn ends: it opens a new terminal window in this session's folder, this session exits, and the window resumes it (claude --resume <this session's id>) once this process has gone. The conversation carries on there.",
+  "Restarts this session once the current turn ends: it opens a new terminal window in the folder this session started in, this session exits, and the window resumes it (claude --resume <this session's id>) once this process has gone. The conversation carries on there.",
   'Call it when a restart is the fix: the person switched accounts, changed a setting that takes effect at startup, or a plugin won\'t reload (try reload_plugins_after_turn first, if it is available). Never on your own to clear a problem a restart doesn\'t fix.',
   'Windows only, in a session run in a terminal.',
   '`reason` (required) says why; it is recorded in the transcript. `resume` is the message that starts your first turn in the restarted session: what to check or do next. Give it whenever you have a next step of your own; leave it out only when the next step waits on someone else.',
@@ -136,7 +138,7 @@ async function env($: EngineInterface, read: () => Promise<string | undefined>):
 }
 
 /** What the launch needs, each from the engine, never from the tool's input; or why it can't go ahead. */
-async function plan($: EngineInterface): Promise<{ powershell: string; id: string } | { refusal: string }> {
+async function plan($: EngineInterface): Promise<{ powershell: string; id: string; cwd: string } | { refusal: string }> {
   const os = await env($, () => $.env.get('OS'))
   if (os !== 'Windows_NT') return { refusal: 'a restart opens its new window only on Windows so far' }
   const root = await env($, () => $.env.get('SystemRoot'))
@@ -150,7 +152,10 @@ async function plan($: EngineInterface): Promise<{ powershell: string; id: strin
     return { refusal: `this session's id can't be read: ${why(err)}` }
   }
   if (!SESSION_ID.test(id)) return { refusal: `this session's id (${JSON.stringify(id)}) is not one claude --resume takes` }
-  return { powershell: powershellPath(root), id }
+  // Where it started, not where it is now: `--resume <id>` looks the session up under the folder's project.
+  const { value: cwd } = await $.state.get(folder)
+  if (typeof cwd !== 'string' || cwd === '') return { refusal: "the folder this session started in isn't known" }
+  return { powershell: powershellPath(root), id, cwd }
 }
 
 /** The restarts under way in the store, each one checked; dropped: anything else, and those gone stale. */
@@ -208,6 +213,7 @@ async function restartNow($: EngineInterface, value: Queued): Promise<void> {
   let opened: string | undefined
   try {
     const run = await $.process.run([launch.powershell, '-NoProfile', '-NonInteractive', '-EncodedCommand', encodeCommand(launcherScript(launch.id))], {
+      cwd: launch.cwd,
       timeoutMs: LAUNCH_MS,
     })
     if (run.exitCode !== 0 || !LAUNCHED.test(run.stdout)) {
@@ -287,6 +293,9 @@ export const register: Register = (on, options) => {
   on('session.start', async ($, e, next) => {
     const started = await next(e)
     isTerminal = e.isInteractive && e.surface === 'terminal'
+    // The first start's folder only: a reload starts the plugin again from wherever the session is now.
+    const { value: first } = await $.state.get(folder)
+    if (typeof first !== 'string' || first === '') await $.state.set(folder, e.cwd)
     await $.tool.register({
       name: 'restart_after_turn',
       description: DESCRIPTION,
@@ -336,7 +345,7 @@ export const register: Register = (on, options) => {
     $.ui.status('restart queued for when this turn ends')
     const then = resume === undefined ? 'then waits for the next message' : `then resumes with: ${resume}`
     return {
-      result: `Queued. Once this turn ends, a new terminal window opens in this session's folder, this session exits, and the window resumes it once this process has gone; the reason is recorded in the transcript: ${reason}. The restarted session ${then}. On anything but Windows nothing runs, and you are told on your next turn.`,
+      result: `Queued. Once this turn ends, a new terminal window opens in the folder this session started in, this session exits, and the window resumes it once this process has gone; the reason is recorded in the transcript: ${reason}. The restarted session ${then}. On anything but Windows nothing runs, and you are told on your next turn.`,
     }
   }).catch(($, e, next) => (next.called ? next(e) : { deny: 'self-restart: queuing the restart failed; nothing is queued.' }))
 
