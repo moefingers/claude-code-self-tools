@@ -2,9 +2,9 @@
 
 Each entry names a plugin and its version, as `version` in `plugins/<name>/.claude-plugin/plugin.json` has it.
 
-## 2026-11-04: self-switch 0.1.1 and self-restart 0.1.4, from the live checks
+## 2026-11-04: self-switch and self-restart, from the live checks
 
-- **self-switch 0.1.1**:
+- **self-switch**:
   - **Claude Code 2.1.318's session registry is read again.** 2.1.318 writes two keys more (`asksForConvertedSkills`, `nameSince`) and `procStart` as a string of digits, so every switch was refused. What liveness reads stays strict: `pid` a whole number, the file's own; `sessionId` a session id; `procStart` a whole number or a string of digits, compared exactly. Missing or of another type, it refuses, naming the field; so does a key that marks a new format (`v`, `schema`, `schemaVersion`, `formatVersion`, `registryVersion`, or a `version` that isn't Claude Code's version as a string). Any other key is ignored, and logged once per process by its name.
   - **More looks when it can't tell.** A `claude.exe` that is starting or exiting reads as unknown for a moment (5 of 370 samples on a busy machine). An unknown verdict now gets up to 3 more probes, 2.5, 3.5 and 4 seconds apart, the claim lock given back before each wait, and refuses only if the last is unknown too.
   - **A Claude Code command is no conversation.** A `claude.exe` running `claude plugin …` (or `mcp`, `doctor`, `update`, `install`, `config`, `auth`, `--version`, `--help`), naming no conversation, and the `claude.exe` it starts, count as accounted: another lane's `claude plugin test` no longer makes every switch read unknown. A command line naming the conversation (L2) still holds it.
@@ -18,7 +18,7 @@ Each entry names a plugin and its version, as `version` in `plugins/<name>/.clau
   - **A conversation that arrived in place switches on.** `/resume` gives the process the resumed conversation's own plugin state, without the start folder, so its next switch was refused and its heartbeat stopped. The start folder is now the process's, and the resume beats the conversation that arrived at once, by the id its start names.
   - Log lines name the plugin once: the engine already draws them under its name.
   - The README quotes the rows as the plugin writes them.
-- **self-restart 0.1.4**: its launcher hashes the slot runner with .NET too, and when it opens a window although this pane runs a slot runner, it says why, in the row the restarted session reads, a toast and the log. Its window's last look refuses whenever a running `claude.exe`'s registry file names the session, whatever its `procStart`.
+- **self-restart**: its launcher hashes the slot runner with .NET too, and when it opens a window although this pane runs a slot runner, it says why, in the row the restarted session reads, a toast and the log. Its window's last look refuses whenever a running `claude.exe`'s registry file names the session, whatever its `procStart`.
 - **The shared machine code**: the registry rule above (`REGISTRY_FIELDS`, `REGISTRY_VERSION_MARKERS`, the extra keys and the mentions in the probe's answer), Claude Code commands (`cli`), the slot's hash by .NET with the reason a hash failed, a slot runner started another way (`slotSeen`), the transport's `fallback`, RECHECK refusing whatever the `procStart`, and the in-place claim check carrying RECHECK. The slot runner changed (its re-check, and the withdrawn record), so `SLOT_SCRIPT_SHA256` did too.
 
 ## 2026-11-03: self-switch 0.1.0, and self-restart 0.1.3 on the shared machine code
