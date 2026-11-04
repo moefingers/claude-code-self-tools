@@ -538,6 +538,7 @@ export function probeScript(input: ProbeInput): string {
     '}',
     // The registry: per file, whether it parses, its key names, and seven values as their JSON types; a
     // value that is a list or an object comes as { nested = "list" } or { nested = "object" }, never as null.
+    // And which of the asked-about ids its text names anywhere (`mentions`): the ids, never the text.
     '$registry = New-Object System.Collections.ArrayList',
     'for ($k = 0; $k -lt $configDirs.Count; $k++) {',
     '  $reg = Join-Path $configDirs[$k] "sessions"',
@@ -547,10 +548,11 @@ export function probeScript(input: ProbeInput): string {
     String.raw`      if ($f.BaseName -notmatch "^\d{1,10}\z") { continue }`,
     '      $o = [ordered]@{ dir = $k; file = [long]$f.BaseName; ok = $false }',
     '      $e = $null',
+    '      $text = $null',
     // Read again twice, 250 ms apart, when it doesn't parse: Claude Code may be rewriting it.
     '      for ($try = 1; $try -le 3 -and $e -isnot [Management.Automation.PSCustomObject]; $try++) {',
     '        if ($try -gt 1) { Start-Sleep -Milliseconds 250 }',
-    '        try { $e = Get-Content -LiteralPath $f.FullName -Raw -Encoding UTF8 | ConvertFrom-Json } catch { $e = $null }',
+    '        try { $text = Get-Content -LiteralPath $f.FullName -Raw -Encoding UTF8; $e = $text | ConvertFrom-Json } catch { $e = $null }',
     '      }',
     '      if ($e -is [Management.Automation.PSCustomObject]) {',
     '        $o["ok"] = $true',
@@ -559,6 +561,8 @@ export function probeScript(input: ProbeInput): string {
     '          $prop = $e.PSObject.Properties | Where-Object { $_.Name -ceq $key } | Select-Object -First 1',
     '          if ($null -ne $prop) { $v = $prop.Value; if ($null -ne $v -and -not ($v -is [string] -or $v -is [ValueType])) { if ($v -is [Array]) { $v = [ordered]@{ nested = "list" } } else { $v = [ordered]@{ nested = "object" } } }; $o[$key] = $v }',
     '        }',
+    '        $mentioned = @($ids | Where-Object { "$text".IndexOf($_, [StringComparison]::OrdinalIgnoreCase) -ge 0 })',
+    '        if ($mentioned.Count -gt 0) { $o["mentions"] = [object[]]$mentioned }',
     '      }',
     '      [void]$registry.Add($o)',
     '    }',
@@ -652,6 +656,8 @@ export type RegistryEntry =
       readonly procStart: number | string
       /** Keys not in REGISTRY_KEYS: ignored, and logged once per process by the plugin. */
       readonly extra: readonly string[]
+      /** The asked-about conversations its text names anywhere, its sessionId included. */
+      readonly mentions: readonly string[]
     }
   | { readonly dir: number; readonly file: number; readonly shape: 'bad'; readonly why: string }
 
@@ -726,7 +732,9 @@ const kindOf = (value: unknown): string => {
  * number equal to the file's name, sessionId a session id, procStart a whole number or a string of
  * digits. Missing or of another type, the file is `bad`, naming the field. A key of
  * REGISTRY_VERSION_MARKERS, or a `version` that isn't a string, is a new format: `bad` too, naming it.
- * Any other key is ignored, and listed in `extra` when it isn't in REGISTRY_KEYS.
+ * Any other key is ignored, and listed in `extra` when it isn't in REGISTRY_KEYS. `mentions` are the
+ * asked-about ids its text names anywhere, which liveness reads (a conversation named outside
+ * sessionId is unknown).
  */
 function registryShape(raw: Record<string, unknown>, dir: number, file: number): RegistryEntry {
   const no = (why: string): RegistryEntry => ({ dir, file, shape: 'bad', why })
@@ -748,7 +756,8 @@ function registryShape(raw: Record<string, unknown>, dir: number, file: number):
     if (!/^[0-9]{1,20}$/.test(procStart)) return no('has a procStart that is a string, but not of digits')
   } else return no(`has a procStart that is a ${kindOf(procStart)}, not a number or a string of digits`)
   const extra = names.filter(key => !(REGISTRY_KEYS as readonly string[]).includes(key))
-  return { dir, file, shape: 'ok', pid, sessionId, procStart, extra }
+  const mentions = 'mentions' in raw ? (raw.mentions as string[]) : []
+  return { dir, file, shape: 'ok', pid, sessionId, procStart, extra, mentions }
 }
 
 /** The probe's answer, every field checked; `{ error }` naming the first that isn't what it must be. */
@@ -809,8 +818,11 @@ export function parseProbe(stdout: string): Probe | { error: string } {
       }
     })
     const registry = list(top.registry, 'the registry').map((value): RegistryEntry => {
-      const r = fields(value, 'a registry entry', ['dir', 'file', 'ok'], ['keys', 'pid', 'sessionId', 'procStart', 'status', 'statusUpdatedAt', 'kind', 'version'])
+      const r = fields(value, 'a registry entry', ['dir', 'file', 'ok'], ['keys', 'pid', 'sessionId', 'procStart', 'status', 'statusUpdatedAt', 'kind', 'version', 'mentions'])
       if (!isCount(r.dir, 7) || !isPid(r.file) || typeof r.ok !== 'boolean') bad('a registry entry has no folder, file or parse flag')
+      if ('mentions' in r && (r.ok !== true || !Array.isArray(r.mentions) || r.mentions.length > 8 || !r.mentions.every(m => typeof m === 'string' && SESSION_ID.test(m)))) {
+        bad("a registry entry's mentions are not session ids")
+      }
       if (r.ok === false && 'keys' in r) bad('a registry entry that did not parse has keys')
       return registryShape(r, r.dir as number, r.file as number)
     })
@@ -982,7 +994,7 @@ export function newRegistryKeys(probe: Probe, seen: Set<string>): string[] {
  * - L6: a claim lock on it that isn't `mine` and isn't stale.
  * Unknown, which refuses too: a source the probe couldn't read; a registry file of a running
  * claude.exe that can't be parsed, whose REGISTRY_FIELDS are missing or of another type, or that
- * marks a new format (registryShape); a claude.exe no current entry accounts for,
+ * marks a new format (registryShape), or that names `id` anywhere but its sessionId; a claude.exe no current entry accounts for,
  * itself or through an older ancestor; the coordinator unreachable; no transcript of it on this
  * machine, or more than one.
  */
@@ -1002,6 +1014,10 @@ export function liveness(probe: Probe, id: string, now: number, opts: { lane?: L
     if (entry.shape === 'bad') {
       if (isLiveClaude) unknown.push(`unknown: the registry file of running claude.exe ${entry.file} ${entry.why}`)
       continue
+    }
+    // Named outside its sessionId (a key this check doesn't read): what that process holds is unclear.
+    if (isLiveClaude && entry.sessionId !== id && entry.mentions.includes(id)) {
+      unknown.push(`unknown: the registry file of running claude.exe ${entry.file} names it outside its sessionId`)
     }
     if (!isLiveClaude || !near(owner.created, entry.procStart)) continue
     current.add(entry.pid)

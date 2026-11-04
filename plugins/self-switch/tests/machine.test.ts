@@ -247,6 +247,23 @@ describe('the registry: what liveness reads is strict, any other key is ignored,
     expect(probeOf(file200(r => ((r.keys = [...(r.keys as string[]), 'schema', 'later']))) ).extraKeys).toEqual([])
   })
 
+  test('a running claude.exe whose file names it outside its sessionId (a new key): unknown, naming the file', () => {
+    // The review's file 2016: sessionId another conversation, the one asked about only in currentSessionId.
+    const named = (r: Record<string, unknown>) => ((r.keys = [...(r.keys as string[]), 'currentSessionId']), (r.mentions = [OTHER, T]))
+    expect(live(file200(named))).toEqual({ verdict: 'unknown', evidence: ['unknown: the registry file of running claude.exe 200 names it outside its sessionId'] })
+    // Named by its sessionId, it is L1 as before, nothing more.
+    expect(live(file200(r => ((r.sessionId = T), (r.mentions = [T])))).evidence).toEqual(['L1: claude.exe 200 (started 2025-10-29 18:02 UTC) holds it'])
+    // Another conversation named: nothing to do with this one.
+    expect(live(file200(r => (r.mentions = [OTHER, W]))).verdict).toBe('not-live')
+    // A file whose pid isn't running is ignored, whatever it names.
+    expect(live(p => p.registry.push({ ...entry(888, OTHER, ft(9)), mentions: [T] })).verdict).toBe('not-live')
+    // What the probe says it names is checked: session ids, at most 8, only in a file that parsed.
+    const bad = (change: (r: Record<string, unknown>) => void) => parseProbe(JSON.stringify(machine(file200(change))))
+    expect(bad(r => (r.mentions = ['not-an-id']))).toMatchObject({ error: expect.stringContaining('mentions are not session ids') })
+    expect(bad(r => (r.mentions = Array.from({ length: 9 }, () => T)))).toMatchObject({ error: expect.stringContaining('mentions are not session ids') })
+    expect(bad(r => (r.mentions = T))).toMatchObject({ error: expect.stringContaining('mentions are not session ids') })
+  })
+
   test('what liveness reads, and what marks a new format, each in one list', () => {
     expect([...REGISTRY_FIELDS]).toEqual(['pid', 'sessionId', 'procStart'])
     expect([...REGISTRY_VERSION_MARKERS]).toEqual(['v', 'schema', 'schemaVersion', 'formatVersion', 'registryVersion'])
@@ -525,6 +542,11 @@ describe('the scripts, as text', () => {
     expect(probe).toContain('$o = [ordered]@{ pid = [long]$p.ProcessId; ppid = [long]$p.ParentProcessId; created = (Get-Created $p); name = "$($p.Name)" }')
     expect(probe).not.toMatch(/commandLine\s*=|cwd\s*=|\$o\["(cwd|name|messagingSocketPath)"\]/)
     expect(probe).toContain('foreach ($key in "pid", "sessionId", "procStart", "status", "statusUpdatedAt", "kind", "version")')
+    // Which asked-about ids a registry file's text names: the ids, never the text.
+    expect(probe).toContain("try { $text = Get-Content -LiteralPath $f.FullName -Raw -Encoding UTF8; $e = $text | ConvertFrom-Json } catch { $e = $null }")
+    expect(probe).toContain('$mentioned = @($ids | Where-Object { "$text".IndexOf($_, [StringComparison]::OrdinalIgnoreCase) -ge 0 })')
+    expect(probe).toContain('if ($mentioned.Count -gt 0) { $o["mentions"] = [object[]]$mentioned }')
+    expect(probe).not.toMatch(/\$o\["text"\]|text = \$text/)
     // A nested value comes as what it is, never as null: a null would read as a missing field's type.
     expect(probe).toContain('if ($v -is [Array]) { $v = [ordered]@{ nested = "list" } } else { $v = [ordered]@{ nested = "object" } }')
     expect(probe).not.toMatch(/\.jsonl"\)\s*-Raw|Get-Content[^\n]*\.jsonl/)

@@ -612,6 +612,22 @@ describe('refusals, before and at the run', () => {
     })
   }
 
+  test('a running claude.exe whose registry file names T outside its sessionId: the switch refuses after one more look', async ($, on) => {
+    const { commands, kinds, session, clock } = engine(on, {
+      probe: machine(p => {
+        const r = p.registry.find(x => x.file === 200) as Record<string, unknown>
+        r.keys = [...(r.keys as string[]), 'currentSessionId']
+        r.mentions = [T]
+      }),
+    })
+    await $.session.start(start)
+    await switchNow($, clock)
+    await clock.advance(3000)
+    expect(commands).toEqual([])
+    expect(kinds()).toEqual(['probe', 'release', 'probe', 'release'])
+    expect(rows(session)).toContain('unknown: the registry file of running claude.exe 200 names it outside its sessionId')
+  })
+
   test("Claude Code 2.1.318's registry, procStart a string: the switch goes; a key it didn't write is logged once and ignored", async ($, on) => {
     const { commands, kinds, logs, clock } = engine(on, {
       probe: machine(p => {
