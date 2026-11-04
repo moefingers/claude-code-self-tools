@@ -36,8 +36,14 @@ export type Heartbeat = { at: number; folder: string; project: string }
  */
 export type Folder = string | null
 
+/**
+ * How many times in a row a new turn has cancelled a queued switch to conversation `key`, before the
+ * run began. Kept in session state; a run that begins clears it.
+ */
+export type Cancels = { key: string; count: number }
+
 declare module 'claude-code' {
   interface PluginState {
-    'self-switch': { queued: Queued | null; folder: Folder }
+    'self-switch': { queued: Queued | null; folder: Folder; cancels: Cancels | null }
   }
 }

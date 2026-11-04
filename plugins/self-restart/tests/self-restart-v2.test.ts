@@ -91,6 +91,7 @@ function engine(
   on('agent.list', () => ({ value: [] }))
   on('classic.SessionStart', () => ({}))
   on('prompt.submit', (_, e) => ({ text: e.text }))
+  on('turn.start', (_, e) => ({ turnId: e.turnId }))
   on('turn.complete', () => ({ text: 'done' }))
   on('process.run', (_, e) => {
     if (e.argv[0] === 'git') {
@@ -236,3 +237,30 @@ for (const [name, machine, said] of [
     expect(held.get('restarts')).toBeUndefined()
   })
 }
+
+test('a queued restart a new turn cancels is told in a plugin row; the third in a row says the session is busy', async ($, on) => {
+  const { scripts, commands, session, clock } = engine(on, { answer: { exitCode: 0, stdout: `launched 17716\r\nclaim ${LAUNCH}\r\n` } })
+  await $.session.start(start)
+  for (const turnId of ['t2', 't3', 't4']) {
+    await $.tool.call({ tool: TOOL, reason: 'Switched accounts.' })
+    await $.turn.complete(answered)
+    await $.turn.start({ text: 'a message', turnId })
+    await clock.advance(1000)
+  }
+  expect(scripts).toEqual([])
+  expect(commands).toEqual([])
+  const said = session.appended().map(row => JSON.stringify(row))
+  expect(said).toHaveLength(3)
+  const row = 'self-restart: your queued restart was cancelled because a new turn started; queue it again at the next finished break.'
+  expect(said[0]).toContain(`${row} The restart you queued didn't go ahead`)
+  expect(said[1]).toContain(`${row} The restart you queued didn't go ahead`)
+  expect(said[1]).not.toContain('in a row')
+  expect(said[2]).toContain(
+    `${row} That is 3 in a row: this session is busy, and messages keep starting turns before the restart can run. Ask the merger to run it with the coordinated go, which waits for idle itself.`,
+  )
+  // The break holds: the restart runs, and the count is over.
+  await $.tool.call({ tool: TOOL, reason: 'Switched accounts.' })
+  await $.turn.complete(answered)
+  await clock.advance(1000)
+  expect(commands).toEqual(['exit'])
+})

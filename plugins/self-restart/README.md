@@ -35,6 +35,7 @@ Lets a session restart itself on Windows. Once the current turn ends, it opens a
 - **Windows only, in a terminal.** Elsewhere nothing runs, and Claude is told on its next turn. A session in an app, an SDK host or a `-p` run is refused at the call.
 - **It says when a step didn't work.** If the window doesn't open, nothing exits. If the exit doesn't run, the window keeps waiting for you to exit (`/exit`), up to 10 minutes.
 - **An interrupted turn cancels it**, with a notice.
+- **A cancel is never lost.** When a new turn (a message, a watch event) takes a queued restart back, that turn reads a row: *self-restart: your queued restart was cancelled because a new turn started; queue it again at the next finished break.* Cancels are counted while they come in a row; from the third, the row adds that the session is busy, and to ask the merger to run it with the coordinated go, which waits for idle itself. A restart whose run begins ends the count.
 - **Subagents can't use it.** A subagent is told to finish its piece and return its result.
 
 To end the session without a restart, see [self-exit](../self-exit). To pick up a plugin change without a restart, see [self-reload](../self-reload).

@@ -65,6 +65,10 @@ import { configureUpdateCheck, loadUpdateCheck, withUpdateNotice } from './updat
 const TOOL = 'mcp__self-switch__switch_after_turn'
 const queued = { plugin: 'self-switch', key: 'queued' } as const
 const folderKey = { plugin: 'self-switch', key: 'folder' } as const
+const cancelsKey = { plugin: 'self-switch', key: 'cancels' } as const
+
+/** After this many cancels in a row by a new turn, the row says the session is busy. */
+const BUSY_AFTER = 3
 
 /** The plugin's store key for switches under way, by the conversation each resumes. */
 const SWITCHES = 'switches'
@@ -513,9 +517,29 @@ async function arrive($: EngineInterface, id: string): Promise<void> {
   }
 }
 
+/**
+ * A queued switch that a new turn took back, told to the model in a plugin row, never lost silently.
+ * Cancels of a switch to the same conversation are counted while they come in a row; from the third,
+ * the row says the session is busy and points to the coordinator's go, which waits for idle itself.
+ */
+async function cancelled($: EngineInterface, value: Queued): Promise<void> {
+  let count = 1
+  try {
+    const { value: last } = await $.state.get(cancelsKey)
+    count = last !== null && last !== undefined && last.key === value.to ? last.count + 1 : 1
+    await $.state.set(cancelsKey, { key: value.to, count })
+  } catch {
+    // Counted or not, the row goes.
+  }
+  const busy = count >= BUSY_AFTER ? ` That is ${count} in a row: this session is busy, and messages keep starting turns before the switch can run. Ask the merger to run it with the coordinated go, which waits for idle itself.` : ''
+  await tellModel($, `self-switch: your queued switch to ${quoted(value.to)} was cancelled because a new turn started; queue it again at the next finished break.${busy}`)
+}
+
 /** Runs the switch, step by step; says so at each step that didn't go ahead. */
 async function switchNow($: EngineInterface, value: Queued): Promise<void> {
   if (armed !== value) return
+  // The break held long enough for the run to start: the cancels in a row end here.
+  await $.state.set(cancelsKey, null)
   $.ui.status(undefined)
   const { to } = value
   const notRun = async (said: string): Promise<void> => {
@@ -756,10 +780,11 @@ export const register: Register = (on, options) => {
     if (e.agentId !== undefined) return started
     void heartbeat($)
     if (armed === undefined) return started
+    const value = armed
     armed = undefined
     $.ui.status(undefined)
     $.ui.toast('Switch cancelled: a new turn started before it ran.')
-    void tellModel($, "The switch you queued didn't go ahead: a new turn started before it ran. This conversation goes on; call switch_after_turn again at the next break.")
+    void cancelled($, value)
     return started
   })
 }

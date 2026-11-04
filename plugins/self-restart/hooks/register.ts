@@ -41,6 +41,10 @@ import { configureUpdateCheck, loadUpdateCheck, withUpdateNotice } from './updat
 
 const queued = { plugin: 'self-restart', key: 'queued' } as const
 const folder = { plugin: 'self-restart', key: 'folder' } as const
+const cancelsKey = { plugin: 'self-restart', key: 'cancels' } as const
+
+/** After this many cancels in a row by a new turn, the row says the session is busy. */
+const BUSY_AFTER = 3
 
 /** The plugin's store key for restarts under way, by session id. */
 const RESTARTS = 'restarts'
@@ -273,9 +277,29 @@ async function refuse($: EngineInterface, toast: string, note: string): Promise<
 /** The row the model reads in the restarted session: why it restarted. */
 const record = ({ reason }: Queued): string => `This session restarted at its own request (restart_after_turn). Reason: ${reason}`
 
+/**
+ * A queued restart that a new turn took back, told to the model in a plugin row, never lost silently;
+ * `then` says what became of it. Cancels are counted while they come in a row; from the third, the row
+ * says the session is busy and points to the coordinator's go, which waits for idle itself.
+ */
+async function cancelled($: EngineInterface, then: string): Promise<void> {
+  let count = 1
+  try {
+    const { value: last } = await $.state.get(cancelsKey)
+    count = last !== null && last !== undefined && last.key === 'restart' ? last.count + 1 : 1
+    await $.state.set(cancelsKey, { key: 'restart', count })
+  } catch {
+    // Counted or not, the row goes.
+  }
+  const busy = count >= BUSY_AFTER ? ` That is ${count} in a row: this session is busy, and messages keep starting turns before the restart can run. Ask the merger to run it with the coordinated go, which waits for idle itself.` : ''
+  await tellModel($, `self-restart: your queued restart was cancelled because a new turn started; queue it again at the next finished break.${busy} ${then}`)
+}
+
 /** Opens the window, then exits; says so at each step that didn't go ahead. */
 async function restartNow($: EngineInterface, value: Queued): Promise<void> {
   if (armed !== value) return
+  // The break held long enough for the run to start: the cancels in a row end here.
+  await $.state.set(cancelsKey, null)
   $.ui.status(undefined)
   const stop = blocked(await busyAgents($))
   if (stop !== undefined) {
@@ -510,7 +534,7 @@ export const register: Register = (on, options) => {
     armed = undefined
     $.ui.status(undefined)
     $.ui.toast('Restart cancelled: a new turn started before this session exited.')
-    void tellModel($, "The restart you queued didn't go ahead: a new turn started before this session exited. The session goes on; call restart_after_turn again at the next break.")
+    void cancelled($, "The restart you queued didn't go ahead: a new turn started before this session exited. The session goes on.")
     return started
   })
 }

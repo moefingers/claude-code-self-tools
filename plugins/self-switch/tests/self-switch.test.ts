@@ -360,12 +360,69 @@ describe('refusals, before and at the run', () => {
     expect(kinds()).toEqual([])
     expect(commands).toEqual([])
     expect(toasts.some(t => /Switch cancelled: a new turn started/.test(t))).toBe(true)
-    expect(rows(session)).toMatch(/switch you queued didn't go ahead: a new turn started/)
+    expect(texts(session)).toEqual([`self-switch: your queued switch to \u00ab${T}\u00bb was cancelled because a new turn started; queue it again at the next finished break.`])
 
     await $.tool.call(call)
     await $.turn.complete({ ...answered, isAborted: true, reason: 'aborted' })
     await clock.advance(MINUTE)
     expect(kinds()).toEqual([])
+  })
+
+  test('cancels by a new turn are counted while they come in a row: the third says the session is busy', async ($, on) => {
+    const { kinds, commands, session, clock } = engine(on)
+    await $.session.start(start)
+    const cancel = async (turnId: string) => {
+      await $.tool.call(call)
+      await $.turn.complete(answered)
+      await $.turn.start({ text: 'a message', turnId })
+      await clock.advance(1000)
+    }
+    await cancel('t2')
+    await cancel('t3')
+    await cancel('t4')
+    expect(kinds()).toEqual([])
+    expect(commands).toEqual([])
+    const said = texts(session)
+    expect(said).toHaveLength(3)
+    const row = `self-switch: your queued switch to \u00ab${T}\u00bb was cancelled because a new turn started; queue it again at the next finished break.`
+    expect(said[0]).toBe(row)
+    expect(said[1]).toBe(row)
+    expect(said[2]).toBe(
+      `${row} That is 3 in a row: this session is busy, and messages keep starting turns before the switch can run. Ask the merger to run it with the coordinated go, which waits for idle itself.`,
+    )
+    // A fourth says it again, counting on.
+    await cancel('t5')
+    expect(texts(session)[3]).toContain('That is 4 in a row')
+  })
+
+  test('a run that begins ends the count; a switch to another conversation counts on its own', async ($, on) => {
+    const { session, clock } = engine(on, { store: { [`alive:${T}`]: { at: NOW, folder: REPO, project: PROJECT } } })
+    await $.session.start(start)
+    for (const turnId of ['t2', 't3']) {
+      await $.tool.call(call)
+      await $.turn.complete(answered)
+      await $.turn.start({ text: 'a message', turnId })
+      await clock.advance(1000)
+    }
+    // The third time the break holds: the run begins (and refuses on T's heartbeat, L5).
+    await $.tool.call(call)
+    await $.turn.complete(answered)
+    await clock.advance(1000)
+    expect(texts(session).at(-1)).toMatch(/L5: its heartbeat/)
+    await $.tool.call(call)
+    await $.turn.complete(answered)
+    await $.turn.start({ text: 'a message', turnId: 't4' })
+    await clock.advance(1000)
+    expect(texts(session).at(-1)).not.toContain('in a row')
+    // Two cancels of a switch to T, then one of a switch to another: that one counts from 1.
+    await $.tool.call(call)
+    await $.turn.complete(answered)
+    await $.turn.start({ text: 'a message', turnId: 't5' })
+    await $.tool.call({ ...call, to: OTHER })
+    await $.turn.complete(answered)
+    await $.turn.start({ text: 'a message', turnId: 't6' })
+    await clock.advance(1000)
+    expect(texts(session).at(-1)).toBe(`self-switch: your queued switch to \u00ab${OTHER}\u00bb was cancelled because a new turn started; queue it again at the next finished break.`)
   })
 
   test("a subagent's turn, starting or ending, leaves the queued switch alone", async ($, on) => {

@@ -19,8 +19,11 @@ export type Restart = { at: number; reason: string; resume?: string; claim?: str
  */
 export type Folder = string | null
 
+/** How many times in a row a new turn has cancelled a queued restart before its run began; a run that begins clears it. */
+export type Cancels = { key: string; count: number }
+
 declare module 'claude-code' {
   interface PluginState {
-    'self-restart': { queued: Queued | null; folder: Folder }
+    'self-restart': { queued: Queued | null; folder: Folder; cancels: Cancels | null }
   }
 }
