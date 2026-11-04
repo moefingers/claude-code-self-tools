@@ -34,9 +34,9 @@
 // left waiting, and the person and the model are told so.
 import type { EngineInterface, Register } from 'claude-code'
 import type { Queued, Restart } from '../types'
-import { CLAIMED, encodeCommand, FALLBACK, LAUNCHED, launcherScript, powershellPath, RELEASED, releaseScript, SESSION_ID, SLOTTED, stateFolder, SYSTEM_ROOT, WAIT_SECONDS } from './launcher'
+import { CLAIMED, FALLBACK, LAUNCHED, launcherScript, powershellPath, RELEASED, releaseScript, SESSION_ID, SLOTTED, stateFolder, SYSTEM_ROOT, WAIT_SECONDS } from './launcher'
 import type { AgentLike } from './machine'
-import { isSafeFolder, oneLine, parseProbe, powershellArgv, probeScript, quoted, readGit, safePoint } from './machine'
+import { isSafeFolder, oneLine, parseProbe, powershellCall, probeScript, quoted, readGit, safePoint } from './machine'
 import { configureUpdateCheck, loadUpdateCheck, withUpdateNotice } from './update-check'
 
 const queued = { plugin: 'self-restart', key: 'queued' } as const
@@ -171,7 +171,8 @@ const PROBE_MS = 60_000
 async function notSafe($: EngineInterface, launch: { powershell: string; id: string; cwd: string }): Promise<string | undefined> {
   let probe: ReturnType<typeof parseProbe> | string
   try {
-    const run = await $.process.run(powershellArgv(launch.powershell, probeScript({ ids: [launch.id], configDirs: [] })), { cwd: launch.cwd, timeoutMs: PROBE_MS })
+    const call = powershellCall(launch.powershell, probeScript({ ids: [launch.id], configDirs: [] }))
+    const run = await $.process.run(call.argv, { stdin: call.stdin, cwd: launch.cwd, timeoutMs: PROBE_MS })
     probe = run.exitCode === 0 ? parseProbe(run.stdout) : `it exited ${run.exitCode}${brief(run.stderr) === '' ? '' : `: ${brief(run.stderr)}`}`
   } catch (err) {
     probe = `it didn't run: ${why(err)}`
@@ -345,7 +346,9 @@ async function restartNow($: EngineInterface, value: Queued): Promise<void> {
   let slot: string | undefined
   let fallback: string | undefined
   try {
-    const run = await $.process.run([launch.powershell, '-NoProfile', '-NonInteractive', '-EncodedCommand', encodeCommand(launcherScript(launch.id))], {
+    const call = powershellCall(launch.powershell, launcherScript(launch.id))
+    const run = await $.process.run(call.argv, {
+      stdin: call.stdin,
       cwd: launch.cwd,
       timeoutMs: LAUNCH_MS,
     })
@@ -427,7 +430,8 @@ async function release($: EngineInterface, id: string, claim: string): Promise<v
     const root = await $.env.get('SystemRoot')
     const local = await $.env.get('LOCALAPPDATA')
     if (root === undefined || !SYSTEM_ROOT.test(root) || !isSafeFolder(local)) return
-    const run = await $.process.run(powershellArgv(powershellPath(root), releaseScript({ stateDir: stateFolder(local), id, by: claim })), { timeoutMs: RELEASE_MS })
+    const call = powershellCall(powershellPath(root), releaseScript({ stateDir: stateFolder(local), id, by: claim }))
+    const run = await $.process.run(call.argv, { stdin: call.stdin, timeoutMs: RELEASE_MS })
     const said = run.exitCode === 0 ? RELEASED.exec(run.stdout)?.[1] : undefined
     if (said !== 'released' && said !== 'absent' && said !== 'not-ours') {
       const what = said === 'busy' ? 'another process had it open throughout' : `exit ${run.exitCode}`

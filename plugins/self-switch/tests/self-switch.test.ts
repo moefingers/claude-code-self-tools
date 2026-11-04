@@ -2,7 +2,7 @@
 // from fixtures; /resume and /exit are recorded, never run. Nothing here starts a process.
 import { describe, expect, mock, test } from 'claude-code/testing'
 import type { AgentStatus, On } from 'claude-code'
-import { claimPath, gatePath, launcherScript, quoted, SLOT_NOT_RECOGNISED, SLOT_SCRIPT_SHA256, slotRecordPath } from '../hooks/machine'
+import { claimPath, gatePath, launcherScript, quoted, SLOT_NOT_RECOGNISED, SLOT_SCRIPT_SHA256, slotRecordPath, STDIN_BOOTSTRAP } from '../hooks/machine'
 import { decode, ELSEWHERE, elsewhere, entry, ft, inSlot, LAUNCH, machine, NOW, OTHER, PERMISSION_FLAGS, PROJECT, type RawProbe, REPO, T, under, W, X } from './fixtures'
 
 const TOOL = 'mcp__self-switch__switch_after_turn'
@@ -163,7 +163,8 @@ function engine(
       if (argv.includes('status')) return ok(Array.from({ length: git.dirty ?? 0 }, (_, i) => ` M file${i}.ts`).join('\n'))
       return ok('')
     }
-    const script = argv[4] === undefined ? '' : decode(argv[4])
+    // The script comes on standard input; the command line is the fixed bootstrap.
+    const script = typeof e.init?.stdin === 'string' ? e.init.stdin : ''
     const kind = script.includes('$take = ') ? 'probe' : script.includes('$inner = @(') ? 'launcher' : script.includes("$answer = 'busy'") ? 'release' : script.includes("{ 'ours' }") ? 'check' : 'other'
     runs.push({ argv, init, script, kind })
     if (kind === 'probe') {
@@ -240,6 +241,9 @@ describe('transports', () => {
     const probe = runs.find(r => r.kind === 'probe')
     expect(probe?.argv.slice(0, 4)).toEqual([POWERSHELL, '-NoProfile', '-NonInteractive', '-EncodedCommand'])
     expect(probe?.argv).toHaveLength(5)
+    // The command line is the fixed bootstrap, whatever the script; the script is on standard input.
+    expect(decode(String(probe?.argv[4]))).toBe(STDIN_BOOTSTRAP)
+    for (const run of runs.filter(r => r.kind !== 'git')) expect(run.argv).toEqual(probe?.argv)
     expect(probe?.script).toContain(`$ids = @('${W}', '${T}')`)
     expect(probe?.script).toContain(`$take = '${T}'`)
     expect(probe?.script).toContain(`$configDirs = @('${CONFIG}')`)

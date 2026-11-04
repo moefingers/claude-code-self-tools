@@ -100,8 +100,24 @@ export function encodeCommand(script: string): string {
   return out
 }
 
-/** The argv that runs `script`: Windows PowerShell by its known path, no profile, no prompts. */
-export const powershellArgv = (powershell: string, script: string): string[] => [powershell, '-NoProfile', '-NonInteractive', '-EncodedCommand', encodeCommand(script)]
+/**
+ * The one -EncodedCommand every generated script runs under: it reads standard input to its end, as
+ * UTF-8, and runs it as one script block. A script on the command line itself, UTF-16LE in base64,
+ * is 2.67 times its length, and the probe passed Windows' 32,767-character limit on a command line
+ * (the process then never starts); on standard input it has no limit. Read whole, then run: never
+ * PowerShell's own line-by-line reading of standard input, which breaks a block over several lines.
+ */
+export const STDIN_BOOTSTRAP =
+  '& ([scriptblock]::Create([IO.StreamReader]::new([Console]::OpenStandardInput(), [Text.UTF8Encoding]::new($false)).ReadToEnd()))'
+
+/**
+ * How `$.process.run` runs `script`: Windows PowerShell by its known path, no profile, no prompts, the
+ * fixed STDIN_BOOTSTRAP as its command, and the script on standard input. The command line is the
+ * same few hundred characters whatever the script.
+ */
+export function powershellCall(powershell: string, script: string): { readonly argv: readonly string[]; readonly stdin: string } {
+  return { argv: [powershell, '-NoProfile', '-NonInteractive', '-EncodedCommand', encodeCommand(STDIN_BOOTSTRAP)], stdin: script }
+}
 
 /**
  * The engine's project folder name for a folder: every character but a letter or a digit becomes `-`
@@ -479,6 +495,23 @@ export const GET_CLI = [
   '}',
 ]
 
+/**
+ * A claude.exe in its last 70 to 120 ms reads an empty command line, so Get-Cli can't tell it is a
+ * Claude Code command, and it would read as unaccounted. Each claude.exe whose command line reads
+ * empty is read again, once, 300 ms later: gone (or its pid another process's), it is dropped from
+ * the table; there, it is read as it is then. Still empty, it stays, unaccounted: that fails closed.
+ */
+export const READ_BLANK_AGAIN = [
+  '$blank = @($table.Values | Where-Object { $_.Name -eq "claude.exe" -and [string]::IsNullOrEmpty("$($_.CommandLine)") })',
+  'if ($blank.Count -gt 0) {',
+  '  Start-Sleep -Milliseconds 300',
+  '  foreach ($b in $blank) {',
+  '    $again = Get-CimInstance -ClassName Win32_Process -Filter "ProcessId = $([int]$b.ProcessId)" -Property ProcessId, ParentProcessId, Name, CreationDate, CommandLine',
+  '    if ($null -eq $again -or $again.CreationDate -ne $b.CreationDate) { $table.Remove([int]$b.ProcessId) } else { $table[[int]$b.ProcessId] = $again }',
+  '  }',
+  '}',
+]
+
 const GET_CLASS = [
   'function Get-Class($p) {',
   '  $n = "$($p.Name)".ToLowerInvariant()',
@@ -548,6 +581,7 @@ export function probeScript(input: ProbeInput): string {
     // Every process once, by id: everything below reads only this table.
     '$table = @{}',
     'foreach ($p in (Get-CimInstance -ClassName Win32_Process -Property ProcessId, ParentProcessId, Name, CreationDate, CommandLine)) { $table[[int]$p.ProcessId] = $p }',
+    ...READ_BLANK_AGAIN,
     ...GET_PARENT,
     ...GET_CREATED,
     ...GET_CLASS,
@@ -1478,7 +1512,17 @@ export function launcherScript(id: string, options?: LaunchOptions): string {
     "  '}',",
     "  'exit $code'",
     ') -join [Environment]::NewLine',
-    '$encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($inner))',
+    // The window's own command line: a fixed bootstrap that unpacks the inner script (GZip, then base64,
+    // inside the bootstrap itself) and runs it as one script block. Nothing is written to disk, and the
+    // line stays well under the 32,767 characters Windows allows one.
+    '$packed = [IO.MemoryStream]::new()',
+    '$gzip = [IO.Compression.GZipStream]::new($packed, [IO.Compression.CompressionMode]::Compress)',
+    '$innerBytes = [Text.Encoding]::UTF8.GetBytes($inner)',
+    '$gzip.Write($innerBytes, 0, $innerBytes.Length)',
+    '$gzip.Dispose()',
+    '$payload = [Convert]::ToBase64String($packed.ToArray())',
+    `$unpack = "& ([scriptblock]::Create([IO.StreamReader]::new([IO.Compression.GZipStream]::new([IO.MemoryStream]::new([Convert]::FromBase64String('$payload')), [IO.Compression.CompressionMode]::Decompress), [Text.Encoding]::UTF8).ReadToEnd()))"`,
+    '$encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($unpack))',
     "Start-Process -FilePath (Join-Path $PSHOME 'powershell.exe') -ArgumentList '-NoProfile', '-EncodedCommand', $encoded",
     '"launched $wait"',
     '"claim $by"',

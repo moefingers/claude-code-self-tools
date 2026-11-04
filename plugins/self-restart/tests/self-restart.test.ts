@@ -1,6 +1,7 @@
 import { describe, expect, mock, test } from 'claude-code/testing'
 import type { AgentStatus, On } from 'claude-code'
 import { encodeCommand, launcherScript, SESSION_MARKERS } from '../hooks/launcher'
+import { STDIN_BOOTSTRAP } from '../hooks/machine'
 
 const TOOL = 'mcp__self-restart__restart_after_turn'
 const HOUR = 60 * 60 * 1000
@@ -111,7 +112,7 @@ function engine(on: On, { env = WINDOWS, id = ID, launcher = 'opens', exit = 'ex
     // The safe point's reads before the launch, answered as a machine at rest and kept out of `runs`,
     // which are the launcher's: git finds no repository, and the probe finds nothing under the session.
     if (e.argv[0] === 'git') return { value: { exitCode: 128, stdout: '', stderr: 'fatal: not a git repository (or any of the parent directories): .git', isStdoutTruncated: false, isStderrTruncated: false } }
-    if (decode(String(e.argv[4] ?? '')).includes('$ids = @(')) return { value: { exitCode: 0, stdout: AT_REST, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+    if (String(e.init?.stdin ?? '').includes('$ids = @(')) return { value: { exitCode: 0, stdout: AT_REST, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
     runs.push({ argv: [...e.argv], init: e.init === undefined ? undefined : { ...e.init } })
     if (launchMs > 0) await clock.sleep(launchMs)
     if (launcher === 'throws') return { deny: 'spawn EPERM' }
@@ -164,7 +165,9 @@ test('the window opens only once the turn has ended, by the fixed path with noth
   expect(run?.argv).toHaveLength(5)
   // The folder the session started in, never one the input names.
   expect(run?.init?.cwd).toBe('C:\\work\\repo')
-  const script = decode(String(run?.argv[4]))
+  // On standard input, under the fixed bootstrap: the command line is the same whatever the script.
+  expect(decode(String(run?.argv[4]))).toBe(STDIN_BOOTSTRAP)
+  const script = String(run?.init?.stdin)
   expect(script).toBe(launcherScript(ID))
   expect(script).toContain(`$id = '${ID}'`)
   for (const part of ['evil', 'Remove-Item', 'Switched accounts', 'deploy check']) expect(JSON.stringify(run)).not.toContain(part)

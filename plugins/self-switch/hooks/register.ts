@@ -59,7 +59,7 @@ import {
   newRegistryKeys,
   pickTransport,
   parseProbe,
-  powershellArgv,
+  powershellCall,
   powershellPath,
   probeScript,
   projectName,
@@ -405,7 +405,8 @@ async function keepTicket($: EngineInterface, id: string, value: Ticket | null):
 /** Removes the claim lock on `id` when it names `by`; says so in the log when it can't. */
 async function release($: EngineInterface, powershell: string, state: string, id: string, by: string): Promise<void> {
   try {
-    const run = await $.process.run(powershellArgv(powershell, releaseScript({ stateDir: state, id, by })), { timeoutMs: RELEASE_MS })
+    const call = powershellCall(powershell, releaseScript({ stateDir: state, id, by }))
+    const run = await $.process.run(call.argv, { stdin: call.stdin, timeoutMs: RELEASE_MS })
     const said = run.exitCode === 0 ? RELEASED.exec(run.stdout)?.[1] : undefined
     if (said === 'released' || said === 'absent' || said === 'not-ours') return
     // `busy`: another process had it open throughout. Left in place, it refuses every other move on
@@ -423,7 +424,8 @@ async function release($: EngineInterface, powershell: string, state: string, id
  */
 async function claimStill($: EngineInterface, ctx: Context, to: string, by: string): Promise<string | undefined> {
   try {
-    const run = await $.process.run(powershellArgv(ctx.powershell, claimCheckScript({ stateDir: ctx.state, id: to, by, configDirs: ctx.configDirs })), { timeoutMs: RELEASE_MS })
+    const call = powershellCall(ctx.powershell, claimCheckScript({ stateDir: ctx.state, id: to, by, configDirs: ctx.configDirs }))
+    const run = await $.process.run(call.argv, { stdin: call.stdin, timeoutMs: RELEASE_MS })
     const held = run.exitCode === 0 ? CLAIM_CHECK_LIVE.exec(run.stdout)?.[1] : undefined
     if (held !== undefined) return `at the last look before /resume, ${oneLine(held, 300)}`
     const said = run.exitCode === 0 ? CLAIM_CHECKED.exec(run.stdout)?.[1] : undefined
@@ -523,7 +525,8 @@ function logNewKeys($: EngineInterface, found: Probe): void {
 async function probe($: EngineInterface, ctx: Context, to: string): Promise<Probe | { failure: string }> {
   try {
     const script = probeScript({ ids: [ctx.own, to], take: to, configDirs: ctx.configDirs, stateDir: ctx.state, ...(ctx.heavySlotRoot === undefined ? {} : { heavySlotRoot: ctx.heavySlotRoot }) })
-    const run = await $.process.run(powershellArgv(ctx.powershell, script), { cwd: ctx.folder, timeoutMs: PROBE_MS })
+    const call = powershellCall(ctx.powershell, script)
+    const run = await $.process.run(call.argv, { stdin: call.stdin, cwd: ctx.folder, timeoutMs: PROBE_MS })
     if (run.exitCode !== 0) return { failure: `it exited ${run.exitCode}${brief(run.stderr) === '' ? '' : `: ${brief(run.stderr)}`}` }
     const parsed = parseProbe(run.stdout)
     return 'error' in parsed ? { failure: parsed.error } : parsed
@@ -795,7 +798,8 @@ async function switchNow($: EngineInterface, value: Queued): Promise<void> {
     let opened: string | undefined
     try {
       const script = launcherScript(to, { folder: pick.folder, claim: by, configDirs: ctx.configDirs, stateDir: ctx.state })
-      const run = await $.process.run(powershellArgv(ctx.powershell, script), { cwd: pick.folder, timeoutMs: LAUNCH_MS })
+      const call = powershellCall(ctx.powershell, script)
+      const run = await $.process.run(call.argv, { stdin: call.stdin, cwd: pick.folder, timeoutMs: LAUNCH_MS })
       if (run.exitCode !== 0 || !LAUNCHED.test(run.stdout)) {
         const said = brief(`${run.stdout} ${run.stderr}`)
         opened = `the launcher exited ${run.exitCode}${said === '' ? '' : `: ${said}`}`

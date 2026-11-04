@@ -107,7 +107,7 @@ function engine(
         ? { value: { exitCode: 128, stdout: '', stderr: 'fatal: not a git repository', isStdoutTruncated: false, isStderrTruncated: false } }
         : { value: { exitCode: 128, stdout: '', stderr: 'fatal: detected dubious ownership in repository', isStdoutTruncated: false, isStderrTruncated: false } }
     }
-    const script = decode(String(e.argv[4]))
+    const script = String(e.init?.stdin ?? '')
     if (script.includes('$ids = @(')) {
       probes.push(script)
       return probe === 'fails'

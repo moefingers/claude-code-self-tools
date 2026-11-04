@@ -7,6 +7,7 @@ import {
   descendants,
   FALLBACK,
   GET_CLI,
+  READ_BLANK_AGAIN,
   type GitState,
   isSafeFolder,
   launcherScript,
@@ -183,6 +184,23 @@ describe('liveness', () => {
     const bad = (proc: Record<string, unknown>) => parseProbe(JSON.stringify(machine(p => p.procs.push(proc as RawProbe['procs'][number]))))
     expect(bad({ pid: 706, ppid: 21, created: ft(76), name: 'node.exe', cli: true })).toMatchObject({ error: expect.stringContaining('a Claude Code command but not a claude.exe') })
     expect(bad({ pid: 706, ppid: 21, created: ft(76), name: 'claude.exe', cli: false })).toMatchObject({ error: expect.stringContaining('a Claude Code command but not a claude.exe') })
+  })
+
+  test('a claude.exe whose command line reads empty (in its last moments) is read again once, 300 ms later, and dropped if gone', () => {
+    expect(READ_BLANK_AGAIN).toEqual([
+      '$blank = @($table.Values | Where-Object { $_.Name -eq "claude.exe" -and [string]::IsNullOrEmpty("$($_.CommandLine)") })',
+      'if ($blank.Count -gt 0) {',
+      '  Start-Sleep -Milliseconds 300',
+      '  foreach ($b in $blank) {',
+      '    $again = Get-CimInstance -ClassName Win32_Process -Filter "ProcessId = $([int]$b.ProcessId)" -Property ProcessId, ParentProcessId, Name, CreationDate, CommandLine',
+      '    if ($null -eq $again -or $again.CreationDate -ne $b.CreationDate) { $table.Remove([int]$b.ProcessId) } else { $table[[int]$b.ProcessId] = $again }',
+      '  }',
+      '}',
+    ])
+    // Right after the process table is read, before anything reads it.
+    const probe = probeScript({ ids: [W, T], configDirs: [CONFIG], stateDir: STATE }).split('\r\n')
+    const table = probe.findIndex(line => line.startsWith('foreach ($p in (Get-CimInstance'))
+    expect(probe.slice(table + 1, table + 1 + READ_BLANK_AGAIN.length)).toEqual([...READ_BLANK_AGAIN])
   })
 
   test('the probe marks a Claude Code command by its arguments, never one that names a conversation', () => {
