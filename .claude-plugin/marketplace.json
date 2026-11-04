@@ -1,6 +1,6 @@
 {
   "name": "claude-code-self-tools",
-  "description": "Small Claude Code plugins that let a session act on itself: compact or clear its conversation, reload its plugins, reconnect an MCP server, read its context window, wake itself later, turn on Remote Control under a title, and exit or restart. Install only the ones you want.",
+  "description": "Small Claude Code plugins that let a session act on itself: compact or clear its conversation, reload its plugins, reconnect an MCP server, read its context window, wake itself later, turn on Remote Control under a title, exit or restart, and switch to another conversation. Install only the ones you want.",
   "owner": {
     "name": "moefingers",
     "url": "https://github.com/moefingers"
@@ -49,7 +49,12 @@
     {
       "name": "self-restart",
       "source": "./plugins/self-restart",
-      "description": "Restarts the session on Windows once the turn ends: a new window resumes the same conversation once the old process has exited, then resumes work on its own."
+      "description": "Restarts the session on Windows once the turn ends: a new window, or the pane's slot, resumes the same conversation once the old process has exited, then resumes work on its own."
+    },
+    {
+      "name": "self-switch",
+      "source": "./plugins/self-switch",
+      "description": "Switches the terminal to another conversation on Windows once the turn ends, for your own use: only when that conversation is open nowhere on this machine and nothing runs under this session; in place, in the pane's slot, or in a new window. It refuses where the coordinator runs switches."
     }
   ]
 }
