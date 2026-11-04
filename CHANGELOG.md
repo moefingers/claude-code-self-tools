@@ -2,6 +2,14 @@
 
 Each entry names a plugin and its version, as `version` in `plugins/<name>/.claude-plugin/plugin.json` has it.
 
+## 2026-11-04: S11 v2, named worktrees and a baseline
+
+- **self-switch**:
+  - **S11 per tree.** Uncommitted changes held a switch by the folder the session started in, which for lanes that start in a shared checkout and work in git worktrees was the wrong tree: the shared checkout's long-standing changes held everyone, and the worker's own were never looked at. Now `switch_after_turn` takes `trees`, the worktrees the session worked in (each a worktree of the start folder's repository, checked at the call and again at the run), and each must be clean. The start folder (in place) holds only on changes made since the conversation started, against a fingerprint kept at its SessionStart; with none, it holds as before and says there is no baseline.
+  - Every S11 hold names the tree, the file count, and whether the changes are *dirty since this conversation started* or *dirty, no baseline*.
+- **self-restart**: its copy of the shared machine code (S11 v2 is unused by it: a restart keeps its checkout).
+- **The shared machine code**: `checkTrees`, `fingerprintOf` (`FINGERPRINT_READS`, the coordinator's S5 reads), `readGit` taking `{ start, trees, folders, dirty }` and giving per-tree `TreeState`s (path, role, branch, head, dirty count, fingerprint), `safePoint` taking a `Baseline`, `sameFolder`, `countStatus`. `SLOT_SCRIPT_SHA256` is unchanged: the slot runner isn't.
+
 ## 2026-11-04: self-switch 0.1.1 and self-restart 0.1.4, from the live checks
 
 - **self-switch 0.1.1**:
