@@ -184,7 +184,7 @@ async function notSafe($: EngineInterface, launch: { powershell: string; id: str
   } catch (err) {
     return `this session's folder can't be read, so git's state there is unknown (${why(err)})`
   }
-  const git = await readGit($, { cwd, folders: [launch.cwd], dirty: false })
+  const git = await readGit($, { start: launch.cwd, folders: [cwd], dirty: false })
   let agents: readonly AgentLike[] | string
   try {
     agents = await $.agent.list()

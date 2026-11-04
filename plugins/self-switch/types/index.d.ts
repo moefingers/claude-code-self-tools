@@ -2,9 +2,10 @@
  * A switch the session was asked for, waiting for its turn to end: the conversation to resume here
  * (a session id), why, where the leaving session's notes are, the message the resumed conversation's
  * first turn starts with (absent: it waits for the next message), and the conversation that asked
- * (its session id at the call): the switch runs only while this session is still that one.
+ * (its session id at the call): the switch runs only while this session is still that one. `trees`:
+ * worktrees of the start folder's repository the session worked in, checked clean before it moves (S11).
  */
-export type Queued = { to: string; reason: string; notes: string; resume?: string; from: string }
+export type Queued = { to: string; reason: string; notes: string; resume?: string; from: string; trees?: string[] }
 
 /**
  * A switch under way, kept in the plugin's own store (`$.store`, key `switches`) by the conversation
