@@ -17,7 +17,7 @@ export type Ticket = {
   at: number
   from: string
   by: string
-  transport: 'in-place' | 'slot' | 'window'
+  transport: 'in-place' | 'slot' | 'pane' | 'window'
   reason: string
   notes: string
   resume?: string
