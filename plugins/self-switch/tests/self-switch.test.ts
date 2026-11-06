@@ -990,14 +990,73 @@ describe('refusals, before and at the run', () => {
     expect(rows(session)).toMatch(/S11: 3 files are uncommitted in .+, the start folder, dirty, no baseline/)
   })
 
-  test('a /clear starts a new conversation: its baseline is taken, by its own id', async ($, on) => {
-    const { held, clock } = engine(on, { git: { dirty: 2 } })
+  test("a /clear carries the baseline of the conversation it ends, never a fresh one: changes made before it still hold", async ($, on) => {
+    const { commands, held, session, world, clock } = engine(on, { id: X, git: { dirty: 14 } })
     await $.session.start(start)
-    await $.classic.SessionStart({ source: 'clear', session_id: T })
+    await $.classic.SessionStart({ source: 'startup', session_id: X })
     await clock.advance(1000)
-    const kept = held.get(`baseline:${T}`) as { at: number; usedAt: number }
-    expect(kept).toMatchObject({ folder: REPO, fingerprint: expect.stringMatching(/^[0-9a-f]{64}$/) })
-    expect(kept.usedAt).toBe(kept.at)
+    const first = held.get(`baseline:${X}`) as { folder: string; fingerprint: string; at: number }
+    expect(first).toMatchObject({ folder: REPO, fingerprint: expect.stringMatching(/^[0-9a-f]{64}$/) })
+    // The conversation edits the shared checkout further, then clears (self-clear between pieces of work).
+    world.diffs['c:/work/repo'] = 'the same 14 files, edited further before the /clear'
+    await clock.advance(MINUTE)
+    await $.classic.SessionStart({ source: 'clear', session_id: W })
+    world.id = W
+    await clock.advance(1000)
+    // The conversation it starts has the baseline the one it ended started with, used now.
+    const carried = held.get(`baseline:${W}`) as { folder: string; fingerprint: string; at: number; usedAt: number }
+    expect(carried).toMatchObject({ folder: first.folder, fingerprint: first.fingerprint, at: first.at })
+    expect(carried.usedAt).toBeGreaterThan(first.at)
+    // So the changes made before the /clear hold its in-place switch.
+    await switchNow($, clock)
+    expect(commands).toEqual([])
+    expect(rows(session)).toMatch(/S11: 14 files are uncommitted in C:\\\\work\\\\repo, the start folder, dirty since this conversation started/)
+  })
+
+  test('a /clear after a conversation with no baseline takes none: the start folder\'s dirt holds', async ($, on) => {
+    const { commands, held, session, world, clock } = engine(on, { id: X, git: { dirty: 3 } })
+    await $.session.start(start)
+    await $.classic.SessionStart({ source: 'clear', session_id: W })
+    world.id = W
+    await clock.advance(1000)
+    expect([...held.keys()].filter(k => k.startsWith('baseline:'))).toEqual([])
+    await switchNow($, clock)
+    expect(commands).toEqual([])
+    expect(rows(session)).toMatch(/S11: 3 files are uncommitted in .+, the start folder, dirty, no baseline/)
+  })
+
+  test('a /clear after a conversation whose baseline is of another folder takes none', async ($, on) => {
+    const other = { folder: ELSEWHERE, fingerprint: 'e'.repeat(64), at: NOW - HOUR, usedAt: NOW - HOUR }
+    const { held, clock } = engine(on, { id: X, git: { dirty: 3 }, store: { [`baseline:${X}`]: other } })
+    await $.session.start(start)
+    await $.classic.SessionStart({ source: 'clear', session_id: W })
+    await clock.advance(1000)
+    expect(held.get(`baseline:${W}`)).toBeUndefined()
+    expect(held.get(`baseline:${X}`)).toEqual(other)
+  })
+
+  test('the conversation a /clear ends is known from session.start too (a reload of the plugin): its baseline is carried', async ($, on) => {
+    const kept = { folder: REPO, fingerprint: 'e'.repeat(64), at: NOW - HOUR, usedAt: NOW - HOUR }
+    const { commands, held, session, world, clock } = engine(on, { id: X, git: { dirty: 3 }, store: { [`baseline:${X}`]: kept } })
+    await $.session.start(start)
+    await $.classic.SessionStart({ source: 'clear', session_id: W })
+    world.id = W
+    await clock.advance(1000)
+    expect(held.get(`baseline:${W}`)).toMatchObject({ folder: REPO, fingerprint: 'e'.repeat(64), at: NOW - HOUR })
+    await switchNow($, clock)
+    expect(commands).toEqual([])
+    expect(rows(session)).toMatch(/S11: 3 files are uncommitted in .+, the start folder, dirty since this conversation started/)
+  })
+
+  test('a fork (--fork-session) takes no baseline: its start folder\'s dirt holds', async ($, on) => {
+    const { commands, held, session, clock } = engine(on, { git: { dirty: 2 } })
+    await $.session.start(start)
+    await $.classic.SessionStart({ source: 'fork', session_id: W })
+    await clock.advance(1000)
+    expect(held.get(`baseline:${W}`)).toBeUndefined()
+    await switchNow($, clock)
+    expect(commands).toEqual([])
+    expect(rows(session)).toMatch(/S11: 2 files are uncommitted in .+, the start folder, dirty, no baseline/)
   })
 
   test('a baseline is pruned 30 days after its last use, never by its age; a switch and the heartbeat mark it used', async ($, on) => {
