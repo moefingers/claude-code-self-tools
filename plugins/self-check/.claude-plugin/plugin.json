@@ -1,6 +1,6 @@
 {
   "name": "self-check",
-  "version": "0.1.0",
+  "version": "0.0.0",
   "description": "Lets a session check that its own tools answer: a nonce echoed through the Bash and PowerShell tools as the model calls them, each within 10 seconds, and the MCP servers listed (exercised only through probes you name). Quietly again when the session is resumed, saying only what failed.",
   "author": { "name": "moefingers", "url": "https://github.com/moefingers" },
   "homepage": "https://github.com/moefingers/claude-code-self-tools/tree/main/plugins/self-check#readme",

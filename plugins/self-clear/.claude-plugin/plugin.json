@@ -1,6 +1,6 @@
 {
   "name": "self-clear",
-  "version": "0.2.0",
+  "version": "0.1.0",
   "description": "Lets a session clear its own conversation between two independent pieces of work, as /clear does, and start the next piece from a handoff it writes: a tool queues the clear, and it runs as the turn ends.",
   "author": { "name": "moefingers", "url": "https://github.com/moefingers" },
   "homepage": "https://github.com/moefingers/claude-code-self-tools/tree/main/plugins/self-clear#readme",
