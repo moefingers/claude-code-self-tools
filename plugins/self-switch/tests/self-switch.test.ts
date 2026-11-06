@@ -2,7 +2,7 @@
 // from fixtures; /resume and /exit are recorded, never run. Nothing here starts a process.
 import { describe, expect, mock, test } from 'claude-code/testing'
 import type { AgentStatus, On } from 'claude-code'
-import { claimPath, gatePath, launcherScript, panePath, paneScript, paneTicketPath, quoted, SLOT_NOT_RECOGNISED, SLOT_SCRIPT_SHA256, slotRecordPath, STDIN_BOOTSTRAP } from '../hooks/machine'
+import { claimPath, gatePath, launcherScript, MAX_UNTRACKED, panePath, paneScript, paneTicketPath, quoted, SLOT_NOT_RECOGNISED, SLOT_SCRIPT_SHA256, slotRecordPath, STDIN_BOOTSTRAP } from '../hooks/machine'
 import { decode, ELSEWHERE, elsewhere, entry, ft, inSlot, LAUNCH, machine, NOW, OTHER, PERMISSION_FLAGS, PROJECT, type RawProbe, REPO, T, under, W, X } from './fixtures'
 
 const TOOL = 'mcp__self-switch__switch_after_turn'
@@ -13,6 +13,12 @@ const LOCAL = 'C:\\Users\\u\\AppData\\Local'
 const STATE = `${LOCAL}\\claude-self-tools`
 const CONFIG = 'C:\\Users\\u\\.claude'
 const WINDOWS = { OS: 'Windows_NT', SystemRoot: 'C:\\Windows', LOCALAPPDATA: LOCAL, USERPROFILE: 'C:\\Users\\u' }
+/**
+ * How long, in real time, the clock waits for a fingerprint's hash after an advance (engine, below).
+ * It takes microseconds, or a few scheduler slices on a loaded machine; the bound sits under the kit's
+ * 5-second test timeout, so a hash that never comes fails with its own message.
+ */
+const HASH_WAIT_MS = 3000
 const GATE = gatePath(STATE, W)
 /** What the leaving row and the arrival say of wake-ups: one plain sentence each, the plugin's own. */
 const DROPPED_HERE = 'Wake-ups pending in this process were dropped with the switch: set them again in the conversation switched to, or here when this one is resumed, if they are still needed.'
@@ -114,19 +120,52 @@ function engine(
   const world = { id, agents, probe: probe ?? machine(), gate, worktrees: git.worktrees ?? [REPO], diffs: {} as Record<string, string>, untrackedTime: NOW - HOUR, cwd }
   const key = (path: string) => path.replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase()
   const held = new Map<string, unknown>(Object.entries(store))
-  const clock = mock.clock(on, { now: NOW })
+  // A fingerprint's hash (crypto.subtle.digest, in the shared machine code) finishes outside the
+  // plugin's engine calls, and the kit's clock settles on those calls alone: under load, an advance
+  // came back with a hash still out, before the switch or the baseline it was for had done anything.
+  // A hash is out from this fake's answer to a fingerprint's last read (its untracked list, then each
+  // untracked file's stat) until the plugin's next call here; the clock waits for it after each move.
+  let hashOut = false
+  /** This fake's answer to a call of the plugin's: a call after a fingerprint's reads says its hash is in. */
+  const answer = <T>(value: T): T => {
+    hashOut = false
+    return value
+  }
+  const kit = mock.clock(on, { now: NOW })
+  /** The kit's clock settled again, the clock where it is, until no hash is out; real time, bounded. */
+  const pastHashes = async (): Promise<void> => {
+    const until = performance.now() + HASH_WAIT_MS
+    while (hashOut) {
+      if (performance.now() > until) {
+        throw new Error(`a fingerprint's hash (crypto.subtle.digest) wasn't in after ${HASH_WAIT_MS / 1000} s of real time: the plugin called nothing after the fingerprint's last read`)
+      }
+      await kit.settle()
+    }
+  }
+  const clock = {
+    now: kit.now,
+    sleep: kit.sleep,
+    advance: async (ms: number): Promise<void> => {
+      await kit.advance(ms)
+      await pastHashes()
+    },
+    settle: async (): Promise<void> => {
+      await kit.settle()
+      await pastHashes()
+    },
+  }
   const session = mock.session(on)
   mock.env(on, env)
-  on('store.get', (_, e) => ({ value: held.get(e.key) }))
+  on('store.get', (_, e) => answer({ value: held.get(e.key) }))
   on('store.set', (_, e) => {
     held.set(e.key, JSON.parse(JSON.stringify(e.value)))
-    return { value: undefined }
+    return answer({ value: undefined })
   })
   on('store.delete', (_, e) => {
     held.delete(e.key)
-    return { value: undefined }
+    return answer({ value: undefined })
   })
-  on('store.keys', () => ({ value: [...held.keys()] }))
+  on('store.keys', () => answer({ value: [...held.keys()] }))
   if (perConversation) {
     // Each conversation its own values: what the plugin set in one is not there in another.
     const states = new Map<string, Map<string, { value: unknown; version: number }>>()
@@ -135,50 +174,53 @@ function engine(
       states.set(world.id, found)
       return found
     }
-    on('state.get', (_, e) => ({ value: mine().get(`${e.plugin}/${e.key}/${e.id ?? ''}`) ?? { value: undefined, version: 0 } }))
+    on('state.get', (_, e) => answer({ value: mine().get(`${e.plugin}/${e.key}/${e.id ?? ''}`) ?? { value: undefined, version: 0 } }))
     on('state.set', (_, e) => {
       const key = `${e.plugin}/${e.key}/${e.id ?? ''}`
       const version = (mine().get(key)?.version ?? 0) + 1
       mine().set(key, { value: JSON.parse(JSON.stringify(e.value)), version })
+      hashOut = false
       return { value: { isSet: true, version } }
     })
   }
   on('session.start', (_, e) => ({ cwd: e.cwd }))
-  on('session.id', () => ({ value: world.id }))
-  on('session.cwd', () => ({ value: world.cwd }))
+  on('session.id', () => answer({ value: world.id }))
+  on('session.cwd', () => answer({ value: world.cwd }))
   on('tool.register', (_, e) => {
     described.push(String(e.description))
-    return { value: { tool: TOOL } }
+    return answer({ value: { tool: TOOL } })
   })
-  on('ui.status', () => ({ value: undefined }))
+  on('ui.status', () => answer({ value: undefined }))
   on('ui.toast', (_, e) => {
     toasts.push(String(e.text))
-    return { value: undefined }
+    return answer({ value: undefined })
   })
   on('ui.log', (_, e) => {
     logs.push(String(e.text))
-    return { value: undefined }
+    return answer({ value: undefined })
   })
-  on('agent.list', () => ({ value: world.agents.map((a, i) => ({ id: `a${i}`, type: 'general-purpose', ...a })) }))
+  on('agent.list', () => answer({ value: world.agents.map((a, i) => ({ id: `a${i}`, type: 'general-purpose', ...a })) }))
   on('classic.SessionStart', () => ({}))
   on('prompt.submit', (_, e) => {
     prompts.push({ text: e.text, origin: e.origin })
-    return { text: e.text }
+    return answer({ text: e.text })
   })
   on('turn.start', (_, e) => ({ turnId: e.turnId }))
   on('turn.complete', () => ({ text: 'done' }))
-  on('fs.exists', (_, e) => ({ value: e.path === GATE ? world.gate !== undefined : false }))
+  on('fs.exists', (_, e) => answer({ value: e.path === GATE ? world.gate !== undefined : false }))
   on('fs.read', (_, e) =>
-    e.path === GATE && world.gate !== undefined ? { value: world.gate } : e.path === panePath(STATE, TOKEN) && pane !== undefined ? { value: pane } : { deny: `ENOENT: ${e.path}` },
+    answer(e.path === GATE && world.gate !== undefined ? { value: world.gate } : e.path === panePath(STATE, TOKEN) && pane !== undefined ? { value: pane } : { deny: `ENOENT: ${e.path}` }),
   )
   on('fs.write', (_, e) => {
     writes.push({ path: e.path, text: e.text })
-    return { value: undefined }
+    return answer({ value: undefined })
   })
+  // An untracked file's stat is one of a fingerprint's reads: a hash still to come stays to come.
   on('fs.stat', (_, e) => ({ value: { kind: 'file', size: e.path.length, mtimeMs: world.untrackedTime, isLink: false } }))
-  on('fs.list', () => ({ value: [...(git.names ?? []), 'HEAD', 'config'].map(name => ({ name, kind: 'file', size: 1, mtimeMs: NOW, isLink: false })) }))
+  on('fs.list', () => answer({ value: [...(git.names ?? []), 'HEAD', 'config'].map(name => ({ name, kind: 'file', size: 1, mtimeMs: NOW, isLink: false })) }))
   const ok = (stdout: string, exitCode = 0) => ({ value: { exitCode, stdout, stderr: exitCode === 0 ? '' : 'failed', isStdoutTruncated: false, isStderrTruncated: false } })
   on('process.run', (_, e) => {
+    hashOut = false
     const argv = [...e.argv]
     const init = e.init === undefined ? undefined : { ...e.init }
     if (argv[0] === 'git') {
@@ -199,7 +241,13 @@ function engine(
       if (argv.includes('--show-current')) return ok(key(folder) === key(REPO) ? 'main\n' : 'feat/x\n')
       if (argv.includes('status')) return ok(Array.from({ length: dirty }, (_, i) => ` M file${i}.ts\0`).join(''))
       if (argv.includes('diff')) return ok(world.diffs[key(folder)] ?? (dirty > 0 ? `diff of ${dirty} files` : ''))
-      if (argv.includes('ls-files') && key(folder) === key(REPO)) return ok(Array.from({ length: git.untracked ?? 0 }, (_, i) => `notes/new${i}.md\0`).join(''))
+      if (argv.includes('ls-files')) {
+        // A fingerprint's untracked list, its last git read: its hash comes once the files are
+        // stated, unless there are too many to read whole.
+        const untracked = key(folder) === key(REPO) ? (git.untracked ?? 0) : 0
+        hashOut = untracked <= MAX_UNTRACKED
+        return ok(Array.from({ length: untracked }, (_, i) => `notes/new${i}.md\0`).join(''))
+      }
       return ok('')
     }
     // The script comes on standard input; the command line is the fixed bootstrap.
@@ -208,8 +256,8 @@ function engine(
     runs.push({ argv, init, script, kind })
     if (kind === 'probe') {
       if (probeFails !== undefined) return ok(probeFails, 1)
-      const answer = typeof world.probe === 'function' ? world.probe(script) : world.probe
-      return ok(`${JSON.stringify(answer)}\r\n`)
+      const found = typeof world.probe === 'function' ? world.probe(script) : world.probe
+      return ok(`${JSON.stringify(found)}\r\n`)
     }
     if (kind === 'launcher') return launcher === 'opens' ? ok(`launched 100\r\nclaim ${LAUNCH}\r\n`) : ok('self-switch: no claude on PATH\r\n', 4)
     if (kind === 'pane') {
@@ -223,6 +271,7 @@ function engine(
     return ok('', 1)
   })
   on('command.run', async (_, e, next) => {
+    hashOut = false
     commands.push({ command: e.command, ...(e.args ? { args: e.args } : {}) })
     if (e.command === 'resume') {
       if (resume === 'refused') return next(e)
