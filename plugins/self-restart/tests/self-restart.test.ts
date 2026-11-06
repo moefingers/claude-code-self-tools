@@ -101,6 +101,9 @@ function engine(on: On, { env = WINDOWS, id = ID, launcher = 'opens', exit = 'ex
   on('agent.list', () => ({
     value: world.agents.map((a, i) => ({ id: `a${i}`, type: 'general-purpose', ...a })),
   }))
+  // The pre-check's crons: CronList allowed, listing none (`as never`: its record's type is the engine's own).
+  on('tool.check', { tool: 'CronList' }, () => ({ decision: 'allow' as const }))
+  on('tool.call', { tool: 'CronList' }, (_, e) => ('input' in e ? { isError: true, result: 'InputValidationError', text: 'InputValidationError' } : { result: { jobs: [] }, text: 'No scheduled jobs.' }) as never)
   on('classic.SessionStart', () => ({}))
   on('prompt.submit', (_, e) => {
     prompts.push(e.text)

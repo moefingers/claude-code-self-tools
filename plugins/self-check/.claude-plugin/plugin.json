@@ -1,0 +1,34 @@
+{
+  "name": "self-check",
+  "version": "0.1.0",
+  "description": "Lets a session check that its own tools answer: a nonce echoed through the Bash and PowerShell tools as the model calls them, each within 10 seconds, and the MCP servers listed (exercised only through probes you name). Quietly again when the session is resumed, saying only what failed.",
+  "author": { "name": "moefingers", "url": "https://github.com/moefingers" },
+  "homepage": "https://github.com/moefingers/claude-code-self-tools/tree/main/plugins/self-check#readme",
+  "repository": "https://github.com/moefingers/claude-code-self-tools",
+  "license": "MIT",
+  "keywords": ["tools", "health", "mod"],
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "updateCheck": {
+      "type": "string",
+      "title": "Update check",
+      "description": "on: when a tool of this plugin is called and the last check is 30 minutes old, fetch this plugin's published plugin.json from GitHub (a plain GET of a public file) and say when a newer version is out. off: never check.",
+      "default": "on",
+      "options": ["on", "off"]
+    },
+    "checkAtResume": {
+      "type": "string",
+      "title": "Check at resume",
+      "description": "on: 10 seconds after this session is resumed, once it is idle, run the same check quietly and say only what failed (a toast, and a note Claude reads with the next message). off: check only when Claude calls tools_check.",
+      "default": "on",
+      "options": ["on", "off"]
+    },
+    "probes": {
+      "type": "string",
+      "multiple": true,
+      "title": "MCP probes",
+      "description": "MCP servers to exercise, each as server=tool: the server as its tools are named (mcp__<server>__<tool>), and one of its tools that only reads and needs no arguments. A server not named here is listed, never called.",
+      "default": []
+    }
+  }
+}
