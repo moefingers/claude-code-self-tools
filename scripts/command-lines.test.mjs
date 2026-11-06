@@ -36,6 +36,8 @@ const scripts = [
   ['the release', machine.releaseScript({ stateDir: state, id: T, by: BY })],
   ["a switch's launcher, 8 config folders", window],
   ["self-restart's launcher", restart],
+  ["self-restart's pane script, the claim and a ticket of the longest folder", machine.paneScript({ stateDir: state, ticket: { token: W, resume: T, by: BY, dir: resumeIn, at: Date.now() }, claim: true })],
+  ["self-switch's pane script, a ticket of the longest folder", machine.paneScript({ stateDir: state, ticket: { token: W, resume: T, by: BY, dir: resumeIn, at: Date.now() } })],
 ]
 
 test('each script runs from standard input: its command line is the fixed bootstrap, under 24,000 characters', () => {
