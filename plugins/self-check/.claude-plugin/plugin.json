@@ -1,7 +1,7 @@
 {
   "name": "self-check",
-  "version": "0.1.0",
-  "description": "Lets a session check that its own tools answer: a nonce echoed through the Bash and PowerShell tools as the model calls them, each within 10 seconds, and the MCP servers listed (exercised only through probes you name). Quietly again when the session is resumed, saying only what failed.",
+  "version": "0.2.0",
+  "description": "Lets a session check that its own tools answer: a nonce echoed through the Bash and PowerShell tools as the model calls them, each within 10 seconds, how much room the session env leaves a Bash command on Windows, and the MCP servers listed (exercised only through probes you name). Quietly again when the session is resumed, saying only what failed. Dedupes Bash's session env after each session start, against Git Bash's 8,186-character cut.",
   "author": { "name": "moefingers", "url": "https://github.com/moefingers" },
   "homepage": "https://github.com/moefingers/claude-code-self-tools/tree/main/plugins/self-check#readme",
   "repository": "https://github.com/moefingers/claude-code-self-tools",
@@ -20,6 +20,13 @@
       "type": "string",
       "title": "Check at resume",
       "description": "on: 10 seconds after this session is resumed, once it is idle, run the same check quietly and say only what failed (a toast, and a note Claude reads with the next message). off: check only when Claude calls tools_check.",
+      "default": "on",
+      "options": ["on", "off"]
+    },
+    "envDedupe": {
+      "type": "string",
+      "title": "Bash env dedupe",
+      "description": "on: after each session start (startup, resume, clear, compact), and when tools_check finds the env at risk, dedupe this session's setup and sessionstart env files (~/.claude/session-env/<session>/*-hook-<n>.sh, which Claude Code puts into every Bash call) once they total over 2 KB: each variable's last assignment is kept, so the environment is the same; a file with any other kind of line is left as it is; backups <name>.orig (once) and <name>.bak (latest). off: never rewrite them; tools_check still says how much room they leave.",
       "default": "on",
       "options": ["on", "off"]
     },

@@ -1,7 +1,9 @@
 // self-check against the engine's kit, fakes only: the tools the session lists, the permission
 // verdicts, the Bash and PowerShell tools as the engine answers them, the MCP servers' probes and the
 // file the check writes. No real tool, process or file is touched; the session id was generated for
-// these tests.
+// these tests. The environment has no %USERPROFILE%, as off Windows, so no check here has a Bash env
+// line and a dead Bash gets the fresh-process hint; tests/env-guard.test.ts covers the env line, its
+// hint and the dedupe.
 import { expect, mock, test } from 'claude-code/testing'
 import type { Engine } from 'claude-code/testing'
 import type { On } from 'claude-code'
