@@ -13,6 +13,22 @@ Each entry names a plugin and its version, as `version` in `plugins/<name>/.clau
 - **The shared machine code**: `PANE_TOKEN`, `panePath`, `paneTicketPath`, `PANE_TICKET_MS`, `PANE_AHEAD_MS`; `Pane`, `PANE_VERSION` (2), `parsePane` (version 2 only; version 1 is said as an older wrapper), `readPane` (the caller reads `CLAUDE_PANE_TOKEN` by its literal name), `paneFallback`; `PaneTicket` (with `by`), `PaneTicketInput`, `PANE_WHY` (the wrapper's words), `checkPaneTicket` (its rules, in its order), `paneTicket`, `paneScript` (with `claim`, it takes the lock for the ticket's own `by`) and `PANE_WRITTEN`. `Transport` gains `pane`, and `pickTransport` takes the tab. self-exit and self-check carry the copy but don't use the tab, so they keep their versions. Its SHA-256 changed, so a copy pinned outside this repository (the coordinator's) is updated on purpose.
 - **Tests**: `scripts/claude-wrapper.test.mjs` runs the wrapper for real in both PowerShells against a stub `claude.exe` that logs its arguments and the names of its environment variables, never their values; checks each refusal against `checkPaneTicket`; runs `paneScript` to write a ticket; covers a ticket whose claim the lock doesn't name (another's, none, unreadable) and a conversation open elsewhere at the last look (a command line, L2; a registry file, L1); and plants faults (the ticket deleted only after use, the age check removed, the loop cap removed, the 10-resume cap removed, `WT_SESSION` cleared, the claim check removed, the last look removed, the pane file left at version 1, the version gate and the parent-pid check removed from the machine code), each caught. `scripts/command-lines.test.mjs` covers the pane scripts.
 
+## 2026-11-05: dev-run, new tool
+
+- **[dev-run](tools/dev-run)**, a script, not a plugin: `node tools/dev-run/dev-run.mjs --name <label> --dir <folder> --port <n> -- <command>` runs one dev server in place of a `next dev` started by hand.
+  - It starts the server at a free-memory floor (6 GiB, 9 before a compile) and restarts it every 10 minutes (at most 10) on the same port, once the port is free.
+  - It stops the server under 4 GiB free and waits for the floor again, and stops for good after 20 minutes of server time with no request.
+  - It stops only what it started, never with `taskkill /T` and never by name:
+    - first the root, through Node's handle;
+    - then, from one process snapshot, each process the root started. A child counts only when it was created at or after its parent, and, once the root is gone, before the root ended and before any later owner of its id started.
+    - Each is stopped deepest first, by id, after its start time is checked again.
+    - A start time read after its process ended is dropped.
+  - It claims a heavy-slot slot for each start's first compile (`--slot`; `=life` for the whole run, `=off` for none). The slot is released at a 2xx request line, which is what Next 16 prints for a first compile, or an older Next's `Compiled` line. Both are read case-sensitively at the line's start.
+  - It finds heavy-slot.sh in `$HEAVY_SLOT_SCRIPT` (a full path that must exist, Windows or Git Bash style), else above the outermost repository that holds `--dir`, never inside it. It resolves every command to a full path, a bare name from PATH only, and refuses one it can't find; Git's bash and `cmd.exe` are taken by full paths too.
+  - It writes a log and an atomic status file under `%LOCALAPPDATA%\claude-self-tools\dev-run\`.
+  - A detached guard stops the server if the runner is killed outright, even before the root's start time was read, and marks the status stopped. It walks a dead root only up to the end the runner saw, or else the pipe's end.
+  - Its tests, run by `scripts/test-all.mjs`, use a fake server, a live check on harmless processes, an allow-list on everything a test may stop, and planted faults, each caught.
+
 ## 2026-11-04: self-exit 0.1.2, self-restart 0.1.6, self-clear 0.2.0 and self-check 0.1.0, self-service: the exit pre-check, self-check, and a clear only with a why
 
 - **self-exit 0.1.2**:

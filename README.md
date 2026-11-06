@@ -164,6 +164,12 @@ To try a plugin from your working copy, start a session with `claude --plugin-di
 
 Each plugin's `tsconfig.json` extends `.claude-plugin/types/tsconfig.json` inside that plugin. Claude Code writes that folder, with type definitions for the version you run, when it loads the plugin from `--plugin-dir` in an interactive session. The folder is not committed.
 
+## Tools
+
+Not plugins: scripts a session runs on the machine.
+
+- [dev-run](tools/dev-run): runs a dev server in place of a `next dev` started by hand. It restarts the server every 10 minutes, starts it only at a free-memory floor, stops it under a lower one, stops it for good when idle, and claims a [heavy-slot](tools/dev-run#heavy-slots) slot for each first compile. Its tests run in `node scripts/test-all.mjs`.
+
 ## License
 
 [MIT](LICENSE)
