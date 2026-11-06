@@ -2,6 +2,23 @@
 
 Each entry names a plugin and its version, as `version` in `plugins/<name>/.claude-plugin/plugin.json` has it.
 
+## 2026-11-06: self-check 0.2.0, the Bash env guard
+
+- **self-check 0.2.0**: guards the Bash tool against dying of its own session env on Windows ([anthropics/claude-code#103861](https://github.com/anthropics/claude-code/issues/103861)).
+  - **The cause** (read from Claude Code 2.1.319's bundle, and reproduced with Git Bash):
+    - Claude Code puts this session's env hook files, `~/.claude/session-env/<session>/(setup|sessionstart|cwdchanged|filechanged)-hook-<n>.sh`, into every Bash call's `bash -c` string, ahead of the command.
+    - Git Bash runs only the first 8,186 characters of that string and drops the rest without a word.
+    - A SessionStart hook that appends at every start (the Vercel plugin adds three `export` lines at each startup, resume, clear and compact) grows the files for as long as the session id lives. Long commands are cut first (`unexpected EOF`), then every command (exit 0, no output). A resume reads the same files, so it never helped.
+  - **The dedupe**, new: in each hook file, only the last assignment of each variable is kept, in order, so the environment is the same.
+    - A file is left as it is when any line isn't a plain assignment (Claude Code's own test), when a variable an earlier line exported is set without `export` by its last line, when it isn't clean UTF-8, when it wouldn't get shorter, or when it changed between the read and the rewrite.
+    - Nothing is rewritten while the hook files total 2 KB or less. One backup per file, `<name>.bak`, overwritten by the next dedupe. Names, counts and lengths are logged to the debug log, never a value.
+    - **When:** right after every session start, once the SessionStart hooks beneath the plugin have appended (they are settings hooks, below every hooks module in the classic chain). Claude Code drops its cached copy of the env script after each SessionStart hook and builds it again at the next Bash call, so that call reads the deduped files. Also in a check that finds the env AT RISK or BROKEN, for a session already over the line. That dedupe doesn't drop Claude Code's cached copy, so the check's line then ends with the next step: move the PowerShell tool's directory away and back in two calls, then retry Bash.
+    - **New setting** `envDedupe`, on by default; `off` never rewrites the files.
+  - **`tools_check` says the env's headroom**, on a line after Bash's: the characters every Bash call carries, the room left for the command, and a verdict, BROKEN (none left), AT RISK (under 2,000) or OK.
+  - **The repair for a dead Bash is corrected.** When its env is AT RISK, BROKEN or can't be measured, the answer names the env-size cause, the dedupe, and moving the PowerShell tool's directory and back in two calls, so Claude Code reads the files again; it no longer says a fresh process repairs it, since a resume reads the same files. A dead Bash with an OK env, and any other dead tool, still get the fresh-process hint. The toast at resume says which.
+  - **Tests**, fakes only (an in-memory env folder under a Temp root, fake variables with low-entropy values, a generated session id; any path outside the root is refused): the refuse-unless-plain rule and Claude Code's regex pinned, the export rule, last-wins order with the same environment after, one backup over forty starts, the 2,048 / 2,049-byte threshold, the verdict boundaries (7,716 / 7,715 / 5,717 / 5,716 characters), a file changed meanwhile, the setting off, subagents, off Windows, `CLAUDE_ENV_FILE` counted and never written, the next step a check's line gives after its own dedupe, and the hints and toast.
+  - A minor version: a new setting, and the plugin now writes the session's env hook files.
+
 ## 2026-11-06: self-remote-control 0.3.0, after a login change: Remote Control reconnected, a cut-off turn resumed, and a shared Remote Control lock
 
 - **self-remote-control 0.3.0**:

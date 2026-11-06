@@ -34,7 +34,7 @@
     {
       "name": "self-check",
       "source": "./plugins/self-check",
-      "description": "Checks that the session's own tools answer: a nonce echoed through Bash and PowerShell as the model calls them, and the MCP servers listed (exercised only through probes you name). Quietly again at resume, saying only what failed."
+      "description": "Checks that the session's own tools answer: a nonce echoed through Bash and PowerShell as the model calls them, the room the session env leaves a Bash command, and the MCP servers listed (exercised only through probes you name). Quietly again at resume, saying only what failed. Dedupes Bash's session env after each session start, against Git Bash's 8,186-character cut."
     },
     {
       "name": "self-wake",
