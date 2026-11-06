@@ -44,7 +44,7 @@
     {
       "name": "self-remote-control",
       "source": "./plugins/self-remote-control",
-      "description": "Reports on the session's Remote Control, connects it under a title, and renames the session. It runs /remote-control only while the session is not connected."
+      "description": "Reports on the session's Remote Control, connects it under a title, and renames the session. After a login change it reconnects Remote Control and resumes a turn the change cut off. It runs /remote-control only while the session is not connected."
     },
     {
       "name": "self-exit",
