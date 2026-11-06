@@ -37,14 +37,17 @@ Everything after `--` is the server's command, run in `--dir` as an argument lis
 3. **Watches memory** every 10 s. Under `--stop-gb`, it stops the server, logs why, and goes back to step 1.
 4. **Restarts every `--restart-min`**: stops the server, waits up to 30 s for the port to be free, then starts again at the floor, with the same command on the same port. If the port is still held after 30 s, it logs the holders' pids and ends with 1, rather than start a second server beside them.
 5. **Stops only what it started, by process id.** It never uses `taskkill /T` or a name. Windows keeps a dead parent's id on its orphans and never checks it, and a later process can take that id, so `/T` can take someone else's processes. dev-run stops in this order:
-   - **The root:** through Node's own handle on it, so never a process that has taken its id. dev-run reads the root's real start time right after the spawn, while the root runs.
-   - **What the root started:** from one process snapshot, walking down by parent id. A child counts only if it was created at or after its parent, the rule `shared/hooks/machine.ts` uses, so an older process carrying the id as its parent is an orphan of the id's earlier owner and is left alone. If the root's id has already been taken, that newer process's children are left alone too.
+   - **The root:** through Node's own handle on it, so never a process that has taken its id. dev-run reads the root's real start time right after the spawn, while the root runs. If the root has ended by the time the read comes back, the time is dropped, because by then its id may be another process's. Nothing is then stopped by id, and what the root started is left to the port wait.
+   - **What the root started:** from one process snapshot, walking down by parent id. A child counts only if it was created at or after its parent, the rule `shared/hooks/machine.ts` uses, so an older process carrying the id as its parent is an orphan of the id's earlier owner and is left alone. Once the root is gone, a child must also have been created before the root ended (dev-run notes the time) and before any later owner of its id started, so a process started under a reused id is left alone, even when that later owner has ended too.
    - **Deepest first, one at a time:** dev-run opens a handle on each process, checks its start time against the snapshot's again, and stops that same process through the handle (`Stop-Process`).
 
    Then it waits for the port to close.
 6. **Stops for good when idle.** Each line matching `--hit` is a request. After `--idle-min` of server time with none, it stops the server and ends with 0, logging `idle: no request for 20 min of server time; stopping for good`. The first start counts as a request, and the idle clock stands still while the server is down, so restarts neither reset it nor run it out.
 7. **Ctrl+C, Ctrl+Break, closing the console, or SIGTERM** stop the server tree, then the runner ends (130, 149, 129, 143).
-8. **No orphan when the runner is killed outright.** No handler runs then, so a small guard process, started detached, holds a pipe from the runner. When the pipe ends with the server still up, the guard stops what's left of its tree. Node ends a child it spawned when it dies (a Windows job), so a Node server usually goes with the runner. A `.cmd` shim's `cmd.exe` goes too, but the server it started doesn't. The runner gives the guard the root's id and real start time once it has read them, about a second after each spawn. The guard stops the root if it still runs, then what it started, by the same walk as a stop. A runner killed in that first second leaves the guard nothing to go on.
+8. **No orphan when the runner is killed outright.** No handler runs then, so a small guard process, started detached, holds a pipe from the runner. When the pipe ends with the server still up, the guard stops what's left of its tree. Node ends a child it spawned when it dies (a Windows job), so a Node server usually goes with the runner. A `.cmd` shim's `cmd.exe` goes too, but the server it started doesn't.
+   - **What the guard is told:** the runner tells it the root's id at once, with the time just before the spawn, then the root's real start time once read, and `done` when it ends by itself.
+   - **When the pipe ends without `done`:** the guard stops what is left by the same walk as a stop. Its lower bound is the root's start time, or the time before the spawn if the runner died before reading it. Its upper bound is the moment the pipe ended, plus half a second, since a dead root starts nothing.
+   - **The status file:** the guard marks it `stopped` with the reason, even when no server was running.
 
 The server's output goes to a file, never to a pipe to the runner. A Node server whose output pipe breaks dies at once, and its workers would keep the port. dev-run reads the file every 100 ms and copies each line to its own output.
 
@@ -86,7 +89,7 @@ Under `%LOCALAPPDATA%\claude-self-tools\dev-run\`:
 node --test tools/dev-run/dev-run.test.mjs
 ```
 
-The tests run dev-run against a fake server (`fixtures/fake-server.mjs`, a small HTTP server that prints Next-style request lines and starts a detached child of its own), with the memory reader, the clock and the slot claim injected. The clock moves only when the runner sleeps, and stands still while a server starts or answers, so the suite takes about 75 seconds, mostly PowerShell reading the process table. They cover:
+The tests run dev-run against a fake server (`fixtures/fake-server.mjs`, a small HTTP server that prints Next-style request lines and starts a detached child of its own), with the memory reader, the clock and the slot claim injected. The clock moves only when the runner sleeps, and stands still while a server starts or answers, so the suite takes about 100 seconds, mostly PowerShell reading the process table. They cover:
 
 - restarts every 10 minutes on the same port, once the port is free;
 - the stop under the stop floor, then the wait for the floor;
@@ -98,19 +101,35 @@ The tests run dev-run against a fake server (`fixtures/fake-server.mjs`, a small
 - name validation;
 - Ctrl+C;
 - a runner killed outright behind a `.cmd` shim, cleaned up by its guard;
+- a root that ends while its start time is read, in a run and in a queued slot claim: no time is kept, and nothing is stopped by id;
+- a dead root whose id a later process took, started a child under, and gave up: that child is left alone;
+- the guard of a runner killed before it read the root's start time: the server behind a shim is stopped, and the status says `stopped`;
 - the slot taken before the spawn and released at the first compiled line or after 3 minutes;
 - `--slot=life`;
 - the compile floor;
 - a claim through the real `heavy-slot.sh`, in a slot folder of its own, so it never takes one of the machine's slots.
 
-Seven planted faults are each run through the same scenarios, which must fail, each on the check meant for it:
+Planted faults are each run through the same scenarios, which must fail, each on the check meant for it:
 
 - a restart that doesn't wait for the port;
 - the stop floor ignored;
 - an idle clock reset at each start;
 - a kill by name;
 - a walk that takes an orphan older than its parent (on the made-up table, and live);
+- a start time kept though it was read after the root ended (in a run, and in a queued claim);
+- a dead root's walk with no bound at its end;
+- a guard that ignores a root whose start time it wasn't told;
 - a slot never released;
 - a slot released before the compile.
 
-Each fault is a copy of `dev-run.mjs` with one line changed. A test's stop script runs only when it is exactly dev-run's by-id script, and every process it names is one that test started.
+Each fault is a copy of `dev-run.mjs` with one line changed.
+
+**What a test may stop.** Every test hands dev-run an exec that works as an allow-list. It runs only these:
+- the process-table snapshot;
+- `netstat -ano`;
+- a start-time read of a process the test started;
+- dev-run's exact stop script, when every target is a process the test started or one descended from it.
+
+Descent is checked apart from dev-run's own walk: up from each target, in the snapshot dev-run read, each parent no younger than its child, to a process the test started and timed while holding its handle. Anything else is refused, and a stopped process is dropped from the list.
+
+The CLI test runs the runner and its guard as processes of their own. `DEV_RUN_STOP_ONLY` confines both to the processes listed in a file, one `<pid> <start time>` per line; it can only narrow what is stopped.

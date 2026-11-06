@@ -9,7 +9,7 @@
 //
 // Windows only. Node's standard library only.
 import { execFile, spawn } from 'node:child_process'
-import { EventEmitter, once } from 'node:events'
+import { EventEmitter } from 'node:events'
 import { appendFileSync, closeSync, existsSync, fstatSync, mkdirSync, openSync, readFileSync, readSync, renameSync, statSync, writeFileSync } from 'node:fs'
 import { freemem, homedir } from 'node:os'
 import { delimiter, dirname, extname, isAbsolute, join, resolve } from 'node:path'
@@ -173,8 +173,12 @@ export function exec(file, args) {
 // (machine.ts's GET_PARENT rule): an older "child" is an orphan of the id's earlier owner. Each is then
 // stopped by id, deepest first, through a handle on which its start time is checked again.
 const START_TOLERANCE = 10_000 // FILETIME units, 1 ms: machine.ts's PROC_START_TOLERANCE
-const SNAPSHOT = "Get-CimInstance -ClassName Win32_Process -Property ProcessId, ParentProcessId, CreationDate | ForEach-Object { if ($null -ne $_.CreationDate) { '{0} {1} {2}' -f $_.ProcessId, $_.ParentProcessId, $_.CreationDate.ToFileTimeUtc() } }"
+export const SNAPSHOT = "Get-CimInstance -ClassName Win32_Process -Property ProcessId, ParentProcessId, CreationDate | ForEach-Object { if ($null -ne $_.CreationDate) { '{0} {1} {2}' -f $_.ProcessId, $_.ParentProcessId, $_.CreationDate.ToFileTimeUtc() } }"
+export const createdScript = pid => `$p = Get-CimInstance -ClassName Win32_Process -Filter 'ProcessId=${pid}' -Property CreationDate; if ($null -ne $p.CreationDate) { $p.CreationDate.ToFileTimeUtc() }`
 const powershell = (command, run) => run(POWERSHELL, ['-NoProfile', '-NonInteractive', '-Command', command])
+
+/** Now, as a FILETIME (BigInt): the unit of a process's start time. */
+export const nowFiletime = () => BigInt(Date.now()) * 10_000n + 116_444_736_000_000_000n
 
 /** Every process, by id: { pid, ppid, created }, created a FILETIME as a BigInt. Null when unreadable. */
 export async function snapshot(run = exec) {
@@ -185,30 +189,36 @@ export async function snapshot(run = exec) {
   return table
 }
 
-/** A process's creation time (FILETIME, BigInt), or null when it is gone. Read it while its handle is held. */
+/**
+ * A process's creation time (FILETIME, BigInt), or null when it is gone. The id names that process
+ * only while its handle is held: a caller that has seen the process end since must drop the time.
+ */
 export async function processCreated(pid, run = exec) {
   if (!Number.isInteger(pid) || pid <= 0) return null
-  const { stdout } = await powershell(`$p = Get-CimInstance -ClassName Win32_Process -Filter 'ProcessId=${pid}' -Property CreationDate; if ($null -ne $p.CreationDate) { $p.CreationDate.ToFileTimeUtc() }`, run)
+  const { stdout } = await powershell(createdScript(pid), run)
   return /^\d+$/.test(stdout.trim()) ? BigInt(stdout.trim()) : null
 }
 
 /**
  * The processes `root` (created at `rootCreated`) started, and theirs, deepest first, from a snapshot;
- * then the root itself with includeRoot, if it still runs. When the root's id has since been taken by
- * a later process, that one's children (all created after it) are left out too.
+ * then the root itself with includeRoot, if it still runs. When the root is gone, what it started was
+ * created before a later owner of its id started, and before the root ended (`endedAt`, when known):
+ * the children of a later owner, even one already gone itself, are left out.
  */
-export function treeOf(table, root, rootCreated, { includeRoot = false } = {}) {
+export function treeOf(table, root, rootCreated, { includeRoot = false, endedAt = null } = {}) {
   const children = new Map()
   for (const p of table.values()) if (p.pid !== p.ppid) children.set(p.ppid, [...(children.get(p.ppid) ?? []), p])
   const holder = table.get(root)
-  const takenAt = holder && holder.created !== rootCreated ? holder.created : null
+  const alive = holder?.created === rootCreated
+  let takenAt = null
+  for (const bound of [alive ? null : holder?.created, alive ? null : endedAt]) if (bound != null && (takenAt === null || bound < takenAt)) takenAt = bound
   const found = []
   const seen = new Set([root])
   const walk = (pid, created, depth, before) => {
     for (const c of children.get(pid) ?? []) {
       if (seen.has(c.pid)) continue
       if (c.created < created) continue // older than its parent: an orphan of the id's earlier owner
-      if (before !== null && c.created >= before) continue // a child of the id's later owner
+      if (before !== null && c.created >= before) continue // after the root's end: a later owner's
       seen.add(c.pid)
       found.push({ pid: c.pid, created: c.created, depth })
       walk(c.pid, c.created, depth + 1, null)
@@ -216,7 +226,7 @@ export function treeOf(table, root, rootCreated, { includeRoot = false } = {}) {
   }
   walk(root, rootCreated, 1, takenAt)
   found.sort((a, b) => b.depth - a.depth)
-  if (includeRoot && holder?.created === rootCreated) found.push({ pid: root, created: rootCreated, depth: 0 })
+  if (includeRoot && alive) found.push({ pid: root, created: rootCreated, depth: 0 })
   return found
 }
 
@@ -239,12 +249,21 @@ export function stopScript(targets) {
 }
 
 /** Stops what `root` started, and theirs (and the root, with includeRoot), deepest first. */
-export async function killTree(root, rootCreated, { includeRoot = false, run = exec } = {}) {
+export async function killTree(root, rootCreated, { includeRoot = false, endedAt = null, run = exec } = {}) {
   if (!Number.isInteger(root) || root <= 0 || root === process.pid || typeof rootCreated !== 'bigint') throw new Error(`refusing to walk from pid ${root}`)
   const table = await snapshot(run)
   if (!table) return { targets: null, results: [] }
-  const targets = treeOf(table, root, rootCreated, { includeRoot }).filter(t => t.pid !== process.pid)
+  const targets = treeOf(table, root, rootCreated, { includeRoot, endedAt }).filter(t => t.pid !== process.pid)
   if (!targets.length) return { targets, results: [] }
+  // A test confines dev-run, and the guard it starts, to the processes it lists in this file, one
+  // "<pid> <start time>" per line. It can only narrow what is stopped.
+  if (process.env.DEV_RUN_STOP_ONLY) {
+    let listed = new Set()
+    try {
+      listed = new Set(readFileSync(process.env.DEV_RUN_STOP_ONLY, 'utf8').split(/\r?\n/).map(l => l.trim()))
+    } catch {}
+    if (!targets.every(t => listed.has(`${t.pid} ${t.created}`))) return { targets, results: ['refused: not all in DEV_RUN_STOP_ONLY'] }
+  }
   const { stdout } = await powershell(stopScript(targets), run)
   return { targets, results: stdout.split(/\r?\n/).map(l => l.trim()).filter(Boolean) }
 }
@@ -273,6 +292,8 @@ export function claimSlot({ script, cwd, bash, env = process.env, note = () => {
   const child = spawn(bash, [script.replace(/\\/g, '/'), 'read', '-r', 'DEV_RUN_HOLD'], { cwd, env, stdio: ['pipe', 'ignore', 'pipe'], windowsHide: true })
   child.stdin.on('error', () => {})
   let held = false
+  let endedAt = null
+  child.once('exit', () => (endedAt = nowFiletime()))
   const exited = new Promise(r => {
     child.once('exit', r)
     child.once('error', e => (note(`heavy-slot: ${e.message}`), r()))
@@ -287,17 +308,20 @@ export function claimSlot({ script, cwd, bash, env = process.env, note = () => {
   })
   return {
     pid: child.pid,
+    child,
     acquired,
     async drop() {
       if (child.exitCode !== null || child.signalCode !== null) return
-      child.stdin.end()
       // Still queued: stop the claim, bash through Node's handle, then what it started; heavy-slot
-      // drops a ticket whose holder is gone. The start time is read while that handle pins the id.
+      // drops a ticket whose holder is gone. The start time is read first, before the pipe ends (bash
+      // could end with it), and dropped if bash ended meanwhile: its id may be another process's by then.
+      let created = held || !child.pid ? null : await processCreated(child.pid, run)
+      if (child.exitCode !== null || child.signalCode !== null) created = null
+      child.stdin.end()
       if (!held && child.pid) {
-        const created = await processCreated(child.pid, run)
         child.kill()
         await exited
-        if (created !== null) await killTree(child.pid, created, { run })
+        if (created !== null) await killTree(child.pid, created, { endedAt, run })
       }
       await exited
     },
@@ -364,6 +388,7 @@ export class DevRun {
     this.compiledRe = new RegExp(o.compiled) // case-sensitive: Next's "Compiled", not any "compiled"
     Object.assign(this, { state: 'waiting', child: null, pid: null, startedAt: null, lastHitAt: null, restarts: 0, lastReason: null })
     Object.assign(this, { idleAnchor: null, downSince: null, quickExits: 0, claim: null, slotName: null, stopReq: null, dirty: false })
+    Object.assign(this, { rootCreated: null, rootEnded: () => null })
     this.stopSignal = new Promise(r => (this.wake = r))
   }
 
@@ -508,6 +533,8 @@ export class DevRun {
     } catch {}
     const fd = openSync(this.outPath, 'a')
     const from = fstatSync(fd).size
+    this.rootCreated = null // never the last start's time beside a new id
+    const spawnedAt = nowFiletime()
     let child
     try {
       child = this.d.spawn(o.file, o.fileArgs, { cwd: o.dir, stdio: ['ignore', fd, fd], windowsHide: true, windowsVerbatimArguments: o.verbatim })
@@ -518,13 +545,20 @@ export class DevRun {
       this.spawnError = e
       this.log(`error: ${e.message}`)
     })
+    // When the root ended: nothing the walk takes from a dead root can be younger.
+    let endedAt = null
+    child.once('exit', () => (endedAt = nowFiletime()))
+    this.rootEnded = () => endedAt
     this.untail = this.tail(child, from)
     this.child = child
     this.pid = child.pid ?? null
     this.startedAt = now
-    // The root's real start time, read while it runs: the walk at the stop, and the guard, take only
-    // what it started. Until the guard has it, a runner killed outright leaves the guard nothing.
+    // The guard knows the root at once, with the time just before the spawn as a lower bound on what
+    // it can have started; then its real start time, read while it runs. A time read after the root
+    // ended is dropped: by then its id may be a later process's.
+    if (this.pid) this.guardSay(`spawned ${this.pid} ${spawnedAt}`)
     this.rootCreated = this.pid ? await processCreated(this.pid, this.d.exec) : null
+    if (child.exitCode !== null || child.signalCode !== null) this.rootCreated = null
     if (this.rootCreated !== null) this.guardSay(`child ${this.pid} ${this.rootCreated}`)
     this.write('running')
     const created = this.rootCreated === null ? 'start time unknown' : `started ${new Date(Number(this.rootCreated / 10_000n) - 11_644_473_600_000).toISOString()}`
@@ -626,7 +660,7 @@ export class DevRun {
   async stopStarted(pid) {
     const created = this.rootCreated
     if (created === null) return this.log(`error: no start time for pid ${pid}, so what it started is left to the port wait`)
-    const { targets, results } = await killTree(pid, created, { run: this.d.exec })
+    const { targets, results } = await killTree(pid, created, { endedAt: this.rootEnded(), run: this.d.exec })
     if (targets === null) this.log('error: could not read the process table, so what the server started is left to the port wait')
     else if (targets.length) this.log(`stopped what pid ${pid} started, deepest first: ${results.join(', ')}`)
   }
@@ -696,7 +730,7 @@ export class DevRun {
 
   endGuard() {
     const g = this.guardProc
-    return g ? new Promise(r => g.stdin.end('none\n', r)) : undefined
+    return g ? new Promise(r => g.stdin.end('done\n', r)) : undefined
   }
 }
 
@@ -706,36 +740,52 @@ export function wireSignals(runner, proc = process) {
 
 // The runner's server root usually dies with the runner: Node puts each child it spawns in a job
 // that ends with it. A root that isn't Node (cmd.exe running a .cmd shim) has no such job, so what it
-// started lives on, holding the port. The guard is told the root's id and real start time, and stops
-// the root if it still runs, and the tree it started, by the same age-checked walk as a stop.
-async function guardMain([runner, statusPath, logPath]) {
-  let pid = null
-  let created = null
-  const lines = createInterface({ input: process.stdin, crlfDelay: Infinity })
-  lines.on('line', l => {
-    const m = /^child (\d+) (\d+)$/.exec(l)
-    pid = m ? Number(m[1]) : null
-    created = m ? BigInt(m[2]) : null
-  })
-  await once(lines, 'close')
-  if (!pid) return
+// started lives on, holding the port. The runner tells the guard, line by line: `spawned <pid> <time
+// just before the spawn>`, then `child <pid> <real start time>`, `none` once it has stopped the server,
+// and `done` when it ends itself. If the pipe ends without `done`, the runner was killed: the guard
+// stops what is left by the same age-checked walk as a stop, bounded above by the pipe's end (a dead
+// root starts nothing), and marks the status stopped.
+const GUARD_MARGIN = 5_000_000n // FILETIME units, 0.5 s: the root can end a moment after the pipe
+
+export async function guard(lines, { runner, statusPath, logPath, run = exec, now = nowFiletime }) {
+  let spawned = null
+  let child = null
+  let done = false
+  for await (const line of lines) {
+    let m
+    if ((m = /^spawned (\d+) (\d+)$/.exec(line))) [spawned, child] = [{ pid: Number(m[1]), created: BigInt(m[2]) }, null]
+    else if ((m = /^child (\d+) (\d+)$/.exec(line))) child = { pid: Number(m[1]), created: BigInt(m[2]) }
+    else if (line === 'none') [spawned, child] = [null, null]
+    else if (line === 'done') done = true
+  }
+  if (done) return
+  const endedAt = now() + GUARD_MARGIN
   const note = msg => {
     try {
       appendFileSync(logPath, `${new Date().toISOString()} guard: ${msg}\n`)
     } catch {}
   }
-  const { targets, results } = await killTree(pid, created, { includeRoot: true })
-  const stopped = results.filter(r => r.startsWith('stopped ')).map(r => r.slice(8))
-  if (targets === null) note(`runner ${runner} ended; the process table could not be read`)
-  else if (targets.length) note(`runner ${runner} ended without stopping its server, pid ${pid}: ${results.join(', ')}`)
-  else note(`runner ${runner} ended; its server ended with it`)
+  // The root's start time, or, if the runner died before it read it, the time just before the spawn,
+  // which nothing the root started can precede. The root itself is stopped only when known exactly.
+  const from = child ?? spawned
+  let reason = 'no server was running'
+  if (from) {
+    const { targets, results } = await killTree(from.pid, from.created, { includeRoot: child !== null, endedAt, run })
+    const stopped = results.filter(r => r.startsWith('stopped ')).map(r => r.slice(8))
+    reason = targets === null ? 'the process table could not be read' : stopped.length ? `its guard stopped pid ${stopped.join(', ')}` : 'its server ended with it'
+    if (targets?.length) note(`runner ${runner} ended without stopping its server, pid ${from.pid}${child ? '' : ', before its start time was read'}: ${results.join(', ')}`)
+  }
+  note(`runner ${runner} ended; ${reason}`)
   const s = readJson(statusPath)
-  const lastReason = `runner ${runner} ended; ${stopped.length ? `its guard stopped pid ${stopped.join(', ')}` : 'its server ended with it'}`
   if (s) {
     try {
-      writeJsonAtomic(statusPath, { ...s, pid: null, state: 'stopped', slot: null, lastReason, at: Date.now() })
+      writeJsonAtomic(statusPath, { ...s, pid: null, state: 'stopped', slot: null, lastReason: `runner ${runner} ended; ${reason}`, at: Date.now() })
     } catch {}
   }
+}
+
+function guardMain([runner, statusPath, logPath]) {
+  return guard(createInterface({ input: process.stdin, crlfDelay: Infinity }), { runner, statusPath, logPath })
 }
 
 async function main(argv) {
