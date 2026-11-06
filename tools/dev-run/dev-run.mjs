@@ -32,7 +32,8 @@ export const HIT_RE = String.raw`^\s*(?:${METHODS})\s+\S+\s+\d{3}\s+in\b`
 // Next prints it once it listens, before it compiles anything.
 export const COMPILED_RE = String.raw`^\s*(?:${METHODS})\s+\S+\s+2\d\d\s+in\b|^\s*(?:\S{1,2}\s+)?Compiled\b(?!\s+\/(?:middleware|proxy|instrumentation)\b)`
 const ANSI = /\x1b\[[0-9;?]*[ -/]*[@-~]/g
-const SYS = join(process.env.SystemRoot || 'C:\\Windows', 'System32')
+const FULL_PATH = /^(?:[A-Za-z]:[\\/]|\\\\)/ // a drive-absolute or UNC path
+const SYS = join(FULL_PATH.test(process.env.SystemRoot ?? '') ? process.env.SystemRoot : 'C:\\Windows', 'System32')
 const NETSTAT = join(SYS, 'NETSTAT.EXE')
 const POWERSHELL = join(SYS, 'WindowsPowerShell', 'v1.0', 'powershell.exe')
 const EXIT_CODES = { SIGINT: 130, SIGTERM: 143, SIGHUP: 129, SIGBREAK: 149 }
@@ -101,12 +102,16 @@ export function parseArgs(argv, env = process.env) {
   }
   if (!SLOT_MODES.includes(o.slot)) throw new UsageError(`--slot takes ${SLOT_MODES.join(', ')}`)
   if (o.slot !== 'off') {
-    if (o.slotScript !== null) o.slotScript = resolve(o.slotScript)
-    else if (env.HEAVY_SLOT_SCRIPT && !/^(?:[A-Za-z]:[\\/]|\\\\)/.test(env.HEAVY_SLOT_SCRIPT))
-      throw new UsageError(`HEAVY_SLOT_SCRIPT must be a full Windows path, like C:\\path\\to\\heavy-slot.sh, not ${env.HEAVY_SLOT_SCRIPT}`)
-    else o.slotScript = findSlotScript(o.dir, env)
+    let source = ''
+    if (o.slotScript !== null) o.slotScript = resolve(fromBashPath(o.slotScript))
+    else if (env.HEAVY_SLOT_SCRIPT) {
+      source = ' (HEAVY_SLOT_SCRIPT)'
+      o.slotScript = fromBashPath(env.HEAVY_SLOT_SCRIPT)
+      if (!FULL_PATH.test(o.slotScript))
+        throw new UsageError(`HEAVY_SLOT_SCRIPT must be a full path, as Windows (C:\\path\\to\\heavy-slot.sh) or Git Bash (/c/path/to/heavy-slot.sh) writes it, not ${env.HEAVY_SLOT_SCRIPT}`)
+    } else o.slotScript = findSlotScript(o.dir, env)
     if (!o.slotScript) throw new UsageError('no heavy-slot.sh: set HEAVY_SLOT_SCRIPT, pass --slot-script <path>, or --slot=off')
-    if (!statSync(o.slotScript, { throwIfNoEntry: false })?.isFile()) throw new UsageError(`no heavy-slot.sh at ${o.slotScript}${env.HEAVY_SLOT_SCRIPT && o.slotScript === env.HEAVY_SLOT_SCRIPT ? ' (HEAVY_SLOT_SCRIPT)' : ''}`)
+    if (!statSync(o.slotScript, { throwIfNoEntry: false })?.isFile()) throw new UsageError(`no heavy-slot.sh at ${o.slotScript}${source}`)
     o.bash = findBash(env)
     if (!o.bash) throw new UsageError('no Git Bash to run heavy-slot.sh: install Git for Windows, or pass --slot=off')
   }
@@ -133,7 +138,9 @@ export function resolveCommand(command, args, cwd, env = process.env) {
     if (/["%!^&|<>\r\n]/.test(a)) throw new UsageError(`«${a}» has a character cmd.exe would read; run the program itself (for Next: node node_modules/next/dist/bin/next dev -p <port>)`)
     return a === '' || /[\s()]/.test(a) ? `"${a}"` : a
   })
-  return { file: env.ComSpec || join(SYS, 'cmd.exe'), fileArgs: ['/d', '/s', '/c', `"${line.join(' ')}"`], verbatim: true }
+  // cmd.exe by a full path: ComSpec when it is one, else Windows' own.
+  const cmd = FULL_PATH.test(env.ComSpec ?? '') ? env.ComSpec : join(SYS, 'cmd.exe')
+  return { file: cmd, fileArgs: ['/d', '/s', '/c', `"${line.join(' ')}"`], verbatim: true }
 }
 
 /**
@@ -143,7 +150,7 @@ export function resolveCommand(command, args, cwd, env = process.env) {
  * repository (as Claude Code's .claude/worktrees are) is inside that one too.
  */
 export function findSlotScript(dir, env = process.env) {
-  if (env.HEAVY_SLOT_SCRIPT) return env.HEAVY_SLOT_SCRIPT
+  if (env.HEAVY_SLOT_SCRIPT) return fromBashPath(env.HEAVY_SLOT_SCRIPT)
   let top = null
   for (let d = resolve(dir); ; d = dirname(d)) {
     if (existsSync(join(d, '.git'))) top = d
@@ -156,15 +163,24 @@ export function findSlotScript(dir, env = process.env) {
   }
 }
 
-/** Git's bash. Never System32's or WindowsApps' bash.exe, which start WSL. */
+/**
+ * Git's bash, as a full path, so the spawn never searches a folder for it: from PATH's absolute
+ * entries only, never System32's or WindowsApps' bash.exe, which start WSL.
+ */
 export function findBash(env = process.env) {
   const skip = [env.SystemRoot || 'C:\\Windows', 'WindowsApps'].map(s => s.toLowerCase())
   for (const d of (env.PATH || '').split(delimiter)) {
-    if (!d || skip.some(s => d.toLowerCase().includes(s))) continue
+    if (!d || !isAbsolute(d) || skip.some(s => d.toLowerCase().includes(s))) continue
     if (existsSync(join(d, 'bash.exe'))) return join(d, 'bash.exe')
   }
   const git = join(env.ProgramFiles || 'C:\\Program Files', 'Git', 'bin', 'bash.exe')
-  return existsSync(git) ? git : null
+  return FULL_PATH.test(git) && existsSync(git) ? git : null
+}
+
+/** A Git Bash path (/o/dir/file) as Windows writes it (O:\dir\file); any other path as it is. */
+export function fromBashPath(path) {
+  const m = /^\/([A-Za-z])(?:\/(.*))?$/.exec(path)
+  return m ? `${m[1].toUpperCase()}:\\${(m[2] ?? '').replace(/\//g, '\\')}` : path
 }
 
 export function homeDir(env = process.env) {

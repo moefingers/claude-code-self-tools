@@ -13,9 +13,9 @@ Each entry names a plugin and its version, as `version` in `plugins/<name>/.clau
     - Each is stopped deepest first, by id, after its start time is checked again.
     - A start time read after its process ended is dropped.
   - It claims a heavy-slot slot for each start's first compile (`--slot`; `=life` for the whole run, `=off` for none). The slot is released at a 2xx request line, which is what Next 16 prints for a first compile, or an older Next's `Compiled` line. Both are read case-sensitively at the line's start.
-  - It finds heavy-slot.sh in `$HEAVY_SLOT_SCRIPT` (a full path that must exist), else above the outermost repository that holds `--dir`, never inside it. It resolves every command to a full path, a bare name from PATH only, and refuses one it can't find.
+  - It finds heavy-slot.sh in `$HEAVY_SLOT_SCRIPT` (a full path that must exist, Windows or Git Bash style), else above the outermost repository that holds `--dir`, never inside it. It resolves every command to a full path, a bare name from PATH only, and refuses one it can't find; Git's bash and `cmd.exe` are taken by full paths too.
   - It writes a log and an atomic status file under `%LOCALAPPDATA%\claude-self-tools\dev-run\`.
-  - A detached guard stops the server if the runner is killed outright, even before the root's start time was read, and marks the status stopped.
+  - A detached guard stops the server if the runner is killed outright, even before the root's start time was read, and marks the status stopped. It walks a dead root only up to the end the runner saw, or else the pipe's end.
   - Its tests, run by `scripts/test-all.mjs`, use a fake server, a live check on harmless processes, an allow-list on everything a test may stop, and planted faults, each caught.
 
 ## 2026-11-04: self-exit 0.1.2, self-restart 0.1.6, self-clear 0.2.0 and self-check 0.1.0, self-service: the exit pre-check, self-check, and a clear only with a why
