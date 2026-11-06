@@ -2,6 +2,44 @@
 
 Each entry names a plugin and its version, as `version` in `plugins/<name>/.claude-plugin/plugin.json` has it.
 
+## 2026-11-06: self-remote-control 0.3.0, after a login change: Remote Control reconnected, a cut-off turn resumed, and a shared Remote Control lock
+
+- **self-remote-control 0.3.0**:
+  - **After a login change**, each session reconnects its own Remote Control and resumes a turn the change cut off, without anyone typing. It works whether the login changed through `/login` in one session or through a tool that swaps the stored login file, for example when an account hits its usage limit.
+    - **What Claude Code does on its own** (read from its 2.1.319 source):
+      - it re-reads the login file once its modification time changes;
+      - Remote Control stops in a session whose signed-in account changed (*signed-in claude.ai account or organization changed on this machine*), and the remote-control command reads not connected about ten seconds later;
+      - a turn the limit cut off stays where it stopped.
+    - **Seeing the change.** The plugin API has no event for a login change, so the plugin checks every 5 seconds.
+      - It reads only the login file's size and modification time, never its contents.
+      - After that changes, it reads the `oauthAccount` record in Claude Code's config file, the record Remote Control checks. It keeps only a hash of the account and organization ids.
+      - A change is another account at two looks in a row. A token refresh or a sign-out isn't one.
+      - A record it can't use (a file over the 4 MiB read limit, no account id) is said once, in a toast that holds nothing from the file.
+    - **The reconnect** happens when Remote Control was connected when the new account was first seen (read before `/login` in the session that runs it), or the `remoteControl` setting for all sessions is on.
+      - `/remote-control` runs under the session's title, only under the shared lock (below), and only on a fresh reading of not connected.
+      - The old link can read connected until it stops, so the plugin waits up to a minute for a not-connected reading, and runs nothing if one never comes.
+      - At most 3 reconnects in 10 minutes per session, with one toast when the cap holds.
+      - In the session running `/login`, it waits until the dialog has closed.
+      - Remote Control is never read on an idle session: only when another account is first seen, and while a change is handled, at most every 15 seconds.
+    - **The resume** sends exactly *There was a small interruption. Please resume from your last turn normally.* It goes once per change, when all of these hold:
+      - the main conversation's last turn ended within 6 hours on an error a new login can clear (`rate_limit`, `authentication_failed`, `billing_error`, `oauth_org_not_allowed`, `account_on_hold`, `overloaded`, `server_error`), with no turn since;
+      - the reconnect has settled;
+      - the session's own delay has passed: 0 to 60 s, drawn from its id, so one switch doesn't start every session's turn in the same second.
+      - A turn running at the change is waited for. A session at a finished break, or one whose error was another kind (`unknown` included), gets nothing.
+      - **The loop-breaker:** a resume whose turn ends on an error at once (no usage, or in under 30 s) isn't followed by another until a person types, at the terminal or from the app. A prompt typed during that turn counts.
+      - A rewind past the cut-off turn isn't seen: the API gives no cheap mark of the newest message, so the 6-hour limit bounds it.
+    - **One toast per change**, for example *Login changed; Remote Control reconnected as "auth-refactor"; resumed the interrupted turn.*
+    - **New settings** `reconnectOnLoginChange` and `resumeAfterLoginChange`, both on by default. With both off, nothing is watched.
+  - **The Remote Control lock**, `%LOCALAPPDATA%\claude-self-tools\rc\<sessionId>.lock`, holds `{"v":1,"by":"<plugin>","at":<ms>}`. Every plugin that runs `/remote-control` takes it: this plugin's queued `connect`, its reconnect, and the coordinator plugin's restart after a switch. So two plugins can't both run the command and leave its panel holding the session.
+    - It is taken and released only by two canonical Windows PowerShell scripts, run byte for byte. The path and text go in `RC_LOCK_PATH` and `RC_LOCK_TEXT`.
+    - **TAKE** (SHA-256 `d9adaec581d817ca46f10fbd1e6fbb6ba845ea26dd2ab01fc5ab04cbf7999dd6`) creates the file exclusively. A stale lock (over 90 s old, or over 90 s in the future) is overwritten in place under a handle no one else can open; TAKE never deletes the lock. It also sweeps other sessions' lock files untouched for a day.
+    - **RELEASE** (SHA-256 `caeb549b91af66bebe634710889da5600d263c43b9bc77c36e61cc8f83e4f9c2`) deletes only the taker's own text, under the handle it compared it through.
+    - The lock is held from just before the fresh not-connected reading until the session reads connected, or 60 s.
+    - Where it can't be placed (no `%LOCALAPPDATA%` folder, no session id, no `%SystemRoot%`), a lock in the session's state orders this plugin's own runs instead.
+    - `scripts/rc-lock.test.mjs` pins both hashes and races real PowerShell takers on Windows: two and four takers on a stale lock, a widened judging window, and a late release against a takeover. Exactly one taker wins each time, and no release deletes another's lock.
+  - The Remote Control reading and running moved to `hooks/connection.ts`, with no change in behaviour.
+  - A minor version: a session now acts after a login change on its own, and a queued `connect` now refuses while another plugin holds the lock.
+
 ## 2026-11-04: self-exit 0.1.2, self-restart 0.1.6, self-clear 0.2.0 and self-check 0.1.0, self-service: the exit pre-check, self-check, and a clear only with a why
 
 - **self-exit 0.1.2**:
