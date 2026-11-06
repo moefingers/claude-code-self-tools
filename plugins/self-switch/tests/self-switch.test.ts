@@ -2,7 +2,7 @@
 // from fixtures; /resume and /exit are recorded, never run. Nothing here starts a process.
 import { describe, expect, mock, test } from 'claude-code/testing'
 import type { AgentStatus, On } from 'claude-code'
-import { claimPath, gatePath, launcherScript, quoted, SLOT_NOT_RECOGNISED, SLOT_SCRIPT_SHA256, slotRecordPath, STDIN_BOOTSTRAP } from '../hooks/machine'
+import { claimPath, gatePath, launcherScript, panePath, paneScript, paneTicketPath, quoted, SLOT_NOT_RECOGNISED, SLOT_SCRIPT_SHA256, slotRecordPath, STDIN_BOOTSTRAP } from '../hooks/machine'
 import { decode, ELSEWHERE, elsewhere, entry, ft, inSlot, LAUNCH, machine, NOW, OTHER, PERMISSION_FLAGS, PROJECT, type RawProbe, REPO, T, under, W, X } from './fixtures'
 
 const TOOL = 'mcp__self-switch__switch_after_turn'
@@ -20,10 +20,14 @@ const DROPPED_THERE = 'Wake-ups the conversation it came from had pending were d
 /** A claude.exe that no registry accounts for yet, as one starting up reads: the verdict is unknown. */
 const starting = (p: RawProbe): void => void p.procs.push({ pid: 600, ppid: 10, created: ft(60), name: 'claude.exe' })
 
-type Run = { argv: readonly string[]; init?: Record<string, unknown>; script?: string; kind: 'probe' | 'launcher' | 'release' | 'check' | 'git' | 'other' }
+type Run = { argv: readonly string[]; init?: Record<string, unknown>; script?: string; kind: 'probe' | 'launcher' | 'pane' | 'release' | 'check' | 'git' | 'other' }
+
+/** The claude wrapper's token for this tab, and its pane file: PowerShell 20, the parent of claude.exe 100. */
+const TOKEN = '00000000-0000-4000-a000-000000000001'
+const PANE = JSON.stringify({ v: 2, pid: 20, started: ft(1) })
 
 /** The test's own `$`, through which the engine fake dispatches what the engine would. */
-type TestDollar = Parameters<Parameters<typeof test>[1]>[0]
+type TestDollar = Parameters<Extract<Parameters<typeof test>[1], (...args: never[]) => unknown>>[0]
 
 type Options = {
   env?: Record<string, string>
@@ -51,6 +55,10 @@ type Options = {
   cwd?: string
   /** What the launcher does. */
   launcher?: 'opens' | 'fails'
+  /** The claude wrapper's pane file for TOKEN, when there is one (the session carries CLAUDE_PANE_TOKEN only when `env` says so). */
+  pane?: string
+  /** What the pane script does: writes the ticket, fails, or writes it while a subagent starts. */
+  paneScript?: 'writes' | 'fails' | 'agent'
   /** What the in-place claim check reads: the lock still this switch's, another's, or none. */
   claim?: 'ours' | 'not-ours' | 'absent'
   /** What the in-place last look's re-check finds holding the conversation now, if anything. */
@@ -84,6 +92,8 @@ function engine(
     gate,
     git = {},
     launcher = 'opens',
+    pane,
+    paneScript: paneAnswer = 'writes',
     claim = 'ours',
     released = 'released',
     resume = 'takes',
@@ -158,7 +168,9 @@ function engine(
   on('turn.start', (_, e) => ({ turnId: e.turnId }))
   on('turn.complete', () => ({ text: 'done' }))
   on('fs.exists', (_, e) => ({ value: e.path === GATE ? world.gate !== undefined : false }))
-  on('fs.read', (_, e) => (e.path === GATE && world.gate !== undefined ? { value: world.gate } : { deny: `ENOENT: ${e.path}` }))
+  on('fs.read', (_, e) =>
+    e.path === GATE && world.gate !== undefined ? { value: world.gate } : e.path === panePath(STATE, TOKEN) && pane !== undefined ? { value: pane } : { deny: `ENOENT: ${e.path}` },
+  )
   on('fs.write', (_, e) => {
     writes.push({ path: e.path, text: e.text })
     return { value: undefined }
@@ -192,7 +204,7 @@ function engine(
     }
     // The script comes on standard input; the command line is the fixed bootstrap.
     const script = typeof e.init?.stdin === 'string' ? e.init.stdin : ''
-    const kind = script.includes('$take = ') ? 'probe' : script.includes('$inner = @(') ? 'launcher' : script.includes("$answer = 'busy'") ? 'release' : script.includes("{ 'ours' }") ? 'check' : 'other'
+    const kind = script.includes('$take = ') ? 'probe' : script.includes('$inner = @(') ? 'launcher' : script.includes('"pane $token"') ? 'pane' : script.includes("$answer = 'busy'") ? 'release' : script.includes("{ 'ours' }") ? 'check' : 'other'
     runs.push({ argv, init, script, kind })
     if (kind === 'probe') {
       if (probeFails !== undefined) return ok(probeFails, 1)
@@ -200,6 +212,12 @@ function engine(
       return ok(`${JSON.stringify(answer)}\r\n`)
     }
     if (kind === 'launcher') return launcher === 'opens' ? ok(`launched 100\r\nclaim ${LAUNCH}\r\n`) : ok('self-switch: no claude on PATH\r\n', 4)
+    if (kind === 'pane') {
+      if (paneAnswer === 'fails') return ok('', 1)
+      // A subagent that starts while the ticket is written stops the switch right before its exit.
+      if (paneAnswer === 'agent') world.agents = [...world.agents, { description: 'Lint', status: 'running' }]
+      return ok(`pane ${TOKEN}\r\n`)
+    }
     if (kind === 'release') return ok(`${released}\r\n`)
     if (kind === 'check') return ok(checkLive === undefined ? `${claim}\r\n` : `live ${checkLive}\r\n`)
     return ok('', 1)
@@ -235,7 +253,7 @@ const HOSTILE = "C:\\x\\claude.exe'; Remove-Item -Recurse C:\\ #"
 const ESCAPED = HOSTILE.split('\\').join('\\\\')
 
 /** Queues the switch, ends the turn, lets the switch run. */
-async function switchNow($: Parameters<Parameters<typeof test>[1]>[0], clock: { advance: (ms: number) => Promise<void> }, input: Record<string, unknown> = call) {
+async function switchNow($: TestDollar, clock: { advance: (ms: number) => Promise<void> }, input: Record<string, unknown> = call) {
   const queued = await $.tool.call({ ...call, ...input })
   expect(queued.deny).toBeUndefined()
   await $.turn.complete(answered)
@@ -472,6 +490,137 @@ describe('transports', () => {
     expect(kinds()).toEqual(['probe', 'launcher', 'release'])
     expect(tickets()).toEqual({})
     expect(rows(session)).toMatch(/didn't happen after all: no window opened \(the launcher exited 4: self-switch: no claude on PATH/)
+  })
+})
+
+describe("the claude wrapper's tab", () => {
+  const WRAPPED = { ...WINDOWS, CLAUDE_PANE_TOKEN: TOKEN }
+  const THERE = { [`alive:${T}`]: { at: NOW - HOUR, folder: ELSEWHERE, project: 'C--work-other' } }
+
+  test("across projects, started through the claude wrapper (its PowerShell is claude.exe's parent): a ticket for this tab, no window, then /exit; the arrival as ever", async ($, on) => {
+    const { runs, commands, toasts, tickets, kinds, world, session, prompts, clock } = engine(on, { env: WRAPPED, pane: PANE, probe: machine(elsewhere), store: THERE })
+    await $.session.start(start)
+    await switchNow($, clock, { resume: 'Go on.' })
+    expect(kinds()).toEqual(['probe', 'pane'])
+    const written = runs.find(r => r.kind === 'pane')
+    // The ticket: this tab's token, the conversation switched to, the claim the probe took (which the
+    // wrapper finds the lock still names), its own folder, now. No claim of the script's own.
+    expect(written?.script).toBe(paneScript({ stateDir: STATE, ticket: { token: TOKEN, resume: T, by: LAUNCH, dir: ELSEWHERE, at: NOW + 500 } }))
+    expect(written?.script).not.toContain('Set-Claim')
+    expect(written?.argv.slice(0, 4)).toEqual([POWERSHELL, '-NoProfile', '-NonInteractive', '-EncodedCommand'])
+    expect(written?.init?.cwd).toBe(ELSEWHERE)
+    expect(commands).toEqual([{ command: 'exit' }])
+    expect(tickets()[T]).toMatchObject({ transport: 'pane', by: LAUNCH })
+    expect(toasts).toContain(`Switching to ${T}: this session exits, and this tab resumes it here once this process has gone.`)
+    expect(texts(session).at(-1)).not.toContain('in a new window')
+
+    // The tab's resumed process: the arrival, the claim released.
+    world.id = T
+    await $.classic.SessionStart({ source: 'resume', session_id: T })
+    await clock.advance(1000)
+    expect(texts(session).at(-1)?.startsWith(`self-switch: a message from session \u00ab${W.slice(0, 8)}\u00bb.`)).toBe(true)
+    expect(prompts).toHaveLength(1)
+    expect(kinds()).toEqual(['probe', 'pane', 'release'])
+  })
+
+  test('in place still comes first, and a verified slot before the tab', async ($, on) => {
+    const inPlace = engine(on, { env: WRAPPED, pane: PANE })
+    await $.session.start(start)
+    await switchNow($, inPlace.clock)
+    expect(inPlace.commands).toEqual([{ command: 'resume', args: T }])
+    expect(inPlace.kinds()).toEqual(['probe', 'check'])
+  })
+
+  test('a verified slot is used before the tab', async ($, on) => {
+    const { kinds, writes, commands, clock } = engine(on, { env: WRAPPED, pane: PANE, probe: machine(p => (elsewhere(p), inSlot(p))), store: THERE })
+    await $.session.start(start)
+    await switchNow($, clock)
+    expect(kinds()).toEqual(['probe'])
+    expect(writes[0]?.path).toBe(slotRecordPath(STATE, `20-${ft(1)}`))
+    expect(commands).toEqual([{ command: 'exit' }])
+  })
+
+  for (const [name, options, why] of [
+    ['a pane file naming another PowerShell', { pane: JSON.stringify({ v: 2, pid: 21, started: ft(1) }) }, "the tab's claude wrapper (PowerShell 21) is not the parent of claude.exe 100; powershell.exe 20 is"],
+    ['no pane file', { pane: undefined }, `this tab's pane file (${STATE}\\panes\\${TOKEN}.json) can't be read`],
+    ['a pane file whose process started at another time', { pane: JSON.stringify({ v: 2, pid: 20, started: ft(5) }) }, "the tab's pane file names process 20, but that process started at another time (another process took its id)"],
+    [
+      'a version 1 pane file (an older wrapper, without the claim check and the last look), though its PowerShell is the parent',
+      { pane: JSON.stringify({ v: 1, pid: 20, started: ft(1) }) },
+      "this tab's claude wrapper is an older one (its pane file is version 1), which checks neither the claim nor whether the conversation is open: copy the current claude-wrapper.ps1 into place",
+    ],
+  ] as const) {
+    test(`a token with ${name}: the window, as before, and the log says why`, async ($, on) => {
+      const { kinds, logs, commands, tickets, clock } = engine(on, { env: WRAPPED, probe: machine(elsewhere), store: THERE, ...options })
+      await $.session.start(start)
+      await switchNow($, clock)
+      expect(kinds()).toEqual(['probe', 'launcher'])
+      expect(commands).toEqual([{ command: 'exit' }])
+      expect(tickets()[T]).toMatchObject({ transport: 'window' })
+      expect(logs).toContain(`this tab's claude wrapper isn't used: ${why}. A new window resumes ${T}.`)
+    })
+  }
+
+  test('no token: the window, and nothing said of a tab', async ($, on) => {
+    const { kinds, logs, clock } = engine(on, { pane: PANE, probe: machine(elsewhere), store: THERE })
+    await $.session.start(start)
+    await switchNow($, clock)
+    expect(kinds()).toEqual(['probe', 'launcher'])
+    expect(logs.some(l => l.includes('claude wrapper'))).toBe(false)
+  })
+
+  test("the target's liveness is unchanged: one alive by its heartbeat refuses, no ticket, the claim released", async ($, on) => {
+    const { kinds, commands, writes, session, clock } = engine(on, {
+      env: WRAPPED,
+      pane: PANE,
+      probe: machine(elsewhere),
+      store: { [`alive:${T}`]: { at: NOW - 60_000, folder: ELSEWHERE, project: 'C--work-other' } },
+    })
+    await $.session.start(start)
+    await switchNow($, clock)
+    expect(kinds()).toEqual(['probe', 'release'])
+    expect(commands).toEqual([])
+    expect(writes).toEqual([])
+    expect(rows(session)).toMatch(/is open elsewhere \(L5: its heartbeat is 1 min old\)/)
+  })
+
+  test('the safe point is unchanged: a background job under the session refuses, no ticket, the claim released', async ($, on) => {
+    const { kinds, commands, clock } = engine(on, {
+      env: WRAPPED,
+      pane: PANE,
+      probe: machine(p => (elsewhere(p), under(p, { pid: 505, created: ft(30), name: 'bash.exe', cls: 'shell' }))),
+      store: THERE,
+    })
+    await $.session.start(start)
+    await switchNow($, clock)
+    expect(kinds()).toEqual(['probe', 'release'])
+    expect(commands).toEqual([])
+  })
+
+  test('a ticket that is not written: nothing exits, the ticket is withdrawn and the claim released', async ($, on) => {
+    const { kinds, commands, writes, tickets, session, clock } = engine(on, { env: WRAPPED, pane: PANE, probe: machine(elsewhere), store: THERE, paneScript: 'fails' })
+    await $.session.start(start)
+    await switchNow($, clock)
+    expect(kinds()).toEqual(['probe', 'pane', 'release'])
+    expect(commands).toEqual([])
+    expect(writes).toEqual([{ path: paneTicketPath(STATE, TOKEN), text: '{"v":1,"cancelled":true}' }])
+    expect(tickets()).toEqual({})
+    expect(rows(session)).toContain("didn't happen after all: this tab's ticket wasn't written (the script exited 1: failed)")
+  })
+
+  test('a subagent started while the ticket was written: nothing exits, the ticket is withdrawn (the wrapper says so, and resumes nothing)', async ($, on) => {
+    const { kinds, commands, writes, clock } = engine(on, { env: WRAPPED, pane: PANE, probe: machine(elsewhere), store: THERE, paneScript: 'agent' })
+    await $.session.start(start)
+    await switchNow($, clock)
+    expect(kinds()).toEqual(['probe', 'pane', 'release'])
+    expect(commands).toEqual([])
+    expect(writes).toEqual([{ path: paneTicketPath(STATE, TOKEN), text: '{"v":1,"cancelled":true}' }])
+  })
+
+  test("the tool's description names the tab, through the claude wrapper", async ($, on) => {
+    const { described } = engine(on)
+    await $.session.start(start)
+    expect(described[0]).toContain("else in this pane's slot (a Windows Terminal pane running self-switch's claude-slot.ps1), else in this same tab when Claude Code was started through the claude wrapper")
   })
 })
 

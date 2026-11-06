@@ -48,6 +48,7 @@ $recordPath = Join-Path $state ('slots\' + $slotId + '.next.json')
 # Whether a running Claude Code holds conversation $id now: $null when none does, else which.
 function Get-Live($id, $configDirs) {
   $live = $null
+  function Test-Exited($p) { $h = $null; try { $h = [Diagnostics.Process]::GetProcessById([int]$p.ProcessId); return $h.HasExited } catch { return ($_.Exception -is [ArgumentException] -or $_.Exception.InnerException -is [ArgumentException]) } finally { if ($null -ne $h) { $h.Dispose() } } }
   $procs = @{}
   foreach ($p in (Get-CimInstance -ClassName Win32_Process -Property ProcessId, Name, CreationDate, CommandLine)) { $procs[[int]$p.ProcessId] = $p }
   $snapshotFt = [DateTime]::UtcNow.ToFileTimeUtc()
@@ -59,6 +60,7 @@ function Get-Live($id, $configDirs) {
       $p = $null
       if ($f.BaseName -match "^\d{1,10}\z") { $p = $procs[[int]$f.BaseName] }
       if ($null -eq $p -or $p.Name -ne "claude.exe") { continue }
+      if (Test-Exited $p) { continue }
       $e = $null
       for ($try = 1; $try -le 3 -and $null -eq $e; $try++) {
         try { $e = Get-Content -LiteralPath $f.FullName -Raw -Encoding UTF8 | ConvertFrom-Json } catch { $e = $null }
@@ -80,7 +82,7 @@ function Get-Live($id, $configDirs) {
       if ($near -and $pidOk -and ($snapshotFt - [long]$p.CreationDate.ToFileTimeUtc()) -gt 600000000 -and $e.sessionId -match "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\z") { $elsewhere[[int]$p.ProcessId] = $true }
     }
   }
-  if ($null -eq $live) { foreach ($p in $procs.Values) { if ($null -eq $live -and $p.ProcessId -ne $PID -and -not $elsewhere.ContainsKey([int]$p.ProcessId) -and "$($p.CommandLine)" -match "(^|[\s\x22])(--resume|--session-id|-r)(\s+|=)[\x22\x27]?$id") { $live = "it is open elsewhere: process $($p.ProcessId) names it on its command line (L2)" } } }
+  if ($null -eq $live) { foreach ($p in $procs.Values) { if ($null -eq $live -and $p.ProcessId -ne $PID -and -not $elsewhere.ContainsKey([int]$p.ProcessId) -and "$($p.CommandLine)" -match "(^|[\s\x22])(--resume|--session-id|-r)(\s+|=)[\x22\x27]?$id" -and -not (Test-Exited $p)) { $live = "it is open elsewhere: process $($p.ProcessId) names it on its command line (L2)" } } }
   return $live
 }
 
