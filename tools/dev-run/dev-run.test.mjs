@@ -129,8 +129,9 @@ function guardedExec(mod, owned, rec) {
       if (parent?.created != null && cur.created >= parent.created) {
         const holder = table.get(cur.ppid)
         if (holder?.created === parent.created) return true
-        const bound = holder ? holder.created : parent.endedAt
-        return bound != null && cur.created < bound
+        // Before the earlier of a later owner's start and the owned process's end, as in treeOf.
+        const bounds = [holder?.created, parent.endedAt].filter(b => b != null)
+        return bounds.length > 0 && bounds.every(b => cur.created < b)
       }
       const up = table.get(cur.ppid)
       if (!up || up.created > cur.created) return false
@@ -538,12 +539,12 @@ test('a runner killed outright leaves no server, even behind a .cmd shim: its gu
   const shim = join(local, 'fake-dev.cmd')
   writeFileSync(shim, `@"${process.execPath}" "${FAKE}" %*\r\n`)
   const floors = ['--floor-gb', '0', '--compile-floor-gb', '0', '--stop-gb', '0']
-  // The runner and its guard run apart from this test, with their own exec: DEV_RUN_STOP_ONLY confines
-  // both to the processes this file lists, the server and its child, by id and start time.
+  // The runner and its guard run apart from this test, with their own exec: --stop-only, which the
+  // runner hands its guard, confines both to the processes this file lists, by id and start time.
   const only = join(local, 'stop-only.txt')
   writeFileSync(only, '')
-  const cli = spawn(process.execPath, [DEV_RUN, '--name', 'cli', '--dir', FIXTURES, '--port', String(port), '--slot=off', ...floors, '--', shim, String(port), '--grandchild'],
-    { env: { ...process.env, LOCALAPPDATA: local, DEV_RUN_STOP_ONLY: only }, stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true })
+  const cli = spawn(process.execPath, [DEV_RUN, '--name', 'cli', '--dir', FIXTURES, '--port', String(port), '--slot=off', ...floors, '--stop-only', only, '--', shim, String(port), '--grandchild'],
+    { env: { ...process.env, LOCALAPPDATA: local }, stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true })
   let out = ''
   cli.stdout.on('data', d => (out += d))
   cli.stderr.on('data', d => (out += d))
@@ -756,6 +757,67 @@ test('DR-4: a queued claim that ends while its start time is read: nothing is st
 test('DR-5: from a dead root, nothing started after its end, even by a later owner of its id that has gone too', { skip }, () => deadRootTableScenario(real))
 test('DR-7: a runner killed before it read the root start time: its guard stops the tree, and the status says stopped', { skip }, () => guardScenario(real))
 
+// A guard run on a made-up process table: its exec answers the snapshot from `rows` and records each
+// stop script, answering "stopped" without running anything. No real process is touched.
+async function fakeGuard(mod, lines, rows, { now, stopOnly = null } = {}) {
+  const dir = mkdtempSync(join(TMP, 'fake-guard-'))
+  const statusPath = join(dir, 's.json')
+  writeFileSync(statusPath, JSON.stringify({ v: 1, state: 'running' }))
+  const stops = []
+  const run = async (file, args) => {
+    const script = String(args.at(-1))
+    if (script === real.SNAPSHOT) return { code: 0, stdout: rows.join('\r\n'), stderr: '' }
+    if (!script.startsWith('$targets = @(')) return { code: 1, stdout: '', stderr: 'refused by the test' }
+    const pids = [...script.matchAll(/'(\d+):/g)].map(m => Number(m[1]))
+    stops.push(pids)
+    return { code: 0, stdout: pids.map(p => `stopped ${p}`).join('\r\n'), stderr: '' }
+  }
+  await mod.guard(lines, { runner: 1, statusPath, logPath: join(dir, 's.log'), stopOnly, run, now })
+  return { stops, status: JSON.parse(readFileSync(statusPath, 'utf8')) }
+}
+
+// DR-5b: the root died before the runner. The runner saw it end at T+2000 (in FILETIME units) and
+// lived on for half a minute; meanwhile a newcomer took the root's id, started Z and its child, and
+// ended. The guard's bound is the root's end, not the pipe's.
+const T = 133_000_000_000_000_000n
+async function rootDiedFirstScenario(mod) {
+  const rows = [`200 100 ${T + 1000n}`, `300 100 ${T + 5000n}`, `400 300 ${T + 5100n}`, `600 500 ${T + 7000n}`]
+  const later = () => T + 300_000_000n
+  const first = await fakeGuard(mod, [`spawned 100 ${T + 900n}`, `child 100 ${T + 1000n}`, `ended 100 ${T + 2000n}`], rows, { now: later })
+  assert.deepEqual(first.stops, [[200]], 'only what the root started before it ended')
+  // An earlier root's end, arriving after a new spawn, is not the new root's: 500's child is stopped.
+  const second = await fakeGuard(mod, [`spawned 100 ${T + 900n}`, `child 100 ${T + 1000n}`, `spawned 500 ${T + 6000n}`, `ended 100 ${T + 2000n}`], rows, { now: later })
+  assert.deepEqual(second.stops, [[600]], 'an end reported for another root is ignored')
+}
+test('DR-5b: a root that died before the runner: the guard walks only to the end the runner saw', { skip }, () => rootDiedFirstScenario(real))
+
+test('--stop-only: a missing, unreadable, malformed or non-regular file refuses every stop, and a refusal is reported as one', { skip }, async () => {
+  const dir = mkdtempSync(join(TMP, 'stop-only-'))
+  const rows = [`200 100 ${T + 1000n}`]
+  const scripts = []
+  const run = async (file, args) => {
+    const script = String(args.at(-1))
+    if (script === real.SNAPSHOT) return { code: 0, stdout: rows.join('\r\n'), stderr: '' }
+    scripts.push(script)
+    return { code: 0, stdout: 'stopped 200', stderr: '' }
+  }
+  const garbage = join(dir, 'garbage.txt')
+  writeFileSync(garbage, `not a list\n200\n200 ${T + 1000n} extra\n`)
+  const listed = join(dir, 'listed.txt')
+  writeFileSync(listed, `﻿200 ${T + 1000n}\r\n`)
+  for (const stopOnly of [join(dir, 'missing.txt'), dir, garbage, 'NUL']) {
+    const r = await real.killTree(100, T + 1000n, { stopOnly, run })
+    assert.ok(r.refused && r.results.length === 0, stopOnly)
+  }
+  assert.equal(scripts.length, 0, 'no stop script ran')
+  assert.deepEqual(await real.killTree(100, T + 1000n, { stopOnly: listed, run }), { targets: [{ pid: 200, created: T + 1000n, depth: 1 }], results: ['stopped 200'] })
+  const { stops, status } = await fakeGuard(real, [`spawned 100 ${T + 900n}`, `child 100 ${T + 1000n}`], rows, { now: () => T + 300_000_000n, stopOnly: join(dir, 'missing.txt') })
+  assert.deepEqual(stops, [])
+  assert.match(status.lastReason, /^runner 1 ended; its guard was refused the stop \(--stop-only\): not all of pid 200 are listed/)
+  // Only as a flag: nothing in the environment confines (or turns off) a stop.
+  assert.ok(!readFileSync(DEV_RUN, 'utf8').includes('process.env.DEV_RUN'), 'no environment switch')
+})
+
 // Planted faults: a copy of dev-run.mjs with one line changed. Each must make its scenario fail.
 let mutants = 0
 async function mutant(find, replace) {
@@ -777,6 +839,7 @@ const FAULTS = [
   ['DR-4: a start time read after the root ended is kept', 'if (child.exitCode !== null || child.signalCode !== null) this.rootCreated = null', '', earlyExitScenario, /no process table read/],
   ['DR-4: a queued claim keeps a start time read after it ended', 'if (child.exitCode !== null || child.signalCode !== null) created = null', '', earlyDropScenario, /no process table read/],
   ['DR-5: a dead root takes children started after its end', 'alive ? null : endedAt]', 'null]', deadRootTableScenario, /nothing started after the root ended/],
+  ["DR-5b: the guard ignores the root's end the runner saw", 'if (ended !== null && ended < endedAt) endedAt = ended', '', rootDiedFirstScenario, /only what the root started before it ended/],
   ['DR-6: the slot-script walk stops at the innermost repository', "if (existsSync(join(d, '.git'))) top = d", "if (top === null && existsSync(join(d, '.git'))) top = d", nestedRepoScenario, /not the main checkout's copy/],
   ["DR-7: the guard ignores a root whose start time it wasn't told", 'const from = child ?? spawned', 'const from = child', guardScenario, /deep-equal|the guard to stop the server/],
   ['the heavy slot is never released', 'if (!claim) return', 'return', slotCompileScenario, /ended \(test deadline\) before the slot to be released/],

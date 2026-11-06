@@ -59,10 +59,12 @@ export const USAGE = `usage: node dev-run.mjs --name <label> --dir <folder> --po
 export class UsageError extends Error {}
 
 const NUMBERS = { port: 'port', 'restart-min': 'restartMin', 'idle-min': 'idleMin', 'floor-gb': 'floorGb', 'compile-floor-gb': 'compileFloorGb', 'stop-gb': 'stopGb' }
-const STRINGS = { name: 'name', dir: 'dir', hit: 'hit', compiled: 'compiled', 'slot-script': 'slotScript' }
+// --stop-only <file> is for tests, and so not in USAGE: it confines every stop, the runner's and its
+// guard's, to the processes the file lists (see readStopOnly). It can only narrow what is stopped.
+const STRINGS = { name: 'name', dir: 'dir', hit: 'hit', compiled: 'compiled', 'slot-script': 'slotScript', 'stop-only': 'stopOnly' }
 
 export function parseArgs(argv, env = process.env) {
-  const o = { restartMin: 10, idleMin: 20, floorGb: 6, compileFloorGb: 9, stopGb: 4, hit: HIT_RE, compiled: COMPILED_RE, slot: 'compile', slotScript: null }
+  const o = { restartMin: 10, idleMin: 20, floorGb: 6, compileFloorGb: 9, stopGb: 4, hit: HIT_RE, compiled: COMPILED_RE, slot: 'compile', slotScript: null, stopOnly: null }
   const sep = argv.indexOf('--')
   if (sep < 0 || sep === argv.length - 1) throw new UsageError('give the server command after --')
   ;[o.command, ...o.args] = argv.slice(sep + 1)
@@ -84,6 +86,7 @@ export function parseArgs(argv, env = process.env) {
   if (!NAME_RE.test(o.name ?? '')) throw new UsageError(`--name must match ${NAME_RE.source}`)
   if (!o.dir) throw new UsageError('--dir is required')
   o.dir = resolve(o.dir)
+  if (o.stopOnly !== null) o.stopOnly = resolve(o.stopOnly)
   if (!statSync(o.dir, { throwIfNoEntry: false })?.isDirectory()) throw new UsageError(`--dir ${o.dir} is not a folder`)
   if (!Number.isInteger(o.port) || o.port < 1 || o.port > 65535) throw new UsageError('--port must be a whole number from 1 to 65535')
   if (!(o.restartMin > 0 && o.restartMin <= MAX_RESTART_MIN)) throw new UsageError(`--restart-min must be over 0 and at most ${MAX_RESTART_MIN}`)
@@ -255,21 +258,33 @@ export function stopScript(targets) {
   ].join('\n')
 }
 
-/** Stops what `root` started, and theirs (and the root, with includeRoot), deepest first. */
-export async function killTree(root, rootCreated, { includeRoot = false, endedAt = null, run = exec } = {}) {
+/**
+ * The processes a test lets dev-run stop (`--stop-only <file>`), one "<pid> <start time>" per line.
+ * Read only from a regular file, never a device or a pipe, which could block; a missing, unreadable
+ * or malformed file, or anything that isn't a regular file, lists nothing, so every stop is refused.
+ */
+function readStopOnly(path) {
+  try {
+    if (!statSync(path).isFile()) return new Set()
+    return new Set(readFileSync(path, 'utf8').replace(/^﻿/, '').split(/\r?\n/).map(l => l.trim()).filter(l => /^\d+ \d+$/.test(l)))
+  } catch {
+    return new Set()
+  }
+}
+
+/**
+ * Stops what `root` started, and theirs (and the root, with includeRoot), deepest first. With
+ * `stopOnly`, a test's list, nothing runs unless every target is on it ({ refused } says why).
+ */
+export async function killTree(root, rootCreated, { includeRoot = false, endedAt = null, stopOnly = null, run = exec } = {}) {
   if (!Number.isInteger(root) || root <= 0 || root === process.pid || typeof rootCreated !== 'bigint') throw new Error(`refusing to walk from pid ${root}`)
   const table = await snapshot(run)
   if (!table) return { targets: null, results: [] }
   const targets = treeOf(table, root, rootCreated, { includeRoot, endedAt }).filter(t => t.pid !== process.pid)
   if (!targets.length) return { targets, results: [] }
-  // A test confines dev-run, and the guard it starts, to the processes it lists in this file, one
-  // "<pid> <start time>" per line. It can only narrow what is stopped.
-  if (process.env.DEV_RUN_STOP_ONLY) {
-    let listed = new Set()
-    try {
-      listed = new Set(readFileSync(process.env.DEV_RUN_STOP_ONLY, 'utf8').split(/\r?\n/).map(l => l.trim()))
-    } catch {}
-    if (!targets.every(t => listed.has(`${t.pid} ${t.created}`))) return { targets, results: ['refused: not all in DEV_RUN_STOP_ONLY'] }
+  if (stopOnly !== null) {
+    const listed = readStopOnly(stopOnly)
+    if (!targets.every(t => listed.has(`${t.pid} ${t.created}`))) return { targets, results: [], refused: `not all of pid ${targets.map(t => t.pid).join(', ')} are listed in ${stopOnly}` }
   }
   const { stdout } = await powershell(stopScript(targets), run)
   return { targets, results: stdout.split(/\r?\n/).map(l => l.trim()).filter(Boolean) }
@@ -295,7 +310,7 @@ export async function portListeners(port, run = exec) {
  * own exit trap gives the slot back. If this process dies, Node's job ends bash with it, and
  * heavy-slot reclaims a slot whose holder is gone the next time a job looks for one.
  */
-export function claimSlot({ script, cwd, bash, env = process.env, note = () => {}, run = exec }) {
+export function claimSlot({ script, cwd, bash, env = process.env, note = () => {}, stopOnly = null, run = exec }) {
   const child = spawn(bash, [script.replace(/\\/g, '/'), 'read', '-r', 'DEV_RUN_HOLD'], { cwd, env, stdio: ['pipe', 'ignore', 'pipe'], windowsHide: true })
   child.stdin.on('error', () => {})
   let held = false
@@ -328,7 +343,7 @@ export function claimSlot({ script, cwd, bash, env = process.env, note = () => {
       if (!held && child.pid) {
         child.kill()
         await exited
-        if (created !== null) await killTree(child.pid, created, { endedAt, run })
+        if (created !== null) await killTree(child.pid, created, { endedAt, stopOnly, run })
       }
       await exited
     },
@@ -498,7 +513,7 @@ export class DevRun {
     const { o } = this
     this.log(`claiming a heavy slot ${o.slot === 'life' ? 'for the run' : 'for the first compile'}`)
     this.write('waiting', 'waiting for a heavy slot')
-    const claim = this.d.claimSlot({ script: o.slotScript, cwd: o.dir, bash: o.bash, note: line => this.log(line) })
+    const claim = this.d.claimSlot({ script: o.slotScript, cwd: o.dir, bash: o.bash, note: line => this.log(line), stopOnly: o.stopOnly })
     const got = await Promise.race([claim.acquired, this.stopSignal.then(() => 'stop')])
     if (got === 'stop' || this.stopReq) {
       await claim.drop()
@@ -554,7 +569,11 @@ export class DevRun {
     })
     // When the root ended: nothing the walk takes from a dead root can be younger.
     let endedAt = null
-    child.once('exit', () => (endedAt = nowFiletime()))
+    // The guard is told too, so that its bound is exact when the root died before the runner.
+    child.once('exit', () => {
+      endedAt = nowFiletime()
+      if (child.pid) this.guardSay(`ended ${child.pid} ${endedAt}`)
+    })
     this.rootEnded = () => endedAt
     this.untail = this.tail(child, from)
     this.child = child
@@ -667,8 +686,9 @@ export class DevRun {
   async stopStarted(pid) {
     const created = this.rootCreated
     if (created === null) return this.log(`error: no start time for pid ${pid}, so what it started is left to the port wait`)
-    const { targets, results } = await killTree(pid, created, { endedAt: this.rootEnded(), run: this.d.exec })
+    const { targets, results, refused } = await killTree(pid, created, { endedAt: this.rootEnded(), stopOnly: this.o.stopOnly, run: this.d.exec })
     if (targets === null) this.log('error: could not read the process table, so what the server started is left to the port wait')
+    else if (refused) this.log(`refused to stop what pid ${pid} started (--stop-only): ${refused}`)
     else if (targets.length) this.log(`stopped what pid ${pid} started, deepest first: ${results.join(', ')}`)
   }
 
@@ -724,7 +744,8 @@ export class DevRun {
   // the guard stops what is left of the server's tree (see guardMain).
   startGuard() {
     if (!this.d.guard) return
-    this.guardProc = spawn(process.execPath, [fileURLToPath(import.meta.url), '--guard', String(process.pid), this.statusPath, this.logPath], {
+    const confined = this.o.stopOnly === null ? [] : [this.o.stopOnly]
+    this.guardProc = spawn(process.execPath, [fileURLToPath(import.meta.url), '--guard', String(process.pid), this.statusPath, this.logPath, ...confined], {
       detached: true, stdio: ['pipe', 'ignore', 'ignore'], windowsHide: true,
     })
     this.guardProc.stdin.on('error', () => {})
@@ -748,25 +769,32 @@ export function wireSignals(runner, proc = process) {
 // The runner's server root usually dies with the runner: Node puts each child it spawns in a job
 // that ends with it. A root that isn't Node (cmd.exe running a .cmd shim) has no such job, so what it
 // started lives on, holding the port. The runner tells the guard, line by line: `spawned <pid> <time
-// just before the spawn>`, then `child <pid> <real start time>`, `none` once it has stopped the server,
-// and `done` when it ends itself. If the pipe ends without `done`, the runner was killed: the guard
-// stops what is left by the same age-checked walk as a stop, bounded above by the pipe's end (a dead
-// root starts nothing), and marks the status stopped.
-const GUARD_MARGIN = 5_000_000n // FILETIME units, 0.5 s: the root can end a moment after the pipe
+// just before the spawn>`, then `child <pid> <real start time>`, `ended <pid> <time>` when it sees the
+// root end, `none` once it has stopped the server, and `done` when it ends itself. If the pipe ends
+// without `done`, the runner was killed: the guard stops what is left by the same age-checked walk as
+// a stop, bounded above by the root's end (a dead root starts nothing): the time the runner saw, or
+// else the pipe's end. It marks the status stopped.
+const GUARD_MARGIN = 1_000_000n // FILETIME units, 100 ms: the root can end a moment after the pipe
 
-export async function guard(lines, { runner, statusPath, logPath, run = exec, now = nowFiletime }) {
+export async function guard(lines, { runner, statusPath, logPath, stopOnly = null, run = exec, now = nowFiletime }) {
   let spawned = null
   let child = null
+  let ended = null
   let done = false
   for await (const line of lines) {
     let m
-    if ((m = /^spawned (\d+) (\d+)$/.exec(line))) [spawned, child] = [{ pid: Number(m[1]), created: BigInt(m[2]) }, null]
-    else if ((m = /^child (\d+) (\d+)$/.exec(line))) child = { pid: Number(m[1]), created: BigInt(m[2]) }
-    else if (line === 'none') [spawned, child] = [null, null]
+    if ((m = /^spawned (\d+) (\d+)$/.exec(line))) [spawned, child, ended] = [{ pid: Number(m[1]), created: BigInt(m[2]) }, null, null]
+    else if ((m = /^child (\d+) (\d+)$/.exec(line))) {
+      if (Number(m[1]) === spawned?.pid) child = { pid: Number(m[1]), created: BigInt(m[2]) }
+    } else if ((m = /^ended (\d+) (\d+)$/.exec(line))) {
+      // Only the current root's end: a slow exit of an earlier root can follow a new spawn.
+      if (Number(m[1]) === spawned?.pid) ended = BigInt(m[2])
+    } else if (line === 'none') [spawned, child, ended] = [null, null, null]
     else if (line === 'done') done = true
   }
   if (done) return
-  const endedAt = now() + GUARD_MARGIN
+  let endedAt = now() + GUARD_MARGIN
+  if (ended !== null && ended < endedAt) endedAt = ended
   const note = msg => {
     try {
       appendFileSync(logPath, `${new Date().toISOString()} guard: ${msg}\n`)
@@ -777,10 +805,12 @@ export async function guard(lines, { runner, statusPath, logPath, run = exec, no
   const from = child ?? spawned
   let reason = 'no server was running'
   if (from) {
-    const { targets, results } = await killTree(from.pid, from.created, { includeRoot: child !== null, endedAt, run })
+    const { targets, results, refused } = await killTree(from.pid, from.created, { includeRoot: child !== null, endedAt, stopOnly, run })
     const stopped = results.filter(r => r.startsWith('stopped ')).map(r => r.slice(8))
-    reason = targets === null ? 'the process table could not be read' : stopped.length ? `its guard stopped pid ${stopped.join(', ')}` : 'its server ended with it'
-    if (targets?.length) note(`runner ${runner} ended without stopping its server, pid ${from.pid}${child ? '' : ', before its start time was read'}: ${results.join(', ')}`)
+    if (targets === null) reason = 'the process table could not be read'
+    else if (refused) reason = `its guard was refused the stop (--stop-only): ${refused}`
+    else reason = stopped.length ? `its guard stopped pid ${stopped.join(', ')}` : 'its server ended with it'
+    if (targets?.length && !refused) note(`runner ${runner} ended without stopping its server, pid ${from.pid}${child ? '' : ', before its start time was read'}: ${results.join(', ')}`)
   }
   note(`runner ${runner} ended; ${reason}`)
   const s = readJson(statusPath)
@@ -791,8 +821,8 @@ export async function guard(lines, { runner, statusPath, logPath, run = exec, no
   }
 }
 
-function guardMain([runner, statusPath, logPath]) {
-  return guard(createInterface({ input: process.stdin, crlfDelay: Infinity }), { runner, statusPath, logPath })
+function guardMain([runner, statusPath, logPath, stopOnly]) {
+  return guard(createInterface({ input: process.stdin, crlfDelay: Infinity }), { runner, statusPath, logPath, stopOnly: stopOnly ?? null })
 }
 
 async function main(argv) {

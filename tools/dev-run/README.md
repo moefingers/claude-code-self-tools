@@ -48,8 +48,8 @@ Everything after `--` is the server's command, run in `--dir` as an argument lis
 6. **Stops for good when idle.** Each line matching `--hit` is a request. After `--idle-min` of server time with none, it stops the server and ends with 0, logging `idle: no request for 20 min of server time; stopping for good`. The first start counts as a request, and the idle clock stands still while the server is down, so restarts neither reset it nor run it out.
 7. **Ctrl+C, Ctrl+Break, closing the console, or SIGTERM** stop the server tree, then the runner ends (130, 149, 129, 143).
 8. **No orphan when the runner is killed outright.** No handler runs then, so a small guard process, started detached, holds a pipe from the runner. When the pipe ends with the server still up, the guard stops what's left of its tree. Node ends a child it spawned when it dies (a Windows job), so a Node server usually goes with the runner. A `.cmd` shim's `cmd.exe` goes too, but the server it started doesn't.
-   - **What the guard is told:** the runner tells it the root's id at once, with the time just before the spawn, then the root's real start time once read, and `done` when it ends by itself.
-   - **When the pipe ends without `done`:** the guard stops what is left by the same walk as a stop. Its lower bound is the root's start time, or the time before the spawn if the runner died before reading it. Its upper bound is the moment the pipe ended, plus half a second, since a dead root starts nothing.
+   - **What the guard is told:** the runner tells it the root's id at once, with the time just before the spawn, then the root's real start time once read, and the moment the root ended when it sees that. It sends `done` when it ends by itself. The guard takes an end only for the root it names, since a slow exit of an earlier root can come after a new spawn.
+   - **When the pipe ends without `done`:** the guard stops what is left by the same walk as a stop. Its lower bound is the root's start time, or the time before the spawn if the runner died before reading it. Its upper bound is the root's end, since a dead root starts nothing: the moment the runner saw it end, or else the moment the pipe ended, plus 100 ms. The bound is exact even when the root died seconds before the runner.
    - **The status file:** the guard marks it `stopped` with the reason, even when no server was running.
 
 The server's output goes to a file, never to a pipe to the runner. A Node server whose output pipe breaks dies at once, and its workers would keep the port. dev-run reads the file every 100 ms and copies each line to its own output.
@@ -114,6 +114,8 @@ The tests run dev-run against a fake server (`fixtures/fake-server.mjs`, a small
 - a runner killed outright behind a `.cmd` shim, cleaned up by its guard;
 - a root that ends while its start time is read, in a run and in a queued slot claim: no time is kept, and nothing is stopped by id;
 - a dead root whose id a later process took, started a child under, and gave up: that child is left alone;
+- the guard of a runner whose root died seconds before it: on a made-up table, nothing a later owner of the root's id started is taken, and an end reported for an earlier root is ignored;
+- `--stop-only` files that refuse (missing, a folder, malformed, a device) and one that allows, and a refusal reported as one;
 - the guard of a runner killed before it read the root's start time: the server behind a shim is stopped, and the status says `stopped`;
 - the slot taken before the spawn and released at the first compiled line or after 3 minutes;
 - `--slot=life`;
@@ -131,6 +133,7 @@ Planted faults are each run through the same scenarios, which must fail, each on
 - a dead root's walk with no bound at its end;
 - a slot-script walk that stops at the innermost repository;
 - a guard that ignores a root whose start time it wasn't told;
+- a guard that ignores the root's end the runner saw, and bounds by the pipe's end alone;
 - a slot never released;
 - a slot released before the compile.
 
@@ -144,4 +147,7 @@ Each fault is a copy of `dev-run.mjs` with one line changed.
 
 Descent is checked apart from dev-run's own walk: up from each target, in the snapshot dev-run read, each parent no younger than its child, to a process the test started and timed while holding its handle. Anything else is refused, and a stopped process is dropped from the list.
 
-The CLI test runs the runner and its guard as processes of their own. `DEV_RUN_STOP_ONLY` confines both to the processes listed in a file, one `<pid> <start time>` per line; it can only narrow what is stopped.
+The CLI test runs the runner and its guard as processes of their own, so it uses `--stop-only <file>`, a flag for tests only and left out of the usage text.
+- **What it does:** it confines every stop, the runner's and its guard's (the runner passes it on), to the processes listed in the file, one `<pid> <start time>` per line. It can only narrow what is stopped.
+- **Bad files refuse:** a missing, unreadable or malformed file refuses every stop, and so does anything that isn't a regular file, which is never read (a device or a pipe could block). A refused stop is logged, and reported in the status, as refused.
+- **A flag, not an environment variable,** so nothing inherited from the environment can switch off tree stops.
