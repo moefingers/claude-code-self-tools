@@ -26,7 +26,7 @@
     "envDedupe": {
       "type": "string",
       "title": "Bash env dedupe",
-      "description": "on: after each session start (startup, resume, clear, compact), and when tools_check finds the env at risk, dedupe this session's env hook files (~/.claude/session-env/<session>/*-hook-<n>.sh, which Claude Code puts into every Bash call) once they total over 2 KB: each variable's last assignment is kept, so the environment is the same; a file with any other kind of line is left as it is; one backup per file (<name>.bak). off: never rewrite them; tools_check still says how much room they leave.",
+      "description": "on: after each session start (startup, resume, clear, compact), and when tools_check finds the env at risk, dedupe this session's setup and sessionstart env files (~/.claude/session-env/<session>/*-hook-<n>.sh, which Claude Code puts into every Bash call) once they total over 2 KB: each variable's last assignment is kept, so the environment is the same; a file with any other kind of line is left as it is; backups <name>.orig (once) and <name>.bak (latest). off: never rewrite them; tools_check still says how much room they leave.",
       "default": "on",
       "options": ["on", "off"]
     },

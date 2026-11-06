@@ -23,8 +23,8 @@
 //
 // The env guard (the `envDedupe` setting, on by default): right after the SessionStart hooks beneath
 // this plugin have run (every source: startup, resume, clear, compact, fork), and when a check finds
-// the env AT RISK or BROKEN, this session's env hook files are deduped (env-guard.ts) once they total
-// over 2 KB. Why then: SessionStart hooks are what grows the files without end (Claude Code clears
+// the env AT RISK or BROKEN, this session's setup and sessionstart env files are deduped (env-guard.ts)
+// once they total over 2 KB, under a 5-second deadline for starting any write. Why then: SessionStart hooks are what grows the files without end (Claude Code clears
 // the cwdchanged and filechanged ones itself), and as settings hooks they sit beneath every hooks
 // module in the classic chain, so after `next` they have all appended; Claude Code drops its cached
 // copy of the script after each SessionStart, Setup, CwdChanged and FileChanged hook and builds it
@@ -34,11 +34,12 @@
 //
 // Each check writes one record, %LOCALAPPDATA%\claude-self-tools\selfcheck\<conversation>.json:
 // `{ v: 1, at, failed }`, the failed tools by name only, which the coordinator's lane report carries.
-// Besides that record, the plugin writes only the deduped env hook files and their one backup each.
+// Besides that record, the plugin writes only the deduped env files and their backups (.orig, once; .bak).
 import type { EngineInterface, Register, ToolInfo } from 'claude-code'
 import type { CheckLine, EnvVerdict } from '../types'
-import { DEDUPE_OVER, dedupeFolder, envFolder, GIT_BASH_LIMIT, grouped, outcomeLine, readEnv, rewritten, roomPhrase, verdictOf } from './env-guard'
+import { dedupeFolder, envFolder, outcomeLine, readEnv, refusedFiles, rewritten } from './env-guard'
 import type { DedupeOutcome, EnvReading } from './env-guard'
+import { DEDUPE_OVER, GIT_BASH_LIMIT, grouped, roomPhrase, verdictOf } from './env-rules'
 import { isSafeFolder, oneLine, quoted, selfcheckPath, selfcheckRecord, stateFolder, within } from './machine'
 import { configureUpdateCheck, loadUpdateCheck, withUpdateNotice } from './update-check'
 
@@ -56,8 +57,10 @@ const PROBE = /^([A-Za-z0-9_-]{1,64})=([A-Za-z0-9_-]{1,128})$/
 /** An MCP tool's name: its server, then the tool. */
 const MCP_TOOL = /^mcp__([A-Za-z0-9_-]+?)__([A-Za-z0-9_-]+)$/
 
-/** How long the env guard may take at a session start. */
+/** The env guard's deadline: no write of a dedupe starts after it, at a session start or in a check. */
 const ENV_MS = 5_000
+/** How much longer a dedupe past its deadline is waited for: a write already under way, and putting a file back. */
+const ENV_GRACE_MS = 5_000
 
 /** What a failure adds when its cause isn't Bash's env: a fresh process usually repairs a dead tool. */
 const RESTART_HINT =
@@ -74,13 +77,16 @@ const ENV_HINT = [
  */
 const AFTER_DEDUPE =
   "Claude Code still holds the old copy: now move the PowerShell tool's directory away and back, in two calls in the main session (`Set-Location ..`, then `Set-Location` to the folder it was in), then retry Bash"
+/** What an env at risk adds when the dedupe refused a file: never a rewrite by hand. */
+const REFUSED_HINT =
+  "A file the Bash env line says was left as it was must not be edited by hand, with Bash, PowerShell or an edit tool: the dedupe couldn't show that a rewrite keeps the environment the same, and a wrong edit breaks every Bash call. Tell the person which file it is, so they can find the plugin that writes it."
 /** What a failed MCP server adds: a reconnect may be all it needs. */
 const MCP_HINT = 'An MCP server that failed may need only a reconnect: reconnect_mcp_after_turn (self-mcp).'
 
 const DESCRIPTION = [
   "Checks that this session's own tools answer: it runs a harmless echo of a fresh nonce through the Bash and the PowerShell tools, as you would call them, each within 10 s, and checks the output holds it; on Windows it says how much room this session's env leaves a Bash command (Git Bash runs only the first 8,186 characters of a call); it lists the MCP servers whose tools are connected, and exercises a server only through a probe the person named in the plugin's settings.",
   'Call it when a tool seems dead (an empty result where there should be output, an `unexpected EOF` from a short command, a call that never answers), before working around it.',
-  'It opens no permission dialog (a tool whose call would ask is "not tested"). It writes its own record of what failed and, when it finds the env at risk and the envDedupe setting is on, a deduped copy of this session\'s env hook files (the same environment, one backup each).',
+  'It opens no permission dialog (a tool whose call would ask is "not tested"). It writes its own record of what failed and, when it finds the env at risk and the envDedupe setting is on, a deduped copy of this session\'s env hook files (the same environment, with backups).',
   'One line per tool: ok, or failed and why; on a failure it says how to repair it.',
 ].join(' ')
 
@@ -231,12 +237,17 @@ async function servers($: EngineInterface, tools: readonly ToolInfo[] | string):
  * The Bash env line of a check: the verdict on the env as Bash runs with it now (before any dedupe
  * the check makes), or no verdict when it couldn't be measured; `said` is the line.
  */
-type EnvLine = { readonly verdict: EnvVerdict | undefined; readonly said: string }
+type EnvLine = { readonly verdict: EnvVerdict | undefined; readonly said: string; readonly hasRefused?: boolean }
 
 /** The files a dedupe left as they were, and why, as a phrase; empty when it left none. */
 function leftAlone(outcome: DedupeOutcome): string {
   if (outcome.kind === 'under') return ''
-  const left = outcome.files.flatMap(f => ('left' in f && f.left !== 'nothing-to-drop' ? [`${f.name} (${f.why ?? f.left.replace(/-/g, ' ')})`] : []))
+  // The plugin's own words as they are; an error from outside it (another plugin's refusal) quoted.
+  const left = outcome.files.flatMap(f => {
+    if (!('left' in f) || f.left === 'nothing-to-drop') return []
+    const said = [f.why ?? f.left.replace(/-/g, ' '), ...(f.error === undefined ? [] : [quoted(oneLine(f.error, 160))])].join(': ')
+    return [`${f.name} (${said})`]
+  })
   return left.length === 0 ? '' : `; left as ${left.length === 1 ? 'it was' : 'they were'}: ${left.join(', ')}`
 }
 
@@ -255,27 +266,49 @@ async function measureEnv($: EngineInterface, folder: string): Promise<EnvLine> 
   const head = `Bash env: ${verdict}: every Bash call carries ${grouped(now.inlined)} characters of session env, ${roomPhrase(now.inlined)} before Git Bash's cut at ${grouped(GIT_BASH_LIMIT)}`
   if (verdict === 'OK') return { verdict, said: head }
   if (!envDedupe) return { verdict, said: `${head}. Not deduped: the envDedupe setting is off` }
-  let outcome: DedupeOutcome
+  let outcome: DedupeOutcome | undefined
   try {
-    outcome = await dedupeFolder($, folder)
+    outcome = await boundedDedupe($, folder)
   } catch (err) {
     return { verdict, said: `${head}. The dedupe failed (${quoted(why(err))})` }
   }
+  if (outcome === undefined) return { verdict, said: `${head}. The dedupe didn't finish within ${(ENV_MS + ENV_GRACE_MS) / 1000} s; it starts no write after ${ENV_MS / 1000} s` }
   $.ui.log(outcomeLine(outcome), { to: 'debug' })
-  if (outcome.kind === 'under') return { verdict, said: `${head}. Not deduped: its hook files hold ${grouped(outcome.bytes)} bytes, at or under ${grouped(DEDUPE_OVER)}` }
+  if (outcome.kind === 'under') return { verdict, said: `${head}. Not deduped: its setup and sessionstart files hold ${grouped(outcome.bytes)} bytes, at or under ${grouped(DEDUPE_OVER)}` }
+  const hasRefused = refusedFiles(outcome).length > 0
   if (rewritten(outcome).length === 0) {
     const left = leftAlone(outcome)
-    return { verdict, said: left === '' ? `${head}. Nothing to dedupe: each variable is set once` : `${head}. Not deduped${left}` }
+    return { verdict, hasRefused, said: left === '' ? `${head}. Nothing to dedupe: each variable is set once` : `${head}. Not deduped${left}` }
   }
   let after: EnvReading
   try {
     after = await readEnv($, folder)
   } catch (err) {
-    return { verdict, said: `${head}. Deduped now, but the files can't be read again (${quoted(why(err))})${leftAlone(outcome)}. ${AFTER_DEDUPE}` }
+    return { verdict, hasRefused, said: `${head}. Deduped now, but the files can't be read again (${quoted(why(err))})${leftAlone(outcome)}. ${AFTER_DEDUPE}` }
   }
   return {
     verdict,
+    hasRefused,
     said: `${head}. Deduped now to ${grouped(after.inlined)} characters (${verdictOf(after.inlined)}), the same environment${leftAlone(outcome)}. ${AFTER_DEDUPE}`,
+  }
+}
+
+/**
+ * The dedupe of `folder` under the env guard's deadline: a timer marks it stopped at 5 s, so no
+ * write starts after that; one already under way, and putting a file back after it, are waited for
+ * 5 s more. Undefined when even that runs out; the flag stays set, so nothing more starts.
+ */
+async function boundedDedupe($: EngineInterface, folder: string): Promise<DedupeOutcome | undefined> {
+  let isStopped = false
+  const deadline = $.clock.after(ENV_MS, () => {
+    isStopped = true
+  })
+  try {
+    const done = await within($, ENV_MS + ENV_GRACE_MS, dedupeFolder($, folder, { stop: { isStopped: () => isStopped } }))
+    return done?.value
+  } finally {
+    isStopped = true
+    deadline.cancel()
   }
 }
 
@@ -288,9 +321,11 @@ async function envOf($: EngineInterface, id: string | undefined): Promise<EnvLin
     return undefined
   }
   if (folder === undefined) return undefined
+  // Reading the files gets 10 s; a dedupe in between has its own deadline and grace on top.
+  const bound = CALL_MS + ENV_MS + ENV_GRACE_MS
   try {
-    const measured = await within($, CALL_MS, measureEnv($, folder))
-    return measured?.value ?? { verdict: undefined, said: `Bash env: not measured: its files weren't read within ${CALL_MS / 1000} s` }
+    const measured = await within($, bound, measureEnv($, folder))
+    return measured?.value ?? { verdict: undefined, said: `Bash env: not measured: its files weren't read within ${bound / 1000} s` }
   } catch (err) {
     return { verdict: undefined, said: `Bash env: not measured (${quoted(why(err))})` }
   }
@@ -328,6 +363,7 @@ function answer({ lines, env }: Checked): string {
   const isEnvAtRisk = env?.verdict === 'AT RISK' || env?.verdict === 'BROKEN'
   const hints = [
     ...(isEnvAtRisk || (isBashDead && envSuspect(env)) ? [ENV_HINT] : []),
+    ...(isEnvAtRisk && env?.hasRefused === true ? [REFUSED_HINT] : []),
     ...(failed.some(l => l.name !== 'Bash') || (isBashDead && !envSuspect(env)) ? [RESTART_HINT] : []),
     ...(failed.some(l => l.name.startsWith('mcp:')) ? [MCP_HINT] : []),
   ]
@@ -335,14 +371,14 @@ function answer({ lines, env }: Checked): string {
   return [head, ...said, ...hints].join('\n')
 }
 
-/** The env guard at a session start: dedupes session `id`'s env hook files once they total over 2 KB. Never throws. */
+/** The env guard at a session start: dedupes session `id`'s setup and sessionstart files once they total over 2 KB. Never throws. */
 async function guardAtStart($: EngineInterface, id: string | undefined): Promise<void> {
   try {
     const folder = await envFolder($, id)
     if (folder === undefined) return
-    const outcome = await within($, ENV_MS, dedupeFolder($, folder))
-    if (outcome === undefined) $.ui.log(`session env: the dedupe didn't finish within ${ENV_MS / 1000} s`, { to: 'debug' })
-    else if (outcome.value.kind === 'done') $.ui.log(outcomeLine(outcome.value), { to: 'debug' })
+    const outcome = await boundedDedupe($, folder)
+    if (outcome === undefined) $.ui.log(`session env: the dedupe didn't finish within ${(ENV_MS + ENV_GRACE_MS) / 1000} s; it starts no write after ${ENV_MS / 1000} s`, { to: 'debug' })
+    else if (outcome.kind === 'done') $.ui.log(outcomeLine(outcome), { to: 'debug' })
   } catch (err) {
     $.ui.log(`session env: the dedupe failed (${why(err)})`, { to: 'debug' })
   }
@@ -377,6 +413,9 @@ async function atIdle($: EngineInterface, id: string): Promise<void> {
     waiting = id
     return
   }
+  // A /clear or a switch since the resume: this process runs another conversation now, and the check
+  // (its env folder above all) is not this one's to make.
+  if ((await sessionId($)) !== id) return
   const checked = await check($, id)
   await record($, id, checked.lines)
   const failed = checked.lines.filter(l => l.status === 'failed')
