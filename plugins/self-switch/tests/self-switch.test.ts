@@ -2,8 +2,8 @@
 // from fixtures; /resume and /exit are recorded, never run. Nothing here starts a process.
 import { describe, expect, mock, test } from 'claude-code/testing'
 import type { AgentStatus, On } from 'claude-code'
-import { claimPath, gatePath, launcherScript, MAX_UNTRACKED, panePath, paneScript, paneTicketPath, quoted, SLOT_NOT_RECOGNISED, SLOT_SCRIPT_SHA256, slotRecordPath, STDIN_BOOTSTRAP } from '../hooks/machine'
-import { decode, ELSEWHERE, elsewhere, entry, ft, inSlot, LAUNCH, machine, NOW, OTHER, PERMISSION_FLAGS, PROJECT, type RawProbe, REPO, T, under, W, X } from './fixtures'
+import { claimPath, gatePath, launchScriptText, type LaunchInput, MAX_UNTRACKED, paneNoLeft, panePath, paneTicketPath, quoted, SLOT_NO_LEFT, SLOT_NOT_RECOGNISED, SLOT_SCRIPT_SHA256, slotRecordPath, STDIN_BOOTSTRAP, wakeMarker, wakePath } from '../hooks/machine'
+import { decode, ELSEWHERE, elsewhere, entry, ft, inSlot, LAUNCH, leftExit, machine, NOW, OTHER, PERMISSION_FLAGS, PROJECT, type RawProbe, REPO, T, under, W, X } from './fixtures'
 
 const TOOL = 'mcp__self-switch__switch_after_turn'
 const HOUR = 60 * 60 * 1000
@@ -26,7 +26,27 @@ const DROPPED_THERE = 'Wake-ups the conversation it came from had pending were d
 /** A claude.exe that no registry accounts for yet, as one starting up reads: the verdict is unknown. */
 const starting = (p: RawProbe): void => void p.procs.push({ pid: 600, ppid: 10, created: ft(60), name: 'claude.exe' })
 
-type Run = { argv: readonly string[]; init?: Record<string, unknown>; script?: string; kind: 'probe' | 'launcher' | 'pane' | 'release' | 'check' | 'git' | 'other' }
+type Run = { argv: readonly string[]; init?: Record<string, unknown>; script?: string; kind: 'probe' | 'launcher' | 'pane' | 'slot' | 'left' | 'release' | 'check' | 'git' | 'other' }
+
+/**
+ * A switch's launch, as the shared launcher builds it: `to` resumed in `folder`, under the probe's
+ * claim, once this session's claude.exe 100 has exited, at `where`.
+ */
+const launchOf = (where: LaunchInput['where'], folder: string, claim: string = LAUNCH, extra: Partial<LaunchInput> = {}): LaunchInput => ({
+  powershell: POWERSHELL,
+  kind: 'resume',
+  id: T,
+  folder,
+  claim,
+  configDirs: [CONFIG],
+  stateDir: STATE,
+  where,
+  waitForExit: { pid: 100, created: ft(2) },
+  tool: 'self-switch',
+  // The run starts half a second after the turn's end: its deadline LAUNCH_DEADLINE_MS after that.
+  deadline: NOW + 500 + 20_000,
+  ...extra,
+})
 
 /** The claude wrapper's token for this tab, and its pane file: PowerShell 20, the parent of claude.exe 100. */
 const TOKEN = '00000000-0000-4000-a000-000000000001'
@@ -60,7 +80,7 @@ type Options = {
    */
   cwd?: string
   /** What the launcher does. */
-  launcher?: 'opens' | 'fails'
+  launcher?: 'opens' | 'fails' | 'refuses'
   /** The claude wrapper's pane file for TOKEN, when there is one (the session carries CLAUDE_PANE_TOKEN only when `env` says so). */
   pane?: string
   /** What the pane script does: writes the ticket, fails, or writes it while a subagent starts. */
@@ -83,6 +103,8 @@ type Options = {
    * left; only once its hooks have returned do they become the resumed one's, and the command returns.
    */
   liveResume?: TestDollar
+  /** self-wake in this session (its tool listed), and its marker's text for this conversation, if there is one. */
+  wake?: { present: boolean; marker?: string }
 }
 
 /** The engine beneath the plugin; and what it was asked to run, write and say. */
@@ -108,6 +130,7 @@ function engine(
     liveResume,
     checkLive,
     cwd = REPO,
+    wake = { present: false },
   }: Options = {},
 ) {
   const runs: Run[] = []
@@ -117,7 +140,7 @@ function engine(
   const logs: string[] = []
   const writes: { path: string; text: string }[] = []
   const described: string[] = []
-  const world = { id, agents, probe: probe ?? machine(), gate, worktrees: git.worktrees ?? [REPO], diffs: {} as Record<string, string>, untrackedTime: NOW - HOUR, cwd }
+  const world = { id, agents, probe: probe ?? machine(), gate, worktrees: git.worktrees ?? [REPO], diffs: {} as Record<string, string>, untrackedTime: NOW - HOUR, cwd, wake }
   const key = (path: string) => path.replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase()
   const held = new Map<string, unknown>(Object.entries(store))
   // A fingerprint's hash (crypto.subtle.digest, in the shared machine code) finishes outside the
@@ -207,9 +230,20 @@ function engine(
   })
   on('turn.start', (_, e) => ({ turnId: e.turnId }))
   on('turn.complete', () => ({ text: 'done' }))
-  on('fs.exists', (_, e) => answer({ value: e.path === GATE ? world.gate !== undefined : false }))
+  // self-wake, when it is in this session: its tool listed, and its marker for this conversation read.
+  on('tool.list', () => answer({ value: world.wake.present ? [{ name: 'mcp__self-wake__wake_after', description: 'Wakes this session later.', mcp: true }] : [] }))
+  const MARKER = wakePath(STATE, W)
+  on('fs.exists', (_, e) => answer({ value: e.path === GATE ? world.gate !== undefined : e.path === MARKER ? world.wake.marker !== undefined : false }))
   on('fs.read', (_, e) =>
-    answer(e.path === GATE && world.gate !== undefined ? { value: world.gate } : e.path === panePath(STATE, TOKEN) && pane !== undefined ? { value: pane } : { deny: `ENOENT: ${e.path}` }),
+    answer(
+      e.path === GATE && world.gate !== undefined
+        ? { value: world.gate }
+        : e.path === panePath(STATE, TOKEN) && pane !== undefined
+          ? { value: pane }
+          : e.path === MARKER && world.wake.marker !== undefined
+            ? { value: world.wake.marker }
+            : { deny: `ENOENT: ${e.path}` },
+    ),
   )
   on('fs.write', (_, e) => {
     writes.push({ path: e.path, text: e.text })
@@ -252,20 +286,41 @@ function engine(
     }
     // The script comes on standard input; the command line is the fixed bootstrap.
     const script = typeof e.init?.stdin === 'string' ? e.init.stdin : ''
-    const kind = script.includes('$take = ') ? 'probe' : script.includes('$inner = @(') ? 'launcher' : script.includes('"pane $token"') ? 'pane' : script.includes("$answer = 'busy'") ? 'release' : script.includes("{ 'ours' }") ? 'check' : 'other'
+    // The shared launcher's script, by where it places the launch: a window ('launcher'), this tab's
+    // ticket ('pane'), or this pane's slot ('slot'); then the left record's script, the release, the check.
+    const kind = script.includes('$take = ')
+      ? 'probe'
+      : script.includes('$window = Start-Process')
+        ? 'launcher'
+        : script.includes("$placed = 'pane ")
+          ? 'pane'
+          : script.includes('$placed = "slot "')
+            ? 'slot'
+            : script.includes('"left " + $id')
+              ? 'left'
+              : script.includes("$answer = 'busy'")
+                ? 'release'
+                : script.includes("{ 'ours' }")
+                  ? 'check'
+                  : 'other'
     runs.push({ argv, init, script, kind })
     if (kind === 'probe') {
       if (probeFails !== undefined) return ok(probeFails, 1)
       const found = typeof world.probe === 'function' ? world.probe(script) : world.probe
       return ok(`${JSON.stringify(found)}\r\n`)
     }
-    if (kind === 'launcher') return launcher === 'opens' ? ok(`launched 100\r\nclaim ${LAUNCH}\r\n`) : ok('self-switch: no claude on PATH\r\n', 4)
+    // The launch takes again the claim its script names, and says what it placed.
+    const by = /^\$by = '((?:launch|slot):[0-9a-f-]{1,40})'$/m.exec(script)?.[1] ?? 'none'
+    if (kind === 'launcher' && launcher === 'refuses') return ok('refused launcher self-switch: claude-launch.ps1 is not where it must be\r\n')
+    if (kind === 'launcher') return launcher === 'opens' ? ok(`claim ${by}\r\nlaunched window - 100\r\n`) : ok('self-switch: no claude on PATH\r\n', 4)
+    if (kind === 'slot') return ok(`claim ${by}\r\nlaunched slot ${by.slice('slot:'.length)}\r\n`)
     if (kind === 'pane') {
       if (paneAnswer === 'fails') return ok('', 1)
       // A subagent that starts while the ticket is written stops the switch right before its exit.
       if (paneAnswer === 'agent') world.agents = [...world.agents, { description: 'Lint', status: 'running' }]
-      return ok(`pane ${TOKEN}\r\n`)
+      return ok(`claim ${by}\r\nlaunched pane ${TOKEN}\r\n`)
     }
+    if (kind === 'left') return ok(`left ${/^\$id = '([0-9a-f-]{36})'$/m.exec(script)?.[1] ?? ''}\r\n`)
     if (kind === 'release') return ok(`${released}\r\n`)
     if (kind === 'check') return ok(checkLive === undefined ? `${claim}\r\n` : `live ${checkLive}\r\n`)
     return ok('', 1)
@@ -284,8 +339,10 @@ function engine(
     return {}
   })
   const tickets = () => (held.get('switches') ?? {}) as Record<string, Record<string, unknown>>
-  const kinds = () => runs.map(r => r.kind).filter(k => k !== 'git')
-  return { runs, commands, prompts, toasts, logs, writes, described, clock, session, world, held, tickets, kinds }
+  // The left record's runs are their own: lefts() (and the tests of the left record) read them.
+  const kinds = () => runs.map(r => r.kind).filter(k => k !== 'git' && k !== 'left')
+  const lefts = () => runs.filter(r => r.kind === 'left')
+  return { runs, commands, prompts, toasts, logs, writes, described, clock, session, world, held, tickets, kinds, lefts }
 }
 
 const start = { cwd: REPO, surface: 'terminal', isInteractive: true } as const
@@ -316,7 +373,7 @@ describe('transports', () => {
 
     const queued = await $.tool.call({ ...call, reason: ` The billing piece is next. ${HOSTILE} `, resume: ` Pick up the invoice tests. ${HOSTILE} ` })
     expect(queued.deny).toBeUndefined()
-    expect(queued.result).toContain(`Pending wake-ups in this process are dropped by the switch: set them again in ${T} if they are still needed.`)
+    expect(queued.result).toContain(`A wake-up set with wake_after holds the switch until it is cancelled or has fired; other pending wake-ups are dropped by the switch: set them again in ${T} if they are still needed.`)
     expect(queued.result).toContain("If this pane runs a slot that can't be used, the switch says why, in the leaving row, a toast and the arrival, and a new window opens.")
     // Nothing runs while the turn does, however long it goes on.
     await clock.advance(MINUTE)
@@ -386,7 +443,7 @@ describe('transports', () => {
     expect(kinds()).toEqual(['probe', 'launcher'])
     const launch = runs.find(r => r.kind === 'launcher')
     expect(launch?.argv.slice(0, 4)).toEqual([POWERSHELL, '-NoProfile', '-NonInteractive', '-EncodedCommand'])
-    expect(launch?.script).toBe(launcherScript(T, { folder: ELSEWHERE, claim: LAUNCH, configDirs: [CONFIG], stateDir: STATE }))
+    expect(launch?.script).toBe(launchScriptText(launchOf({ window: true }, ELSEWHERE)))
     expect(launch?.init?.cwd).toBe(ELSEWHERE)
     expect(commands).toEqual([{ command: 'exit' }])
     expect(tickets()[T]).toMatchObject({ transport: 'window', by: LAUNCH })
@@ -402,10 +459,12 @@ describe('transports', () => {
     await $.session.start(start)
     await switchNow($, clock)
 
-    expect(kinds()).toEqual(['probe'])
-    expect(writes).toHaveLength(1)
-    expect(writes[0]?.path).toBe(slotRecordPath(STATE, `20-${ft(1)}`))
-    expect(JSON.parse(writes[0]?.text ?? '')).toEqual({ v: 1, resume: T, folder: ELSEWHERE, at: NOW + 500, configDirs: [CONFIG] })
+    // The record, written by the shared launcher in one run with the claim the probe took (the slot's).
+    expect(kinds()).toEqual(['probe', 'slot'])
+    const slot = `20-${ft(1)}`
+    expect(runs.find(r => r.kind === 'slot')?.script).toBe(launchScriptText(launchOf({ slot }, ELSEWHERE, `slot:${slot}`)))
+    expect(runs.find(r => r.kind === 'slot')?.script).toContain(`$final = '${slotRecordPath(STATE, slot)}'`)
+    expect(writes).toEqual([])
     expect(commands).toEqual([{ command: 'exit' }])
     expect(runs.some(r => r.kind === 'launcher')).toBe(false)
   })
@@ -554,8 +613,10 @@ describe("the claude wrapper's tab", () => {
     const written = runs.find(r => r.kind === 'pane')
     // The ticket: this tab's token, the conversation switched to, the claim the probe took (which the
     // wrapper finds the lock still names), its own folder, now. No claim of the script's own.
-    expect(written?.script).toBe(paneScript({ stateDir: STATE, ticket: { token: TOKEN, resume: T, by: LAUNCH, dir: ELSEWHERE, at: NOW + 500 } }))
-    expect(written?.script).not.toContain('Set-Claim')
+    expect(written?.script).toBe(launchScriptText(launchOf({ pane: { token: TOKEN } }, ELSEWHERE, LAUNCH, { now: NOW + 500 })))
+    // The claim is the probe's, taken again in the launch's own run (the same session's: idempotent).
+    expect(written?.script).toContain(`$by = '${LAUNCH}'`)
+    expect(written?.script).toContain('if (-not $taken) { $taken = Set-Claim $claimPath $claimText }')
     expect(written?.argv.slice(0, 4)).toEqual([POWERSHELL, '-NoProfile', '-NonInteractive', '-EncodedCommand'])
     expect(written?.init?.cwd).toBe(ELSEWHERE)
     expect(commands).toEqual([{ command: 'exit' }])
@@ -584,8 +645,7 @@ describe("the claude wrapper's tab", () => {
     const { kinds, writes, commands, clock } = engine(on, { env: WRAPPED, pane: PANE, probe: machine(p => (elsewhere(p), inSlot(p))), store: THERE })
     await $.session.start(start)
     await switchNow($, clock)
-    expect(kinds()).toEqual(['probe'])
-    expect(writes[0]?.path).toBe(slotRecordPath(STATE, `20-${ft(1)}`))
+    expect(kinds()).toEqual(['probe', 'slot'])
     expect(commands).toEqual([{ command: 'exit' }])
   })
 
@@ -654,7 +714,7 @@ describe("the claude wrapper's tab", () => {
     expect(commands).toEqual([])
     expect(writes).toEqual([{ path: paneTicketPath(STATE, TOKEN), text: '{"v":1,"cancelled":true}' }])
     expect(tickets()).toEqual({})
-    expect(rows(session)).toContain("didn't happen after all: this tab's ticket wasn't written (the script exited 1: failed)")
+    expect(rows(session)).toContain("didn't happen after all: this tab's ticket wasn't written (the launcher exited 1: failed)")
   })
 
   test('a subagent started while the ticket was written: nothing exits, the ticket is withdrawn (the wrapper says so, and resumes nothing)', async ($, on) => {
@@ -673,11 +733,11 @@ describe("the claude wrapper's tab", () => {
   })
 })
 
-test("the tool's description says pending wake-ups are dropped, and to set them again where they are needed", async ($, on) => {
+test("the tool's description says a wake_after wake-up holds the switch, and others are dropped", async ($, on) => {
   const { described } = engine(on)
   await $.session.start(start)
   expect(described).toHaveLength(1)
-  expect(described[0]).toContain('Stop Monitor tasks first. Pending wake-ups in this process are dropped by the switch, whichever way it goes: set them again in the conversation switched to, if they are still needed.')
+  expect(described[0]).toContain('Stop Monitor tasks first. A wake-up pending from wake_after holds the switch: cancel it (cancel_wake) or wait for it; wake-ups of any other kind are dropped by the switch, so set them again in the conversation switched to if they are still needed.')
   expect(described[0]).not.toMatch(/carries this process's timers/)
 })
 
@@ -1507,7 +1567,7 @@ describe('arrival', () => {
     ])
     expect(tickets()).toEqual({})
     expect(kinds()).toEqual(['release'])
-    expect(runs[runs.length - 1]?.script).toContain(`Join-Path '${STATE}' 'claims\\${T}.lock'`)
+    expect(runs.filter(r => r.kind !== 'left').at(-1)?.script).toContain(`$path = '${STATE}\\claims\\${T}.lock'`)
 
     // Resumed again later: nothing more.
     await $.classic.SessionStart({ source: 'resume', session_id: T })
@@ -1663,4 +1723,295 @@ test('the claim lock and the slot record live under %LOCALAPPDATA%\\claude-self-
   expect(claimPath(STATE, T)).toBe(`C:\\Users\\u\\AppData\\Local\\claude-self-tools\\claims\\${T}.lock`)
   expect(slotRecordPath(STATE, '20-5')).toBe('C:\\Users\\u\\AppData\\Local\\claude-self-tools\\slots\\20-5.next.json')
   expect(GATE).toBe(`C:\\Users\\u\\AppData\\Local\\claude-self-tools\\gate\\${W}.json`)
+})
+
+describe("S10w: a wake-up armed with self-wake holds the switch (self-wake's marker)", () => {
+  const ARMED = wakeMarker({ armed: true, due: NOW + 10 * MINUTE, at: NOW - MINUTE })
+  const IDLE = wakeMarker({ armed: false, at: NOW - MINUTE })
+
+  test('armed: refused at the call, saying when it is due and how to stop it; nothing runs', async ($, on) => {
+    const { kinds, commands, clock } = engine(on, { wake: { present: true, marker: ARMED } })
+    await $.session.start(start)
+    const refused = await $.tool.call(call)
+    expect(refused.deny).toBe('Not queued: S10w: a wake-up is pending (due 2026-11-03 12:10 UTC): cancel it with cancel_wake, or wait for it.')
+    await $.turn.complete(answered)
+    await clock.advance(1000)
+    expect(kinds()).toEqual([])
+    expect(commands).toEqual([])
+  })
+
+  test('armed after the call: the run holds before the probe, and nothing moves', async ($, on) => {
+    const { kinds, commands, world, session, clock } = engine(on, { wake: { present: true, marker: IDLE } })
+    await $.session.start(start)
+    expect((await $.tool.call(call)).deny).toBeUndefined()
+    world.wake = { present: true, marker: ARMED }
+    await $.turn.complete(answered)
+    await clock.advance(1000)
+    expect(kinds()).toEqual([])
+    expect(commands).toEqual([])
+    expect(rows(session)).toContain("didn't run: S10w: a wake-up is pending (due 2026-11-03 12:10 UTC): cancel it with cancel_wake, or wait for it.")
+  })
+
+  test('self-wake on with no marker for this conversation: unknown, and unknown holds (never read as none)', async ($, on) => {
+    const { kinds, commands, clock } = engine(on, { wake: { present: true } })
+    await $.session.start(start)
+    const refused = await $.tool.call(call)
+    expect(refused.deny).toMatch(/^Not queued: S10w: whether a wake-up is pending is unknown, and unknown holds: self-wake is on, but its marker for this conversation isn't there \(.+\): update self-wake to 0\.2\.0 or later, which writes one\.$/)
+    await $.turn.complete(answered)
+    await clock.advance(1000)
+    expect(kinds()).toEqual([])
+    expect(commands).toEqual([])
+  })
+
+  test('a marker that is not of its shape is unknown too', async ($, on) => {
+    const { clock } = engine(on, { wake: { present: true, marker: '{"v":1,"armed":true,"at":1}' } })
+    await $.session.start(start)
+    expect((await $.tool.call(call)).deny).toMatch(/S10w: whether a wake-up is pending is unknown, and unknown holds: self-wake's marker for this conversation is not of its shape: update self-wake to 0\.2\.0 or later/)
+    await clock.advance(1000)
+  })
+
+  test('a marker that says nothing is armed, or no self-wake at all: no hold, the switch goes', async ($, on) => {
+    const idle = engine(on, { wake: { present: true, marker: IDLE } })
+    await $.session.start(start)
+    await switchNow($, idle.clock)
+    expect(idle.commands).toEqual([{ command: 'resume', args: T }])
+  })
+
+  test('without self-wake in the session there is nothing to wait for', async ($, on) => {
+    const none = engine(on, { wake: { present: false } })
+    await $.session.start(start)
+    await switchNow($, none.clock)
+    expect(none.commands).toEqual([{ command: 'resume', args: T }])
+  })
+})
+
+describe('the left record (\u00a73.4)', () => {
+  const THERE = { [`alive:${T}`]: { at: NOW - HOUR, folder: ELSEWHERE, project: 'C--work-other' } }
+
+  test('the probe asks for the left records of both conversations', async ($, on) => {
+    const { runs, clock } = engine(on)
+    await $.session.start(start)
+    await switchNow($, clock)
+    const probe = runs.find(r => r.kind === 'probe')?.script ?? ''
+    expect(probe).toContain(`[void]$leftPaths.Add(@('${W}', '${STATE}\\left\\${W}.json'))`)
+    expect(probe).toContain(`[void]$leftPaths.Add(@('${T}', '${STATE}\\left\\${T}.json'))`)
+    expect(probe).toContain(`$leftKeyPath = '${STATE}\\left.key'`)
+  })
+
+  test('in place: the arriving side writes it for the conversation left, LEFT_SETTLE_MS after the SessionStart, keyed by the event id; never before the /resume (LR3)', async ($, on) => {
+    const { commands, lefts, clock } = engine(on)
+    await $.session.start(start)
+    await switchNow($, clock)
+    expect(commands).toEqual([{ command: 'resume', args: T }])
+    // Nothing yet: the leaving side writes none for an in-place move.
+    expect(lefts()).toEqual([])
+    await $.classic.SessionStart({ source: 'resume', session_id: T })
+    await clock.advance(2900)
+    expect(lefts()).toEqual([])
+    await clock.advance(200)
+    expect(lefts()).toHaveLength(1)
+    const script = lefts()[0]?.script ?? ''
+    // For W, the conversation this process held before the event, by this process (found above the script).
+    expect(script).toContain(`$id = '${W}'`)
+    expect(script).toContain("$how = 'in-place'")
+    expect(script).toContain("$by = 'self-switch'")
+    expect(script).toContain(`$configDirs = @('${CONFIG}')`)
+  })
+
+  test('a /resume or a /clear the person typed writes it too; a startup or a resume of the same conversation does not', async ($, on) => {
+    const { lefts, clock } = engine(on)
+    await $.session.start(start)
+    await $.classic.SessionStart({ source: 'startup', session_id: W })
+    await $.classic.SessionStart({ source: 'resume', session_id: W })
+    await clock.advance(5000)
+    expect(lefts()).toEqual([])
+    await $.classic.SessionStart({ source: 'clear', session_id: X })
+    await clock.advance(5000)
+    expect(lefts().map(r => /^\$id = '(.+)'$/m.exec(r.script ?? '')?.[1])).toEqual([W])
+  })
+
+  test('on exit (a window): written right before /exit, for this conversation, by this very process, after the launch is placed', async ($, on) => {
+    const { runs, commands, lefts, clock } = engine(on, { probe: machine(elsewhere), store: THERE })
+    await $.session.start(start)
+    await switchNow($, clock)
+    expect(commands).toEqual([{ command: 'exit' }])
+    expect(lefts()).toHaveLength(1)
+    const script = lefts()[0]?.script ?? ''
+    expect(script).toContain(`$id = '${W}'`)
+    expect(script).toContain("$how = 'exit'")
+    expect(script).toContain(`if ([long]$session.ProcessId -ne 100 -or [math]::Abs([long](Get-Created $session) - [long]'${ft(2)}') -gt 10000)`)
+    expect(runs.findIndex(r => r.kind === 'left')).toBeGreaterThan(runs.findIndex(r => r.kind === 'launcher'))
+  })
+
+  test('a switch that stops before its exit leaves no exit record behind it that could waive anything: its process still runs (LR6)', async ($, on) => {
+    const { commands, lefts, clock } = engine(on, { probe: machine(elsewhere), store: THERE, launcher: 'fails' })
+    await $.session.start(start)
+    await switchNow($, clock)
+    expect(commands).toEqual([])
+    expect(lefts()).toEqual([])
+  })
+
+  test('a return trip: a left record waives L3 in place, and the last look checks the transcript against it (LR12)', async ($, on) => {
+    const { runs, commands, clock } = engine(on, { probe: machine(p => leftExit(p)) })
+    await $.session.start(start)
+    await switchNow($, clock)
+    // Without the record, T's transcript written 55 s ago would hold it (L3).
+    expect(commands).toEqual([{ command: 'resume', args: T }])
+    const check = runs.find(r => r.kind === 'check')?.script ?? ''
+    expect(check).toContain(`$leftSize = $null; $leftMtime = $null; $leftExitAt = ${NOW - 60_000}`)
+    expect(check).toContain('([DateTimeOffset]$seen[0].LastWriteTimeUtc).ToUnixTimeMilliseconds() -gt ([long]$leftExitAt + 10000)')
+  })
+
+  test('the window takes the left record to its last look too', async ($, on) => {
+    const { runs, commands, clock } = engine(on, { probe: machine(p => (elsewhere(p), leftExit(p, r => (r.transcript = { dir: 0, project: 'C--work-other', size: 4096, mtime: NOW - 55_000 })))), store: THERE })
+    await $.session.start(start)
+    await switchNow($, clock)
+    expect(commands).toEqual([{ command: 'exit' }])
+    const launch = runs.find(r => r.kind === 'launcher')?.script ?? ''
+    expect(launch).toBe(launchScriptText(launchOf({ window: true }, ELSEWHERE, LAUNCH, { left: { exitAt: NOW - 60_000 } })))
+  })
+
+  /** T left a minute ago by exiting, its transcript in the other project: live by L3 alone, waived by the record. */
+  const leftOther = (p: RawProbe): void => (elsewhere(p), leftExit(p, r => (r.transcript = { dir: 0, project: 'C--work-other', size: 4096, mtime: NOW - 55_000 })))
+
+  test("this pane's slot runner, whose last look can't check the record until slots v2: a new window takes the move, under a launch's claim, saying why", async ($, on) => {
+    const { runs, kinds, commands, logs, tickets, session, clock } = engine(on, { probe: machine(p => (leftOther(p), inSlot(p))), store: THERE })
+    await $.session.start(start)
+    await switchNow($, clock)
+    expect(kinds()).toEqual(['probe', 'launcher'])
+    expect(commands).toEqual([{ command: 'exit' }])
+    const launch = runs.find(r => r.kind === 'launcher')?.script ?? ''
+    // A fresh launch's claim, which the launch takes over from the slot's (this process holds both).
+    const claim = /^\$by = '(launch:[0-9a-f-]{36})'$/m.exec(launch)?.[1]
+    expect(claim).toBeDefined()
+    expect(launch).not.toContain(`$by = 'slot:`)
+    // The window's last look checks the transcript against the record.
+    expect(launch).toContain(`$leftSize = $null; $leftMtime = $null; $leftExitAt = ${NOW - 60_000}`)
+    expect(tickets()[T]).toMatchObject({ transport: 'window', by: claim, fallback: SLOT_NO_LEFT })
+    expect(logs).toContain(`this pane's slot runner isn't used: ${SLOT_NO_LEFT}. A new window resumes ${T}.`)
+    expect(rows(session)).toContain(SLOT_NO_LEFT)
+  })
+
+  test('the window refusing that move gives back both claims: the slot\'s the probe took, and the launch\'s', async ($, on) => {
+    const { kinds, commands, clock } = engine(on, { probe: machine(p => (leftOther(p), inSlot(p))), store: THERE, launcher: 'refuses' })
+    await $.session.start(start)
+    await switchNow($, clock)
+    expect(commands).toEqual([])
+    expect(kinds()).toEqual(['probe', 'launcher', 'release', 'release'])
+  })
+
+  test("an older claude wrapper (pane file version 2), whose last look doesn't check the record: a new window, and the log says why", async ($, on) => {
+    const { runs, kinds, commands, logs, clock } = engine(on, { env: { ...WINDOWS, CLAUDE_PANE_TOKEN: TOKEN }, pane: PANE, probe: machine(leftOther), store: THERE })
+    await $.session.start(start)
+    await switchNow($, clock)
+    expect(kinds()).toEqual(['probe', 'launcher'])
+    expect(commands).toEqual([{ command: 'exit' }])
+    expect(runs.find(r => r.kind === 'launcher')?.script ?? '').toContain(`$leftExitAt = ${NOW - 60_000}`)
+    expect(logs).toContain(`this tab's claude wrapper isn't used: ${paneNoLeft({ pid: 20, started: ft(1), v: 2 })}. A new window resumes ${T}.`)
+  })
+
+  test("a current claude wrapper (pane file version 3): the tab, its ticket carrying the record's stat for the wrapper's last look", async ($, on) => {
+    const { runs, kinds, commands, clock } = engine(on, { env: { ...WINDOWS, CLAUDE_PANE_TOKEN: TOKEN }, pane: JSON.stringify({ v: 3, pid: 20, started: ft(1) }), probe: machine(leftOther), store: THERE })
+    await $.session.start(start)
+    await switchNow($, clock)
+    expect(kinds()).toEqual(['probe', 'pane'])
+    expect(commands).toEqual([{ command: 'exit' }])
+    const script = runs.find(r => r.kind === 'pane')?.script ?? ''
+    const ticket = JSON.parse(/^\s*\$text = '(\{.+\})'$/m.exec(script)?.[1] ?? '{}') as { left?: unknown }
+    expect(ticket.left).toEqual({ exitAt: NOW - 60_000 })
+  })
+
+  test('a move that does not rest on the record (its verdict is not live without it) keeps this pane\'s slot', async ($, on) => {
+    // T's transcript an hour old: not live by L3 without the record; the record is read, and not needed.
+    const { kinds, clock } = engine(on, { probe: machine(p => (leftOther(p), inSlot(p), (p.transcripts = p.transcripts.map(t => (t.id === T ? { ...t, mtime: NOW - HOUR } : t))))), store: THERE })
+    await $.session.start(start)
+    await switchNow($, clock)
+    expect(kinds()).toEqual(['probe', 'slot'])
+  })
+
+  test("a record whose MAC doesn't match, or that names another conversation, waives nothing (LR1, LR9)", async ($, on) => {
+    const { commands, session, world, clock } = engine(on, { probe: machine(p => leftExit(p, r => (r.macOk = false))) })
+    await $.session.start(start)
+    await switchNow($, clock)
+    expect(commands).toEqual([])
+    expect(rows(session)).toContain("left record ignored: its MAC doesn't match under this machine's key")
+    world.probe = machine(p => leftExit(p, r => (r.id = X)))
+    await clock.advance(3 * MINUTE)
+    await switchNow($, clock)
+    expect(commands).toEqual([])
+    expect(rows(session)).toContain(`left record ignored: it names another conversation (${X})`)
+  })
+})
+
+describe("the tab's last look reads every config folder the switch reads (the coordinator's review, finding 1)", () => {
+  const WRAPPED = { ...WINDOWS, CLAUDE_PANE_TOKEN: TOKEN }
+  const THERE = { [`alive:${T}`]: { at: NOW - HOUR, folder: ELSEWHERE, project: 'C--work-other' } }
+  const SECOND = 'D:\\other cfg'
+  const V3 = JSON.stringify({ v: 3, pid: 20, started: ft(1) })
+
+  test('two config folders and a current wrapper (pane file version 3): the tab, its ticket naming both folders for the last look', { options: { configDirs: [SECOND] } }, async ($, on) => {
+    const { runs, kinds, commands, clock } = engine(on, { env: WRAPPED, pane: V3, probe: machine(elsewhere), store: THERE })
+    await $.session.start(start)
+    await switchNow($, clock)
+    expect(kinds()).toEqual(['probe', 'pane'])
+    const script = runs.find(r => r.kind === 'pane')?.script ?? ''
+    const ticket = JSON.parse(/^\s*\$text = '(\{.+\})'$/m.exec(script)?.[1] ?? '{}') as { configDirs?: string[] }
+    expect(ticket.configDirs).toEqual([CONFIG, SECOND])
+    expect(commands).toEqual([{ command: 'exit' }])
+  })
+
+  test('two config folders and an older wrapper (pane file version 2, its own folder alone): the window, and the log says why', { options: { configDirs: [SECOND] } }, async ($, on) => {
+    const { kinds, logs, commands, tickets, clock } = engine(on, { env: WRAPPED, pane: PANE, probe: machine(elsewhere), store: THERE })
+    await $.session.start(start)
+    await switchNow($, clock)
+    expect(kinds()).toEqual(['probe', 'launcher'])
+    expect(tickets()[T]).toMatchObject({ transport: 'window' })
+    expect(commands).toEqual([{ command: 'exit' }])
+    expect(logs).toContain(
+      `this tab's claude wrapper isn't used: this tab's claude wrapper is an older one (its pane file is version 2), whose last look reads its own config folder alone, and this move reads 2: copy the current claude-wrapper.ps1 into place. A new window resumes ${T}.`,
+    )
+  })
+
+  test('one config folder and an older wrapper: the tab, as before', async ($, on) => {
+    const { kinds, clock } = engine(on, { env: WRAPPED, pane: PANE, probe: machine(elsewhere), store: THERE })
+    await $.session.start(start)
+    await switchNow($, clock)
+    expect(kinds()).toEqual(['probe', 'pane'])
+  })
+})
+
+describe('a run the switch gave up on can leave nothing behind (the coordinator\'s review, finding 2)', () => {
+  const WRAPPED = { ...WINDOWS, CLAUDE_PANE_TOKEN: TOKEN }
+  const THERE = { [`alive:${T}`]: { at: NOW - HOUR, folder: ELSEWHERE, project: 'C--work-other' } }
+
+  test('the launch carries a deadline 20 s ahead, under the 30 s its run may take', async ($, on) => {
+    const { runs, clock } = engine(on, { env: WRAPPED, pane: PANE, probe: machine(elsewhere), store: THERE })
+    await $.session.start(start)
+    await switchNow($, clock)
+    const script = runs.find(r => r.kind === 'pane')?.script ?? ''
+    expect(script).toContain(`if ([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() -gt ${NOW + 500 + 20_000}) { Refuse 'late'`)
+    expect(runs.find(r => r.kind === 'pane')?.init?.timeoutMs).toBe(30_000)
+  })
+
+  test('a ticket that is not written (no clean answer): withdrawn and its claim released at once, and again 3 s later', async ($, on) => {
+    const { kinds, writes, clock } = engine(on, { env: WRAPPED, pane: PANE, probe: machine(elsewhere), store: THERE, paneScript: 'fails' })
+    await $.session.start(start)
+    await switchNow($, clock)
+    expect(kinds()).toEqual(['probe', 'pane', 'release'])
+    expect(writes).toEqual([{ path: paneTicketPath(STATE, TOKEN), text: '{"v":1,"cancelled":true}' }])
+    await clock.advance(4000)
+    expect(kinds()).toEqual(['probe', 'pane', 'release', 'release'])
+    expect(writes).toEqual([
+      { path: paneTicketPath(STATE, TOKEN), text: '{"v":1,"cancelled":true}' },
+      { path: paneTicketPath(STATE, TOKEN), text: '{"v":1,"cancelled":true}' },
+    ])
+  })
+
+  test('a window that the launcher refused cleanly is not taken back again: the script gave back its own', async ($, on) => {
+    const { kinds, clock } = engine(on, { probe: machine(elsewhere), store: THERE, launcher: 'refuses' })
+    await $.session.start(start)
+    await switchNow($, clock)
+    await clock.advance(4000)
+    expect(kinds()).toEqual(['probe', 'launcher', 'release'])
+  })
 })

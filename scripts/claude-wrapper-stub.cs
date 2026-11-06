@@ -1,7 +1,8 @@
-// A stub claude.exe for scripts/claude-wrapper.test.mjs, compiled there by Windows PowerShell's
-// Add-Type into a temporary folder. It never runs Claude Code. Each run appends one JSON line to
-// %STUB_LOG%: its arguments, its folder, the NAMES of its environment variables (never a value), whether
-// CLAUDE_CODE_FORCE_SESSION_PERSISTENCE is "1", whether the wrapper's ticket was still there when it
+// A stub claude.exe for scripts/claude-wrapper.test.mjs and scripts/claude-launch.test.mjs, compiled
+// there by Windows PowerShell's Add-Type into a temporary folder. It never runs Claude Code. Each run
+// appends one JSON line to %STUB_LOG%: its arguments, its folder, the NAMES of its environment variables
+// (never a value), whether CLAUDE_CODE_FORCE_SESSION_PERSISTENCE and
+// CLAUDE_CODE_DISABLE_BG_SHELL_PRESSURE_REAP are "1", whether the wrapper's ticket was still there when it
 // started, and the wrapper's pane file. Then, as self-restart or self-switch would, it writes the
 // ticket for its run from %STUB_PLAN%\<run>.json, if there is one, with {TOKEN} replaced by its
 // CLAUDE_PANE_TOKEN and "{NOW}", "{OLD}" and "{AHEAD}" by the time now, 200 s ago and 60 s ahead, in
@@ -44,6 +45,7 @@ public static class ClaudeStub {
     line.Append(",\"cwd\":" + Q(Environment.CurrentDirectory));
     line.Append(",\"env\":[" + string.Join(",", names.ConvertAll(new Converter<string, string>(Q)).ToArray()) + "]");
     line.Append(",\"forceIsOne\":" + (Environment.GetEnvironmentVariable("CLAUDE_CODE_FORCE_SESSION_PERSISTENCE") == "1" ? "true" : "false"));
+    line.Append(",\"reapIsOne\":" + (Environment.GetEnvironmentVariable("CLAUDE_CODE_DISABLE_BG_SHELL_PRESSURE_REAP") == "1" ? "true" : "false"));
     line.Append(",\"ticketPresent\":" + (ticket != null && File.Exists(ticket) ? "true" : "false"));
     line.Append(",\"pane\":" + (pane != null && File.Exists(pane) ? Q(File.ReadAllText(pane)) : "null"));
     line.Append("}");

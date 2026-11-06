@@ -4,9 +4,7 @@
 import { describe, expect, test } from 'claude-code/testing'
 import {
   type Baseline,
-  CLEAR_MARKERS,
   countStatus,
-  FORCE_PERSISTENCE,
   descendants,
   FINGERPRINT_READS,
   FALLBACK,
@@ -14,8 +12,12 @@ import {
   LAUNCH_LINE_TRUSTED_AFTER_MS,
   READ_BLANK_AGAIN,
   type GitState,
+  type Pane,
   isSafeFolder,
-  launcherScript,
+  LAUNCH_ENV_CLEAR,
+  LAUNCH_ENV_SET,
+  launchScriptText,
+  type LaunchInput,
   liveness,
   newRegistryKeys,
   oneLine,
@@ -46,6 +48,7 @@ import {
   PANE_WRITTEN,
   paneFallback,
   panePath,
+  paneReads,
   paneScript,
   paneTicket,
   paneTicketPath,
@@ -638,8 +641,8 @@ describe('transports', () => {
 
 describe("the claude wrapper's tab", () => {
   const TOKEN = '00000000-0000-4000-a000-000000000001'
-  /** The fixture's pane: PowerShell 20, the parent of this session's claude.exe 100. */
-  const SHELL = { pid: 20, started: ft(1) }
+  /** The fixture's pane: PowerShell 20, the parent of this session's claude.exe 100, a current wrapper's (version 3). */
+  const SHELL: Pane = { pid: 20, started: ft(1), v: 3 }
   const tab = (pane = SHELL, token = TOKEN) => ({ token, pane })
 
   test('its files sit at token-shaped paths only', () => {
@@ -651,14 +654,15 @@ describe("the claude wrapper's tab", () => {
     }
   })
 
-  test('a pane file is { v: 2, pid, started }, the start an exact FILETIME string; version 1 is an older wrapper, and gets nothing', () => {
-    expect(parsePane(JSON.stringify({ v: 2, pid: 20, started: ft(1) }))).toEqual({ pid: 20, started: ft(1) })
+  test('a pane file is { v: 3, pid, started } (or version 2\'s), the start an exact FILETIME string; version 1 is an older wrapper, and gets nothing', () => {
+    expect(parsePane(JSON.stringify({ v: 3, pid: 20, started: ft(1) }))).toEqual({ pid: 20, started: ft(1), v: 3 })
+    expect(parsePane(JSON.stringify({ v: 2, pid: 20, started: ft(1) }))).toEqual({ pid: 20, started: ft(1), v: 2 })
     expect(parsePane(JSON.stringify({ v: 1, pid: 20, started: ft(1) }))).toEqual({
       why: "this tab's claude wrapper is an older one (its pane file is version 1), which checks neither the claim nor whether the conversation is open: copy the current claude-wrapper.ps1 into place",
     })
-    expect(parsePane(`\uFEFF${JSON.stringify({ v: 2, pid: 20, started: ft(1) })}`)).toEqual({ pid: 20, started: ft(1) })
-    for (const bad of ['{"v":3,"pid":20,"started":"1"}', '{"v":"2","pid":20,"started":"1"}', '{"v":2,"pid":"20","started":"1"}', `{"v":2,"pid":20,"started":${ft(1)}}`, '{"v":2,"pid":20}', '[]']) {
-      expect(parsePane(bad)).toEqual({ why: "this tab's pane file is not { v: 2, pid, started }" })
+    expect(parsePane(`\uFEFF${JSON.stringify({ v: 3, pid: 20, started: ft(1) })}`)).toEqual({ pid: 20, started: ft(1), v: 3 })
+    for (const bad of ['{"v":4,"pid":20,"started":"1"}', '{"v":"3","pid":20,"started":"1"}', '{"v":3,"pid":"20","started":"1"}', `{"v":3,"pid":20,"started":${ft(1)}}`, '{"v":3,"pid":20}', '[]']) {
+      expect(parsePane(bad)).toEqual({ why: "this tab's pane file is not { v: 3, pid, started }" })
     }
     expect(parsePane('not json')).toEqual({ why: "this tab's pane file is not JSON" })
   })
@@ -666,9 +670,9 @@ describe("the claude wrapper's tab", () => {
   test("used only when its PowerShell is this claude.exe's own parent, started when the pane file says", () => {
     expect(paneFallback(probeOf(), SHELL)).toBeUndefined()
     // Within 1 ms: CIM reads a start to the microsecond, .NET to the tick.
-    expect(paneFallback(probeOf(), { pid: 20, started: String(BigInt(ft(1)) + BigInt(9_999)) })).toBeUndefined()
-    expect(paneFallback(probeOf(), { pid: 21, started: ft(1) })).toBe("the tab's claude wrapper (PowerShell 21) is not the parent of claude.exe 100; powershell.exe 20 is")
-    expect(paneFallback(probeOf(), { pid: 20, started: String(BigInt(ft(1)) + BigInt(10_001)) })).toBe(
+    expect(paneFallback(probeOf(), { pid: 20, started: String(BigInt(ft(1)) + BigInt(9_999)), v: 3 })).toBeUndefined()
+    expect(paneFallback(probeOf(), { pid: 21, started: ft(1), v: 3 })).toBe("the tab's claude wrapper (PowerShell 21) is not the parent of claude.exe 100; powershell.exe 20 is")
+    expect(paneFallback(probeOf(), { pid: 20, started: String(BigInt(ft(1)) + BigInt(10_001)), v: 3 })).toBe(
       "the tab's pane file names process 20, but that process started at another time (another process took its id)",
     )
     const bash = probeOf(p => (p.procs = p.procs.map(x => (x.pid === 20 ? { ...x, name: 'bash.exe' } : x))))
@@ -688,8 +692,16 @@ describe("the claude wrapper's tab", () => {
     expect(pickTransport(probeOf(elsewhere), W, T, ELSEWHERE, tab())).toEqual({ transport: 'pane', token: TOKEN, folder: ELSEWHERE })
     expect(pickTransport(probeOf(), W, T, undefined, tab())).toEqual({ transport: 'in-place' })
     expect(pickTransport(probeOf(p => (elsewhere(p), inSlot(p))), W, T, ELSEWHERE, tab())).toEqual({ transport: 'slot', slot: `20-${ft(1)}`, folder: ELSEWHERE })
-    expect(pickTransport(probeOf(elsewhere), W, T, ELSEWHERE, tab({ pid: 21, started: ft(1) }))).toEqual({ transport: 'window', folder: ELSEWHERE })
+    expect(pickTransport(probeOf(elsewhere), W, T, ELSEWHERE, tab({ pid: 21, started: ft(1), v: 3 }))).toEqual({ transport: 'window', folder: ELSEWHERE })
     expect(pickTransport(probeOf(elsewhere), W, T, ELSEWHERE, tab(SHELL, 'not-a-token'))).toEqual({ transport: 'window', folder: ELSEWHERE })
+    // A wrapper of version 2 reads its own config folder alone: the tab for a switch that reads one, the window for one that reads two.
+    const older = tab({ pid: 20, started: ft(1), v: 2 })
+    expect(pickTransport(probeOf(elsewhere), W, T, ELSEWHERE, older, 1)).toEqual({ transport: 'pane', token: TOKEN, folder: ELSEWHERE })
+    expect(pickTransport(probeOf(elsewhere), W, T, ELSEWHERE, older, 2)).toEqual({ transport: 'window', folder: ELSEWHERE })
+    expect(pickTransport(probeOf(elsewhere), W, T, ELSEWHERE, tab(), 2)).toEqual({ transport: 'pane', token: TOKEN, folder: ELSEWHERE })
+    expect(paneReads(older.pane, 2)).toBe("this tab's claude wrapper is an older one (its pane file is version 2), whose last look reads its own config folder alone, and this move reads 2: copy the current claude-wrapper.ps1 into place")
+    expect(paneReads(older.pane, 1)).toBeUndefined()
+    expect(paneReads(SHELL, 8)).toBeUndefined()
     // The folder rules come first: an unknown folder refuses, tab or not.
     expect(pickTransport(probeOf(elsewhere), W, T, undefined, tab())).toMatchObject({ refusal: expect.stringContaining("folder isn't known here") })
   })
@@ -721,8 +733,14 @@ describe("the claude wrapper's tab", () => {
     expect(read({ ...good, dir: 'work\\other' })).toEqual({ why: PANE_WHY.dir })
     expect(read({ ...good, dir: "C:\\work\\o'ther" })).toEqual({ why: PANE_WHY.dir })
     expect(read({ ...good, dir: 'C:\\work\\o\u2019ther' })).toEqual({ why: PANE_WHY.dir })
+    // The config folders its last look reads besides the wrapper's own: 1 to 8 absolute folders, when there.
+    expect(read({ ...good, configDirs: ['C:\\Users\\u\\.claude', 'D:\\other cfg'] })).toEqual({ ticket: { ...good, configDirs: ['C:\\Users\\u\\.claude', 'D:\\other cfg'] } })
+    for (const configDirs of [[], 'C:\\x', ['relative'], ["C:\\o'brien"], ['C:\\a\nb'], [5], Array.from({ length: 9 }, (_, i) => `C:\\c${i}`), [`C:\\${'x'.repeat(240)}`]]) {
+      expect(read({ ...good, configDirs })).toEqual({ why: PANE_WHY.configs })
+    }
     // The first rule broken is the one said.
     expect(read({ ...good, v: 2, token: X, at: 0 })).toEqual({ why: PANE_WHY.version })
+    expect(read({ ...good, dir: 'relative', configDirs: [] })).toEqual({ why: PANE_WHY.dir })
   })
 
   test('paneTicket builds only a ticket the wrapper takes, of an absolute folder without quotes', () => {
@@ -733,6 +751,17 @@ describe("the claude wrapper's tab", () => {
     expect(() => paneTicket({ ...ticket, by: `slot:20-${ft(1)}` })).toThrow(/names no claim/)
     expect(() => paneTicket({ ...ticket, dir: 'C:\\work\\..\\other' })).toThrow(/not an absolute folder/)
     expect(() => paneTicket({ ...ticket, dir: "C:\\work\\o'ther" })).toThrow(/not an absolute folder/)
+    // The config folders, each an absolute folder without quotes.
+    expect(paneTicket({ ...ticket, configDirs: ['C:\\Users\\u\\.claude'] })).toBe(JSON.stringify({ v: 1, token: TOKEN, resume: T, by: LAUNCH, dir: ELSEWHERE, at: NOW, configDirs: ['C:\\Users\\u\\.claude'] }))
+    expect(() => paneTicket({ ...ticket, configDirs: ["C:\\o'brien"] })).toThrow(/not an absolute folder/)
+    expect(() => paneTicket({ ...ticket, configDirs: [] })).toThrow(/config folders are not absolute folders/)
+    // A left record's stat: { size, mtime } or { exitAt }, whole numbers, nothing else.
+    expect(JSON.parse(paneTicket({ ...ticket, left: { size: 4096, mtime: NOW - 55_000 } })).left).toEqual({ size: 4096, mtime: NOW - 55_000 })
+    expect(JSON.parse(paneTicket({ ...ticket, left: { exitAt: NOW - 60_000 } })).left).toEqual({ exitAt: NOW - 60_000 })
+    const read = (left: unknown) => checkPaneTicket(JSON.stringify({ v: 1, token: TOKEN, resume: T, by: LAUNCH, dir: ELSEWHERE, at: NOW, left }), TOKEN, NOW)
+    expect(read({ exitAt: NOW })).toEqual({ ticket: { v: 1, token: TOKEN, resume: T, by: LAUNCH, dir: ELSEWHERE, at: NOW, left: { exitAt: NOW } } })
+    for (const bad of [{ size: 1 }, { size: 1, mtime: 2, exitAt: 3 }, { exitAt: -1 }, { exitAt: 1.5 }, { size: '1', mtime: 2 }, 'exitAt', [1, 2]]) expect(read(bad)).toEqual({ why: PANE_WHY.left })
+    expect(() => paneTicket({ ...ticket, left: { exitAt: -1 } })).toThrow(/left record's stat/)
   })
 
   test('the pane script: the ticket written whole under another name, then moved into place; the claim only when asked, for the ticket\'s own claimant, before it', () => {
@@ -808,23 +837,38 @@ describe("the coordinator's gate", () => {
 
 describe('the scripts, as text', () => {
   const probe = probeScript({ ids: [W, T], take: T, configDirs: [CONFIG, 'D:\\other cfg'], stateDir: STATE, heavySlotRoot: 'C:\\tools\\slots' })
-  const restart = launcherScript(W)
-  const window = launcherScript(T, { folder: ELSEWHERE, claim: LAUNCH, configDirs: [CONFIG], stateDir: STATE })
+  /** A launch through the shared launcher, after this session's claude.exe 100: self-restart's ('auto'), or a switch's window. */
+  const launchFor = (input: Partial<LaunchInput>): LaunchInput => ({
+    powershell: 'C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe',
+    kind: 'resume',
+    id: T,
+    folder: ELSEWHERE,
+    claim: LAUNCH,
+    configDirs: [CONFIG],
+    stateDir: STATE,
+    where: { window: true },
+    waitForExit: { pid: 100, created: ft(2) },
+    ...input,
+  })
+  const restart = launchScriptText(launchFor({ id: W, folder: REPO, where: 'auto', tool: 'self-restart' }))
+  const window = launchScriptText(launchFor({ tool: 'self-switch' }))
   const release = releaseScript({ stateDir: STATE, id: T, by: LAUNCH })
 
   test('only session ids, and folders without quotes, are accepted', () => {
     for (const id of ['', 'session-1', `${T} `, `${T}'`, T.toUpperCase(), `${T}\n`, `${T}'; calc; '`]) {
       expect(() => probeScript({ ids: [W, id], configDirs: [CONFIG], stateDir: STATE })).toThrow()
-      expect(() => launcherScript(id)).toThrow()
+      expect(() => launchScriptText(launchFor({ id }))).toThrow()
       expect(() => releaseScript({ stateDir: STATE, id, by: LAUNCH })).toThrow()
     }
     expect(() => probeScript({ ids: [W], take: T, configDirs: [CONFIG], stateDir: STATE })).toThrow()
     for (const folder of ["C:\\o'brien", 'C:\\a\u2019b', 'C:\\a"b', 'C:\\a\nb', 'relative\\path', '\\\\server\\share', 'C:\\a\\..\\b', 'C:/a', 'C:\\a:b']) {
       expect(isSafeFolder(folder)).toBe(false)
       expect(() => probeScript({ ids: [W], configDirs: [folder], stateDir: STATE })).toThrow()
-      expect(() => launcherScript(T, { folder, claim: LAUNCH, configDirs: [CONFIG], stateDir: STATE })).toThrow()
+      expect(() => launchScriptText(launchFor({ folder }))).toThrow()
     }
-    expect(() => launcherScript(T, { folder: ELSEWHERE, claim: 'slot:1-2', configDirs: [CONFIG], stateDir: STATE })).toThrow()
+    // A window names a launch's claim, never a slot's; and a folder with a ';' is refused (wt splits on it).
+    expect(() => launchScriptText(launchFor({ claim: 'slot:1-2' }))).toThrow()
+    expect(() => launchScriptText(launchFor({ folder: 'C:\\a;b' }))).toThrow()
     expect(() => releaseScript({ stateDir: STATE, id: T, by: "launch:x'; calc" })).toThrow()
   })
 
@@ -836,9 +880,11 @@ describe('the scripts, as text', () => {
     expect(window).toContain(`$by = '${LAUNCH}'`)
     // Quotes PowerShell reads as single quotes are doubled, the curly ones included.
     expect(psQuote("a'b\u2018c\u2019d\u201ae\u201bf")).toBe("a''b\u2018\u2018c\u2019\u2019d\u201a\u201ae\u201b\u201bf")
-    // The launcher escapes in the script what it reads there: claude's path, the folder, the config folders.
-    for (const script of [restart, window]) expect(script).toContain('[Management.Automation.Language.CodeGeneration]::EscapeSingleQuotedStringContent($claude.Source)')
-    expect(window).toContain('$folderText = [Management.Automation.Language.CodeGeneration]::EscapeSingleQuotedStringContent($folder)')
+    // The window's script goes in whole as one single-quoted literal, its own literals' quotes doubled:
+    // nothing is read and spliced in at run time.
+    expect(window).toContain(`$inner = '$ErrorActionPreference = "Stop"`)
+    expect(window).toContain(`$folder = ''${ELSEWHERE}''`)
+    expect(window).not.toContain('EscapeSingleQuotedStringContent')
   })
 
   test('the probe: the age-guarded walk, CreateNew, and what it never prints', () => {
@@ -869,7 +915,7 @@ describe('the scripts, as text', () => {
     expect(probe.indexOf('New-Claim $claimPath $claimText')).toBeLessThan(probe.indexOf('$locks = New-Object'))
   })
 
-  test("a launched claude's environment: every session marker cleared, NO_COLOR too, WT_SESSION and WT_PROFILE_ID untouched, transcripts forced on, the REAP setting kept", () => {
+  test("a launched claude's environment: every session marker cleared, NO_COLOR too, WT_SESSION and WT_PROFILE_ID untouched, transcripts forced on, the REAP setting kept on", () => {
     for (const name of [
       'AI_AGENT',
       'CLAUDECODE',
@@ -887,62 +933,60 @@ describe('the scripts, as text', () => {
       'NO_COLOR',
     ]) {
       expect(SESSION_MARKERS as readonly string[]).toContain(name)
+      expect(LAUNCH_ENV_CLEAR).toContain(name)
     }
-    // Never cleared: the person's choice, and the terminal's (Claude Code reads WT_SESSION on Windows to
-    // draw its Unicode prompt and its links).
+    // claude-launch.ps1 clears exactly SESSION_MARKERS (NO_COLOR among them), and sets two.
+    expect(LAUNCH_ENV_CLEAR).toEqual([...SESSION_MARKERS])
+    expect(LAUNCH_ENV_SET).toEqual({ CLAUDE_CODE_FORCE_SESSION_PERSISTENCE: '1', CLAUDE_CODE_DISABLE_BG_SHELL_PRESSURE_REAP: '1' })
+    // Never cleared: the person's choice, kept on, and the terminal's (Claude Code reads WT_SESSION on
+    // Windows to draw its Unicode prompt and its links). Neither WT name is set either.
     for (const name of ['CLAUDE_CODE_DISABLE_BG_SHELL_PRESSURE_REAP', 'CLAUDE_CODE_FORCE_SESSION_PERSISTENCE', 'WT_SESSION', 'WT_PROFILE_ID']) {
-      expect(SESSION_MARKERS as readonly string[]).not.toContain(name)
-      expect(CLEAR_MARKERS).not.toContain(name)
+      expect(LAUNCH_ENV_CLEAR).not.toContain(name)
     }
-    expect(CLEAR_MARKERS.match(/"[A-Za-z_]+"/g)).toEqual(SESSION_MARKERS.map(name => `"${name}"`))
-    expect(FORCE_PERSISTENCE).toBe('$env:CLAUDE_CODE_FORCE_SESSION_PERSISTENCE = "1"')
+    expect(Object.keys(LAUNCH_ENV_SET)).not.toContain('WT_SESSION')
+    expect(Object.keys(LAUNCH_ENV_SET)).not.toContain('WT_PROFILE_ID')
+    // The window and the restart clear and set nothing themselves: claude-launch.ps1 does, right before claude.
     for (const script of [restart, window]) {
-      expect(script).not.toContain('CLAUDE_CODE_DISABLE_BG_SHELL_PRESSURE_REAP')
-      // The new tab's or window's own, exactly as it has them: nothing names them.
-      expect(script).not.toContain('WT_SESSION')
-      expect(script).not.toContain('WT_PROFILE_ID')
-      expect(script.indexOf(`  '${FORCE_PERSISTENCE}',`)).toBe(script.indexOf(`  '${CLEAR_MARKERS}',`) + `  '${CLEAR_MARKERS}',`.length + 2)
+      expect(script).not.toContain('SetEnvironmentVariable')
+      for (const name of [...SESSION_MARKERS, 'WT_SESSION', 'WT_PROFILE_ID', 'CLAUDE_CODE_DISABLE_BG_SHELL_PRESSURE_REAP', 'CLAUDE_CODE_FORCE_SESSION_PERSISTENCE']) expect(script).not.toContain(name)
     }
   })
 
-  test('the launcher: the scrub list, then the folder, then claude; the re-check after the wait and before claude', () => {
+  test('the launcher: the wait, the re-check, the claim, the folder, then claude-launch.ps1 by its pinned path and hash', () => {
     for (const script of [restart, window]) {
-      const clears = script.split(/\r?\n/).filter(line => line.includes('SetEnvironmentVariable'))
-      expect(clears).toHaveLength(1)
-      expect(clears[0]).toContain(CLEAR_MARKERS)
-      expect(clears[0]?.match(/"[A-Za-z_]+"/g)).toEqual(SESSION_MARKERS.map(name => `"${name}"`))
-      expect(script).toContain(`  '${FORCE_PERSISTENCE}',`)
-      const wait = script.indexOf('Wait-Process')
-      const recheck = script.indexOf(RECHECK[2])
+      const wait = script.indexOf('Wait-Process -Id 100')
+      const recheck = script.indexOf(RECHECK[2] ?? '', wait)
       const claimCheck = script.indexOf('the claim on it no longer names this window')
-      const folder = script.indexOf("'Set-Location -LiteralPath $folder'")
-      const claude = script.indexOf("--resume '$id'")
+      const folder = script.indexOf('-not (Test-Path -LiteralPath $folder -PathType Container)', claimCheck)
+      const hash = script.indexOf("(Get-Sha256 $launchPath) -cne '", folder)
+      const claude = script.indexOf('& $launchPath -Resume $id -Dir $folder')
       expect(wait).toBeGreaterThan(0)
       expect(recheck).toBeGreaterThan(wait)
       expect(claimCheck).toBeGreaterThan(recheck)
-      expect(script.indexOf(clears[0] ?? '')).toBeGreaterThan(claimCheck)
-      expect(folder).toBeGreaterThan(script.indexOf(clears[0] ?? ''))
-      expect(claude).toBeGreaterThan(folder)
-      for (const line of RECHECK) expect(script).toContain(`'    ${line}'`)
+      expect(folder).toBeGreaterThan(claimCheck)
+      expect(hash).toBeGreaterThan(folder)
+      expect(claude).toBeGreaterThan(hash)
+      for (const line of RECHECK) expect(script.indexOf(`    ${line}`, wait)).toBeGreaterThan(wait)
       // A registry file that doesn't read is read again twice, 250 ms apart, before it counts as unknown;
       // unknown, the window says so, gives the line to resume by hand, and waits for Enter.
       expect(RECHECK).toContain('    for ($try = 1; $try -le 3 -and $null -eq $e; $try++) {')
       expect(RECHECK).toContain('      if ($null -eq $e -and $try -lt 3) { Start-Sleep -Milliseconds 250 }')
-      expect(script).toContain('$refusal = \\"The session is not resumed here, so that two copies never write it: \\" + $live + \\".\\"'.split('\\"').join('"'))
-      expect(script).toContain("Write-Host 'Once it is safe, resume it yourself: claude --resume $id'")
+      expect(script).toContain('$refusal = "The session is not resumed here, so that two copies never write it: " + $live + "."')
+      expect(script).toContain('Write-Host ("Once it is safe, resume it yourself: " + "claude-launch.ps1 -Resume " + $id + " -Dir " + $folder)')
       // The window stops on a failed read, so the re-check's catch refuses: a new PowerShell would go on.
-      const stops = script.indexOf(`  '$ErrorActionPreference = "Stop"',`)
-      expect(stops).toBeGreaterThan(wait)
+      const stops = script.indexOf('$ErrorActionPreference = "Stop"')
+      expect(stops).toBeGreaterThan(0)
       expect(stops).toBeLessThan(recheck)
-      expect(script).toContain("Test-Path -LiteralPath $folder -PathType Container")
       expect(script).toContain('if ($null -ne $up -and $up.CreationDate -le $child.CreationDate) { return $up }')
       expect(script).not.toContain('-replace')
       expect(script).not.toContain('Remove-Item')
+      // The launch script checks claude-launch.ps1 too, before it takes the claim or opens anything.
+      expect(script.indexOf("Refuse 'launcher'")).toBeLessThan(script.indexOf('$taken = New-Claim $claimPath $claimText'))
     }
-    // The restart takes the claim itself, with CreateNew; the switch's window checks the one the probe took.
+    // Both take the claim in their own run, with CreateNew (the switch's again: the probe's, its own session's).
     expect(restart).toContain('[IO.FileMode]::CreateNew')
-    expect(window).not.toContain('[IO.FileMode]::CreateNew')
-    expect(window).toContain('if ($null -eq $lock -or $lock.by -cne $by) { "self-switch: the claim on this conversation does not name this launch')
+    expect(window).toContain('[IO.FileMode]::CreateNew')
+    expect(window).toContain("if (-not $taken) { Refuse 'claim' ($tool + ': another switch, restart or launch holds the claim on this conversation') }")
   })
 
   test('the last-moment re-check reads the registry as the probe does: sessionId without regard to case, named in another key, and L2 past a process that moved on', () => {
@@ -982,8 +1026,8 @@ describe('the scripts, as text', () => {
       '    }',
     ])
     expect(RECHECK.some(line => line.includes('sessionId -eq $id -and'))).toBe(false)
-    // The window carries it after the wait, and the restart's launcher too.
-    for (const script of [restart, window]) for (const line of RECHECK.slice(at - 2, at + 4)) expect(script).toContain(`'    ${line}'`)
+    // The window carries it after the wait, and the restart's too.
+    for (const script of [restart, window]) for (const line of RECHECK.slice(at - 2, at + 4)) expect(script).toContain(`    ${line}`)
   })
 
   test('the slot is hashed by .NET, never by Get-FileHash, and a hash that fails keeps its reason', () => {
@@ -1010,42 +1054,41 @@ describe('the scripts, as text', () => {
     expect(restart).toContain('if ($slotSeen) { $slotFallback = "this pane runs claude-slot.ps1 some other way than the slot runner the plugin recognises (Windows PowerShell, powershell.exe -File with the script" + [char]39 + "s absolute path), so it is no slot" }')
   })
 
-  test('the restart launcher says why it passed over a slot runner, on a line of its own after the claim', () => {
+  test('the restart launch says why it passed over a slot runner, on a line of its own after the claim', () => {
     expect(restart).toContain(
       'if ($null -ne $slot -and -not $slotOk) { if ($null -ne $slotHashError) { $slotFallback = "slot hash unreadable: " + $slotHashError } else { $slotFallback = "this pane" + [char]39 + "s claude-slot.ps1 has another SHA-256 than the one shipped" } }',
     )
-    const said = restart.indexOf('if ($null -ne $slotFallback) { "fallback " + ($slotFallback -split "\r?\n")[0] }')
-    expect(said).toBeGreaterThan(restart.indexOf('"claim $by"', restart.indexOf('Start-Process')))
+    const said = restart.indexOf('[Console]::Out.WriteLine("fallback " + ($slotFallback -split "\\r?\\n")[0])')
+    expect(said).toBeGreaterThan(restart.indexOf('[Console]::Out.WriteLine("claim " + $by)'))
     // A switch's window prints none: its probe said it already.
     expect(window).not.toContain('$slotFallback')
-    expect(FALLBACK.exec(`launched 100\r\nclaim ${LAUNCH}\r\nfallback slot hash unreadable: denied\r\n`)?.[1]).toBe('slot hash unreadable: denied')
-    expect(FALLBACK.exec(`launched 100\r\nclaim ${LAUNCH}\r\n`)).toBeNull()
+    expect(FALLBACK.exec(`claim ${LAUNCH}\r\nfallback slot hash unreadable: denied\r\nlaunched window - 100\r\n`)?.[1]).toBe('slot hash unreadable: denied')
+    expect(FALLBACK.exec(`claim ${LAUNCH}\r\nlaunched window - 100\r\n`)).toBeNull()
   })
 
-  test("the restart launcher uses the slot only for a folder its runner takes: absolute, no quote, the conversation's own", () => {
+  test("the restart launch uses the slot only for a folder its runner takes: the conversation's own", () => {
     const check = restart.indexOf('  $projectName = [regex]::Replace($folder, "[^A-Za-z0-9]", "-")')
     expect(check).toBeGreaterThan(restart.indexOf('$slotOk = $slotHash -eq'))
     expect(check).toBeLessThan(restart.indexOf('if ($slotOk) { $by = "slot:"'))
     expect(restart).toContain('(Join-Path $dir ("projects\\" + $projectName + "\\" + $id + ".jsonl"))')
-    // The whole condition, line for line: the slot is given up unless all three hold.
-    expect(restart.split(/\r?\n/)).toContain(
-      '  if (-not ($inProject -and $folder -cmatch "^[A-Za-z]:\\\\" -and $folder -notmatch "[\\x00-\\x1f\\x22\\x27\\u2018\\u2019\\u201a\\u201b\\u201c\\u201d\\u201e]")) { $slotOk = $false; $slotFallback = "the folder this session started in isn" + [char]39 + "t one the slot runner takes" }',
-    )
+    // The slot is given up unless the folder holds the conversation; absolute and without quotes it is already (checked before).
+    expect(restart).toContain('  if (-not $inProject) { $slotOk = $false; $slotFallback = "the folder is not one the slot runner takes: no transcript of the conversation under its project" }')
+    expect(() => launchScriptText(launchFor({ id: W, folder: "C:\\o'brien", where: 'auto' }))).toThrow()
   })
 
-  test('the restart launcher leaves a verified slot a record instead of a window', () => {
+  test('the restart launch leaves a verified slot a record instead of a window', () => {
     expect(restart).toContain(`$slotOk = $slotHash -eq '${SLOT_SCRIPT_SHA256}'`)
     // Named by the slot's id as PowerShell writes it: the pid and the exact FILETIME, a string.
-    expect(restart).toContain('$record = Join-Path $state ("slots\\" + $slot["id"] + ".next.json")')
+    expect(restart).toContain('$final = Join-Path $state ("slots\\" + $slot["id"] + ".next.json")')
     expect(restart).toContain('$slot = [ordered]@{ pid = [long]$up.ProcessId; created = $slotCreated; id = "$($up.ProcessId)-$slotCreated"; path = $slotPath; sha256 = $slotHash }')
     expect(restart).toContain('return [string][long]$p.CreationDate.ToFileTimeUtc()')
-    expect(restart.indexOf('if ($slotOk) {\r\n  $record')).toBeLessThan(restart.indexOf('Start-Process'))
+    expect(restart.indexOf('  if ($transport -eq "slot") {')).toBeLessThan(restart.indexOf('Start-Process'))
   })
 
   test('no permission flag of any kind, in any script', () => {
     for (const script of [probe, restart, window, release]) for (const flag of PERMISSION_FLAGS) expect(script).not.toContain(flag)
-    // claude runs with --resume and its id, and nothing else.
-    for (const script of [restart, window]) expect(script.split(/\r?\n/).filter(line => line.includes("& '$exe'"))).toEqual([`  "& '$exe' --resume '$id'",`])
+    // claude-launch.ps1 runs with -Resume and the id, -Dir and the folder, and nothing else.
+    for (const script of [restart, window]) expect(script.split(/\r?\n/).filter(line => line.includes('& $launchPath'))).toEqual(['& $launchPath -Resume $id -Dir $folder'])
   })
 
   test('the release removes the lock only when it names the claimant', () => {

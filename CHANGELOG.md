@@ -2,6 +2,23 @@
 
 Each entry names a plugin and its version, as `version` in `plugins/<name>/.claude-plugin/plugin.json` has it.
 
+## Unreleased: session recycling phase 2, stage S1: one launcher, the launch environment, the left record, wake markers and lanes.json
+
+No version changes yet: these ship with the versions that close phase 2.
+
+- **The shared launcher** (`shared/hooks/machine.ts`, every plugin with the machine code): `launch(input)` and `parseLaunch(stdout)` place every restart and switch out of a session, a slot's record, the tab's ticket or a window, in one script run that finds the caller's own `claude.exe`, makes the checks asked for, takes the claim lock and places the launch, answering `claim`, `launched`, `fallback` or `refused <code> <why>`. A deadline (20 s, under a 30 s run) stops a late placement, and a launch found placed late is taken back. `pickLaunchTransport` picks this tab, this pane's slot, then a window. The README's [launcher API](README.md#the-launcher-api) has every field.
+- **`claude-launch.ps1`** (new, `plugins/self-switch/slot/`): the one script a window runs to start `claude` (`-Resume`, `-Start -Name`, `-Lane`, or a new session), with the launch environment applied right before it: the session markers, `NO_COLOR` and `PSExecutionPolicyPreference` cleared; `CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1` and `CLAUDE_CODE_DISABLE_BG_SHELL_PRESSURE_REAP=1` set; `WT_SESSION` and `WT_PROFILE_ID` untouched. A window runs it from `%LOCALAPPDATA%\claude-self-tools` at its pinned SHA-256 only, and the launch puts its own copy there (`LAUNCH_SCRIPT_TEXT`, written whole, checked, moved over) when the file is missing or has another hash: refused only when it can't. `scripts/embed-launch.mjs` keeps the copy in the machine code equal to the script.
+- **Every generated script resets `PSModulePath`** to Windows PowerShell's own folders first, so a Windows Terminal tab whose module path lists PowerShell 7's never loads 7's modules into 5.1.
+- **The left record** (self-switch): a signed record of a conversation the process just left, which lets a switch back to it soon after waive its fresh transcript and heartbeat, and only those, once nothing touched it since. The probe reads it (`left`), the liveness check waives with evidence, and the last look in place and in the window checks the transcript again. The claude wrapper (pane file version 3) checks it from its ticket; a move through this pane's slot runner, which doesn't until slots v2, or an older wrapper, goes to a new window instead, saying why.
+- **Liveness reads the session's own process as itself** (`self`): its own registry entry and command line no longer hold the conversation it is leaving.
+- **`exitBlockers`** also takes the session's background tasks, named with how to stop each.
+- **Session ids in paths** go through one check (`idPath`): a path built from anything but a session id throws.
+- **self-switch: S10w.** A wake-up armed with self-wake for this conversation holds the switch; self-wake on with no marker it can read holds too, saying to update self-wake to 0.2.0 or later.
+- **A launch refuses a folder with a semicolon**, as well as a quote, a control character or `< > | ? * /`, naming the class of character at fault (self-restart's start folder included).
+- **self-wake: wake markers.** `%LOCALAPPDATA%\claude-self-tools\wake\<conversation>.json` says whether a wake-up is armed for each conversation the process holds.
+- **lanes.json**: `readLanes`, `lanesUpdateScript` (one entry at a time, under a lock held as a handle) and `claude-launch.ps1 -Lane`; [`tools/lanes-seed`](tools/lanes-seed/lanes-seed.mjs) prints a proposed file from a session inventory and writes nothing.
+- **The claude wrapper, pane file version 3**: a ticket names the config folders the move read, and the wrapper's last look reads the registry of each, so a tab move under more than one config folder can't resume a conversation open under another. A ticket carries a left record's stat when the move rests on one, and the wrapper's last look checks the transcript against it. A resumed claude gets `CLAUDE_CODE_DISABLE_BG_SHELL_PRESSURE_REAP=1` too. A version 2 wrapper gets a ticket only for a move that reads one config folder and rests on no left record. The wrapper's SHA-256 changed: copy it into place again.
+
 ## 2026-11-06: self-remote-control 0.3.0, after a login change: Remote Control reconnected, a cut-off turn resumed, and a shared Remote Control lock
 
 - **self-remote-control 0.3.0**:

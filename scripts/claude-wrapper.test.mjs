@@ -13,7 +13,7 @@
 import assert from 'node:assert/strict'
 import { spawn, spawnSync } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
-import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { after, before, describe, test } from 'node:test'
@@ -42,6 +42,11 @@ const ID = '00000000-0000-4000-a000-000000000001'
 const OTHER_TOKEN = '00000000-0000-4000-a000-000000000002'
 /** The token a ticket is built with before the stub puts the tab's own in its place. */
 const PLACEHOLDER = '00000000-0000-4000-8000-000000000000'
+
+/** The line that reads the ticket's config folders into the last look, once each. */
+const LOOK_IN = String.raw`        if ($null -ne $t.configDirs) { foreach ($dir in @($t.configDirs)) { if (@($lookIn | Where-Object { $_.TrimEnd('\') -eq $dir.TrimEnd('\') }).Count -eq 0) { $lookIn += $dir } } }` + '\n'
+/** The line that takes the left record's last look, after RECHECK found nothing. */
+const LEFT_LOOK = '        if ($null -eq $why -and $null -ne $t.left) { $why = Test-Left $t.resume $lookIn $t.left.size $t.left.mtime $t.left.exitAt }\n'
 
 /** The line the wrapper prints for a ticket it doesn't use. */
 const NOT_USED = 'claude: the ticket to resume a session in this tab was not used: '
@@ -122,6 +127,7 @@ $after = [ordered]@{
   location = (Get-Location).ProviderPath
   tokenSet = $null -ne [Environment]::GetEnvironmentVariable('CLAUDE_PANE_TOKEN')
   forceSet = $null -ne [Environment]::GetEnvironmentVariable('CLAUDE_CODE_FORCE_SESSION_PERSISTENCE')
+  reapSet = $null -ne [Environment]::GetEnvironmentVariable('CLAUDE_CODE_DISABLE_BG_SHELL_PRESSURE_REAP')
   markersLost = @($markers | Where-Object { [Environment]::GetEnvironmentVariable($_) -ne 'marker-test' })
   wt = ($env:WT_SESSION -eq 'wt-test') -and ($env:WT_PROFILE_ID -eq 'wt-profile-test')
   files = @(if (Test-Path -LiteralPath $panes) { Get-ChildItem -LiteralPath $panes -File | ForEach-Object { $_.Name } })
@@ -196,6 +202,7 @@ function leftAsItWas(check, dirs, result) {
   check(a.location === dirs.start, `the folder is put back (${a.location})`)
   check(a.tokenSet === false, 'CLAUDE_PANE_TOKEN is put back (unset)')
   check(a.forceSet === false, 'CLAUDE_CODE_FORCE_SESSION_PERSISTENCE is put back (unset)')
+  check(a.reapSet === false, 'CLAUDE_CODE_DISABLE_BG_SHELL_PRESSURE_REAP is put back (unset)')
   check(a.markersLost.length === 0, `the markers are put back (${a.markersLost.join(', ')})`)
   check(a.wt === true, 'WT_SESSION and WT_PROFILE_ID are as they were')
   check(a.files.length === 0, `the pane file and the ticket are gone (${a.files.join(', ')})`)
@@ -220,13 +227,14 @@ async function resumesOnce(shell, wrapper = WRAPPER) {
     const apart = BigInt(pane.started) - BigInt(result.after.created)
     check(apart <= 10_000n && apart >= -10_000n, `the pane file's start is the shell's, within 1 ms, as the probe reads it (${apart} ticks apart)`)
   }
-  check(pane !== undefined && JSON.parse(first?.pane ?? '{}').v === 2, 'the pane file is version 2: the wrapper that checks the claim and takes the last look')
+  check(pane !== undefined && JSON.parse(first?.pane ?? '{}').v === 3, 'the pane file is version 3: the wrapper that checks the claim and takes the last look in every config folder the ticket names')
   check(second !== undefined && JSON.stringify(second.args) === JSON.stringify(['--resume', dirs.id]), `the resume runs claude --resume <id>, nothing more (${JSON.stringify(second?.args)})`)
   check(second?.cwd === dirs.work, `the resume runs in the ticket's folder (${second?.cwd})`)
   check(second?.ticketPresent === false, 'the ticket was deleted before the resume ran')
   check(second?.pane === first?.pane, 'the resume keeps the tab: same token, same pane file')
   for (const name of machine.SESSION_MARKERS) check(second !== undefined && !second.env.includes(name), `the resume runs without ${name}`)
   check(second?.forceIsOne === true, 'the resume runs with CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1')
+  check(second?.reapIsOne === true, 'the resume runs with CLAUDE_CODE_DISABLE_BG_SHELL_PRESSURE_REAP=1 (the launch environment)')
   for (const name of ['WT_SESSION', 'WT_PROFILE_ID', 'CLAUDE_PANE_TOKEN']) check(second !== undefined && second.env.includes(name), `the resume keeps ${name}`)
   check(third === undefined, 'nothing runs after a resume that left no ticket')
   check(result.stdout.includes(`Resuming ${dirs.id} here, in ${dirs.work}.`), 'the resume is said')
@@ -256,6 +264,12 @@ const BROKEN = [
   { name: 'whose claim lock is not JSON', why: machine.PANE_WHY.lock, pure: false, ticket: dirs => ticketFor(dirs), setup: dirs => writeFileSync(dirs.lock, 'not json') },
   { name: 'a missing folder', why: machine.PANE_WHY.dir, pure: false, ticket: dirs => ticketFor(dirs, { dir: join(dirs.root, 'gone') }) },
   { name: 'a relative folder', why: machine.PANE_WHY.dir, pure: true, ticket: dirs => ticketFor(dirs, { dir: 'work' }) },
+  { name: 'naming a config folder that is not absolute', why: machine.PANE_WHY.configs, pure: true, ticket: dirs => ticketFor(dirs, { configDirs: [dirs.config, 'config'] }) },
+  { name: 'naming no config folders in a list', why: machine.PANE_WHY.configs, pure: true, ticket: dirs => ticketFor(dirs, { configDirs: [] }) },
+  { name: 'with a left record stat of a size alone', why: machine.PANE_WHY.left, pure: true, ticket: dirs => ticketFor(dirs, { left: { size: 1 } }) },
+  { name: 'with a left record stat of both kinds', why: machine.PANE_WHY.left, pure: true, ticket: dirs => ticketFor(dirs, { left: { size: 1, mtime: 2, exitAt: 3 } }) },
+  { name: 'with a left record exit time below zero', why: machine.PANE_WHY.left, pure: true, ticket: dirs => ticketFor(dirs, { left: { exitAt: -5 } }) },
+  { name: 'with a left record stat that is text', why: machine.PANE_WHY.left, pure: true, ticket: dirs => ticketFor(dirs, { left: 'size 1' }) },
   { name: 'a missing transcript', why: machine.PANE_WHY.transcript, pure: false, ticket: dirs => ticketFor(dirs, { dir: dirs.start }) },
   { name: 'withdrawn', why: machine.PANE_WHY.withdrawn, pure: true, ticket: () => JSON.stringify({ v: 1, cancelled: true }) },
   { name: 'version 2', why: machine.PANE_WHY.version, pure: true, ticket: dirs => ticketFor(dirs, { v: 2 }) },
@@ -318,6 +332,63 @@ async function liveElsewhere(shell, how, wrapper = WRAPPER) {
   } finally {
     other.kill()
   }
+}
+
+/**
+ * A ticket that names a second config folder (a switch that reads two), for a conversation a running
+ * claude.exe holds by a registry file in that second folder: the wrapper's last look reads that folder
+ * too, and refuses in one line; nothing is resumed (the coordinator's review, finding 1).
+ */
+async function liveInSecondConfig(shell, wrapper = WRAPPER) {
+  const dirs = lab()
+  const second = join(dirs.root, 'config-2')
+  mkdirSync(join(second, 'sessions'), { recursive: true })
+  const bin = join(dirs.root, 'elsewhere')
+  mkdirSync(bin)
+  copyFileSync(stub, join(bin, 'claude.exe'))
+  const env = { SystemRoot: SYSTEM_ROOT, LOCALAPPDATA: join(dirs.root, 'elsewhere-local'), STUB_LOG: join(dirs.root, 'elsewhere.jsonl'), STUB_SLEEP_MS: '90000' }
+  const other = spawn(join(bin, 'claude.exe'), [], { env, windowsHide: true, stdio: 'ignore' })
+  writeFileSync(join(second, 'sessions', `${other.pid}.json`), JSON.stringify({ pid: other.pid, sessionId: dirs.id, procStart: '0' }))
+  try {
+    const result = await run(shell, dirs, { wrapper, plan: { 1: ticketFor(dirs, { configDirs: [dirs.config, second] }) } })
+    const { found, check } = problems()
+    check(result.runs.length === 1, `nothing is resumed (${result.runs.length} runs)`)
+    const why = `it may be open elsewhere: the registry file of running Claude Code ${other.pid} names it, though its procStart is not that process start time (a stale file, or a format this check does not know)`
+    check(result.stdout.includes(`${NOT_USED}${why}. Once it is safe, resume it yourself: claude --resume ${dirs.id}`), `one line says why: ${why} (${result.stdout.slice(0, 600)})`)
+    leftAsItWas(check, dirs, result)
+    return found
+  } finally {
+    other.kill()
+  }
+}
+
+/**
+ * A switch back to a conversation left moments ago, its ticket carrying the left record's stat (and its
+ * config folders naming the tab's own again, as the plugins name them): `how` 'same' (in place, the
+ * transcript's size and time as they are: resumed), 'grown' (in place, the transcript written after the
+ * stat was taken: refused), 'exit-old' (on exit, the transcript last written more than 10 s after the
+ * exit time: refused), 'exit-fresh' (on exit, written before it: resumed).
+ */
+async function leftRecord(shell, how, wrapper = WRAPPER) {
+  const dirs = lab()
+  const transcript = join(dirs.config, 'projects', machine.projectName(dirs.work), `${dirs.id}.jsonl`)
+  writeFileSync(transcript, '{"type":"user"}\n')
+  const stat = statSync(transcript)
+  const left =
+    how === 'same' || how === 'grown'
+      ? { size: stat.size, mtime: Math.floor(stat.mtimeMs) }
+      : { exitAt: how === 'exit-old' ? Math.floor(stat.mtimeMs) - 60_000 : Math.floor(stat.mtimeMs) }
+  if (how === 'grown') writeFileSync(transcript, '{"type":"user"}\n{"type":"assistant"}\n')
+  const result = await run(shell, dirs, { wrapper, plan: { 1: ticketFor(dirs, { configDirs: [dirs.config], left }) } })
+  const { found, check } = problems()
+  const resumes = how === 'same' || how === 'exit-fresh'
+  check(result.runs.length === (resumes ? 2 : 1), `${resumes ? 'one resume' : 'nothing resumed'} (${result.runs.length} runs; ${result.stdout.slice(0, 600)})`)
+  if (!resumes) {
+    const why = how === 'grown' ? 'its transcript changed since it was left (another process may have resumed it)' : 'its transcript was written after it was left (another process may have resumed it)'
+    check(result.stdout.includes(`${NOT_USED}${why}. Once it is safe, resume it yourself: claude --resume ${dirs.id}`), `one line says why: ${why} (${result.stdout.slice(0, 600)})`)
+  } else check(!result.stdout.includes(NOT_USED), `no ticket is refused (${result.stdout.slice(0, 600)})`)
+  leftAsItWas(check, dirs, result)
+  return found
 }
 
 /** Eleven tickets, 10.5 seconds apart: ten resumes, then the eleventh is refused (10 per `claude` typed). */
@@ -496,9 +567,20 @@ describe('the claude wrapper, in each PowerShell', { skip: !isWindows && 'Window
     const slot = readFileSync(join(ROOT, 'plugins', 'self-switch', 'slot', 'claude-slot.ps1'), 'utf8')
     const unread = "'whether it is open elsewhere is unknown: the registry or the process table could not be read (' + $_.Exception.Message + ')'"
     assert.ok(slot.includes(unread) && text.includes(`} catch { $live = ${unread} }`))
-    // Run right before claude, after every other check.
-    assert.ok(text.indexOf('if ($null -eq $why) { $why = Get-Live $t.resume @($config) }') > text.indexOf("{ 'this tab resumed 3 times within 30 seconds' }"))
-    assert.ok(text.indexOf('if ($null -eq $why) { $why = Get-Live $t.resume @($config) }') < text.indexOf('& $exe --resume $t.resume'))
+    // Run right before claude, after every other check, in this tab's own config folder and every one the ticket names.
+    const look = text.indexOf('        $why = Get-Live $t.resume $lookIn')
+    assert.ok(look > text.indexOf("{ 'this tab resumed 3 times within 30 seconds' }"))
+    assert.ok(look < text.indexOf('& $exe --resume $t.resume'))
+    assert.ok(text.indexOf('        $lookIn = @($config)') < look)
+    assert.ok(text.indexOf(LOOK_IN) < look)
+    // Then the left record's last look, LEFT_RECHECK line for line, right after it and before claude.
+    for (const line of machine.LEFT_RECHECK) assert.ok(text.includes(`      ${line}\n`), `missing from the wrapper's left record check: ${line}`)
+    const left = text.indexOf(LEFT_LOOK)
+    assert.ok(left > look && left < text.indexOf('& $exe --resume $t.resume'))
+    // The launch environment's set is the machine code's LAUNCH_ENV_SET, applied to a resume.
+    const set = Object.entries(machine.LAUNCH_ENV_SET).map(([name, value]) => `${name} = '${value}'`).join('; ')
+    assert.ok(text.includes(`  $launchSet = [ordered]@{ ${set} }\n`))
+    assert.ok(text.includes('      foreach ($name in $launchSet.Keys) { Set-Item -LiteralPath "Env:$name" -Value $launchSet[$name] }\n'))
   })
 
   for (const [name, shell] of SHELLS) {
@@ -516,6 +598,14 @@ describe('the claude wrapper, in each PowerShell', { skip: !isWindows && 'Window
       })
       test("a conversation a running claude.exe's registry file names at the last look (L1): refused, in the window's words", async () => {
         assert.deepEqual(await liveElsewhere(shell, 'L1'), [])
+      })
+      for (const how of ['same', 'grown', 'exit-old', 'exit-fresh']) {
+        test(`a switch back that rests on a left record (${how}): ${how === 'same' || how === 'exit-fresh' ? 'resumed' : 'refused at the last look'}`, async () => {
+          assert.deepEqual(await leftRecord(shell, how), [])
+        })
+      }
+      test('a conversation held under a second config folder the ticket names: refused at the last look', async () => {
+        assert.deepEqual(await liveInSecondConfig(shell), [])
       })
       test('a restart of a resumed session: the claude that just exited named the id, and is not taken for one holding it (R-1)', async () => {
         assert.deepEqual(await resumesAfterResume(shell, false), [])
@@ -626,7 +716,7 @@ describe('planted faults, each caught', { skip: !isWindows && 'Windows only', co
   })
 
   test('the last look removed: a conversation open elsewhere is resumed a second time', async () => {
-    const path = planted('      if ($null -eq $why) { $why = Get-Live $t.resume @($config) }\n', '')
+    const path = planted('        $why = Get-Live $t.resume $lookIn\n', '')
     assert.notDeepEqual(await liveElsewhere(shell, 'L2', path), [])
   })
 
@@ -645,7 +735,20 @@ describe('planted faults, each caught', { skip: !isWindows && 'Windows only', co
   })
 
   test('the pane file left at version 1: the plugins would give that tab no ticket', async () => {
-    assert.notDeepEqual(await resumesOnce(shell, planted('[ordered]@{ v = 2; pid = $PID; started = $started }', '[ordered]@{ v = 1; pid = $PID; started = $started }')), [])
+    assert.notDeepEqual(await resumesOnce(shell, planted('[ordered]@{ v = 3; pid = $PID; started = $started }', '[ordered]@{ v = 1; pid = $PID; started = $started }')), [])
+  })
+
+  test("the ticket's config folders left out of the last look: a conversation held under the second is resumed", async () => {
+    assert.notDeepEqual(await liveInSecondConfig(shell, planted(LOOK_IN, '')), [])
+  })
+
+  test("the left record's last look removed: a transcript written since the record is resumed all the same", async () => {
+    assert.notDeepEqual(await leftRecord(shell, 'grown', planted(LEFT_LOOK, '')), [])
+  })
+
+  test('the REAP setting left out of a resume: the resumed claude runs with shells reaped', async () => {
+    const path = planted(" CLAUDE_CODE_DISABLE_BG_SHELL_PRESSURE_REAP = '1' }", ' }')
+    assert.notDeepEqual(await resumesOnce(shell, path), [])
   })
 
   test('the version gate removed from the machine code: a version 1 pane file, a wrapper without these checks, is taken', async () => {
@@ -658,11 +761,11 @@ describe('planted faults, each caught', { skip: !isWindows && 'Windows only', co
     const faulty = await import(pathToFileURL(join(dir, 'machine.ts')).href)
     const v1 = JSON.stringify({ v: 1, pid: 20, started: '134062345678901240' })
     const v2 = JSON.stringify({ v: 2, pid: 20, started: '134062345678901240' })
-    // The real code: version 2 only, and version 1 said as an older wrapper.
-    assert.deepEqual(machine.parsePane(v2), { pid: 20, started: '134062345678901240' })
+    // The real code: versions 3 and 2 only, and version 1 said as an older wrapper.
+    assert.deepEqual(machine.parsePane(v2), { pid: 20, started: '134062345678901240', v: 2 })
     assert.match(machine.parsePane(v1).why, /an older one \(its pane file is version 1\)/)
     // The fault is caught: version 1 is taken.
-    assert.deepEqual(faulty.parsePane(v1), { pid: 20, started: '134062345678901240' })
+    assert.deepEqual(faulty.parsePane(v1), { pid: 20, started: '134062345678901240', v: 1 })
   })
 
   test("the parent-pid check removed from the machine code: a pane file naming another PowerShell is taken", async () => {

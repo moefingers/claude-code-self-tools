@@ -1,13 +1,38 @@
 import { describe, expect, mock, test } from 'claude-code/testing'
 import type { AgentStatus, On } from 'claude-code'
-import { encodeCommand, launcherScript, SESSION_MARKERS } from '../hooks/launcher'
-import { STDIN_BOOTSTRAP } from '../hooks/machine'
+import { encodeCommand, launchScriptText, SESSION_MARKERS } from '../hooks/launcher'
+import { LAUNCH_ENV_CLEAR, type LaunchInput, STDIN_BOOTSTRAP } from '../hooks/machine'
 
 const TOOL = 'mcp__self-restart__restart_after_turn'
 const HOUR = 60 * 60 * 1000
 const ID = '0f8fad5b-d9cb-469f-a165-70867728950e'
 const POWERSHELL = 'C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe'
-const WINDOWS = { OS: 'Windows_NT', SystemRoot: 'C:\\Windows' }
+const WINDOWS = { OS: 'Windows_NT', SystemRoot: 'C:\\Windows', LOCALAPPDATA: 'C:\\Users\\u\\AppData\\Local', USERPROFILE: 'C:\\Users\\u' }
+
+/** The claim a launch script names (`$by`): a fresh launch's each time. */
+const claimOf = (script: string): string => /^\$by = '(launch:[0-9a-f-]{36})'$/m.exec(script)?.[1] ?? 'none'
+
+/**
+ * self-restart's launch, as the shared launcher builds it for this session: its own id, the folder it
+ * started in, its config folder, this pane's slot or a window ('auto'), after its own claude.exe 100.
+ */
+const restartInput = (claim: string): LaunchInput => ({
+  powershell: POWERSHELL,
+  kind: 'resume',
+  id: ID,
+  folder: 'C:\\work\\repo',
+  claim,
+  configDirs: ['C:\\Users\\u\\.claude'],
+  stateDir: 'C:\\Users\\u\\AppData\\Local\\claude-self-tools',
+  where: 'auto',
+  waitForExit: { pid: 100, created: '134062345688901240' },
+  now: 1_000_500,
+  tool: 'self-restart',
+  deadline: 1_000_500 + 20_000,
+})
+
+/** The launch script for one claim, as self-restart builds it. */
+const RESTART = launchScriptText(restartInput('launch:00000000-0000-4000-a000-000000000004'))
 
 type Run = { argv: readonly string[]; init?: Record<string, unknown> }
 
@@ -85,6 +110,8 @@ function engine(on: On, { env = WINDOWS, id = ID, launcher = 'opens', exit = 'ex
     return { value: undefined }
   })
   on('store.keys', () => ({ value: [...held.keys()] }))
+  // The pending marker's writes: taken, and not looked at here (self-restart-v2.test.ts reads them).
+  on('fs.write', () => ({ value: undefined }))
   on('session.start', (_, e) => ({ cwd: e.cwd }))
   on('session.id', () => ({ value: world.id }))
   on('session.cwd', () => ({ value: 'C:\\work\\repo' }))
@@ -120,7 +147,9 @@ function engine(on: On, { env = WINDOWS, id = ID, launcher = 'opens', exit = 'ex
     if (launchMs > 0) await clock.sleep(launchMs)
     if (launcher === 'throws') return { deny: 'spawn EPERM' }
     if (launcher === 'fails') return { value: { exitCode: 3, stdout: 'self-restart: no claude.exe above this launcher\r\n', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
-    return { value: { exitCode: 0, stdout: 'launched 17716\r\n', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+    // The launch took the claim its script names, and opened a window.
+    const by = claimOf(String(e.init?.stdin ?? ''))
+    return { value: { exitCode: 0, stdout: `claim ${by}\r\nlaunched window - 17716\r\n`, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
   })
   on('command.run', async (_, e, next) => {
     commands.push(e.command)
@@ -171,7 +200,10 @@ test('the window opens only once the turn has ended, by the fixed path with noth
   // On standard input, under the fixed bootstrap: the command line is the same whatever the script.
   expect(decode(String(run?.argv[4]))).toBe(STDIN_BOOTSTRAP)
   const script = String(run?.init?.stdin)
-  expect(script).toBe(launcherScript(ID))
+  // The shared launcher's script for this session: its id, its folder, its own claude.exe, a fresh claim.
+  expect(claimOf(script)).not.toBe('none')
+  // The run comes half a second after the turn's end, a minute in: its deadline LAUNCH_DEADLINE_MS after that.
+  expect(script).toBe(launchScriptText({ ...restartInput(claimOf(script)), now: 1_060_500, deadline: 1_060_500 + 20_000 }))
   expect(script).toContain(`$id = '${ID}'`)
   for (const part of ['evil', 'Remove-Item', 'Switched accounts', 'deploy check']) expect(JSON.stringify(run)).not.toContain(part)
   for (const part of ['evil', 'Remove-Item']) expect(script).not.toContain(part)
@@ -272,13 +304,15 @@ describe('nothing launches, and nothing exits, when what the launch needs is not
   }
 })
 
-test('the launcher script refuses anything but a session id', () => {
-  for (const id of ['', 'session-1', `${ID} `, `${ID}'`, ID.toUpperCase(), `${ID}\n`]) expect(() => launcherScript(id)).toThrow()
-  expect(launcherScript(ID)).toContain(`--resume '$id'`)
+test('the launch refuses anything but a session id, and a folder with a quote or a semicolon', () => {
+  for (const id of ['', 'session-1', `${ID} `, `${ID}'`, ID.toUpperCase(), `${ID}\n`]) expect(() => launchScriptText({ ...restartInput('launch:00000000-0000-4000-a000-000000000004'), id })).toThrow()
+  for (const folder of ["C:\\o'brien", 'C:\\a;b', 'C:\\a"b', 'relative']) expect(() => launchScriptText({ ...restartInput('launch:00000000-0000-4000-a000-000000000004'), folder })).toThrow()
+  // claude-launch.ps1 runs claude: the window passes it the id and the folder, by name.
+  expect(RESTART).toContain('& $launchPath -Resume $id -Dir $folder')
 })
 
-test('the launcher script: quiet progress, parents older than their children, quotes escaped, a pause when the resume fails', () => {
-  const script = launcherScript(ID)
+test('the launch script: quiet progress, parents older than their children, values as literals, a pause when the resume fails', () => {
+  const script = RESTART
   // Windows PowerShell 5.1's module progress, as CLIXML, would fill the one-line failure.
   expect(script).toContain("$ProgressPreference = 'SilentlyContinue'")
   // Every step up the walk, both of them, takes a parent only while it is older than the child.
@@ -286,18 +320,18 @@ test('the launcher script: quiet progress, parents older than their children, qu
   expect(script).toContain('if ($null -ne $up -and $up.CreationDate -le $child.CreationDate) { return $up }')
   expect(script.split('= Get-Parent $').length - 1).toBe(2)
   expect(script).not.toContain('$table[[int]$at.ParentProcessId]')
-  // Every quote PowerShell reads as one, curly ones included, is doubled in claude's path.
-  expect(script).toContain('[Management.Automation.Language.CodeGeneration]::EscapeSingleQuotedStringContent($claude.Source)')
+  // The id, the folder and the claim go in as single-quoted literals, checked before: nothing is escaped at run time.
+  expect(script).toContain(`$folder = 'C:\\work\\repo'`)
   expect(script).not.toContain('-replace')
   // An error, or an end within 10 seconds: the window says how to resume by hand, and waits.
-  expect(script).toContain("'$code = $LASTEXITCODE'")
-  expect(script).toContain("'if ($code -ne 0 -or ((Get-Date) - $started).TotalSeconds -lt 10) {'")
-  expect(script).toContain('resume it yourself: claude --resume $id')
-  expect(script.split("Read-Host 'Press Enter to close this window'").length - 1).toBe(2)
+  expect(script).toContain('$code = $LASTEXITCODE')
+  expect(script).toContain('if ($code -ne 0 -or ((Get-Date) - $started).TotalSeconds -lt 10) {')
+  expect(script).toContain('"Once it is safe, resume it yourself: " + "claude-launch.ps1 -Resume " + $id + " -Dir " + $folder')
+  expect(script.split('Read-Host "Press Enter to close this window"').length - 1).toBe(2)
   expect(script).not.toContain('-NoExit')
 })
 
-test("the window clears the old session's markers before claude --resume, and nothing else", () => {
+test("the window leaves the launch environment to claude-launch.ps1: it clears and sets nothing itself", () => {
   // Claude Code's own markers, from the environment-variables reference and from what its tools' processes carry.
   expect(SESSION_MARKERS).toEqual([
     'CLAUDE_CODE_CHILD_SESSION',
@@ -318,38 +352,25 @@ test("the window clears the old session's markers before claude --resume, and no
     'CLAUDE_CODE_SSE_PORT',
     'NO_COLOR',
   ])
-  const script = launcherScript(ID)
-  const clears = script.split(/\r?\n/).filter(line => line.includes('SetEnvironmentVariable'))
-  expect(clears).toHaveLength(1)
-  const clear = clears[0] ?? ''
-  // Exactly the listed names, each quoted, CLAUDE_CODE_CHILD_SESSION (nested: no transcript) first.
-  expect(clear.match(/"[A-Za-z_]+"/g)).toEqual(SESSION_MARKERS.map(name => `"${name}"`))
-  // WT_SESSION and WT_PROFILE_ID stay as the new window has them: Claude Code reads WT_SESSION to draw
-  // its Unicode prompt and its links. Nothing in the script names either.
-  expect(script).not.toContain('WT_SESSION')
-  expect(script).not.toContain('WT_PROFILE_ID')
-  expect(clear).toContain('[Environment]::SetEnvironmentVariable($name, $null, [EnvironmentVariableTarget]::Process)')
-  // Never a variable a person sets.
-  for (const name of ['CLAUDE_CODE_FORCE_SESSION_PERSISTENCE', 'CLAUDE_CODE_DISABLE_BG_SHELL_PRESSURE_REAP', 'CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC', 'ANTHROPIC_API_KEY', 'PATH']) {
-    expect(clear).not.toContain(`"${name}"`)
-  }
-  // In the window, after the wait and before claude runs.
-  expect(script.indexOf(clear)).toBeGreaterThan(script.indexOf('Wait-Process'))
-  expect(script.indexOf(clear)).toBeLessThan(script.indexOf("--resume '$id'"))
-  // Transcripts on whatever a later Claude Code adds: set after the clear, before claude.
-  const force = script.indexOf(`'$env:CLAUDE_CODE_FORCE_SESSION_PERSISTENCE = "1"'`)
-  expect(force).toBeGreaterThan(script.indexOf(clear))
-  expect(force).toBeLessThan(script.indexOf("--resume '$id'"))
+  // The list claude-launch.ps1 clears is that one (scripts/claude-launch.test.mjs reads the script).
+  expect(LAUNCH_ENV_CLEAR).toEqual([...SESSION_MARKERS])
+  const script = RESTART
+  // The window sets and clears nothing: no marker, no NO_COLOR, no WT_SESSION or WT_PROFILE_ID, no REAP.
+  expect(script).not.toContain('SetEnvironmentVariable')
+  for (const name of [...SESSION_MARKERS, 'WT_SESSION', 'WT_PROFILE_ID', 'CLAUDE_CODE_DISABLE_BG_SHELL_PRESSURE_REAP', 'CLAUDE_CODE_FORCE_SESSION_PERSISTENCE']) expect(script).not.toContain(name)
+  // claude-launch.ps1, from its pinned place, after the wait and the last look.
+  expect(script).toContain("$launchPath = 'C:\\Users\\u\\AppData\\Local\\claude-self-tools\\claude-launch.ps1'")
+  expect(script.indexOf('& $launchPath -Resume $id -Dir $folder')).toBeGreaterThan(script.indexOf('Wait-Process'))
 })
 
 test('the encoded command is the script as UTF-16LE base64', () => {
   expect(encodeCommand('dir')).toBe('ZABpAHIA')
   expect(encodeCommand('a')).toBe('YQA=')
-  expect(decode(encodeCommand(launcherScript(ID)))).toBe(launcherScript(ID))
+  expect(decode(encodeCommand(RESTART))).toBe(RESTART)
 })
 
 for (const [launcher, said] of [
-  ['fails', /launcher exited 3: self-restart: no claude.exe above this launcher/],
+  ['fails', /exit 3: self-restart: no claude.exe above this launcher/],
   ['throws', /launcher didn't run: .*spawn EPERM/],
 ] as const) {
   test(`a launcher that ${launcher} opens no window and exits nothing, and its first prompt is taken back`, async ($, on) => {
@@ -479,8 +500,10 @@ test('a message that starts a turn while the window opens stops the exit, and th
   const rows = JSON.stringify(session.appended())
   expect(rows).toMatch(/window opened, but this session didn't exit: a new turn started/)
   expect(rows).not.toMatch(/restarted at its own request/)
-  // The first prompt is taken back: the window may still resume the session if the person exits.
-  expect(held.get('restarts')).toEqual({})
+  // The first prompt is taken back: the window may still resume the session if the person exits, and
+  // the record keeps only the claim the window holds, for the process that resumes it to release.
+  const LAUNCH = claimOf(String(runs[0]?.init?.stdin))
+  expect(held.get('restarts')).toEqual({ [ID]: { at: 1_000_500, reason: 'Switched accounts.', claim: LAUNCH } })
 })
 
 test('a subagent that starts while the window opens stops the exit', async ($, on) => {

@@ -18,6 +18,7 @@ Lets a session wake itself later: some minutes after the turn ends, it sends its
 - **An interrupted turn drops the wake-up it asked for.** One armed in an earlier turn stands, and the notice says so.
 - **It survives a reload of the plugin.** The wake-up is kept in session state; when the plugin's code reloads, it is armed again for the time left, or fires at once if that time has passed. It fires once.
 - **It lasts as long as the session.** Quitting Claude Code drops it.
+- **It says whether a wake-up is armed, per conversation.** The plugin keeps `%LOCALAPPDATA%\claude-self-tools\wake\<conversation id>.json`, `{ "v": 1, "armed": true|false, "due"?: <ms>, "at": <ms> }`, written whole: at the start of each conversation the process holds (a startup, a `/resume`, a `/clear`), when a wake-up is armed or replaced, when it fires, and when it is cancelled. `armed` is true only while the process holds a timer for that conversation. [self-switch](../self-switch) and the coordinator read it: a wake-up armed holds a switch, which would drop it. The marker holds ids and times, nothing of the note.
 - **Subagents can't use it.** A subagent is told to say what to check later and when, so the main session can set the wake-up.
 
 ## Update check

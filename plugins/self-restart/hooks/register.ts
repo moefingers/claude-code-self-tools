@@ -8,21 +8,24 @@
 // an answer. An interrupted turn cancels it. Only the main conversation restarts this way, never a
 // subagent, and only one run in a terminal with a person at its prompt.
 //
-// The launch: one fixed PowerShell script by Windows PowerShell's known path, its only variable the
-// session's id, which must be a UUID; see launcher.ts. Nothing from the tool's input reaches the
-// launch. It takes the claim lock on the conversation, so a switch moving it at the same time can't
-// resume it too. The new window waits for this session's claude.exe to exit, then reads the session
-// registry and the process table again, and resumes only when nothing else holds the conversation,
-// so two copies never write one session. When this session runs in a slot (a Windows Terminal pane
-// running self-switch's claude-slot.ps1 of the shipped hash), the launcher leaves the slot a record
-// instead, and the slot resumes the session in the same pane once it has exited. The resumed session's
-// copy of this plugin releases the claim lock.
+// The launch: one run of the shared launcher (launch, in the shared machine code; see launcher.ts), by
+// Windows PowerShell's known path, its inputs the session's id (a UUID), the folder it started in, its
+// config folder and its own claude.exe from the probe that judged the safe point. Nothing from the
+// tool's input reaches the launch. It takes the claim lock on the conversation, so a switch moving it
+// at the same time can't resume it too. The new window waits for this session's claude.exe to exit,
+// then reads the session registry and the process table again, and resumes only when nothing else
+// holds the conversation, so two copies never write one session; it runs claude-launch.ps1, the one
+// script that starts claude, with the launch environment. When this session runs in a slot (a Windows
+// Terminal pane running self-switch's claude-slot.ps1 of the shipped hash), the launch leaves the slot
+// a record instead, and the slot resumes the session in the same pane once it has exited. The resumed
+// session's copy of this plugin releases the claim lock. self-restart writes no left record: it
+// resumes its own conversation.
 //
 // The tab, tried first: when this session was started through the claude wrapper (a `claude`
 // function in the person's PowerShell profile, tools/claude-wrapper/claude-wrapper.ps1), it carries
 // CLAUDE_PANE_TOKEN, and the wrapper's pane file names the PowerShell that runs it. When that
 // PowerShell is this claude.exe's own parent (paneFallback, on the probe that judged the safe point),
-// one fixed script (paneScript) takes the claim lock and leaves the wrapper a ticket naming that claim,
+// the launch ({ pane }) takes the claim lock and leaves the wrapper a ticket naming that claim,
 // written whole and moved into place, and no window opens: once this session exits, the wrapper
 // deletes the ticket, checks it (the claim lock must still name its claim, and right before claude
 // runs, the window's last look: no running Claude Code holds the conversation), and runs
@@ -58,9 +61,9 @@
 // left waiting, and the person and the model are told so.
 import type { EngineInterface, Register } from 'claude-code'
 import type { Queued, Restart } from '../types'
-import { CLAIMED, FALLBACK, LAUNCHED, launcherScript, powershellPath, RELEASED, releaseScript, SESSION_ID, SLOTTED, stateFolder, SYSTEM_ROOT, WAIT_SECONDS } from './launcher'
-import type { PendingKind, Probe } from './machine'
-import { blockersText, exitBlockers, isSafeFolder, markPending, oneLine, PANE_WRITTEN, paneFallback, paneScript, powershellCall, quoted, readExit, readGit, readPane, safePoint } from './machine'
+import { launch as buildLaunch, parseLaunch, powershellPath, RELEASED, releaseScript, SESSION_ID, stateFolder, SYSTEM_ROOT, WAIT_SECONDS } from './launcher'
+import type { LaunchInput, PendingKind, Probe } from './machine'
+import { blockersText, exitBlockers, isSafeFolder, LAUNCH_DEADLINE_MS, LAUNCH_RETRY_MS, launchFolderFault, launchFolderSaid, markPending, oneLine, paneFallback, paneTicketPath, powershellCall, quoted, readExit, readGit, readPane, safePoint } from './machine'
 import { configureUpdateCheck, loadUpdateCheck, withUpdateNotice } from './update-check'
 
 const queued = { plugin: 'self-restart', key: 'queued' } as const
@@ -246,6 +249,21 @@ async function paneOf($: EngineInterface, launch: { id: string; cwd: string }, p
   return passed === undefined ? { token, state } : { fallback: passed }
 }
 
+/**
+ * Where the launch keeps its files and reads its checks: the plugins' state folder under
+ * %LOCALAPPDATA%, and this session's own config folder (CLAUDE_CONFIG_DIR, or %USERPROFILE%\.claude),
+ * whose registry the window's last look reads; `refusal` when either isn't an absolute folder.
+ */
+async function places($: EngineInterface): Promise<{ readonly state: string; readonly configDirs: readonly string[] } | { readonly refusal: string }> {
+  const local = await env($, () => $.env.get('LOCALAPPDATA'))
+  if (!isSafeFolder(local)) return { refusal: `%LOCALAPPDATA% reads ${JSON.stringify(local ?? '')}, not an absolute folder without quotes, so the claim lock can't be kept` }
+  const configured = await env($, () => $.env.get('CLAUDE_CONFIG_DIR'))
+  const profile = await env($, () => $.env.get('USERPROFILE'))
+  const own = configured !== undefined && configured !== '' ? configured : profile === undefined ? undefined : `${profile}\\.claude`
+  if (!isSafeFolder(own)) return { refusal: `this session's config folder (CLAUDE_CONFIG_DIR, or %USERPROFILE%\\.claude) reads ${JSON.stringify(own ?? '')}, not an absolute folder without quotes` }
+  return { state: stateFolder(local), configDirs: [own.replace(/\\+$/, '')] }
+}
+
 /** The pending marker: `kind` while the restart is queued or armed, null once it ran or was cancelled. */
 async function mark($: EngineInterface, kind: PendingKind | null): Promise<void> {
   const failed = await markPending($, kind)
@@ -412,56 +430,88 @@ async function restartNow($: EngineInterface, value: Queued): Promise<void> {
   let tab = false
   /** The claim the ticket, the slot's record or the window holds, once it is in place. */
   let claimed: string | undefined
-  if (pane !== undefined && 'token' in pane) {
-    // The claim, then the ticket, in one run of one fixed script; no window. The ticket names the
-    // claim, for one launch, and the wrapper resumes only while the claim lock still names it.
+  // One run of the shared launcher (launch, machine.ts): it checks this is the claude.exe the probe
+  // judged, takes the claim on this conversation for one launch, and places the restart: this tab's
+  // ticket when the claude wrapper runs it; else this pane's slot when its runner is verified and takes
+  // the folder; else a new window running claude-launch.ps1. The wrapper, the slot and the window each
+  // resume only while the claim lock still names it, and right before claude look again.
+  const site = await places($)
+  const own = judged.probe.session
+  const folderFault = launchFolderFault(launch.cwd)
+  if ('refusal' in site) opened = site.refusal
+  else if (folderFault !== undefined) opened = launchFolderSaid(launch.cwd, folderFault)
+  else if (own === null) opened = "this session's own claude.exe wasn't found above the probe"
+  else {
+    /** The claim the script printed it took, once it took one. */
     let claim: string | undefined
+    /** This launch's own claim: a fresh launch's, which the script names and takes. */
+    const ours = `launch:${crypto.randomUUID()}`
+    /** The run ended without a clean answer (an exit code, no answer, a timeout): it may have placed something. */
+    let unclean = false
     try {
-      const ticket = { token: pane.token, resume: launch.id, by: `launch:${crypto.randomUUID()}`, dir: launch.cwd, at: await $.clock.now() }
-      const call = powershellCall(launch.powershell, paneScript({ stateDir: pane.state, ticket, claim: true }))
-      const run = await $.process.run(call.argv, {
-        stdin: call.stdin,
-        cwd: launch.cwd,
-        timeoutMs: LAUNCH_MS,
-      })
-      claim = CLAIMED.exec(run.stdout)?.[1]
-      if (run.exitCode !== 0 || PANE_WRITTEN.exec(run.stdout)?.[1] !== pane.token) {
-        const said = brief(`${run.stdout} ${run.stderr}`)
-        opened = `the ticket for this tab wasn't written (exit ${run.exitCode}${said === '' ? '' : `: ${said}`})`
-      } else {
-        tab = true
-        claimed = claim
-        // The resumed session's copy of this plugin releases the claim, as it does the launcher's.
-        if (claim !== undefined) await keep($, launch.id, { ...kept, claim })
+      const now = await $.clock.now()
+      const input: LaunchInput = {
+        powershell: launch.powershell,
+        kind: 'resume',
+        id: launch.id,
+        folder: launch.cwd,
+        claim: ours,
+        configDirs: site.configDirs,
+        stateDir: site.state,
+        where: pane !== undefined && 'token' in pane ? { pane: { token: pane.token } } : 'auto',
+        waitForExit: { pid: own.pid, created: own.created },
+        now,
+        tool: 'self-restart',
+        deadline: now + LAUNCH_DEADLINE_MS,
       }
-    } catch (err) {
-      opened = `the ticket for this tab wasn't written: ${why(err)}`
-    }
-    // A claim taken for a ticket that isn't there is given back at once.
-    if (opened !== undefined && claim !== undefined) await release($, launch.id, claim)
-  } else {
-    try {
-      const call = powershellCall(launch.powershell, launcherScript(launch.id))
+      const call = buildLaunch(input)
       const run = await $.process.run(call.argv, {
         stdin: call.stdin,
         cwd: launch.cwd,
         timeoutMs: LAUNCH_MS,
       })
-      slot = SLOTTED.exec(run.stdout)?.[1]
-      if (run.exitCode !== 0 || (slot === undefined && !LAUNCHED.test(run.stdout))) {
-        const said = brief(`${run.stdout} ${run.stderr}`)
-        opened = `the launcher exited ${run.exitCode}${said === '' ? '' : `: ${said}`}`
+      const answer = parseLaunch(run.stdout)
+      claim = answer.claim
+      if (run.exitCode !== 0 || !('launched' in answer)) {
+        unclean = run.exitCode !== 0 || !('refused' in answer)
+        const said = 'refused' in answer ? answer.refused.why : brief(`${run.stdout} ${run.stderr}`)
+        const nothing = pane !== undefined && 'token' in pane ? "the ticket for this tab wasn't written" : "the launcher didn't place the restart"
+        opened = `${nothing} (${run.exitCode !== 0 ? `exit ${run.exitCode}` : 'refused'}${said === '' ? '' : `: ${said}`})`
       } else {
-        // The claim the launcher took: the resumed session's copy of this plugin releases it.
-        const claim = CLAIMED.exec(run.stdout)?.[1]
+        const placed = answer.launched
+        if (placed.transport === 'slot') slot = placed.label
+        if (placed.transport === 'pane') tab = true
+        // The claim the launch took: the resumed session's copy of this plugin releases it.
         claimed = claim
         if (claim !== undefined) await keep($, launch.id, { ...kept, claim })
         // A slot runner found but not used: the launcher says why, and so does the restart.
-        const passed = slot === undefined ? FALLBACK.exec(run.stdout)?.[1] : undefined
-        if (passed !== undefined) fallback = oneLine(passed, 300)
+        if (placed.transport === 'window' && answer.fallback !== undefined) fallback = oneLine(answer.fallback, 300)
       }
     } catch (err) {
+      unclean = true
       opened = `the launcher didn't run: ${why(err)}`
+    }
+    // A claim taken for a launch that isn't in place is given back at once (a clean refusal gave back
+    // its own already). After a run that ended without a clean answer, a ticket that may be there is
+    // written over as withdrawn and this launch's claim released, and once more LAUNCH_RETRY_MS later: a
+    // run killed at its timeout may still have been writing (its own deadline check takes back what it
+    // placed late; this catches a write that slipped past it). Only this launch's own claim, never a slot's.
+    if (opened !== undefined && claim !== undefined && claim !== ours) await release($, launch.id, claim)
+    if (opened !== undefined && !unclean && claim === ours) await release($, launch.id, ours)
+    if (opened !== undefined && unclean) {
+      const ticket = pane !== undefined && 'token' in pane ? paneTicketPath(site.state, pane.token) : undefined
+      const takeBack = async (): Promise<void> => {
+        if (ticket !== undefined) {
+          try {
+            await $.fs.write(ticket, JSON.stringify({ v: 1, cancelled: true }))
+          } catch {
+            // Honoured only with the claim, which is released here.
+          }
+        }
+        await release($, launch.id, ours)
+      }
+      await takeBack()
+      $.clock.after(LAUNCH_RETRY_MS, () => void takeBack())
     }
   }
   if (opened === undefined) await noteRestart($, launch.id)

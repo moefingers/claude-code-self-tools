@@ -105,13 +105,87 @@ The attached clients that `status` lists are the screens drawing the session now
 self-restart and self-switch share one module of machine code (`shared/hooks/machine.ts`): a probe of the machine, the rules that judge it, and the launcher. self-exit uses it for its pre-check, and self-check for its record's path. Each script runs in Windows PowerShell, by its known path under the Windows folder, as one fixed script whose only inputs are session ids and folders the plugin checked.
 
 - **Never two copies of one conversation.** Before a switch, a probe reads every running `claude.exe`, Claude Code's own session registry, the transcripts' folders and times, and the claim locks; the switch goes ahead only when the conversation is open nowhere on this machine, and refuses when it can't be sure. The same run takes a claim lock on the conversation, so of two moves that race, one wins.
-- **The window.** The launcher finds the session's own `claude.exe` and opens a new console window with `Start-Process`. `cmd /c start` would hand the plugin's output pipes on to the new session, and hold the plugin's call open for as long as that session runs.
-- **The wait, and the last look.** The window waits for the old `claude.exe` to exit, then reads the registry and the process table once more, and runs `claude --resume <id>` only if nothing else holds the conversation and the claim still names it. So two copies never write one session, and Remote Control, which a second copy would leave off, connects in the new one.
-- **A top-level session, in the mode a new one starts in.** The window clears the markers Claude Code sets in the processes it starts, which would make the resumed session count as nested, and passes `claude` no permission flag of any kind.
+- **One launcher.** Every restart and switch out of the session (a slot's record, the tab's ticket, a window) is placed by one function, `launch()` in the shared machine code, in one script run that checks, takes the claim and places it; see [The launcher API](#the-launcher-api). The window it opens runs [`claude-launch.ps1`](plugins/self-switch/slot/claude-launch.ps1), the one script that starts `claude`.
+- **The window.** The launch finds the session's own `claude.exe` and opens a new console window with `Start-Process`. `cmd /c start` would hand the plugin's output pipes on to the new session, and hold the plugin's call open for as long as that session runs.
+- **The wait, and the last look.** The window waits for the old `claude.exe` to exit, then reads the registry and the process table once more, and runs `claude-launch.ps1 -Resume <id>` only if nothing else holds the conversation and the claim still names it. So two copies never write one session, and Remote Control, which a second copy would leave off, connects in the new one.
+- **A top-level session, in the mode a new one starts in.** `claude-launch.ps1` sets [the launch environment](#the-launch-environment) right before `claude`, and passes it no permission flag of any kind.
 - **Slots keep your panes.** A Windows Terminal pane can run self-switch's `claude-slot.ps1`, which runs `claude` and, when it exits, resumes the conversation a switch or restart left it a record for, in the same pane. The plugins use a pane as a slot only when its script has the hash they ship. See [self-switch](plugins/self-switch#slots-keep-your-panes).
-- **The same tab, through the claude wrapper.** Nothing outside a terminal tab can type into it once `claude` has exited, so the tab's own PowerShell has to be the one that resumes. [`tools/claude-wrapper/claude-wrapper.ps1`](tools/claude-wrapper/claude-wrapper.ps1) is a `claude` function for your PowerShell profile: you go on typing `claude`, and it runs the real `claude.exe` with your arguments. It gives each run a token (`CLAUDE_PANE_TOKEN`) and a pane file naming the PowerShell that runs it. A restart or a switch out of that session, when that PowerShell is the session's own parent and its pane file is of version 2, leaves the tab a ticket naming the claim it took, and exits; the function deletes the ticket, checks it (this tab's token, a session id and a launch's claim, at most 120 seconds old, an existing folder whose project holds the conversation's transcript, and the claim lock on the conversation still naming the ticket's claim), takes the window's and the slot's last look right before claude runs (no running Claude Code holds the conversation, read again from the session registry and every command line), and runs `claude --resume <id>` in the same tab, with Claude Code's markers cleared as a window clears them. The token is no secret (it names the pane file, and every process under claude has it), so the claim and the last look are what keep a ticket from putting a second process on a conversation. At most 10 resumes per `claude` typed, and never a fourth within 30 seconds. A ticket it doesn't use is said in one line, and you are back at the prompt. To use it, copy the file to `%LOCALAPPDATA%\claude-self-tools\claude-wrapper.ps1` and add `. "$env:LOCALAPPDATA\claude-self-tools\claude-wrapper.ps1"` to your `$PROFILE`. Without it, a restart or a switch opens a new window, as before.
+- **The same tab, through the claude wrapper.** Nothing outside a terminal tab can type into it once `claude` has exited, so the tab's own PowerShell has to be the one that resumes. [`tools/claude-wrapper/claude-wrapper.ps1`](tools/claude-wrapper/claude-wrapper.ps1) is a `claude` function for your PowerShell profile: you go on typing `claude`, and it runs the real `claude.exe` with your arguments. It gives each run a token (`CLAUDE_PANE_TOKEN`) and a pane file naming the PowerShell that runs it. A restart or a switch out of that session, when that PowerShell is the session's own parent and its pane file is of version 3, leaves the tab a ticket naming the claim it took and every config folder the move reads, and exits; the function deletes the ticket, checks it (this tab's token, a session id and a launch's claim, at most 120 seconds old, an existing folder whose project holds the conversation's transcript, its config folders absolute folders, its left record's stat, when it carries one, whole numbers, and the claim lock on the conversation still naming the ticket's claim), takes the window's and the slot's last look right before claude runs (no running Claude Code holds the conversation, read again from the session registry of its own config folder and of each the ticket names, and every command line), and runs `claude --resume <id>` in the same tab, with Claude Code's markers cleared as a window clears them. A wrapper of version 2 (before this one) reads its own config folder alone, so it gets a ticket only for a move that reads that one alone; copy the current one into place for the rest. The token is no secret (it names the pane file, and every process under claude has it), so the claim and the last look are what keep a ticket from putting a second process on a conversation. At most 10 resumes per `claude` typed, and never a fourth within 30 seconds. A ticket it doesn't use is said in one line, and you are back at the prompt. To use it, copy the file to `%LOCALAPPDATA%\claude-self-tools\claude-wrapper.ps1` and add `. "$env:LOCALAPPDATA\claude-self-tools\claude-wrapper.ps1"` to your `$PROFILE`. Without it, a restart or a switch opens a new window, as before.
 - **The first prompt** waits in the plugin's own store, never on a command line, and the resumed session's copy of the plugin sends it.
+- **A pending wake-up holds a switch (S10w).** self-switch reads self-wake's [wake marker](#wake-markers) for its own conversation: a wake-up armed holds the switch, and so does self-wake being on with no marker it can read.
+- **Return trips.** A conversation a process has just left reads as live for about ten minutes (its transcript and its heartbeat are fresh). self-switch writes a [left record](#return-trips-the-left-record) when it moves its own process off one, and a switch back to it soon after goes ahead once the record shows nothing touched it since.
 - **Windows only** for now.
+
+### The launcher API
+
+`launch(input)` and `parseLaunch(stdout)`, in [`shared/hooks/machine.ts`](shared/hooks/machine.ts), are how every plugin (these and the coordinator's) starts a Claude Code process. `launch` returns `{ argv, stdin }` for `$.process.run`: Windows PowerShell by its known path, a fixed bootstrap on the command line, and the script on standard input, so the command line is the same few hundred characters whatever the script. Its input, each field checked before anything is spliced into the script (a bad one throws):
+
+| Field | What |
+| :- | :- |
+| `powershell` | `powershellPath(SystemRoot)`. |
+| `kind`, `id`, `name` | `resume` (`claude --resume <id>`) or `start` (`claude --session-id <id> --name <name>`; `name` lowercase letters, digits and hyphens). |
+| `folder` | The conversation's own folder: absolute, no quote, control character or `;`. |
+| `claim` | The claimant the claim lock names: `launch:<uuid>`, or `slot:<id>` for that slot. |
+| `configDirs`, `stateDir` | The config folders the checks read (1 to 8), and `%LOCALAPPDATA%\claude-self-tools`. |
+| `where` | `{ pane: { token } }` (this tab, through the claude wrapper's ticket), `{ slot: id }` (this pane's slot runner), `{ window: true }` (a new window), or `'auto'` (this pane's slot when its runner is verified and takes the folder, else a window: self-restart's). |
+| `checks` | `live` (NOT LIVE now, for a launch that doesn't wait), `fresh` (a start's id is new: required for a start). `floor` and `input` come with slots v2 and throw until then. |
+| `left` | A left record's stat (`{ size, mtime }` or `{ exitAt }`): the window's last look refuses if the transcript changed since. |
+| `waitForExit` | `{ pid, created }`: the caller's own claude.exe, which the tab, the slot or the window waits out before it resumes. |
+| `now`, `deadline` | The ticket's time; and the last moment the launch may be placed (callers give `LAUNCH_DEADLINE_MS`, 20 s, under a 30 s run): past it, nothing is placed, and a launch found past it once placed is taken back. |
+| `tool` | Who launches, as a refusal names it. |
+
+The script, in one run: resets `PSModulePath`; finds the caller's own `claude.exe` (and checks it is `waitForExit`); for a window, puts `claude-launch.ps1` in place when it is missing or has another SHA-256 than this release ships (the copy the launch carries, `LAUNCH_SCRIPT_TEXT`: written whole under another name, checked, moved over, read back), and is refused only when that fails; makes the checks asked for; takes the claim lock (`CreateNew`, as the probe does); and places the launch. It answers one of:
+
+```
+claim launch:<uuid>
+launched window - 17716          # or: launched pane <token> | launched slot <pid>-<created>
+fallback <why this pane's slot runner wasn't used>   # 'auto' only, when it went to the window
+
+refused <code> <why>             # session, wait, slot, launcher, live, fresh, claim, place, late
+```
+
+A refusal after the claim gives the claim back first. `pickLaunchTransport(probe, { replacing, pane, configCount })` picks `where` for a launch that replaces its caller, in order: this tab, this pane's slot, a window. Examples:
+
+```ts
+// A restart (self-restart's): this tab when the wrapper runs it, else 'auto'.
+launch({ powershell, kind: 'resume', id: own, folder: startFolder, claim: `launch:${crypto.randomUUID()}`, configDirs, stateDir,
+  where: { pane: { token } }, waitForExit: { pid, created }, now, deadline: now + LAUNCH_DEADLINE_MS, tool: 'self-restart' })
+// A switch's window to another project's conversation, its left record checked at the last look.
+launch({ ..., id: to, folder: toFolder, claim: probeClaim, where: { window: true }, left: live.waived, waitForExit, deadline, tool: 'self-switch' })
+// A start in a new window, its id checked new.
+launch({ ..., kind: 'start', id: crypto.randomUUID(), name: 'dealerwrap', where: { window: true }, checks: { fresh: true } })
+```
+
+### The launch environment
+
+[`claude-launch.ps1`](plugins/self-switch/slot/claude-launch.ps1) is the one script that runs `claude` for a launch. Right before it runs `claude`, after its checks, the module path and the folder, it:
+
+- removes `LAUNCH_ENV_CLEAR`: the variables Claude Code sets in the processes it starts (`CLAUDE_CODE_CHILD_SESSION` and the rest of `SESSION_MARKERS`; a `claude` that inherits them is nested, and saves no transcript), `NO_COLOR` among them (Claude Code sets it in its tool shells, so a tab launched from one draws no colour), and `PSExecutionPolicyPreference`;
+- sets `LAUNCH_ENV_SET`: `CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1` (transcripts on, whatever marker a later Claude Code adds) and `CLAUDE_CODE_DISABLE_BG_SHELL_PRESSURE_REAP=1` (Mo's choice: the page file carries the load rather than shells being reaped);
+- never touches `WT_SESSION` or `WT_PROFILE_ID`: Claude Code reads `WT_SESSION` to draw its prompt and its links.
+
+`claude` is `%USERPROFILE%\.local\bin\claude.exe` when it is there, else the first `claude` application on `PATH`. It is also the hand tool:
+
+```
+claude-launch.ps1 -Resume <session id> [-Dir <folder>]
+claude-launch.ps1 -Start <session id> -Name <name> [-Dir <folder>]
+claude-launch.ps1 -Lane <name>              # the name's current conversation and folder, from lanes.json
+claude-launch.ps1 [-Dir <folder>]           # a new session
+```
+
+It lives beside the slot runner, `%LOCALAPPDATA%\claude-self-tools\claude-launch.ps1`, and nobody copies it there: every launch that opens a window first puts its own copy there when the file is missing or has another SHA-256 (`LAUNCH_SCRIPT_SHA256`), and the window runs it only from there, only with that hash, checked again right before it runs. A launch is refused only when the file can't be put in place (the folder can't be written, say), saying why. An edited copy is replaced at the next launch. The slot runner and the claude wrapper keep the same list of their own until slots v2 (a test holds them equal); the wrapper sets `LAUNCH_ENV_SET` too, and the slot runner sets the persistence variable alone until then.
+
+### Return trips: the left record
+
+When self-switch moves its own process off a conversation W (in place, from the arriving conversation's SessionStart, 3 s after it; or right before its own `/exit`), it writes `%LOCALAPPDATA%\claude-self-tools\left\<W>.json`: which process left W and when, and W's transcript as it stood (its config folder, project, size and time), with an HMAC-SHA256 under `left.key`, 32 random bytes made once and read only inside the fixed scripts. A switch to W reads the record with its probe, and it waives two of the liveness signals, W's fresh transcript and heartbeat, and only those, when all of these hold: the MAC matches and the record names W; it is at most 10 minutes old; W's one transcript is in the folder and project it names and is unchanged since (in place: the same size and time; on exit: no write more than 10 s after); the process that left it is gone, or holds another conversation; and no heartbeat came after it. A running Claude Code that holds W, a command line naming it, a claim lock and anything unreadable still refuse. The last look checks the transcript again: in place, in the window and in a tab of the claude wrapper (pane file version 3, the ticket carrying the record's stat), each refusing if W's transcript changed since. This pane's slot runner doesn't check it until slots v2, nor does an older wrapper: a move that rests on a record goes to a new window instead, saying why. No record is written for an `/exit` you type, a crash or a kill. self-restart writes none: it resumes its own conversation. The MAC stops stray or torn writes; it is no defence against another process of your own user, which could as well run `claude --resume`.
+
+### Wake markers
+
+self-wake writes `%LOCALAPPDATA%\claude-self-tools\wake\<conversation>.json`, `{ "v": 1, "armed": true|false, "due"?: <ms>, "at": <ms> }`: at the start of each conversation its process holds, when a wake-up is armed or replaced, when it fires, and when it is cancelled. `armed` is true only while the process holds a timer for that conversation's wake-up. self-switch and the coordinator read it (S10w): armed holds a switch or a go; self-wake on with no marker, or one that doesn't read, holds too, saying to update self-wake to 0.2.0 or later; without self-wake in the session, nothing holds.
+
+### lanes.json
+
+`<config folder>\lanes.json` maps each session name to its current conversation: `{ "v": 1, "at", "lanes": { "<name>": { "session", "folder", "window"?, "tab"?, "ws", "at" } } }`. The coordinator plugin writes one entry at a time with `lanesUpdateScript` (a lock held as a handle, a temporary file, `[IO.File]::Replace`); `readLanes` reads it strictly, dropping a malformed entry and keeping the rest; `claude-launch.ps1 -Lane <name>` resumes the entry's conversation in the entry's folder. It is a map, not an authority: a launch from it checks the conversation as any launch does. [`tools/lanes-seed`](tools/lanes-seed/lanes-seed.mjs) prints a proposed file from a session inventory, and writes nothing.
 
 ### Why there is no effort, model or permission switch
 

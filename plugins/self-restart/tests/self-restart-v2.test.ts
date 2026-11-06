@@ -1,17 +1,38 @@
-// self-restart on the launcher v2 (the shared machine code): the claim lock it takes, the slot it
-// uses when its pane is one, the re-check after the wait, and the release once the session resumed.
-// The tests in self-restart.test.ts are the rest, unchanged.
+// self-restart on the shared launcher (launch, in the shared machine code): the claim lock it takes,
+// the slot it uses when its pane is one, the re-check after the wait, and the release once the
+// session resumed. The tests in self-restart.test.ts are the rest.
 import { expect, mock, test } from 'claude-code/testing'
 import type { On } from 'claude-code'
-import { launcherScript, SESSION_MARKERS } from '../hooks/launcher'
-import { RECHECK, SLOT_SCRIPT_SHA256 } from '../hooks/machine'
+import { launchScriptText, SESSION_MARKERS } from '../hooks/launcher'
+import { type LaunchInput, leftScript, RECHECK, SLOT_SCRIPT_SHA256 } from '../hooks/machine'
 
 const TOOL = 'mcp__self-restart__restart_after_turn'
 const HOUR = 60 * 60 * 1000
 const ID = '0f8fad5b-d9cb-469f-a165-70867728950e'
-const WINDOWS = { OS: 'Windows_NT', SystemRoot: 'C:\\Windows', LOCALAPPDATA: 'C:\\Users\\u\\AppData\\Local' }
+const WINDOWS = { OS: 'Windows_NT', SystemRoot: 'C:\\Windows', LOCALAPPDATA: 'C:\\Users\\u\\AppData\\Local', USERPROFILE: 'C:\\Users\\u' }
 const SLOT = '20-134062345678901240'
-const LAUNCH = 'launch:5e1a9c3b-7d2f-4b8e-a6c4-1f9d3e7b2a5c'
+/** The claim a launch takes: a fresh one each time, read back from its script. */
+const claimOf = (script: string): string => /^\$by = '(launch:[0-9a-f-]{36})'$/m.exec(script)?.[1] ?? 'none'
+
+/** self-restart's launch for this session, as the shared launcher builds it ('auto': this pane's slot, else a window). */
+const restartInput = (claim: string): LaunchInput => ({
+  powershell: 'C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe',
+  kind: 'resume',
+  id: ID,
+  folder: 'C:\\work\\repo',
+  claim,
+  configDirs: ['C:\\Users\\u\\.claude'],
+  stateDir: 'C:\\Users\\u\\AppData\\Local\\claude-self-tools',
+  where: 'auto',
+  waitForExit: { pid: 100, created: '134062345688901240' },
+  now: 1_000_500,
+  tool: 'self-restart',
+  deadline: 1_000_500 + 20_000,
+})
+
+/** What the launch answers, by what it placed: a window, or this pane's slot (the claim then the slot's own). */
+const WINDOW = (script: string) => `claim ${claimOf(script)}\r\nlaunched window - 17716\r\n`
+const SLOTTED = `claim slot:${SLOT}\r\nlaunched slot ${SLOT}\r\n`
 
 /** Base64 back to text, as PowerShell reads an -EncodedCommand: UTF-16LE. */
 function decode(encoded: string): string {
@@ -68,7 +89,7 @@ const MARKER = `${WINDOWS.LOCALAPPDATA}\\claude-self-tools\\pending\\${ID}.json`
 /** The engine beneath the plugin, its launcher answering `answer`; and what it was asked to run. */
 function engine(
   on: On,
-  { answer, store = {}, probe = probeOf(), git = 'no-repo', cwd = 'reads', crons = [], released = 'released' }: { answer: { exitCode: number; stdout: string }; store?: Record<string, unknown>; released?: 'released' | 'busy' } & Machine,
+  { answer, store = {}, probe = probeOf(), git = 'no-repo', cwd = 'reads', crons = [], released = 'released' }: { answer: { exitCode: number; stdout: string | ((script: string) => string) }; store?: Record<string, unknown>; released?: 'released' | 'busy' } & Machine,
 ) {
   const probes: string[] = []
   const described: string[] = []
@@ -134,7 +155,7 @@ function engine(
     }
     scripts.push(script)
     if (script.includes("'not-ours'")) return { value: { exitCode: 0, stdout: `${released}\r\n`, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
-    return { value: { ...answer, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+    return { value: { exitCode: answer.exitCode, stdout: typeof answer.stdout === 'function' ? answer.stdout(script) : answer.stdout, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
   })
   on('command.run', async (_, e) => {
     commands.push(e.command)
@@ -147,50 +168,58 @@ function engine(
 const start = { cwd: 'C:\\work\\repo', surface: 'terminal', isInteractive: true } as const
 const answered = { answer: 'done', durationMs: 1, turnId: 't1', isAborted: false, reason: 'answer' } as const
 
-test("the launcher v2 for this session's own id: the claim, the re-check after the wait, the scrub, and claude with no other flag", () => {
-  const script = launcherScript(ID)
-  // The claim on this conversation, taken in the launcher's own run, with CreateNew.
+test("the launch for this session's own id: the claim, the re-check after the wait, claude-launch.ps1, and no flag of its own", () => {
+  const script = launchScriptText(restartInput('launch:00000000-0000-4000-a000-000000000004'))
+  // The claim on this conversation, taken in the launch's own run, with CreateNew, after the checks.
   expect(script).toContain('[IO.File]::Open($path, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::Read)')
   expect(script).toContain('if (-not $taken) { $taken = Set-Claim $claimPath $claimText }')
-  expect(script).toContain('$claimPath = Join-Path $state ("claims\\" + $id + ".lock")')
-  expect(script).toContain('"self-restart: another switch or restart holds the claim on this conversation ($claimPath), so it is not resumed"; exit 5')
+  expect(script).toContain(`$claimPath = 'C:\\Users\\u\\AppData\\Local\\claude-self-tools\\claims\\${ID}.lock'`)
+  expect(script).toContain("if (-not $taken) { Refuse 'claim' ($tool + ': another switch, restart or launch holds the claim on this conversation') }")
+  // The process it waits for is this session's own claude.exe, by its id and its start.
+  expect(script).toContain("if ([long]$session.ProcessId -ne 100 -or [math]::Abs([long](Get-Created $session) - [long]'134062345688901240') -gt 10000) { Refuse 'wait'")
   // The window re-reads the registry and the process table after the wait, and checks the claim, before claude.
-  const wait = script.indexOf('Wait-Process')
-  const claude = script.indexOf("--resume '$id'")
+  const wait = script.indexOf('Wait-Process -Id 100')
+  const claude = script.indexOf('& $launchPath -Resume $id -Dir $folder')
+  expect(wait).toBeGreaterThan(0)
   for (const line of RECHECK) {
-    expect(script.indexOf(`'    ${line}'`)).toBeGreaterThan(wait)
-    expect(script.indexOf(`'    ${line}'`)).toBeLessThan(claude)
+    expect(script.indexOf(`    ${line}`, wait)).toBeGreaterThan(wait)
+    expect(script.indexOf(`    ${line}`, wait)).toBeLessThan(claude)
   }
   expect(script.indexOf('the claim on it no longer names this window')).toBeGreaterThan(wait)
   expect(script.indexOf('the claim on it no longer names this window')).toBeLessThan(claude)
-  // In the folder it was started in (the launcher runs there), checked to be a folder.
-  expect(script).toContain('$folder = (Get-Location).ProviderPath')
-  expect(script.indexOf("'Set-Location -LiteralPath $folder'")).toBeLessThan(claude)
-  // The scrub, once, naming the markers.
-  expect(script.split(/\r?\n/).filter(line => line.includes('SetEnvironmentVariable'))).toHaveLength(1)
-  for (const name of SESSION_MARKERS) expect(script).toContain(`"${name}"`)
+  // In the folder it was started in, checked to be a folder; claude-launch.ps1 goes there.
+  expect(script).toContain("$folder = 'C:\\work\\repo'")
+  expect(script.indexOf('if ($null -eq $refusal -and -not (Test-Path -LiteralPath $folder -PathType Container))')).toBeLessThan(claude)
+  // No scrub here: claude-launch.ps1 is the one place the launch environment is set.
+  expect(script).not.toContain('SetEnvironmentVariable')
+  for (const name of SESSION_MARKERS) expect(script).not.toContain(name)
   for (const flag of ['--permission-mode', '--dangerously-skip-permissions', 'bypassPermissions']) expect(script).not.toContain(flag)
-  // A slot whose script has the shipped hash gets a record instead of a window.
+  // A slot whose script has the shipped hash, and takes the folder, gets a record instead of a window.
   expect(script).toContain(`$slotOk = $slotHash -eq '${SLOT_SCRIPT_SHA256}'`)
-  expect(script.indexOf('[IO.File]::WriteAllText($record, $text)')).toBeLessThan(script.indexOf('Start-Process'))
+  expect(script.indexOf('[IO.File]::WriteAllText($temp, $text)')).toBeLessThan(script.indexOf('Start-Process'))
+  // self-restart writes no left record (review gap 5), and leftScript refuses it as a writer.
+  expect(script).not.toContain('left.key')
+  expect(() => leftScript({ stateDir: 'C:\\Users\\u\\AppData\\Local\\claude-self-tools', id: ID, how: 'exit', configDirs: ['C:\\Users\\u\\.claude'], by: 'self-restart' as never })).toThrow(/self-restart resumes its own conversation/)
 })
 
 test('a pane that is a verified slot: the launcher leaves the slot a record, no window opens, and the session exits', async ($, on) => {
-  const { scripts, commands, toasts, held, session, clock } = engine(on, { answer: { exitCode: 0, stdout: `slot ${SLOT}\r\nclaim slot:${SLOT}\r\n` } })
+  const { scripts, commands, toasts, held, session, clock } = engine(on, { answer: { exitCode: 0, stdout: SLOTTED } })
   await $.session.start(start)
   await $.tool.call({ tool: TOOL, reason: 'Switched accounts.', resume: 'Go on.' })
   await $.turn.complete(answered)
   await clock.advance(1000)
-  expect(scripts).toEqual([launcherScript(ID)])
+  expect(scripts).toEqual([launchScriptText(restartInput(claimOf(scripts[0] ?? '')))])
   expect(commands).toEqual(['exit'])
   expect(toasts.some(t => /Restarting: this pane's slot resumes this session once it has exited/.test(t))).toBe(true)
   expect(JSON.stringify(session.appended())).toContain('restarted at its own request (restart_after_turn). Reason: Switched accounts.')
   expect((held.get('restarts') as Record<string, { claim?: string }>)[ID]?.claim).toBe(`slot:${SLOT}`)
+  // No left record: self-restart resumes its own conversation (review gap 5).
+  expect(scripts.some(s => s.includes('left.key'))).toBe(false)
 })
 
 test("a slot runner the launcher passed over for a window: the restart says why, in the row, the toast and the log", async ($, on) => {
   const why = 'slot hash unreadable: Exception calling "ReadAllBytes" with "1" argument(s): "Access to the path is denied."'
-  const { commands, toasts, logs, session, clock } = engine(on, { answer: { exitCode: 0, stdout: `launched 17716\r\nclaim ${LAUNCH}\r\nfallback ${why}\r\n` } })
+  const { commands, toasts, logs, session, clock } = engine(on, { answer: { exitCode: 0, stdout: (script: string) => `${WINDOW(script)}fallback ${why}\r\n` } })
   await $.session.start(start)
   await $.tool.call({ tool: TOOL, reason: 'Switched accounts.' })
   await $.turn.complete(answered)
@@ -203,7 +232,7 @@ test("a slot runner the launcher passed over for a window: the restart says why,
 })
 
 test('a window with no slot passed over, or the slot itself, says nothing of a fallback', async ($, on) => {
-  const { toasts, session, clock } = engine(on, { answer: { exitCode: 0, stdout: `launched 17716\r\nclaim ${LAUNCH}\r\n` } })
+  const { toasts, session, clock } = engine(on, { answer: { exitCode: 0, stdout: WINDOW } })
   await $.session.start(start)
   await $.tool.call({ tool: TOOL, reason: 'Switched accounts.' })
   await $.turn.complete(answered)
@@ -213,12 +242,14 @@ test('a window with no slot passed over, or the slot itself, says nothing of a f
 })
 
 test('the claim the window took is kept for the resumed session, which releases it once', async ($, on) => {
-  const opened = engine(on, { answer: { exitCode: 0, stdout: `launched 17716\r\nclaim ${LAUNCH}\r\n` } })
+  const opened = engine(on, { answer: { exitCode: 0, stdout: WINDOW } })
   await $.session.start(start)
   await $.tool.call({ tool: TOOL, reason: 'Switched accounts.' })
   await $.turn.complete(answered)
   await opened.clock.advance(1000)
   const kept = (opened.held.get('restarts') as Record<string, { claim?: string; at: number }>)[ID]
+  const LAUNCH = claimOf(opened.scripts[0] ?? '')
+  expect(LAUNCH).not.toBe('none')
   expect(kept?.claim).toBe(LAUNCH)
 
   // The resumed process: its copy of the plugin releases that claim, and only that one.
@@ -227,7 +258,7 @@ test('the claim the window took is kept for the resumed session, which releases 
   const release = opened.scripts.filter(s => s.includes("'not-ours'"))
   expect(release).toHaveLength(1)
   expect(release[0]).toContain(`$lock.by -cne '${LAUNCH}'`)
-  expect(release[0]).toContain(`Join-Path 'C:\\Users\\u\\AppData\\Local\\claude-self-tools' 'claims\\${ID}.lock'`)
+  expect(release[0]).toContain(`$path = 'C:\\Users\\u\\AppData\\Local\\claude-self-tools\\claims\\${ID}.lock'`)
   await $.classic.SessionStart({ source: 'resume', session_id: ID })
   await opened.clock.advance(1000)
   expect(opened.scripts.filter(s => s.includes("'not-ours'"))).toHaveLength(1)
@@ -235,7 +266,7 @@ test('the claim the window took is kept for the resumed session, which releases 
 
 test('a claim another switch holds: the launcher resumes nothing, no window opens, nothing exits', async ($, on) => {
   const { commands, toasts, session, held, clock } = engine(on, {
-    answer: { exitCode: 5, stdout: 'self-restart: another switch or restart holds the claim on this conversation (C:\\x\\claims\\y.lock), so it is not resumed\r\n' },
+    answer: { exitCode: 0, stdout: 'refused claim self-restart: another switch, restart or launch holds the claim on this conversation\r\n' },
   })
   await $.session.start(start)
   await $.tool.call({ tool: TOOL, reason: 'Switched accounts.' })
@@ -243,12 +274,24 @@ test('a claim another switch holds: the launcher resumes nothing, no window open
   await clock.advance(1000)
   expect(commands).toEqual([])
   expect(toasts.some(t => /Restart didn't run/.test(t))).toBe(true)
-  expect(JSON.stringify(session.appended())).toMatch(/launcher exited 5: self-restart: another switch or restart holds the claim/)
+  expect(JSON.stringify(session.appended())).toMatch(/the launcher didn't place the restart \(refused: self-restart: another switch, restart or launch holds the claim/)
   expect(held.get('restarts')).toEqual({})
 })
 
+test('a start folder a launch never takes (a semicolon in it): refused, naming the character, nothing launched, nothing exits', async ($, on) => {
+  const { scripts, commands, toasts, session, clock } = engine(on, { answer: { exitCode: 0, stdout: WINDOW } })
+  await $.session.start({ ...start, cwd: 'C:\\work\\a;b' })
+  await $.tool.call({ tool: TOOL, reason: 'Switched accounts.' })
+  await $.turn.complete(answered)
+  await clock.advance(1000)
+  expect(scripts).toEqual([])
+  expect(commands).toEqual([])
+  expect(toasts.some(t => /Restart didn't run/.test(t))).toBe(true)
+  expect(JSON.stringify(session.appended())).toContain('holds a semicolon (;), so a launch never takes it: it takes an absolute folder with no quote, control character, semicolon')
+})
+
 test('at the call and before the launch, the full safe point: the probe asks of this session alone, and claims nothing', async ($, on) => {
-  const { probes, scripts, commands, clock } = engine(on, { answer: { exitCode: 0, stdout: `launched 17716\r\nclaim ${LAUNCH}\r\n` } })
+  const { probes, scripts, commands, clock } = engine(on, { answer: { exitCode: 0, stdout: WINDOW } })
   await $.session.start(start)
   await $.tool.call({ tool: TOOL, reason: 'Switched accounts.' })
   // The pre-check at the call, then again before the launch.
@@ -262,7 +305,7 @@ test('at the call and before the launch, the full safe point: the probe asks of 
     expect(probe).toContain('$state = $null')
   }
   // An MCP server's node under the session doesn't count: the launch goes ahead.
-  expect(scripts).toEqual([launcherScript(ID)])
+  expect(scripts).toEqual([launchScriptText(restartInput(claimOf(scripts[0] ?? '')))])
   expect(commands).toEqual(['exit'])
 })
 
@@ -282,7 +325,7 @@ for (const [name, machine, said] of [
   ['a session folder that cannot be read', { cwd: 'fails' as const }, /this session's folder can't be read, so git's state there is unknown/],
 ] as const) {
   test(`${name}, there by the time the restart is armed, holds it: no window, no exit, the model told why, the marker done`, async ($, on) => {
-    const { scripts, commands, toasts, held, session, writes, world, clock } = engine(on, { answer: { exitCode: 0, stdout: `launched 17716\r\nclaim ${LAUNCH}\r\n` } })
+    const { scripts, commands, toasts, held, session, writes, world, clock } = engine(on, { answer: { exitCode: 0, stdout: WINDOW } })
     await $.session.start(start)
     expect((await $.tool.call({ tool: TOOL, reason: 'Switched accounts.' })).deny).toBeUndefined()
     // It comes after the call, before the turn ends.
@@ -316,7 +359,7 @@ for (const [name, machine, said] of [
   ],
 ] as const) {
   test(`${name} at the call refuses it, naming how to stop it: nothing is queued, armed or marked`, async ($, on) => {
-    const { scripts, commands, writes, clock } = engine(on, { answer: { exitCode: 0, stdout: `launched 17716\r\nclaim ${LAUNCH}\r\n` }, ...machine })
+    const { scripts, commands, writes, clock } = engine(on, { answer: { exitCode: 0, stdout: WINDOW }, ...machine })
     await $.session.start(start)
     expect((await $.tool.call({ tool: TOOL, reason: 'Switched accounts.' })).deny).toBe(said)
     await $.turn.complete(answered)
@@ -328,7 +371,7 @@ for (const [name, machine, said] of [
 }
 
 test('the pending marker: written at the call and at the arm, done right before the exit runs', async ($, on) => {
-  const { commands, writes, clock } = engine(on, { answer: { exitCode: 0, stdout: `launched 17716\r\nclaim ${LAUNCH}\r\n` } })
+  const { commands, writes, clock } = engine(on, { answer: { exitCode: 0, stdout: WINDOW } })
   await $.session.start(start)
   await $.tool.call({ tool: TOOL, reason: 'Switched accounts.' })
   expect(writes).toEqual([{ path: MARKER, text: '{"v":1,"kind":"restart","at":1000000}' }])
@@ -361,7 +404,7 @@ test('the pending marker says done when the restart is cancelled: a new turn, an
 })
 
 test('a queued restart a new turn cancels is told in a plugin row; the third in a row says the session is busy', async ($, on) => {
-  const { scripts, commands, session, clock } = engine(on, { answer: { exitCode: 0, stdout: `launched 17716\r\nclaim ${LAUNCH}\r\n` } })
+  const { scripts, commands, session, clock } = engine(on, { answer: { exitCode: 0, stdout: WINDOW } })
   await $.session.start(start)
   for (const turnId of ['t2', 't3', 't4']) {
     await $.tool.call({ tool: TOOL, reason: 'Switched accounts.' })
@@ -401,7 +444,7 @@ test('a release that finds the lock held open throughout is logged, never taken 
   const { logs, clock } = engine(on, {
     answer: { exitCode: 0, stdout: '' },
     released: 'busy',
-    store: { restarts: { [ID]: { at: 1_000_000 - 60_000, reason: 'Switched accounts.', claim: LAUNCH } } },
+    store: { restarts: { [ID]: { at: 1_000_000 - 60_000, reason: 'Switched accounts.', claim: 'launch:00000000-0000-4000-a000-000000000005' } } },
   })
   await $.session.start(start)
   await $.classic.SessionStart({ source: 'resume', session_id: ID })

@@ -26,8 +26,26 @@ const resumeIn = folder('E', 'work')
 /** A command line as Windows builds it from an argv: each argument with a space or a quote quoted. */
 const commandLine = argv => argv.map(a => (/[\s"]/.test(a) ? `"${a}"` : a)).join(' ')
 
-const window = machine.launcherScript(T, { folder: resumeIn, claim: BY, configDirs, stateDir: state })
-const restart = machine.launcherScript(T)
+/** A launch through the shared launcher, with the largest inputs it takes. */
+const launchFor = change => machine.launchScriptText({
+  powershell: POWERSHELL,
+  kind: 'resume',
+  id: T,
+  folder: resumeIn,
+  claim: BY,
+  configDirs,
+  stateDir: state,
+  where: { window: true },
+  waitForExit: { pid: 4294967295, created: '99999999999999999999' },
+  left: { size: 9007199254740991, mtime: 9007199254740991 },
+  deadline: 9007199254740991,
+  tool: 'self-restart',
+  ...change,
+})
+const window = launchFor({})
+const restart = launchFor({ where: 'auto', left: undefined })
+const start = launchFor({ kind: 'start', name: 'a'.repeat(40), checks: { fresh: true }, waitForExit: undefined, left: undefined })
+const TOKEN = '00000000-0000-4000-a000-000000000001'
 const scripts = [
   ["self-switch's probe: two ids, the claim, 8 config folders, a heavy-slot root", machine.probeScript({ ids: [W, T], take: T, configDirs, stateDir: state, heavySlotRoot: folder('F', 'heavy') })],
   ["self-restart's probe", machine.probeScript({ ids: [W], configDirs: [], stateDir: state })],
@@ -38,6 +56,16 @@ const scripts = [
   ["self-restart's launcher", restart],
   ["self-restart's pane script, the claim and a ticket of the longest folder", machine.paneScript({ stateDir: state, ticket: { token: W, resume: T, by: BY, dir: resumeIn, at: Date.now() }, claim: true })],
   ["self-switch's pane script, a ticket of the longest folder", machine.paneScript({ stateDir: state, ticket: { token: W, resume: T, by: BY, dir: resumeIn, at: Date.now() } })],
+  ['the launch to a window: 8 config folders, the longest folder, a left record, a deadline', window],
+  ["the launch 'auto' (self-restart's): this pane's slot or a window", restart],
+  ['the launch of a start: its id checked new in 8 config folders', start],
+  ["the launch to this tab: a ticket naming 8 config folders", launchFor({ where: { pane: { token: TOKEN } }, now: Date.now(), left: undefined })],
+  ["the launch to this pane's slot", launchFor({ where: { slot: '4294967295-99999999999999999999' }, claim: 'slot:4294967295-99999999999999999999', left: undefined })],
+  ['the in-place check with a left record', machine.claimCheckScript({ stateDir: state, id: T, by: BY, configDirs, left: { size: 9007199254740991, mtime: 9007199254740991 } })],
+  ['the left record, written', machine.leftScript({ stateDir: state, id: T, how: 'exit', configDirs, by: 'coordinator', go: `wu_${'a'.repeat(40)}`, process: { pid: 4294967295, created: '99999999999999999999' } })],
+  ['the left records, read: 8 ids', machine.leftReadScript({ stateDir: state, ids: Array.from({ length: 8 }, () => T), configDirs })],
+  ["the probe, reading 8 ids' left records", machine.probeScript({ ids: Array.from({ length: 8 }, () => T), take: T, configDirs, stateDir: state, heavySlotRoot: folder('F', 'heavy'), left: true })],
+  ['lanes.json, one entry of the longest folder', machine.lanesUpdateScript({ configDir: configDirs[0], name: 'a'.repeat(40), entry: { session: T, folder: resumeIn, window: 'w'.repeat(40), tab: 't'.repeat(40), ws: 'w_abcdefghijkl', at: 9007199254740991 } })],
 ]
 
 test('each script runs from standard input: its command line is the fixed bootstrap, under 24,000 characters', () => {
@@ -52,47 +80,34 @@ test('each script runs from standard input: its command line is the fixed bootst
 })
 
 /**
- * The window's inner script, as the launcher builds it at run time: each element of its `$inner = @(`
- * list, single-quoted ones as they are, double-quoted ones with PowerShell's expansion of the values
- * the launcher reads (each at its largest), joined with CRLF.
+ * The window's own script, as the launch script carries it: one single-quoted literal, `$inner = '...'`,
+ * its own quotes doubled. It ends at the first single quote that isn't doubled.
  */
 function innerOf(script) {
-  const lines = script.split('\r\n')
-  const from = lines.indexOf('$inner = @(')
-  const to = lines.indexOf(') -join [Environment]::NewLine')
-  assert.ok(from > 0 && to > from, 'the inner script is built from a list')
-  const values = {
-    wait: '4294967295',
-    id: T,
-    by: BY,
-    exe: folder('C', 'claude').slice(0, 225) + `${B}claude.exe`,
-    folderText: resumeIn,
-    stateText: state,
-    configText: configDirs.map(d => `'${d}'`).join(', '),
+  const from = script.indexOf("$inner = '")
+  assert.ok(from > 0, 'the window script is one literal')
+  let i = from + "$inner = '".length
+  const start = i
+  for (; i < script.length; i += 1) {
+    if (script[i] === "'" && script[i + 1] === "'") {
+      i += 1
+      continue
+    }
+    if (script[i] === "'") break
   }
-  return lines
-    .slice(from + 1, to)
-    .map(line => line.trim().replace(/,$/, ''))
-    .map(element => {
-      if (element.startsWith("'")) return element.slice(1, -1).split("''").join("'")
-      assert.ok(element.startsWith('"'), `an element is a quoted string: ${element}`)
-      return element
-        .slice(1, -1)
-        .replace(/`\$/g, '\u0000')
-        .replace(/\$([A-Za-z]+)/g, (all, name) => (name in values ? values[name] : all))
-        .replace(/\u0000/g, '$')
-        .replace(/`"/g, '"')
-    })
-    .join('\r\n')
+  return script.slice(start, i).split("''").join("'")
 }
 
 test("the window's own command line: the inner script GZip-compressed in a fixed unpacking bootstrap, under 24,000 characters", () => {
   for (const [name, script] of [["a switch's window", window], ["self-restart's window", restart]]) {
     const inner = innerOf(script)
-    assert.ok(inner.includes(`$id = '${T}'`) && inner.includes(`--resume '${T}'`), `${name}: the inner script`)
+    assert.ok(inner.includes(`$id = '${T}'`) && inner.includes('& $launchPath -Resume $id -Dir $folder'), `${name}: the inner script`)
     // The window is started with the unpacking bootstrap, never the inner script itself.
     assert.ok(script.includes('$encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($unpack))'), name)
-    const unpackLine = script.split('\r\n').find(line => line.startsWith('$unpack = "'))
+    const unpackLine = script
+      .split('\r\n')
+      .map(line => line.trimStart())
+      .find(line => line.startsWith('$unpack = "'))
     assert.ok(unpackLine !== undefined, `${name}: the unpacking bootstrap`)
     const payload = gzipSync(Buffer.from(inner, 'utf8')).toString('base64')
     const unpack = unpackLine.slice('$unpack = "'.length, -1).replace('$payload', payload)
@@ -107,10 +122,12 @@ test("the window's own command line: the inner script GZip-compressed in a fixed
 test("every run of a script passes it on standard input: the bootstrap never reads the engine's default stdin", () => {
   for (const plugin of ['self-switch', 'self-restart']) {
     const text = readFileSync(join(ROOT, 'plugins', plugin, 'hooks', 'register.ts'), 'utf8')
-    const calls = text.split('powershellCall(').length - 1
+    // A script built by powershellCall, or by launch(), the shared launcher, which is powershellCall too.
+    const calls = text.split('powershellCall(').length - 1 + text.split('buildLaunch(').length - 1
     const runs = text.split('$.process.run(').length - 1
     const withStdin = (text.match(/\$\.process\.run\(call\.argv, \{\s*stdin: call\.stdin,/g) ?? []).length
     assert.ok(calls > 0, `${plugin} runs its scripts through powershellCall`)
+    assert.ok(!text.includes('import { launch,') && !/\blaunch\(/.test(text.replace(/buildLaunch\(/g, '')), `${plugin} calls launch() only as buildLaunch`)
     assert.equal(runs, calls, `${plugin}: every $.process.run is of a powershellCall`)
     assert.equal(withStdin, calls, `${plugin}: every run passes the call's stdin`)
   }
@@ -128,8 +145,8 @@ test('the machine code runs PowerShell only through powershellCall with its stdi
   assert.equal(calls, withStdin, 'each powershellCall is run with its stdin')
 })
 
-test('self-exit and self-check start no process of their own: the probe runs through the machine code, the tools through $.tool.call', () => {
-  for (const plugin of ['self-exit', 'self-check']) {
+test('self-exit, self-check and self-wake start no process of their own: the probe runs through the machine code, the tools through $.tool.call', () => {
+  for (const plugin of ['self-exit', 'self-check', 'self-wake']) {
     const text = readFileSync(join(ROOT, 'plugins', plugin, 'hooks', 'register.ts'), 'utf8')
     assert.equal(text.includes('$.process.run('), false, `${plugin} runs no process itself`)
     assert.equal(text.includes('$.process.spawn('), false, `${plugin} spawns no process itself`)

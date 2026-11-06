@@ -8,21 +8,26 @@
 # What it does:
 # - It runs the real claude.exe with your arguments, in this tab, and waits for it, as before.
 # - It gives this run a fresh token, CLAUDE_PANE_TOKEN, which claude inherits, and writes a pane file,
-#   %LOCALAPPDATA%\claude-self-tools\panes\<token>.json (version 2), naming this PowerShell by its
+#   %LOCALAPPDATA%\claude-self-tools\panes\<token>.json (version 3), naming this PowerShell by its
 #   process id and start time. self-restart and self-switch leave this tab a ticket only when claude's
 #   parent process is that one; otherwise they open a new window, as they do without this function.
 # - When claude exits, it looks for that ticket, panes\<token>.next.json, and deletes it before anything
 #   else. It uses it only when the ticket is for this token, names a conversation by its id and the
-#   claim on it, is at most 120 seconds old, and names an existing folder whose project holds that
-#   conversation's transcript (by name; it is never read); when the claim lock on that conversation
-#   names the ticket's claim; and when, read again right before claude runs, no running Claude Code
-#   holds the conversation (the same last look a switch's window and slot take). Then it runs
+#   claim on it, is at most 120 seconds old, names an existing folder whose project holds that
+#   conversation's transcript (by name; it is never read), and names its config folders, if it does,
+#   as absolute folders, and its left record's stat, if it does, as whole numbers; when the claim lock
+#   on that conversation names the ticket's claim; and when, read again right before claude runs, no
+#   running Claude Code holds the conversation (the same last look a switch's window and slot take), in
+#   this tab's own config folder or any the ticket names: a switch that reads more than one gets the
+#   same look here as in its window; and, for a switch back to a conversation left moments ago (one that
+#   rests on a left record), its transcript is as the record says, unchanged since. Then it runs
 #   claude --resume <id> in that folder, in this tab, and loops: a resumed session can restart again.
 #   At most 10 resumes, and never a fourth within 30 seconds. A ticket it doesn't use is said in one
 #   line, and you are back at the prompt.
 # - A resumed claude gets no argument but --resume <id>, and the environment a new session would:
 #   the variables Claude Code sets in the processes it starts are cleared, NO_COLOR among them, and
-#   CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1 is set. WT_SESSION and WT_PROFILE_ID are left alone.
+#   CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1 and CLAUDE_CODE_DISABLE_BG_SHELL_PRESSURE_REAP=1 are set (the
+#   launch environment, as claude-launch.ps1 sets it). WT_SESSION and WT_PROFILE_ID are left alone.
 # - When it returns, your environment and folder are as they were, and the pane file is gone.
 # - With no LOCALAPPDATA (an SSH or remoting shell), it just runs claude: no token, no pane file.
 
@@ -50,11 +55,19 @@ function claude {
   $claim = '^launch:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\z'
   # Set by Claude Code in the processes it starts, and NO_COLOR: a resumed claude must not inherit them.
   $markers = 'CLAUDE_CODE_CHILD_SESSION', 'CLAUDECODE', 'CLAUDE_CODE_SESSION_ID', 'CLAUDE_PID', 'CLAUDE_EFFORT', 'CLAUDE_CODE_BRIDGE_SESSION_ID', 'CLAUDE_CODE_MESSAGING_SOCKET', 'CLAUDE_CODE_MESSAGING_TOKEN', 'CLAUDE_CODE_REMOTE', 'CLAUDE_CODE_REMOTE_SESSION_ID', 'CLAUDE_JOB_DIR', 'AI_AGENT', 'CLAUDE_CODE_ENTRYPOINT', 'CLAUDE_CODE_EXECPATH', 'CLAUDE_CODE_SESSION_ATTENDED', 'CLAUDE_CODE_SSE_PORT', 'NO_COLOR'
+  # Set for a resumed claude: LAUNCH_ENV_SET in the plugins' machine code, as claude-launch.ps1 sets it.
+  $launchSet = [ordered]@{ CLAUDE_CODE_FORCE_SESSION_PERSISTENCE = '1'; CLAUDE_CODE_DISABLE_BG_SHELL_PRESSURE_REAP = '1' }
   # Everything this function changes in the environment, kept to be put back when it returns.
-  $names = @('CLAUDE_PANE_TOKEN', 'CLAUDE_CODE_FORCE_SESSION_PERSISTENCE') + $markers
+  $names = @('CLAUDE_PANE_TOKEN') + @($launchSet.Keys) + $markers
   $saved = @{}
   foreach ($name in $names) { $saved[$name] = [Environment]::GetEnvironmentVariable($name) }
   $isNumber = { param($x) $x -is [int] -or $x -is [long] -or $x -is [double] -or $x -is [decimal] }
+  # A ticket's config folders: 1 to 8, each an absolute folder of at most 240 characters with no quote
+  # or control character (the rule its own folder is read by).
+  $isFolders = { param($list) $list -is [array] -and $list.Count -ge 1 -and $list.Count -le 8 -and @($list | Where-Object { $_ -isnot [string] -or $_.Length -gt 240 -or $_ -cnotmatch '^[A-Za-z]:\\' -or $_ -match '[\x00-\x1f"''\u2018-\u201e]' }).Count -eq 0 }
+  # A ticket's left record stat: { size, mtime } or { exitAt }, whole numbers, nothing else.
+  $isWhole = { param($x) (& $isNumber $x) -and $x -ge 0 -and [math]::Floor([double]$x) -eq [double]$x }
+  $isLeft = { param($l) if ($l -isnot [Management.Automation.PSCustomObject]) { return $false }; $keys = @($l.PSObject.Properties | ForEach-Object { $_.Name } | Sort-Object) -join ','; return (($keys -ceq 'mtime,size' -and (& $isWhole $l.size) -and (& $isWhole $l.mtime)) -or ($keys -ceq 'exitAt' -and (& $isWhole $l.exitAt))) }
 
   # Whether a running Claude Code holds conversation $id now: $null when none does, else why. The last
   # look a switch's window and the slot runner take before claude runs (RECHECK in the plugins' machine
@@ -103,6 +116,24 @@ function claude {
     return $live
   }
 
+  # Whether conversation $id's transcript changed since the left record the ticket carries said how it
+  # was left: $null when it didn't, else why. The window's last look for a move that rests on a left
+  # record (LEFT_RECHECK in the plugins' machine code), line for line, after Get-Live found nothing.
+  # Anything it can't read counts as changed.
+  function Test-Left($id, $configDirs, $leftSize, $leftMtime, $leftExitAt) {
+    $ErrorActionPreference = 'Stop'
+    $live = $null
+    try {
+      if ($null -eq $live) {
+        $seen = @(foreach ($dir in $configDirs) { $projects = Join-Path $dir "projects"; if (Test-Path -LiteralPath $projects -PathType Container) { foreach ($d in @(Get-ChildItem -LiteralPath $projects -Directory -Force)) { $tx = Join-Path $d.FullName ($id + ".jsonl"); if (Test-Path -LiteralPath $tx -PathType Leaf) { Get-Item -LiteralPath $tx -Force } } } })
+        if ($seen.Count -ne 1) { $live = "its transcript is not one file on this machine now (" + $seen.Count + " found), so whether it changed since it was left is unknown" }
+        elseif ($null -ne $leftExitAt) { if (([DateTimeOffset]$seen[0].LastWriteTimeUtc).ToUnixTimeMilliseconds() -gt ([long]$leftExitAt + 10000)) { $live = "its transcript was written after it was left (another process may have resumed it)" } }
+        elseif ([long]$seen[0].Length -ne [long]$leftSize -or ([DateTimeOffset]$seen[0].LastWriteTimeUtc).ToUnixTimeMilliseconds() -ne [long]$leftMtime) { $live = "its transcript changed since it was left (another process may have resumed it)" }
+      }
+    } catch { $live = 'whether its transcript changed since it was left is unknown (' + $_.Exception.Message + ')' }
+    return $live
+  }
+
   # This run: a fresh token, and the pane file naming this PowerShell by its process id and start time.
   # If it can't be written, claude runs all the same, without a token: a restart opens a new window.
   $token = [guid]::NewGuid().ToString()
@@ -117,7 +148,7 @@ function claude {
       if (-not ((& $isNumber $owner.pid) -and (Get-Process -Id $owner.pid -ErrorAction SilentlyContinue))) { Remove-Item -LiteralPath $old.FullName -Force -ErrorAction SilentlyContinue }
     }
     $started = [string](Get-Process -Id $PID).StartTime.ToFileTimeUtc()
-    [IO.File]::WriteAllText($paneFile, (ConvertTo-Json -Compress -InputObject ([ordered]@{ v = 2; pid = $PID; started = $started })))
+    [IO.File]::WriteAllText($paneFile, (ConvertTo-Json -Compress -InputObject ([ordered]@{ v = 3; pid = $PID; started = $started })))
     $env:CLAUDE_PANE_TOKEN = $token
   } catch {
     Write-Host "claude: this tab's pane file was not written ($($_.Exception.Message)), so a restart opens a new window."
@@ -150,12 +181,22 @@ function claude {
         elseif ($t.by -isnot [string] -or $t.by -cnotmatch $claim) { 'it names no claim' }
         elseif (-not (& $isNumber $t.at) -or $age -gt 120000 -or $age -lt -5000) { 'its time is not within the last 120 seconds' }
         elseif ($t.dir -isnot [string] -or $t.dir -cnotmatch '^[A-Za-z]:\\' -or $t.dir -match '[\x00-\x1f"''\u2018-\u201e]' -or -not (Test-Path -LiteralPath $t.dir -PathType Container)) { 'its folder is not an existing folder' }
+        elseif ($null -ne $t.configDirs -and -not (& $isFolders $t.configDirs)) { 'its config folders are not absolute folders' }
+        elseif ($null -ne $t.left -and -not (& $isLeft $t.left)) { 'its left record''s stat is not a size and a time, or an exit time' }
         elseif (-not (Test-Path -LiteralPath (Join-Path $config ('projects\' + ($t.dir -replace '[^A-Za-z0-9]', '-') + '\' + $t.resume + '.jsonl')) -PathType Leaf)) { "no transcript of it is under its folder's project" }
         elseif ($null -eq $lock -or $lock.by -cne $t.by) { 'the claim lock on that conversation does not name this ticket' }
         elseif ($resumes.Count -ge 10) { 'this tab has resumed 10 times already' }
         elseif (@($resumes | Where-Object { ([datetime]::UtcNow - $_).TotalSeconds -lt 30 }).Count -ge 3) { 'this tab resumed 3 times within 30 seconds' }
-      # The last look, right before claude runs: is the conversation open anywhere now?
-      if ($null -eq $why) { $why = Get-Live $t.resume @($config) }
+      # The last look, right before claude runs: is the conversation open anywhere now? In this tab's own
+      # config folder and every one the ticket names, as the switch read them: reading more registries
+      # can only find the conversation held, never free it. Then, for a move that rests on a left record,
+      # its transcript as the record says.
+      if ($null -eq $why) {
+        $lookIn = @($config)
+        if ($null -ne $t.configDirs) { foreach ($dir in @($t.configDirs)) { if (@($lookIn | Where-Object { $_.TrimEnd('\') -eq $dir.TrimEnd('\') }).Count -eq 0) { $lookIn += $dir } } }
+        $why = Get-Live $t.resume $lookIn
+        if ($null -eq $why -and $null -ne $t.left) { $why = Test-Left $t.resume $lookIn $t.left.size $t.left.mtime $t.left.exitAt }
+      }
       if ($null -ne $why) {
         $hint = if ($t.resume -is [string] -and $t.resume -cmatch $uuid) { " Once it is safe, resume it yourself: claude --resume $($t.resume)" } else { '' }
         Write-Host "claude: the ticket to resume a session in this tab was not used: $why.$hint"
@@ -163,9 +204,9 @@ function claude {
       }
       $resumes += [datetime]::UtcNow
       # The environment a new session gets: Claude Code's markers and NO_COLOR removed (not set to empty,
-      # which PowerShell 7 keeps), transcripts on.
+      # which PowerShell 7 keeps), then the launch environment's set: transcripts on, shells not reaped.
       foreach ($name in $markers) { Remove-Item -LiteralPath "Env:$name" -ErrorAction SilentlyContinue }
-      $env:CLAUDE_CODE_FORCE_SESSION_PERSISTENCE = '1'
+      foreach ($name in $launchSet.Keys) { Set-Item -LiteralPath "Env:$name" -Value $launchSet[$name] }
       Set-Location -LiteralPath $t.dir
       Write-Host "Resuming $($t.resume) here, in $($t.dir)."
       & $exe --resume $t.resume
