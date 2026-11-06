@@ -27,8 +27,16 @@
 //
 // Only the main conversation acts this way, never a subagent. An interrupted turn cancels what it
 // queued, its resume included.
+//
+// After a login change, the session reconnects Remote Control and resumes a turn the change (or
+// the limit before it) cut off, on its own: relogin.ts. Both a queued connect and that reconnect
+// run the command only under the Remote Control lock, which the coordinator plugin takes too:
+// rc-lock.ts.
 import type { EngineInterface, Register } from 'claude-code'
-import type { Queued } from '../types'
+import type { Held, Queued } from '../types'
+import { read, readNow, runRemoteControl, sessionTitle, why, type Reading } from './connection'
+import { LOCK_HOLD_MS, releaseLock, takeLock } from './rc-lock'
+import { aroundLogin, configureRelogin, forgetTurn, noteFailure, notePersonPrompt, noteTurnEnd, noteTurnStart, startWatch } from './relogin'
 import { configureUpdateCheck, loadUpdateCheck, withUpdateNotice } from './update-check'
 
 const queued = { plugin: 'self-remote-control', key: 'queued' } as const
@@ -38,12 +46,10 @@ const title = { plugin: 'self-remote-control', key: 'title' } as const
 const SETTLE_MS = 500
 /** How long after a connect to look again, for whether it took. */
 const CHECK_MS = 3000
+/** While a connect that hasn't read connected holds the lock: how often to look again. */
+const HOLD_LOOK_MS = 15_000
 /** The longest title /rename keeps. */
 const NAME_MAX = 200
-
-/** The remote-control command's description while this session is connected, and while it is not. */
-const CONNECTED = 'Disconnect Remote Control'
-const NOT_CONNECTED = 'Control this session from your phone or claude.ai/code'
 
 const DESCRIPTION = [
   'Reports on, connects or renames this session for Remote Control: the link that lets the user follow and steer the session from a phone or a browser, whose session list shows each session by its title.',
@@ -59,11 +65,6 @@ const DESCRIPTION = [
 const SUBAGENT =
   "A subagent can't read or change the session's Remote Control. Finish your piece and return its result; the main session can connect."
 
-type Reading =
-  | { state: 'connected' | 'not connected' }
-  | { state: 'unavailable' }
-  | { state: 'unknown'; description: string }
-
 /** How an action ended: a toast for the person, and for one that didn't take, a note for the model. */
 type Outcome = { toast: string; note?: string }
 
@@ -78,12 +79,6 @@ function badName(name: string): string | undefined {
   if (/[\r\n]/.test(name)) return '`name` is a title on one line.'
   if (name.length > NAME_MAX) return `\`name\` is at most ${NAME_MAX} characters, as /rename keeps.`
   return undefined
-}
-
-/** Why a call was refused, as one line. */
-function why(err: unknown): string {
-  const said = (err instanceof Error ? err.message : String(err)).trim()
-  return said === '' ? 'no reason given' : said
 }
 
 /** ` as "<name>"`, or nothing when there is no name. */
@@ -120,24 +115,6 @@ async function report($: EngineInterface, { toast, note }: Outcome, resume: stri
   if (note !== undefined) await tellModel($, note)
 }
 
-/** Whether this session's Remote Control is connected, from the remote-control command's description. */
-async function read($: EngineInterface): Promise<Reading> {
-  const command = (await $.command.list()).find(c => c.name === 'remote-control' && c.source === 'builtin')
-  if (command === undefined) return { state: 'unavailable' }
-  if (command.description === CONNECTED) return { state: 'connected' }
-  if (command.description === NOT_CONNECTED) return { state: 'not connected' }
-  return { state: 'unknown', description: command.description }
-}
-
-/** `read`, a failed read taken as unknown. */
-async function readNow($: EngineInterface): Promise<Reading> {
-  try {
-    return await read($)
-  } catch (err) {
-    return { state: 'unknown', description: `no reading: ${why(err)}` }
-  }
-}
-
 /** Why `connect` won't run the command on this reading. */
 function refusal(reading: Reading): string {
   if (reading.state === 'unavailable') {
@@ -147,16 +124,6 @@ function refusal(reading: Reading): string {
     return `Can't tell whether Remote Control is connected: the remote-control command reads "${reading.description}", which this plugin doesn't recognise. Run while connected, that command opens its panel and waits for the user, so it isn't run.`
   }
   return 'Remote Control is already connected; nothing to do.'
-}
-
-/** Runs the remote-control command, titled `name` when there is one. */
-function runRemoteControl($: EngineInterface, name: string | undefined) {
-  return $.command.run(name === undefined ? { command: 'remote-control' } : { command: 'remote-control', args: name })
-}
-
-/** The session's custom title as last carried, or undefined when it has none or none was read. */
-async function sessionTitle($: EngineInterface): Promise<string | undefined> {
-  return (await $.state.get(title)).value ?? undefined
 }
 
 /** Keeps the session's custom title as a hook input carries it: absent, the session has none. */
@@ -262,16 +229,29 @@ async function runQueued($: EngineInterface, value: Queued): Promise<void> {
     }
   }
   const lead = value.rename ? `Session renamed "${value.name}". ` : ''
-  await connectNow($, await readNow($), value.name ?? (await sessionTitle($)), value.resume, lead)
+  await connectNow($, value.name ?? (await sessionTitle($)), value.resume, lead)
 }
 
-/** Connects, only on a fresh "not connected" reading, then says whether it took, after `lead`. */
-async function connectNow($: EngineInterface, reading: Reading, name: string | undefined, resume: string | undefined, lead: string): Promise<void> {
+/**
+ * Connects under the Remote Control lock (rc-lock.ts), only on a "not connected" reading taken once
+ * the lock is held, then says whether it took, after `lead`. The lock is held until the session
+ * reads connected, or LOCK_HOLD_MS.
+ */
+async function connectNow($: EngineInterface, name: string | undefined, resume: string | undefined, lead: string): Promise<void> {
+  const taken = await takeLock($, await $.clock.now())
+  if ('busy' in taken) {
+    const busy = `${taken.busy}, so nothing ran; check with remote_control status.`
+    await report($, { toast: `${lead}Remote Control: ${busy}`, note: `${lead}The Remote Control connect you queued didn't run: ${busy}` }, resume)
+    return
+  }
+  const reading = await readNow($)
   if (reading.state === 'connected') {
+    await releaseLock($, taken.held)
     await report($, { toast: `${lead}Remote Control was already connected; nothing ran.` }, resume)
     return
   }
   if (reading.state !== 'not connected') {
+    await releaseLock($, taken.held)
     await report(
       $,
       { toast: `${lead}Remote Control not connected: ${refusal(reading)}`, note: `${lead}The Remote Control connect you queued did not run. ${refusal(reading)}` },
@@ -282,6 +262,7 @@ async function connectNow($: EngineInterface, reading: Reading, name: string | u
   try {
     await runRemoteControl($, name)
   } catch (err) {
+    await releaseLock($, taken.held)
     await report(
       $,
       { toast: `${lead}Remote Control didn't connect: ${why(err)}`, note: `${lead}The Remote Control connect you queued didn't run: ${why(err)}` },
@@ -289,15 +270,26 @@ async function connectNow($: EngineInterface, reading: Reading, name: string | u
     )
     return
   }
-  $.clock.after(CHECK_MS, () => void checkConnected($, name, resume, lead))
+  $.clock.after(CHECK_MS, () => void checkConnected($, name, resume, lead, taken.held))
 }
 
-async function checkConnected($: EngineInterface, name: string | undefined, resume: string | undefined, lead: string): Promise<void> {
+/** Gives the lock back once the session reads connected, or once it has been held LOCK_HOLD_MS. */
+async function holdUntilConnected($: EngineInterface, held: Held): Promise<void> {
+  if ((await $.clock.now()) - held.at >= LOCK_HOLD_MS || (await readNow($)).state === 'connected') {
+    await releaseLock($, held)
+    return
+  }
+  $.clock.after(HOLD_LOOK_MS, () => void holdUntilConnected($, held))
+}
+
+async function checkConnected($: EngineInterface, name: string | undefined, resume: string | undefined, lead: string, held: Held): Promise<void> {
   const reading = await readNow($)
   if (reading.state === 'connected') {
+    await releaseLock($, held)
     await report($, { toast: `${lead}Remote Control connected${titled(name)}.` }, resume)
     return
   }
+  $.clock.after(HOLD_LOOK_MS, () => void holdUntilConnected($, held))
   await report(
     $,
     {
@@ -310,6 +302,7 @@ async function checkConnected($: EngineInterface, name: string | undefined, resu
 
 export const register: Register = (on, options) => {
   configureUpdateCheck('self-remote-control', options)
+  configureRelogin(options)
 
   // First, so it is outermost on this plugin's tools: it sees each answer, and adds the update
   // notice when one is due. It never waits on the check; see update-check.ts.
@@ -345,14 +338,40 @@ export const register: Register = (on, options) => {
       isDeferred: false,
     })
     loadUpdateCheck($)
+    startWatch($)
     return started
   })
 
   on('classic.SessionStart', async ($, e, next) => {
     const done = await next(e)
     await remember($, e)
+    // Another conversation: its last turn isn't the one this plugin saw end.
+    if (e.agent_id === undefined && (e.source === 'clear' || e.source === 'resume' || e.source === 'fork')) await forgetTurn($)
     return done
   })
+
+  // The main conversation's turns, for whether a login change cut one off.
+  on('turn.start', async ($, e, next) => {
+    const started = await next(e)
+    if (e.agentId === undefined) await noteTurnStart($, e.text)
+    return started
+  })
+
+  on('classic.StopFailure', async ($, e, next) => {
+    const done = await next(e)
+    if (e.agent_id === undefined) await noteFailure($, String(e.error))
+    return done
+  })
+
+  // A prompt the person typed, at the terminal or from the app: a resume the loop-breaker held may go again.
+  on('prompt.submit', async ($, e, next) => {
+    const done = await next(e)
+    if (done.drop === undefined && (e.origin.kind === 'composer' || e.origin.kind === 'bridge')) await notePersonPrompt($)
+    return done
+  }).catch(($, e, next) => next(e))
+
+  // A /login here: a login change waits until its dialog has closed (relogin.ts).
+  on('command.run', { command: 'login' }, ($, e, next) => aroundLogin($, () => next(e))).catch(($, e, next) => next(e))
 
   on('classic.UserPromptSubmit', async ($, e, next) => {
     const done = await next(e)
@@ -383,6 +402,7 @@ export const register: Register = (on, options) => {
   on('turn.complete', async ($, e, next) => {
     const done = await next(e)
     if (e.agentId !== undefined) return done
+    await noteTurnEnd($, { reason: e.reason, durationMs: e.durationMs, ...(e.usage === undefined ? {} : { usage: e.usage }) })
     const { value } = await $.state.get(queued)
     if (!value) return done
     await $.state.set(queued, null)
