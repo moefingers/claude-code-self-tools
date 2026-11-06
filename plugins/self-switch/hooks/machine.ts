@@ -32,10 +32,15 @@
 //   claude no permission flag of any kind, so the resumed session starts in the mode a new one would.
 // - The claim lock: %LOCALAPPDATA%\claude-self-tools\claims\<id>.lock, created with CreateNew by the
 //   run that judges, holding { v, by, pid, created, at, transport }. `by` names the one that resumes:
-//   `slot:<pid>-<created>` (a slot runner) or `launch:<uuid>` (one window, or one in-place move).
+//   `slot:<pid>-<created>` (a slot runner) or `launch:<uuid>` (one window, one in-place move, or one
+//   ticket for the claude wrapper's tab).
 //   It is stale when its creator (pid and creation time) isn't running and it is older than 15 minutes.
 // - The slot runner's hash (SLOT_SCRIPT_SHA256): plugins/self-switch/slot/claude-slot.ps1, byte for
 //   byte. A pane is used as a slot only when the script its parent runs has this hash.
+// - The claude wrapper's tab (tools/claude-wrapper/claude-wrapper.ps1, a `claude` function in the
+//   person's PowerShell profile): its token and pane file (readPane, parsePane), whether this
+//   claude.exe runs right under it (paneFallback), and the ticket it resumes from (paneTicket to build
+//   one, checkPaneTicket for the rules the wrapper reads it by; paneScript writes it whole).
 // - The gate file the coordinator writes (gatePath, readGate), and git's state (readGit).
 // - The exit pre-check (exitBlockers, readExit): what would make a queued /exit stop at its
 //   confirmation, or end work still running: session crons (the built-in CronList, through
@@ -152,6 +157,15 @@ export const slotRecordPath = (state: string, slot: string): string => `${state}
 /** The coordinator's gate file for conversation `id`. */
 export const gatePath = (state: string, id: string): string => `${state}\\gate\\${id}.json`
 
+/** A tab's token, as the claude wrapper makes it ([guid]::NewGuid()): a lowercase UUID. */
+export const PANE_TOKEN = SESSION_ID
+
+/** The claude wrapper's pane file for the tab with `token`; undefined for a token that isn't one, so nothing else is joined into a path. */
+export const panePath = (state: string, token: string): string | undefined => (PANE_TOKEN.test(token) ? `${state}\\panes\\${token}.json` : undefined)
+
+/** The ticket the claude wrapper reads when its claude exits, for the tab with `token`; undefined for a token that isn't one. */
+export const paneTicketPath = (state: string, token: string): string | undefined => (PANE_TOKEN.test(token) ? `${state}\\panes\\${token}.next.json` : undefined)
+
 // ---------------------------------------------------------------------------------------------
 // Another session's words, as data.
 
@@ -227,6 +241,12 @@ export const CLAIM_STALE_MS = 15 * 60 * 1000
 /** A slot record older than this is not honoured. */
 export const SLOT_RECORD_MS = 120 * 1000
 
+/** A ticket for the claude wrapper's tab older than this is not honoured, as a slot record isn't. */
+export const PANE_TICKET_MS = 120 * 1000
+
+/** A ticket whose time is further ahead of the wrapper's clock than this is not honoured either. */
+export const PANE_AHEAD_MS = 5 * 1000
+
 /** A gate file older than this is ignored. */
 export const GATE_MS = 24 * 60 * 60 * 1000
 
@@ -287,7 +307,7 @@ export const REGISTRY_VERSION_MARKERS = ['v', 'schema', 'schemaVersion', 'format
 export const LAUNCH_LINE_TRUSTED_AFTER_MS = 60_000
 
 /** The SHA-256 of plugins/self-switch/slot/claude-slot.ps1, as it is committed. */
-export const SLOT_SCRIPT_SHA256 = '9e8c984c89ea6d1503635a5280c6fc224406ef724767f7b5e31323d4e6be490e'
+export const SLOT_SCRIPT_SHA256 = 'db33bcf242ac2df21be9ab6c3de382d8dca45b712eacbb4429cce49dddee6a43'
 
 /**
  * The variables Claude Code sets in the processes it starts, which a top-level claude must not inherit:
@@ -453,9 +473,17 @@ const TAKE_CLAIM = [
  * names $id refuses whatever its procStart; the start time only words the line. procStart compares as a [double]:
  * a string of digits, as Claude Code 2.1.318 writes it, converts as a number does, and at today's
  * FILETIMEs a double is off by at most 32 ticks, well within the 1 ms tolerance.
+ * A process that has exited by the time it would count, for L1 or L2, is passed over (Test-Exited):
+ * it holds nothing, and the claude.exe a slot, a window or the claude wrapper just waited out names
+ * the conversation on its command line. Asked only of the few that would count, never of the whole
+ * table. Gone (GetProcessById: not running) is exited; a process that can't be asked (access denied),
+ * or a pid another process has taken since, counts as before. On Windows 11 an exited process isn't
+ * listed by Win32_Process even while a handle to it is open (seen in PowerShell 5.1 and 7), so this
+ * is for a process that exits between the table's read and the look, or a Windows that lists one.
  */
 export const RECHECK = [
   '$live = $null',
+  'function Test-Exited($p) { $h = $null; try { $h = [Diagnostics.Process]::GetProcessById([int]$p.ProcessId); return $h.HasExited } catch { return ($_.Exception -is [ArgumentException] -or $_.Exception.InnerException -is [ArgumentException]) } finally { if ($null -ne $h) { $h.Dispose() } } }',
   '$procs = @{}',
   'foreach ($p in (Get-CimInstance -ClassName Win32_Process -Property ProcessId, Name, CreationDate, CommandLine)) { $procs[[int]$p.ProcessId] = $p }',
   // The table's time, read as soon as it is: a process started less than 60 s before it keeps L2.
@@ -469,6 +497,7 @@ export const RECHECK = [
   '    $p = $null',
   String.raw`    if ($f.BaseName -match "^\d{1,10}\z") { $p = $procs[[int]$f.BaseName] }`,
   '    if ($null -eq $p -or $p.Name -ne "claude.exe") { continue }',
+  '    if (Test-Exited $p) { continue }',
   '    $e = $null',
   '    for ($try = 1; $try -le 3 -and $null -eq $e; $try++) {',
   '      try { $e = Get-Content -LiteralPath $f.FullName -Raw -Encoding UTF8 | ConvertFrom-Json } catch { $e = $null }',
@@ -494,7 +523,7 @@ export const RECHECK = [
   '  }',
   '}',
   // L2: a command line naming it, past a claude.exe whose own current entry names another conversation.
-  String.raw`if ($null -eq $live) { foreach ($p in $procs.Values) { if ($null -eq $live -and $p.ProcessId -ne $PID -and -not $elsewhere.ContainsKey([int]$p.ProcessId) -and "$($p.CommandLine)" -match "(^|[\s\x22])(--resume|--session-id|-r)(\s+|=)[\x22\x27]?$id") { $live = "it is open elsewhere: process $($p.ProcessId) names it on its command line (L2)" } } }`,
+  String.raw`if ($null -eq $live) { foreach ($p in $procs.Values) { if ($null -eq $live -and $p.ProcessId -ne $PID -and -not $elsewhere.ContainsKey([int]$p.ProcessId) -and "$($p.CommandLine)" -match "(^|[\s\x22])(--resume|--session-id|-r)(\s+|=)[\x22\x27]?$id" -and -not (Test-Exited $p)) { $live = "it is open elsewhere: process $($p.ProcessId) names it on its command line (L2)" } } }`,
 ] as const
 
 /**
@@ -1523,10 +1552,14 @@ export async function readGit(
 // ---------------------------------------------------------------------------------------------
 // Transports.
 
-/** `fallback`, on a window: why this pane's slot runner wasn't used, when it runs in one. */
+/**
+ * `fallback`, on a window: why this pane's slot runner wasn't used, when it runs in one. `pane`: the
+ * claude wrapper's tab, by its token (a ticket, then /exit; the wrapper resumes it in the same tab).
+ */
 export type Transport =
   | { readonly transport: 'in-place' }
   | { readonly transport: 'slot'; readonly slot: string; readonly folder: string }
+  | { readonly transport: 'pane'; readonly token: string; readonly folder: string }
   | { readonly transport: 'window'; readonly folder: string; readonly fallback?: string }
 
 /** Why a parent that runs claude-slot.ps1 some other way isn't used as a slot. */
@@ -1544,12 +1577,21 @@ export function slotFallback(slot: SlotParent): string {
  * - in place (`/resume`), only when this session's transcript and `to`'s sit in the same project
  *   folder of the same config folder, compared without regard to case;
  * - else in the slot this claude.exe runs under, only when its script has the shipped hash;
+ * - else in this tab, by a ticket for the claude wrapper (`pane`: the session's CLAUDE_PANE_TOKEN and
+ *   the pane file it names), only when the wrapper's PowerShell is this claude.exe's own parent
+ *   (paneFallback);
  * - else a new window, with `fallback` saying why when this claude.exe runs under a slot runner that
  *   isn't used (slotFallback).
- * The slot and the window resume `to` in `folder` (its own, from its heartbeat): an absolute folder
- * whose project name is `to`'s project folder, in this session's own config folder.
+ * The slot, the tab and the window resume `to` in `folder` (its own, from its heartbeat): an absolute
+ * folder whose project name is `to`'s project folder, in this session's own config folder.
  */
-export function pickTransport(probe: Probe, from: string, to: string, folder: string | undefined): Transport | { refusal: string } {
+export function pickTransport(
+  probe: Probe,
+  from: string,
+  to: string,
+  folder: string | undefined,
+  pane?: { readonly token: string; readonly pane: Pane },
+): Transport | { refusal: string } {
   const own = probe.transcripts.filter(t => t.id === from)
   const target = probe.transcripts.filter(t => t.id === to)
   if (target.length !== 1) return { refusal: `${to} has ${target.length} transcripts on this machine, not one` }
@@ -1564,6 +1606,7 @@ export function pickTransport(probe: Probe, from: string, to: string, folder: st
   const slot = probe.slot
   // The slot's id as the probe printed it: a FILETIME through a JavaScript number would not round-trip.
   if (slot !== null && slot.sha256 === SLOT_SCRIPT_SHA256) return { transport: 'slot', slot: slot.id, folder }
+  if (pane !== undefined && PANE_TOKEN.test(pane.token) && paneFallback(probe, pane.pane) === undefined) return { transport: 'pane', token: pane.token, folder }
   if (slot !== null) return { transport: 'window', folder, fallback: slotFallback(slot) }
   if (probe.slotSeen) return { transport: 'window', folder, fallback: SLOT_NOT_RECOGNISED }
   return { transport: 'window', folder }
@@ -1853,6 +1896,227 @@ export function claimCheckScript(input: { readonly stateDir: string; readonly id
     '$lock = $null',
     'try { $lock = Get-Content -LiteralPath $path -Raw -Encoding UTF8 | ConvertFrom-Json } catch { $lock = $null }',
     `if ($null -ne $lock -and $lock.by -ceq '${by}') { 'ours' } else { 'not-ours' }`,
+  ].join('\r\n')
+}
+
+// ---------------------------------------------------------------------------------------------
+// The claude wrapper's tab: a restart or a switch resumed in the same Windows Terminal tab.
+//
+// The claude wrapper (tools/claude-wrapper/claude-wrapper.ps1) is a `claude` function in the
+// person's PowerShell profile. Each time `claude` is typed it gives claude.exe a fresh token,
+// CLAUDE_PANE_TOKEN (a lowercase UUID), and writes a pane file, panePath(state, token):
+// `{ "v": 2, "pid": <its PowerShell's process id>, "started": "<that process's start, a FILETIME>" }`.
+// When claude exits, it looks for the ticket, paneTicketPath(state, token), deletes it before
+// anything else, and runs `claude --resume <id>` in that tab only when the ticket holds: the rules of
+// checkPaneTicket, and on disk, its folder is there, its project holds the conversation's transcript,
+// and the claim lock on the conversation names the ticket's claim (`by`); then, at most 10 resumes and
+// never a fourth within 30 seconds; and last, right before claude runs, the same last look the slot
+// runner and the window take (RECHECK, line for line): no running Claude Code holds the conversation.
+// Then it loops: a resumed session can restart again.
+//
+// The token is no secret (it names the pane file, and every process under claude has it), so the
+// claim and the last look are what keep a ticket from putting a second process on a conversation.
+// The plugins write a ticket only for a pane file of version 2, the wrapper that makes those checks
+// (an older or edited one gets a new window), and only when the pane file's process is this
+// claude.exe's own parent (paneFallback): a claude started under another one inherits the token, but
+// its parent is a tool's shell, and it gets a new window as before.
+
+/** The claude wrapper's pane file: the PowerShell that runs claude, by its process id and its start (a FILETIME as an exact decimal string). */
+export type Pane = { readonly pid: number; readonly started: string }
+
+/** The pane file's version that the claude wrapper with the claim check and the last look writes. */
+export const PANE_VERSION = 2
+
+/**
+ * A pane file's text, checked: `{ v: 2, pid, started }`; `why` naming what it isn't. Version 1 is a
+ * wrapper without the claim check and the last look: no ticket for it.
+ */
+export function parsePane(text: string): Pane | { readonly why: string } {
+  let raw: unknown
+  try {
+    raw = JSON.parse(text.replace(/^\uFEFF/, ''))
+  } catch {
+    return { why: "this tab's pane file is not JSON" }
+  }
+  if (isRecord(raw) && raw.v === 1) {
+    return { why: "this tab's claude wrapper is an older one (its pane file is version 1), which checks neither the claim nor whether the conversation is open: copy the current claude-wrapper.ps1 into place" }
+  }
+  if (!isRecord(raw) || raw.v !== PANE_VERSION || !isPid(raw.pid) || !isTicks(raw.started)) return { why: "this tab's pane file is not { v: 2, pid, started }" }
+  return { pid: raw.pid as number, started: raw.started as string }
+}
+
+/**
+ * The pane file of the tab with `token` (the session's CLAUDE_PANE_TOKEN, which the caller reads by
+ * its literal name), read with the engine and checked; `why` when there is none, or it isn't one.
+ */
+export async function readPane($: EngineInterface, state: string, token: string): Promise<Pane | { readonly why: string }> {
+  const path = panePath(state, token)
+  if (path === undefined) return { why: 'CLAUDE_PANE_TOKEN is not a token the claude wrapper gives (a lowercase UUID)' }
+  let text: unknown
+  try {
+    text = await $.fs.read(path)
+  } catch {
+    return { why: `this tab's pane file (${path}) can't be read` }
+  }
+  return typeof text === 'string' ? parsePane(text) : { why: `this tab's pane file (${path}) can't be read as text` }
+}
+
+/** The names the claude wrapper's PowerShell runs under. */
+const POWERSHELL_NAME = /^(?:pwsh|powershell)\.exe$/i
+
+/**
+ * Why the claude wrapper's tab can't take a restart or a switch, or undefined when it can: the pane
+ * file's process is this session's claude.exe's own parent (the parent of the top of its run of
+ * claude.exe parents, older than it, from the probe's process table), a PowerShell, started when the
+ * pane file says, within 1 ms (its id wasn't taken by another process since).
+ */
+export function paneFallback(probe: Probe, pane: Pane): string | undefined {
+  const table = byPid(probe)
+  const session = sessionProcess(probe, table)
+  if (session === undefined) return "this session's own claude.exe wasn't found above the probe, so its parent can't be checked"
+  const parent = parentOf(table, session)
+  if (parent === undefined) return `the parent of claude.exe ${session.pid} isn't running`
+  if (parent.pid !== pane.pid) return `the tab's claude wrapper (PowerShell ${pane.pid}) is not the parent of claude.exe ${session.pid}; ${parent.name} ${parent.pid} is`
+  if (!POWERSHELL_NAME.test(parent.name)) return `the parent of claude.exe ${session.pid} is ${parent.name} ${parent.pid}, not PowerShell`
+  if (!near(parent.created, pane.started)) return `the tab's pane file names process ${pane.pid}, but that process started at another time (another process took its id)`
+  return undefined
+}
+
+/**
+ * A ticket for the claude wrapper's tab: the tab's token, the conversation to resume, the claim lock's
+ * claimant on it (`launch:<uuid>`), its folder, and when (milliseconds since the epoch).
+ */
+export type PaneTicket = { readonly v: 1; readonly token: string; readonly resume: string; readonly by: string; readonly dir: string; readonly at: number }
+
+/** The claim a ticket names: one launch's. */
+const LAUNCH_CLAIM = /^launch:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
+
+/**
+ * Why the claude wrapper doesn't use a ticket, each as it prints it, in the order it checks them; it
+ * checks the last three on disk, past checkPaneTicket. Then come its caps, and last the re-check
+ * (RECHECK), whose words are the slot runner's and the window's.
+ */
+export const PANE_WHY = {
+  json: 'it is not a JSON object',
+  withdrawn: 'it was withdrawn',
+  version: 'it is not version 1',
+  token: 'it is for another tab',
+  resume: 'it names no conversation by its id',
+  claim: 'it names no claim',
+  age: 'its time is not within the last 120 seconds',
+  dir: 'its folder is not an existing folder',
+  transcript: "no transcript of it is under its folder's project",
+  lock: 'the claim lock on that conversation does not name this ticket',
+} as const
+
+/** A drive-absolute folder with no quote of any kind or control character: the folder rule the wrapper and the slot runner read a record by. */
+const TICKET_DIR = /^[A-Za-z]:\\/
+const TICKET_DIR_UNSAFE = /[\u0000-\u001f"'\u2018-\u201e]/
+
+/**
+ * A ticket's text as the claude wrapper reads it, by the same rules in the same order: a JSON object;
+ * not withdrawn (`cancelled: true`, which a switch or restart that took it back writes over it); `v`
+ * the number 1; `token` exactly the tab's; `resume` a session id; `by` one launch's claim; `at` a
+ * number within the last 120 seconds (and not more than 5 seconds ahead); `dir` a drive-absolute
+ * folder with no quote or control character. The wrapper then checks on disk that `dir` is there,
+ * that its project, in its own config folder, holds `<resume>.jsonl` (by name; it never reads it),
+ * and that the claim lock on `resume` names `by`; then its caps; and right before claude runs, RECHECK.
+ */
+export function checkPaneTicket(text: string, token: string, now: number): { readonly ticket: PaneTicket } | { readonly why: string } {
+  let raw: unknown
+  try {
+    raw = JSON.parse(text.replace(/^\uFEFF/, ''))
+  } catch {
+    return { why: PANE_WHY.json }
+  }
+  if (!isRecord(raw)) return { why: PANE_WHY.json }
+  if (raw.cancelled === true) return { why: PANE_WHY.withdrawn }
+  if (raw.v !== 1) return { why: PANE_WHY.version }
+  if (typeof raw.token !== 'string' || raw.token !== token) return { why: PANE_WHY.token }
+  if (typeof raw.resume !== 'string' || !SESSION_ID.test(raw.resume)) return { why: PANE_WHY.resume }
+  if (typeof raw.by !== 'string' || !LAUNCH_CLAIM.test(raw.by)) return { why: PANE_WHY.claim }
+  if (typeof raw.at !== 'number' || !Number.isFinite(raw.at) || now - raw.at > PANE_TICKET_MS || now - raw.at < -PANE_AHEAD_MS) return { why: PANE_WHY.age }
+  if (typeof raw.dir !== 'string' || !TICKET_DIR.test(raw.dir) || TICKET_DIR_UNSAFE.test(raw.dir)) return { why: PANE_WHY.dir }
+  return { ticket: { v: 1, token: raw.token as string, resume: raw.resume as string, by: raw.by as string, dir: raw.dir as string, at: raw.at as number } }
+}
+
+/** What a ticket is built from: all of PaneTicket but its version. */
+export type PaneTicketInput = Omit<PaneTicket, 'v'>
+
+/**
+ * A ticket for the claude wrapper's tab, as JSON. Throws on anything the wrapper wouldn't take as of
+ * `at` (checkPaneTicket), on a token that isn't one, and on a folder that isn't an absolute folder
+ * without quotes or control characters (isSafeFolder), so nothing else is written.
+ */
+export function paneTicket(input: PaneTicketInput): string {
+  if (!PANE_TOKEN.test(input.token)) throw new Error(`not a tab's token: ${JSON.stringify(input.token)}`)
+  checkFolder("the ticket's folder", input.dir)
+  const text = JSON.stringify({ v: 1, token: input.token, resume: input.resume, by: input.by, dir: input.dir, at: input.at })
+  const checked = checkPaneTicket(text, input.token, input.at)
+  if ('why' in checked) throw new Error(`not a ticket the claude wrapper takes: ${checked.why}`)
+  return text
+}
+
+/** The line the pane script ends with once the ticket is in place: `pane <token>`. */
+export const PANE_WRITTEN = /^pane ([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\s*$/m
+
+/**
+ * The script that leaves the claude wrapper's tab its ticket (paneTicket), written whole under
+ * another name in the panes folder and then moved into place, so the wrapper never reads half of one.
+ * With `claim` (self-restart's: no probe took one), it first takes the claim lock on the ticket's
+ * conversation for the ticket's own claimant (`by`), in the same run, as the launcher does
+ * (`claim <by>`), and writes no ticket when another holds it (exit 5). Without it, the claim the
+ * ticket names is the probe's (self-switch's). Throws on any input that isn't what it must be.
+ */
+export function paneScript(input: { readonly stateDir: string; readonly ticket: PaneTicketInput; readonly claim?: boolean }): string {
+  const state = checkFolder('the state folder', input.stateDir)
+  const text = paneTicket(input.ticket)
+  const { token, resume, by } = input.ticket
+  const claim =
+    input.claim === true
+      ? [
+          `$id = '${resume}'`,
+          // The session's claude.exe, as the launcher finds it: the nearest above this script, then the
+          // top of its unbroken run of claude.exe parents.
+          '$table = @{}',
+          'foreach ($p in (Get-CimInstance -ClassName Win32_Process -Property ProcessId, ParentProcessId, Name, CreationDate, CommandLine)) { $table[[int]$p.ProcessId] = $p }',
+          ...GET_PARENT,
+          ...GET_CREATED,
+          '$session = $null',
+          '$at = $table[[int]$PID]',
+          'for ($i = 0; $i -lt 8 -and $null -ne $at; $i++) {',
+          '  $at = Get-Parent $at',
+          "  if ($null -ne $at -and $at.Name -eq 'claude.exe') { $session = $at; break }",
+          '}',
+          "if ($null -eq $session) { 'self-restart: no claude.exe above this script'; exit 3 }",
+          'for ($i = 0; $i -lt 8; $i++) {',
+          '  $up = Get-Parent $session',
+          "  if ($null -eq $up -or $up.Name -ne 'claude.exe') { break }",
+          '  $session = $up',
+          '}',
+          `$by = '${by}'`,
+          "$transport = 'pane'",
+          '$claimPath = Join-Path $state ("claims\\" + $id + ".lock")',
+          ...TAKE_CLAIM,
+          'if (-not $taken) { "self-restart: another switch or restart holds the claim on this conversation ($claimPath), so it is not resumed"; exit 5 }',
+          '"claim $by"',
+        ]
+      : []
+  return [
+    "$ErrorActionPreference = 'Stop'",
+    "$ProgressPreference = 'SilentlyContinue'",
+    `$state = ${literal(state)}`,
+    `$token = '${token}'`,
+    ...claim,
+    '$panes = Join-Path $state "panes"',
+    '[void][IO.Directory]::CreateDirectory($panes)',
+    '$final = Join-Path $panes ($token + ".next.json")',
+    '$temp = Join-Path $panes ($token + "." + [guid]::NewGuid().ToString() + ".tmp")',
+    `[IO.File]::WriteAllText($temp, ${literal(text)})`,
+    // No backup file: [NullString]::Value, since PowerShell passes $null to a .NET string as "", which Replace refuses.
+    'try { if ([IO.File]::Exists($final)) { [IO.File]::Replace($temp, $final, [NullString]::Value) } else { [IO.File]::Move($temp, $final) } }',
+    'catch { [IO.File]::Delete($temp); throw }',
+    '"pane $token"',
   ].join('\r\n')
 }
 

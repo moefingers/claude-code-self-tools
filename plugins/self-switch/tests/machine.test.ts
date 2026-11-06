@@ -40,6 +40,16 @@ import {
   SLOT_NOT_RECOGNISED,
   SLOT_SCRIPT_SHA256,
   safePoint,
+  checkPaneTicket,
+  PANE_TICKET_MS,
+  PANE_WHY,
+  PANE_WRITTEN,
+  paneFallback,
+  panePath,
+  paneScript,
+  paneTicket,
+  paneTicketPath,
+  parsePane,
 } from '../hooks/machine'
 import { ELSEWHERE, elsewhere, entry, ft, inSlot, LAUNCH, machine, NOW, OTHER, PERMISSION_FLAGS, PROJECT, type RawProbe, REPO, T, under, W, X } from './fixtures'
 
@@ -623,6 +633,128 @@ describe('transports', () => {
   test("a project's name is the folder with every character but a letter or digit made a dash", () => {
     expect(projectName('D:\\work\\my_repo-3000')).toBe('D--work-my-repo-3000')
     expect(projectName(`C:\\${'x'.repeat(201)}`)).toBeUndefined()
+  })
+})
+
+describe("the claude wrapper's tab", () => {
+  const TOKEN = '3a7c9e15-4b2d-4f6a-8c1e-9d0b7a5f3e21'
+  /** The fixture's pane: PowerShell 20, the parent of this session's claude.exe 100. */
+  const SHELL = { pid: 20, started: ft(1) }
+  const tab = (pane = SHELL, token = TOKEN) => ({ token, pane })
+
+  test('its files sit at token-shaped paths only', () => {
+    expect(panePath(STATE, TOKEN)).toBe(`${STATE}\\panes\\${TOKEN}.json`)
+    expect(paneTicketPath(STATE, TOKEN)).toBe(`${STATE}\\panes\\${TOKEN}.next.json`)
+    for (const bad of ['..\\x', TOKEN.toUpperCase(), `${TOKEN} `, '']) {
+      expect(panePath(STATE, bad)).toBeUndefined()
+      expect(paneTicketPath(STATE, bad)).toBeUndefined()
+    }
+  })
+
+  test('a pane file is { v: 2, pid, started }, the start an exact FILETIME string; version 1 is an older wrapper, and gets nothing', () => {
+    expect(parsePane(JSON.stringify({ v: 2, pid: 20, started: ft(1) }))).toEqual({ pid: 20, started: ft(1) })
+    expect(parsePane(JSON.stringify({ v: 1, pid: 20, started: ft(1) }))).toEqual({
+      why: "this tab's claude wrapper is an older one (its pane file is version 1), which checks neither the claim nor whether the conversation is open: copy the current claude-wrapper.ps1 into place",
+    })
+    expect(parsePane(`\uFEFF${JSON.stringify({ v: 2, pid: 20, started: ft(1) })}`)).toEqual({ pid: 20, started: ft(1) })
+    for (const bad of ['{"v":3,"pid":20,"started":"1"}', '{"v":"2","pid":20,"started":"1"}', '{"v":2,"pid":"20","started":"1"}', `{"v":2,"pid":20,"started":${ft(1)}}`, '{"v":2,"pid":20}', '[]']) {
+      expect(parsePane(bad)).toEqual({ why: "this tab's pane file is not { v: 2, pid, started }" })
+    }
+    expect(parsePane('not json')).toEqual({ why: "this tab's pane file is not JSON" })
+  })
+
+  test("used only when its PowerShell is this claude.exe's own parent, started when the pane file says", () => {
+    expect(paneFallback(probeOf(), SHELL)).toBeUndefined()
+    // Within 1 ms: CIM reads a start to the microsecond, .NET to the tick.
+    expect(paneFallback(probeOf(), { pid: 20, started: String(BigInt(ft(1)) + BigInt(9_999)) })).toBeUndefined()
+    expect(paneFallback(probeOf(), { pid: 21, started: ft(1) })).toBe("the tab's claude wrapper (PowerShell 21) is not the parent of claude.exe 100; powershell.exe 20 is")
+    expect(paneFallback(probeOf(), { pid: 20, started: String(BigInt(ft(1)) + BigInt(10_001)) })).toBe(
+      "the tab's pane file names process 20, but that process started at another time (another process took its id)",
+    )
+    const bash = probeOf(p => (p.procs = p.procs.map(x => (x.pid === 20 ? { ...x, name: 'bash.exe' } : x))))
+    expect(paneFallback(bash, SHELL)).toBe('the parent of claude.exe 100 is bash.exe 20, not PowerShell')
+    expect(paneFallback(probeOf(p => (p.session = null)), SHELL)).toBe("this session's own claude.exe wasn't found above the probe, so its parent can't be checked")
+    expect(paneFallback(probeOf(p => (p.procs = p.procs.filter(x => x.pid !== 20))), SHELL)).toBe("the parent of claude.exe 100 isn't running")
+    // A claude.exe nested under this one (from a tool's shell) inherits the token, but its parent is that shell.
+    const nested = probeOf(p => {
+      p.procs.push({ pid: 500, ppid: 100, created: ft(20), name: 'bash.exe', cls: 'shell' }, { pid: 600, ppid: 500, created: ft(21), name: 'claude.exe' }, { pid: 700, ppid: 600, created: ft(1000), name: 'powershell.exe' })
+      p.self = 700
+      p.session = { pid: 600, created: ft(21) }
+    })
+    expect(paneFallback(nested, SHELL)).toBe("the tab's claude wrapper (PowerShell 20) is not the parent of claude.exe 600; bash.exe 500 is")
+  })
+
+  test('across projects: a verified slot first, then the tab, then the window; in place before them all', () => {
+    expect(pickTransport(probeOf(elsewhere), W, T, ELSEWHERE, tab())).toEqual({ transport: 'pane', token: TOKEN, folder: ELSEWHERE })
+    expect(pickTransport(probeOf(), W, T, undefined, tab())).toEqual({ transport: 'in-place' })
+    expect(pickTransport(probeOf(p => (elsewhere(p), inSlot(p))), W, T, ELSEWHERE, tab())).toEqual({ transport: 'slot', slot: `20-${ft(1)}`, folder: ELSEWHERE })
+    expect(pickTransport(probeOf(elsewhere), W, T, ELSEWHERE, tab({ pid: 21, started: ft(1) }))).toEqual({ transport: 'window', folder: ELSEWHERE })
+    expect(pickTransport(probeOf(elsewhere), W, T, ELSEWHERE, tab(SHELL, 'not-a-token'))).toEqual({ transport: 'window', folder: ELSEWHERE })
+    // The folder rules come first: an unknown folder refuses, tab or not.
+    expect(pickTransport(probeOf(elsewhere), W, T, undefined, tab())).toMatchObject({ refusal: expect.stringContaining("folder isn't known here") })
+  })
+
+  test('a ticket is read by the wrapper\'s rules, in its order, and in its words', () => {
+    const good = { v: 1, token: TOKEN, resume: T, by: LAUNCH, dir: ELSEWHERE, at: NOW }
+    const read = (ticket: unknown, now = NOW) => checkPaneTicket(typeof ticket === 'string' ? ticket : JSON.stringify(ticket), TOKEN, now)
+    expect(read(good)).toEqual({ ticket: good })
+    expect(read(good, NOW + PANE_TICKET_MS)).toEqual({ ticket: good })
+    expect(read(good, NOW - 5000)).toEqual({ ticket: good })
+    expect(read('not json')).toEqual({ why: PANE_WHY.json })
+    expect(read([good])).toEqual({ why: PANE_WHY.json })
+    expect(read({ v: 1, cancelled: true })).toEqual({ why: PANE_WHY.withdrawn })
+    expect(read({ ...good, cancelled: true })).toEqual({ why: PANE_WHY.withdrawn })
+    expect(read({ ...good, v: 2 })).toEqual({ why: PANE_WHY.version })
+    expect(read({ ...good, v: '1' })).toEqual({ why: PANE_WHY.version })
+    expect(read({ ...good, token: X })).toEqual({ why: PANE_WHY.token })
+    expect(read({ ...good, token: TOKEN.toUpperCase() })).toEqual({ why: PANE_WHY.token })
+    expect(read({ ...good, resume: T.toUpperCase() })).toEqual({ why: PANE_WHY.resume })
+    expect(read({ ...good, resume: `${T}\n` })).toEqual({ why: PANE_WHY.resume })
+    // The claim it names: one launch's, as the claim lock writes it.
+    expect(read({ ...good, by: undefined })).toEqual({ why: PANE_WHY.claim })
+    expect(read({ ...good, by: `slot:20-${ft(1)}` })).toEqual({ why: PANE_WHY.claim })
+    expect(read({ ...good, by: LAUNCH.toUpperCase() })).toEqual({ why: PANE_WHY.claim })
+    expect(read({ ...good, by: `${LAUNCH} ` })).toEqual({ why: PANE_WHY.claim })
+    expect(read(good, NOW + PANE_TICKET_MS + 1)).toEqual({ why: PANE_WHY.age })
+    expect(read(good, NOW - 5001)).toEqual({ why: PANE_WHY.age })
+    expect(read({ ...good, at: String(NOW) })).toEqual({ why: PANE_WHY.age })
+    expect(read({ ...good, dir: 'work\\other' })).toEqual({ why: PANE_WHY.dir })
+    expect(read({ ...good, dir: "C:\\work\\o'ther" })).toEqual({ why: PANE_WHY.dir })
+    expect(read({ ...good, dir: 'C:\\work\\o\u2019ther' })).toEqual({ why: PANE_WHY.dir })
+    // The first rule broken is the one said.
+    expect(read({ ...good, v: 2, token: X, at: 0 })).toEqual({ why: PANE_WHY.version })
+  })
+
+  test('paneTicket builds only a ticket the wrapper takes, of an absolute folder without quotes', () => {
+    const ticket = { token: TOKEN, resume: T, by: LAUNCH, dir: ELSEWHERE, at: NOW }
+    expect(paneTicket(ticket)).toBe(JSON.stringify({ v: 1, token: TOKEN, resume: T, by: LAUNCH, dir: ELSEWHERE, at: NOW }))
+    expect(() => paneTicket({ ...ticket, token: 'not-a-token' })).toThrow(/not a tab's token/)
+    expect(() => paneTicket({ ...ticket, resume: 'x' })).toThrow(/names no conversation by its id/)
+    expect(() => paneTicket({ ...ticket, by: `slot:20-${ft(1)}` })).toThrow(/names no claim/)
+    expect(() => paneTicket({ ...ticket, dir: 'C:\\work\\..\\other' })).toThrow(/not an absolute folder/)
+    expect(() => paneTicket({ ...ticket, dir: "C:\\work\\o'ther" })).toThrow(/not an absolute folder/)
+  })
+
+  test('the pane script: the ticket written whole under another name, then moved into place; the claim only when asked, for the ticket\'s own claimant, before it', () => {
+    const ticket = { token: TOKEN, resume: T, by: LAUNCH, dir: ELSEWHERE, at: NOW }
+    const plain = paneScript({ stateDir: STATE, ticket })
+    expect(plain).toContain(`$state = '${STATE}'`)
+    expect(plain).toContain(`$token = '${TOKEN}'`)
+    expect(plain).toContain(`[IO.File]::WriteAllText($temp, '${paneTicket(ticket)}')`)
+    expect(plain).toContain('$temp = Join-Path $panes ($token + "." + [guid]::NewGuid().ToString() + ".tmp")')
+    expect(plain).toContain('try { if ([IO.File]::Exists($final)) { [IO.File]::Replace($temp, $final, [NullString]::Value) } else { [IO.File]::Move($temp, $final) } }')
+    expect(plain).not.toContain('Set-Claim')
+    expect(PANE_WRITTEN.exec(`claim ${LAUNCH}\r\npane ${TOKEN}\r\n`)?.[1]).toBe(TOKEN)
+    const claimed = paneScript({ stateDir: STATE, ticket, claim: true })
+    expect(claimed).toContain(`$id = '${T}'`)
+    expect(claimed).toContain(`$by = '${LAUNCH}'`)
+    expect(claimed).not.toContain('NewGuid().ToString()\r\n$transport')
+    expect(claimed).toContain("$transport = 'pane'")
+    expect(claimed).toContain('if (-not $taken) { $taken = Set-Claim $claimPath $claimText }')
+    expect(claimed.indexOf('"claim $by"')).toBeLessThan(claimed.indexOf('[IO.File]::WriteAllText($temp'))
+    for (const flag of PERMISSION_FLAGS) expect(claimed).not.toContain(flag)
+    expect(() => paneScript({ stateDir: "C:\\x'y", ticket })).toThrow(/state folder/)
+    expect(() => paneScript({ stateDir: STATE, ticket: { ...ticket, at: Number.NaN } })).toThrow(/not a ticket the claude wrapper takes/)
   })
 })
 

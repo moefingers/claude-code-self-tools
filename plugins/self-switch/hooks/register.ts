@@ -22,6 +22,14 @@
 //   session id must then read `to`, or the switch didn't take and is said not to have;
 // - the slot, when this claude.exe runs in a pane's claude-slot.ps1 of the shipped hash: a record for
 //   the slot, then `/exit`; the slot runner checks it all again and resumes `to` in the same pane;
+// - the tab, when this session was started through the claude wrapper (a `claude` function in the
+//   person's PowerShell profile, tools/claude-wrapper/claude-wrapper.ps1): it carries
+//   CLAUDE_PANE_TOKEN, and the wrapper's pane file names the PowerShell that is this claude.exe's own
+//   parent (paneFallback, on the probe that judged), and the pane file is of version 2, the wrapper
+//   that checks the claim and takes the last look. A ticket for the wrapper naming the probe's claim,
+//   written whole and moved into place (paneScript), then `/exit`; the wrapper deletes the ticket,
+//   checks it (the claim lock must still name its claim; right before claude runs, RECHECK), and
+//   resumes `to` in its folder, in the same tab. Taken back, the ticket is overwritten as withdrawn;
 // - a new window otherwise: the launcher, which waits for this process to exit, checks again, and
 //   resumes `to`; then `/exit`. When this pane runs a slot runner that can't be used (its script
 //   can't be hashed, or has another hash), the leaving row, the toast and the arrival say why.
@@ -53,9 +61,14 @@
 // names, never by `$.session.id()`.
 import type { EngineInterface, Register, Timer } from 'claude-code'
 import type { Heartbeat, Queued, Ticket } from '../types'
-import type { AgentLike, Probe } from './machine'
+import type { AgentLike, Pane, Probe } from './machine'
 import {
   BUSY_AGENTS,
+  PANE_WRITTEN,
+  paneFallback,
+  paneScript,
+  paneTicketPath,
+  readPane,
   type Baseline,
   checkTrees,
   CLAIM_CHECK_LIVE,
@@ -140,7 +153,7 @@ const ARRIVAL_FALLBACK_MS = 5000
 const MAX_KEPT = 50
 
 const DESCRIPTION = [
-  "Switches this terminal to another conversation once the current turn ends: this conversation ends here, its context untouched, and conversation `to` (a session id, as claude --resume takes) is resumed in its place: in this same process when both live in one project folder, else in this pane's slot (a Windows Terminal pane running self-switch's claude-slot.ps1), else in a new window.",
+  "Switches this terminal to another conversation once the current turn ends: this conversation ends here, its context untouched, and conversation `to` (a session id, as claude --resume takes) is resumed in its place: in this same process when both live in one project folder, else in this pane's slot (a Windows Terminal pane running self-switch's claude-slot.ps1), else in this same tab when Claude Code was started through the claude wrapper (the `claude` function from claude-code-self-tools in the person's PowerShell profile), else in a new window.",
   "For the person's own use: call it only when they ask you to switch to another conversation, at a finished break (never mid-merge, mid-push or mid-task), with your notes written first. Stop Monitor tasks first. Pending wake-ups in this process are dropped by the switch, whichever way it goes: set them again in the conversation switched to, if they are still needed.",
   'Where the coordinator runs, switches come from it: this tool refuses there.',
   '`reason` and `notes` (where your notes are) are required; both are recorded in this conversation and in the one resumed. `resume` is the message that starts the resumed conversation\'s first turn.',
@@ -235,6 +248,18 @@ async function env(read: () => Promise<string | undefined>): Promise<string | un
   } catch {
     return undefined
   }
+}
+
+/**
+ * This tab's claude wrapper: the session's CLAUDE_PANE_TOKEN and the pane file it names. `why` when a
+ * session with a token has no pane file that reads; undefined when it has none (it wasn't started
+ * through the wrapper). Whether the switch can use it is pickTransport's (paneFallback).
+ */
+async function tabOf($: EngineInterface, state: string): Promise<{ readonly token: string; readonly pane: Pane } | { readonly why: string } | undefined> {
+  const token = await env(() => $.env.get('CLAUDE_PANE_TOKEN'))
+  if (token === undefined || token === '') return undefined
+  const pane = await readPane($, state, token)
+  return 'why' in pane ? pane : { token, pane }
 }
 
 /** The session's id, or undefined when it can't be read. */
@@ -391,7 +416,7 @@ function ticketOf(value: unknown): Ticket | undefined {
   if (!isRecord(value)) return undefined
   const { at, from, by, transport, reason, notes, resume, fallback } = value
   if (typeof at !== 'number' || typeof from !== 'string' || !SESSION_ID.test(from) || typeof by !== 'string') return undefined
-  if (transport !== 'in-place' && transport !== 'slot' && transport !== 'window') return undefined
+  if (transport !== 'in-place' && transport !== 'slot' && transport !== 'pane' && transport !== 'window') return undefined
   if (typeof reason !== 'string' || typeof notes !== 'string') return undefined
   // Masked again as it is read: another process may have written the store.
   return {
@@ -809,10 +834,15 @@ async function switchNow($: EngineInterface, value: Queued): Promise<void> {
   }
   if (live.verdict !== 'not-live') return held(`${to} is ${live.verdict === 'live' ? 'open' : 'possibly open'} elsewhere (${live.evidence.join('; ')})`)
   if (by === undefined) return held(`the claim lock on ${to} wasn't taken (${found.claim?.taken === false ? found.claim.why : 'none was asked for'})`)
-  const pick = pickTransport(found, ctx.own, to, beat?.folder)
+  // This tab's claude wrapper, when the session carries its token: pickTransport uses it only when its
+  // PowerShell is this claude.exe's own parent, on the probe that judged.
+  const tab = await tabOf($, ctx.state)
+  const pick = pickTransport(found, ctx.own, to, beat?.folder, tab !== undefined && 'pane' in tab ? tab : undefined)
   if ('refusal' in pick) return held(pick.refusal)
   if (pick.transport === 'slot' && by !== `slot:${pick.slot}`) return held("the claim lock doesn't name this pane's slot")
-  if (pick.transport === 'window' && !by.startsWith('launch:')) return held("the claim lock doesn't name a launch")
+  if ((pick.transport === 'window' || pick.transport === 'pane') && !by.startsWith('launch:')) return held("the claim lock doesn't name a launch")
+  // A tab with a token that a new window is used instead of: why, for the log.
+  const tabPassed = pick.transport !== 'window' || tab === undefined ? undefined : 'why' in tab ? tab.why : paneFallback(found, tab.pane)
   // S11: the start folder (in place: the next conversation works in it) against its baseline; the named
   // worktrees, and the session's own folder when it is another tree, always.
   const git = await readGit($, { start: ctx.folder, trees: value.trees ?? [], cwd: ctx.cwd, folders: [ctx.cwd], dirty: pick.transport === 'in-place' })
@@ -889,6 +919,27 @@ async function switchNow($: EngineInterface, value: Queued): Promise<void> {
     } catch (err) {
       return undo(`the slot's record wasn't written: ${why(err)}`, record)
     }
+  } else if (pick.transport === 'pane') {
+    // The ticket for this tab's claude wrapper, written whole and moved into place; taken back, it is
+    // overwritten as withdrawn (undo), which the wrapper says and resumes nothing.
+    record = paneTicketPath(ctx.state, pick.token)
+    let written: string | undefined
+    try {
+      // The claim the probe took for this launch: the wrapper resumes only while the lock still names it.
+      const call = powershellCall(ctx.powershell, paneScript({ stateDir: ctx.state, ticket: { token: pick.token, resume: to, by, dir: pick.folder, at: await $.clock.now() } }))
+      const run = await $.process.run(call.argv, {
+        stdin: call.stdin,
+        cwd: pick.folder,
+        timeoutMs: LAUNCH_MS,
+      })
+      if (run.exitCode !== 0 || PANE_WRITTEN.exec(run.stdout)?.[1] !== pick.token) {
+        const said = brief(`${run.stdout} ${run.stderr}`)
+        written = `the script exited ${run.exitCode}${said === '' ? '' : `: ${said}`}`
+      }
+    } catch (err) {
+      written = `the script didn't run: ${why(err)}`
+    }
+    if (written !== undefined) return undo(`this tab's ticket wasn't written (${written})`, record)
   } else {
     let opened: string | undefined
     try {
@@ -909,12 +960,20 @@ async function switchNow($: EngineInterface, value: Queued): Promise<void> {
   const late = armed !== value ? 'a new turn started' : blocked(await busyAgents($))
   if (late !== undefined) return undo(late, record)
   await noteRecent($, ctx.own)
-  const where = pick.transport === 'slot' ? "this pane's slot resumes it here" : fallback === undefined ? 'a new window resumes it' : `a new window resumes it, not this pane's slot (${fallback})`
+  const where =
+    pick.transport === 'slot'
+      ? "this pane's slot resumes it here"
+      : pick.transport === 'pane'
+        ? 'this tab resumes it here'
+        : fallback === undefined
+          ? 'a new window resumes it'
+          : `a new window resumes it, not this pane's slot (${fallback})`
   // Taken back right before the command, after the last wait: a turn that starts up to here stops it.
   if (armed !== value) return undo('a new turn started', record)
   armed = undefined
   $.ui.log(`Switching to ${to}: ${value.reason}`)
   if (fallback !== undefined) $.ui.log(`this pane's slot runner isn't used: ${fallback}. A new window resumes ${to}.`)
+  if (tabPassed !== undefined) $.ui.log(`this tab's claude wrapper isn't used: ${oneLine(tabPassed, 300)}. A new window resumes ${to}.`)
   $.ui.toast(`Switching to ${to}: this session exits, and ${where} once this process has gone.`)
   try {
     await $.command.run({ command: 'exit' })
@@ -923,7 +982,12 @@ async function switchNow($: EngineInterface, value: Queued): Promise<void> {
   }
   // An exit that took ends this module with the session, and this never fires.
   $.clock.after(CHECK_MS, () => {
-    const waits = pick.transport === 'slot' ? 'The slot honours its record for 2 minutes' : `The new window waits up to ${WAIT_SECONDS / 60} minutes for this session to exit`
+    const waits =
+      pick.transport === 'slot'
+        ? 'The slot honours its record for 2 minutes'
+        : pick.transport === 'pane'
+          ? "This tab's claude wrapper honours its ticket for 2 minutes"
+          : `The new window waits up to ${WAIT_SECONDS / 60} minutes for this session to exit`
     $.ui.toast(`The exit ran, but the session is still open. ${waits}.`)
     void tellModel($, `The switch's exit ran, but this session is still open (a dialog may have been answered no). ${waits}, then gives up; the claim on ${to} is released when its ticket runs out, 15 minutes after the switch.`)
   })
@@ -1066,7 +1130,7 @@ export const register: Register = (on, options) => {
     await $.state.set(queued, resume === undefined ? asked : { ...asked, resume })
     $.ui.status('switch queued for when this turn ends')
     return {
-      result: `Queued. Once this turn ends, this terminal switches to conversation ${to}: this conversation ends here, untouched, and ${to} resumes in this process, in this pane's slot, or in a new window, whichever applies. First the plugin checks that ${to} is open nowhere on this machine and that nothing runs under this session; if anything is, nothing moves and you are told on your next turn. If this pane runs a slot that can't be used, the switch says why, in the leaving row, a toast and the arrival, and a new window opens. Pending wake-ups in this process are dropped by the switch: set them again in ${to} if they are still needed. Reason: ${quoted(reason)}. Notes: ${quoted(notes)}.`,
+      result: `Queued. Once this turn ends, this terminal switches to conversation ${to}: this conversation ends here, untouched, and ${to} resumes in this process, in this pane's slot, in this tab (when Claude Code was started through the claude wrapper), or in a new window, whichever applies. First the plugin checks that ${to} is open nowhere on this machine and that nothing runs under this session; if anything is, nothing moves and you are told on your next turn. If this pane runs a slot that can't be used, the switch says why, in the leaving row, a toast and the arrival, and a new window opens. Pending wake-ups in this process are dropped by the switch: set them again in ${to} if they are still needed. Reason: ${quoted(reason)}. Notes: ${quoted(notes)}.`,
     }
   }).catch(($, e, next) => (next.called ? next(e) : { deny: 'self-switch: queuing the switch failed; nothing is queued.' }))
 
