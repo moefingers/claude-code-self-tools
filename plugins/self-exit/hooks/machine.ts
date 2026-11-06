@@ -2144,6 +2144,9 @@ export async function readExit($: EngineInterface, probe?: { readonly powershell
 /** A pending marker older than this is ignored: the exit or restart it stood for didn't run, or ran without saying so. */
 export const PENDING_MS = 15 * 60 * 1000
 
+/** A pending marker whose `at` is further ahead of the reader's clock than this is bad: no marker holds forever. */
+export const PENDING_AHEAD_MS = 60 * 1000
+
 /** What a pending marker stands for. */
 export type PendingKind = 'exit' | 'restart'
 
@@ -2162,7 +2165,9 @@ export const PENDING_DONE = JSON.stringify({ v: 1, done: true })
 /**
  * A pending marker as the coordinator reads it: `pending` (an exit or restart is queued or armed,
  * and the marker is at most 15 minutes old: hold deliveries), `done` (it ran or was cancelled),
- * `stale` (older than 15 minutes), or `bad` (another shape). Only `pending` holds anything.
+ * `stale` (older than 15 minutes), or `bad` (another shape, or an `at` more than a minute ahead of
+ * `now`, which would otherwise hold deliveries for as long as it stays ahead). Only `pending` holds
+ * anything.
  */
 export function readPending(text: string, now: number): 'pending' | 'done' | 'stale' | 'bad' {
   let raw: unknown
@@ -2174,7 +2179,7 @@ export function readPending(text: string, now: number): 'pending' | 'done' | 'st
   if (!isRecord(raw) || raw.v !== 1) return 'bad'
   if (raw.done === true) return 'done'
   if (raw.kind !== 'exit' && raw.kind !== 'restart') return 'bad'
-  if (typeof raw.at !== 'number' || !Number.isFinite(raw.at)) return 'bad'
+  if (typeof raw.at !== 'number' || !Number.isFinite(raw.at) || raw.at > now + PENDING_AHEAD_MS) return 'bad'
   return now - raw.at > PENDING_MS ? 'stale' : 'pending'
 }
 

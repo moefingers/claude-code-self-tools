@@ -101,12 +101,9 @@ async function shell($: EngineInterface, tool: 'Bash' | 'PowerShell', listed: bo
     const verdict = await within($, CALL_MS, $.tool.check({ tool, input: { command } }))
     if (verdict === undefined) return line('not-tested', `not tested: its permission wasn't answered within ${CALL_MS / 1000} s`)
     const { decision, reason } = verdict.value
-    if (decision !== 'allow') {
-      const because = typeof reason === 'string' && reason.trim() !== '' ? `: ${oneLine(reason, 160)}` : ''
-      return line('not-tested', `not tested: ${decision === 'ask' ? 'needs permission' : 'refused by permissions'} (${decision}${because})`)
-    }
+    if (decision !== 'allow') return line('not-tested', `not tested: ${denied(decision, reason)}`)
   } catch (err) {
-    return line('not-tested', `not tested: its permission can't be read (${why(err)})`)
+    return line('not-tested', `not tested: its permission can't be read (${quoted(why(err))})`)
   }
   try {
     // The tool's arguments at the top level, as `$.tool.call` takes them (`$.tool.check` takes them
@@ -116,15 +113,23 @@ async function shell($: EngineInterface, tool: 'Bash' | 'PowerShell', listed: bo
     const ran = await within($, CALL_MS, call)
     if (ran === undefined) return line('failed', `failed: timed out after ${CALL_MS / 1000} s`)
     const run = ran.value as { readonly deny?: string; readonly isError?: boolean; readonly result?: unknown; readonly text?: string }
-    if (typeof run.deny === 'string') return line('not-tested', `not tested: refused (${oneLine(run.deny, 160)})`)
-    if (run.isError === true) return line('failed', `failed: ${oneLine(String(run.text ?? 'it reported an error'), 200) || 'it reported an error'}`)
+    // Text from outside the plugin (a hook's refusal, the tool's error, its output) is quoted, one
+    // line: the row at resume carries it to the model as data.
+    if (typeof run.deny === 'string') return line('not-tested', `not tested: refused (${quoted(oneLine(run.deny, 160))})`)
+    if (run.isError === true) return line('failed', `failed: it reported an error (${quoted(oneLine(String(run.text ?? ''), 200))})`)
     const out = output(run)
     if (out.trim() === '') return line('failed', 'failed: no output')
     if (!out.includes(token)) return line('failed', `failed: the output didn't hold the nonce (it read ${quoted(oneLine(out, 80))})`)
     return line('ok', 'ok')
   } catch (err) {
-    return line('failed', `failed: ${why(err)}`)
+    return line('failed', `failed: it didn't run (${quoted(why(err))})`)
   }
+}
+
+/** A permission verdict other than allow, as a line says it: the reason, if any, quoted. */
+function denied(decision: string, reason: string | undefined): string {
+  const because = typeof reason === 'string' && reason.trim() !== '' ? `: ${quoted(oneLine(reason, 160))}` : ''
+  return `${decision === 'ask' ? 'needs permission' : 'refused by permissions'} (${decision}${because})`
 }
 
 /** The text an MCP result's first text block holds, if any. */
@@ -139,7 +144,7 @@ function firstText(content: unknown): string | undefined {
  * is exercised only by its probe, and only when that tool is one of its listed tools.
  */
 async function servers($: EngineInterface, tools: readonly ToolInfo[] | string): Promise<CheckLine[]> {
-  if (typeof tools === 'string') return [{ name: 'MCP', status: 'failed', said: `MCP servers: failed: the session's tools can't be listed (${tools})` }]
+  if (typeof tools === 'string') return [{ name: 'MCP', status: 'failed', said: `MCP servers: failed: the session's tools can't be listed (${quoted(tools)})` }]
   const counts = new Map<string, number>()
   const names = new Set<string>()
   for (const t of tools) {
@@ -165,13 +170,23 @@ async function servers($: EngineInterface, tools: readonly ToolInfo[] | string):
       const listed = `listed (${count} tool${count === 1 ? '' : 's'})`
       if (probe === undefined) return line('listed', `${listed}, not exercised`)
       if (!names.has(`mcp__${server}__${probe}`)) return line('not-tested', `${listed}; its probe ${probe} isn't one of its tools, so not exercised`)
+      // `$.mcp.call` asks no permission, so the probe's verdict is asked first, as for the shells:
+      // anything but allow is not tested, and nothing is called.
+      try {
+        const verdict = await within($, CALL_MS, $.tool.check({ tool: `mcp__${server}__${probe}`, input: {} }))
+        if (verdict === undefined) return line('not-tested', `${listed}; not tested: its probe ${probe}'s permission wasn't answered within ${CALL_MS / 1000} s`)
+        const { decision, reason } = verdict.value
+        if (decision !== 'allow') return line('not-tested', `${listed}; not tested: its probe ${probe} ${denied(decision, reason)}`)
+      } catch (err) {
+        return line('not-tested', `${listed}; not tested: its probe ${probe}'s permission can't be read (${quoted(why(err))})`)
+      }
       try {
         const ran = await within($, CALL_MS, $.mcp.call(server, probe, {}))
         if (ran === undefined) return line('failed', `failed: its probe ${probe} timed out after ${CALL_MS / 1000} s`)
-        if (ran.value.isError) return line('failed', `failed: its probe ${probe} reported an error (${oneLine(firstText(ran.value.content) ?? 'no text', 160)})`)
+        if (ran.value.isError) return line('failed', `failed: its probe ${probe} reported an error (${quoted(oneLine(firstText(ran.value.content) ?? '', 160))})`)
         return line('ok', `ok (probe ${probe})`)
       } catch (err) {
-        return line('failed', `failed: its probe ${probe} didn't run (${why(err)})`)
+        return line('failed', `failed: its probe ${probe} didn't run (${quoted(why(err))})`)
       }
     }),
   )

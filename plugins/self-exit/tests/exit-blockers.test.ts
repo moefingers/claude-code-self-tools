@@ -8,6 +8,7 @@ import {
   cronJobs,
   exitBlockers,
   parseProbe,
+  PENDING_AHEAD_MS,
   PENDING_DONE,
   PENDING_MS,
   pendingMarker,
@@ -192,6 +193,11 @@ describe('the pending marker', () => {
     expect(readPending(pendingMarker('restart', NOW - PENDING_MS), NOW)).toBe('pending')
     expect(readPending(pendingMarker('restart', NOW - PENDING_MS - 1), NOW)).toBe('stale')
     expect(readPending(PENDING_DONE, NOW)).toBe('done')
+    // A marker from up to a minute ahead (two clocks a little apart) still holds; further ahead is
+    // bad, so no marker holds deliveries forever.
+    expect(readPending(pendingMarker('exit', NOW + PENDING_AHEAD_MS), NOW)).toBe('pending')
+    expect(readPending(pendingMarker('exit', NOW + PENDING_AHEAD_MS + 1), NOW)).toBe('bad')
+    expect(readPending(pendingMarker('restart', NOW + 365 * 24 * 60 * 60 * 1000), NOW)).toBe('bad')
     for (const text of ['', '{', '[]', '{"v":2,"kind":"exit","at":1}', '{"v":1,"kind":"switch","at":1}', '{"v":1,"kind":"exit"}', '{"v":1,"kind":"exit","at":"soon"}', '{"v":1,"done":"yes"}']) {
       expect(readPending(text, NOW)).toBe('bad')
     }
@@ -205,7 +211,7 @@ describe('the self-check record', () => {
   })
 
   test('it holds names only, at most 8', () => {
-    expect(selfcheckRecord(NOW, ['Bash', 'mcp:linear-outlast'])).toBe(`{"v":1,"at":${NOW},"failed":["Bash","mcp:linear-outlast"]}`)
+    expect(selfcheckRecord(NOW, ['Bash', 'mcp:example'])).toBe(`{"v":1,"at":${NOW},"failed":["Bash","mcp:example"]}`)
     expect(JSON.parse(selfcheckRecord(NOW, ['Bash', 'failed: no output', 'mcp:a b', 'PowerShell']))).toEqual({ v: 1, at: NOW, failed: ['Bash', 'PowerShell'] })
     expect(JSON.parse(selfcheckRecord(NOW, Array.from({ length: 12 }, (_, i) => `mcp:s${i}`))).failed).toHaveLength(8)
     expect(readSelfcheck(selfcheckRecord(NOW, ['PowerShell']))).toEqual({ at: NOW, failed: ['PowerShell'] })
