@@ -637,7 +637,7 @@ describe('transports', () => {
 })
 
 describe("the claude wrapper's tab", () => {
-  const TOKEN = '3a7c9e15-4b2d-4f6a-8c1e-9d0b7a5f3e21'
+  const TOKEN = '00000000-0000-4000-a000-000000000001'
   /** The fixture's pane: PowerShell 20, the parent of this session's claude.exe 100. */
   const SHELL = { pid: 20, started: ft(1) }
   const tab = (pane = SHELL, token = TOKEN) => ({ token, pane })

@@ -38,8 +38,8 @@ const SHELLS = [
  * their own (lab()), so that one run's resumed claude, still on its command line, is never another's
  * conversation open elsewhere.
  */
-const ID = '0f8fad5b-d9cb-469f-a165-70867728950e'
-const OTHER_TOKEN = '6f99096c-131e-42f4-ac89-702712ef1faf'
+const ID = '00000000-0000-4000-a000-000000000001'
+const OTHER_TOKEN = '00000000-0000-4000-a000-000000000002'
 /** The token a ticket is built with before the stub puts the tab's own in its place. */
 const PLACEHOLDER = '00000000-0000-4000-8000-000000000000'
 
@@ -275,7 +275,7 @@ async function refused(shell, broken, wrapper = WRAPPER) {
   check(said.length === 1 && said[0].startsWith(`${NOT_USED}${broken.why}.`), `one line says why: ${broken.why} (${JSON.stringify(said)})`)
   // The same rule, in the same words, in the machine code the plugins build tickets with.
   const now = Date.now()
-  const token = '5e1a9c3b-7d2f-4b8e-a6c4-1f9d3e7b2a5c'
+  const token = randomUUID()
   const verdict = machine.checkPaneTicket(rendered(template, token, now), token, now)
   if (broken.pure) check('why' in verdict && verdict.why === broken.why, `checkPaneTicket says the same (${JSON.stringify(verdict)})`)
   else check('ticket' in verdict, `checkPaneTicket takes it: the wrapper's own check, on disk, refuses it (${JSON.stringify(verdict)})`)
@@ -561,7 +561,7 @@ describe('the last look, in the slot runner and the window too (Windows PowerShe
 describe('the ticket the plugins write', { skip: !isWindows && 'Windows only' }, () => {
   test('paneScript writes paneTicket whole, by a move, and replaces one already there; no temporary file is left', () => {
     const state = mkdtempSync(join(work, 'state-'))
-    const token = '5e1a9c3b-7d2f-4b8e-a6c4-1f9d3e7b2a5c'
+    const token = randomUUID()
     for (const at of [Date.now(), Date.now() + 1]) {
       const ticket = { token, resume: ID, by: `launch:${token}`, dir: work, at }
       const call = machine.powershellCall(WINDOWS_POWERSHELL, machine.paneScript({ stateDir: state, ticket }))

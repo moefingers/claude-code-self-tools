@@ -23,7 +23,7 @@ const starting = (p: RawProbe): void => void p.procs.push({ pid: 600, ppid: 10, 
 type Run = { argv: readonly string[]; init?: Record<string, unknown>; script?: string; kind: 'probe' | 'launcher' | 'pane' | 'release' | 'check' | 'git' | 'other' }
 
 /** The claude wrapper's token for this tab, and its pane file: PowerShell 20, the parent of claude.exe 100. */
-const TOKEN = '3a7c9e15-4b2d-4f6a-8c1e-9d0b7a5f3e21'
+const TOKEN = '00000000-0000-4000-a000-000000000001'
 const PANE = JSON.stringify({ v: 2, pid: 20, started: ft(1) })
 
 /** The test's own `$`, through which the engine fake dispatches what the engine would. */

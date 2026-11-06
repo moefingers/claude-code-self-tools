@@ -10,13 +10,13 @@ import { checkPaneTicket, panePath, paneScript, quoted } from '../hooks/machine'
 
 const TOOL = 'mcp__self-restart__restart_after_turn'
 const HOUR = 60 * 60 * 1000
-const ID = '0f8fad5b-d9cb-469f-a165-70867728950e'
-const OTHER = 'c4b8e1d7-2a9f-4c6e-9b3a-7f0d5e2c8a1b'
-const TOKEN = '3a7c9e15-4b2d-4f6a-8c1e-9d0b7a5f3e21'
+const ID = '00000000-0000-4000-a000-000000000001'
+const OTHER = '00000000-0000-4000-a000-000000000002'
+const TOKEN = '00000000-0000-4000-a000-000000000003'
 const LOCAL = 'C:\\Users\\u\\AppData\\Local'
 const STATE = `${LOCAL}\\claude-self-tools`
 const REPO = 'C:\\work\\repo'
-const LAUNCH = 'launch:5e1a9c3b-7d2f-4b8e-a6c4-1f9d3e7b2a5c'
+const LAUNCH = 'launch:00000000-0000-4000-a000-000000000004'
 /** The PowerShell that runs this session's claude.exe 100: pid 20, started at this FILETIME. */
 const SHELL_STARTED = '134062345678901240'
 const PANE = JSON.stringify({ v: 2, pid: 20, started: SHELL_STARTED })
