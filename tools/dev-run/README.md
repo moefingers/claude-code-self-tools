@@ -31,10 +31,15 @@ Everything after `--` is the server's command, run in `--dir` as an argument lis
 2. **Runs the command**, and records the root of its process tree.
 3. **Watches memory** every 10 s. Under `--stop-gb`, it stops the server, logs why, and goes back to step 1.
 4. **Restarts every `--restart-min`**: stops the server, waits up to 30 s for the port to be free, then starts again at the floor, with the same command on the same port. If the port is still held after 30 s, it logs the holders' pids and ends with 1, rather than start a second server beside them.
-5. **Stops by process id only**: `taskkill /T /F /PID <root>`, its own tree, never by name and never anything else. Then it waits for the port to close.
+5. **Stops only what it started, by process id.** It never uses `taskkill /T` or a name. Windows keeps a dead parent's id on its orphans and never checks it, and a later process can take that id, so `/T` can take someone else's processes. dev-run stops in this order:
+   - **The root:** through Node's own handle on it, so never a process that has taken its id. dev-run reads the root's real start time right after the spawn, while the root runs.
+   - **What the root started:** from one process snapshot, walking down by parent id. A child counts only if it was created at or after its parent, the rule `shared/hooks/machine.ts` uses, so an older process carrying the id as its parent is an orphan of the id's earlier owner and is left alone. If the root's id has already been taken, that newer process's children are left alone too.
+   - **Deepest first, one at a time:** dev-run opens a handle on each process, checks its start time against the snapshot's again, and stops that same process through the handle (`Stop-Process`).
+
+   Then it waits for the port to close.
 6. **Stops for good when idle.** Each line matching `--hit` is a request. After `--idle-min` of server time with none, it stops the server and ends with 0, logging `idle: no request for 20 min of server time; stopping for good`. The first start counts as a request, and the idle clock stands still while the server is down, so restarts neither reset it nor run it out.
 7. **Ctrl+C, Ctrl+Break, closing the console, or SIGTERM** stop the server tree, then the runner ends (130, 149, 129, 143).
-8. **No orphan when the runner is killed outright.** No handler runs then, so a small guard process, started detached, holds a pipe from the runner. When the pipe ends with the server still up, the guard stops what's left of its tree. Node ends a child it spawned when it dies (a Windows job), so a Node server usually goes with the runner. A `.cmd` shim's `cmd.exe` goes too, but the server it started doesn't. The guard kills the tree of each process the root started while it ran, matched by parent id and by a creation time between the root's start and the runner's end, never by a reused id.
+8. **No orphan when the runner is killed outright.** No handler runs then, so a small guard process, started detached, holds a pipe from the runner. When the pipe ends with the server still up, the guard stops what's left of its tree. Node ends a child it spawned when it dies (a Windows job), so a Node server usually goes with the runner. A `.cmd` shim's `cmd.exe` goes too, but the server it started doesn't. The runner gives the guard the root's id and real start time once it has read them, about a second after each spawn. The guard stops the root if it still runs, then what it started, by the same walk as a stop. A runner killed in that first second leaves the guard nothing to go on.
 
 The server's output goes to a file, never to a pipe to the runner. A Node server whose output pipe breaks dies at once, and its workers would keep the port. dev-run reads the file every 100 ms and copies each line to its own output.
 
@@ -64,7 +69,7 @@ Under `%LOCALAPPDATA%\claude-self-tools\dev-run\`:
 - **`--slot=life`:** holds the slot from before each spawn until that server stops. Every restart gives it back and claims it again, so no hold outlasts `--restart-min`.
 - **`--slot=off`:** no slot.
 
-**How the claim works.** dev-run runs `bash heavy-slot.sh read -r DEV_RUN_HOLD`, with Git's bash (never `System32\bash.exe`, which is WSL) and a pipe as its input. heavy-slot queues it, waits and takes a slot as for any job, writes its owner file (the bash process, the time, `--dir`), prints `[heavy-slot] holding <slot>`, and runs `read`, which waits on the pipe. To release, dev-run ends the pipe: `read` returns and heavy-slot's own exit trap removes the slot. A claim still in the queue is ended by its process id; heavy-slot drops a ticket whose holder is gone. If the runner is killed, the claim's bash dies with it, and heavy-slot reclaims a slot whose holder is gone the next time a job looks for one. `.gate-cap` applies as to any job: at 0, a server waits in `waiting` with `lastReason` `waiting for a heavy slot`. heavy-slot's lines are copied to the runner's log.
+**How the claim works.** dev-run runs `bash heavy-slot.sh read -r DEV_RUN_HOLD`, with Git's bash (never `System32\bash.exe`, which is WSL) and a pipe as its input. heavy-slot queues it, waits and takes a slot as for any job, writes its owner file (the bash process, the time, `--dir`), prints `[heavy-slot] holding <slot>`, and runs `read`, which waits on the pipe. To release, dev-run ends the pipe: `read` returns and heavy-slot's own exit trap removes the slot. A claim still in the queue is ended like a server: bash through Node's handle, then what it started, by the same walk. heavy-slot drops a ticket whose holder is gone. If the runner is killed, the claim's bash dies with it, and heavy-slot reclaims a slot whose holder is gone the next time a job looks for one. `.gate-cap` applies as to any job: at 0, a server waits in `waiting` with `lastReason` `waiting for a heavy slot`. heavy-slot's lines are copied to the runner's log.
 
 **What it costs.** A server held to its compile takes a slot for seconds when someone requests a page soon after it starts. If nobody requests one, it holds the slot for the full 3 minutes, at each start and each restart. A slot held for a compile is one fewer for commits and builds, and two servers compiling at once fill both.
 
@@ -76,12 +81,14 @@ Under `%LOCALAPPDATA%\claude-self-tools\dev-run\`:
 node --test tools/dev-run/dev-run.test.mjs
 ```
 
-The tests run dev-run against a fake server (`fixtures/fake-server.mjs`, a small HTTP server that prints Next-style request lines and starts a child of its own), with the memory reader, the clock and the slot claim injected. The clock moves only when the runner sleeps, and stands still while a server starts or answers, so the suite takes about 30 seconds. They cover:
+The tests run dev-run against a fake server (`fixtures/fake-server.mjs`, a small HTTP server that prints Next-style request lines and starts a detached child of its own), with the memory reader, the clock and the slot claim injected. The clock moves only when the runner sleeps, and stands still while a server starts or answers, so the suite takes about 75 seconds, mostly PowerShell reading the process table. They cover:
 
 - restarts every 10 minutes on the same port, once the port is free;
 - the stop under the stop floor, then the wait for the floor;
 - the idle exit, across restarts;
 - killing only its own tree, by PID, with a second server left running;
+- the tree walk on a made-up process table, where an orphan older than the root carries the root's id as its parent;
+- the walk on live, harmless processes (`fixtures/sleeper.mjs`): it stops exactly the tree it started, deepest first, and leaves an older process and a real orphan alone;
 - the status file's states;
 - name validation;
 - Ctrl+C;
@@ -91,13 +98,14 @@ The tests run dev-run against a fake server (`fixtures/fake-server.mjs`, a small
 - the compile floor;
 - a claim through the real `heavy-slot.sh`, in a slot folder of its own, so it never takes one of the machine's slots.
 
-Six planted faults are each run through the same scenarios, which must fail:
+Seven planted faults are each run through the same scenarios, which must fail, each on the check meant for it:
 
 - a restart that doesn't wait for the port;
 - the stop floor ignored;
 - an idle clock reset at each start;
 - a kill by name;
+- a walk that takes an orphan older than its parent (on the made-up table, and live);
 - a slot never released;
 - a slot released before the compile.
 
-Each fault is a copy of `dev-run.mjs` with one line changed. A test's `taskkill` can only reach processes that test started.
+Each fault is a copy of `dev-run.mjs` with one line changed. A test's stop script runs only when it is exactly dev-run's by-id script, and every process it names is one that test started.

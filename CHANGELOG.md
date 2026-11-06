@@ -7,11 +7,11 @@ Each entry names a plugin and its version, as `version` in `plugins/<name>/.clau
 - **[dev-run](tools/dev-run)**, a script, not a plugin: `node tools/dev-run/dev-run.mjs --name <label> --dir <folder> --port <n> -- <command>` runs one dev server in place of a `next dev` started by hand.
   - It starts the server at a free-memory floor (6 GiB, 9 before a compile) and restarts it every 10 minutes (at most 10) on the same port, once the port is free.
   - It stops the server under 4 GiB free and waits for the floor again, and stops for good after 20 minutes of server time with no request.
-  - It kills only its own tree, by PID.
+  - It stops only what it started: the root through Node's handle, then, from one process snapshot, each process the root started (a child only when created at or after its parent), deepest first, by id, after re-checking its start time. Never `taskkill /T`, never by name.
   - It claims a heavy-slot slot for each start's first compile (`--slot`; `=life` for the whole run, `=off` for none).
   - It writes a log and an atomic status file under `%LOCALAPPDATA%\claude-self-tools\dev-run\`.
   - A detached guard stops the server if the runner is killed outright.
-  - Its tests, run by `scripts/test-all.mjs`, use a fake server and six planted faults.
+  - Its tests, run by `scripts/test-all.mjs`, use a fake server, a live check on harmless processes, and seven planted faults.
 
 ## 2026-11-04: self-exit 0.1.2, self-restart 0.1.6, self-clear 0.2.0 and self-check 0.1.0, self-service: the exit pre-check, self-check, and a clear only with a why
 

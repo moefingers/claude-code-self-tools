@@ -20,6 +20,7 @@ const HERE = dirname(fileURLToPath(import.meta.url))
 const DEV_RUN = join(HERE, 'dev-run.mjs')
 const FIXTURES = join(HERE, 'fixtures')
 const FAKE = join(FIXTURES, 'fake-server.mjs')
+const SLEEPER = join(FIXTURES, 'sleeper.mjs')
 const TMP = mkdtempSync(join(tmpdir(), 'dev-run-test-'))
 const REQUEST = /^\s*GET \S+ 200 in/
 const MIN = 60_000
@@ -92,30 +93,40 @@ function clock() {
   return c
 }
 
+// The code under test runs its own exec, but a stop script runs only when it is exactly dev-run's
+// by-id script, and every process it names is one this test started. Read-only calls pass.
+function guardedExec(mod, ours, runs) {
+  return (file, args) => {
+    const script = String(args.at(-1))
+    if (/taskkill/i.test(file) || (/powershell/i.test(file) && /Stop-Process|\.Kill\(|\$targets/.test(script))) {
+      const targets = [...script.matchAll(/'(\d+):(\d+)'/g)].map(m => ({ pid: Number(m[1]), created: BigInt(m[2]) }))
+      const ok = /powershell/i.test(file) && script === real.stopScript(targets) && targets.every(t => ours.has(t.pid))
+      runs.push({ pids: targets.map(t => t.pid), ok })
+      if (!ok) return Promise.resolve({ code: 1, stdout: '', stderr: 'refused by the test' })
+    }
+    return mod.exec(file, args)
+  }
+}
+
 // One runner (from `mod`: dev-run.mjs or a planted fault) on a fake server, with everything recorded.
 async function harness(mod, { name, flags = [], mem = 10, limitMin = 90, linger = 0 }) {
   const port = await freePort()
   const home = mkdtempSync(join(TMP, `${name}-`))
   const o = mod.parseArgs(['--name', name, '--dir', FIXTURES, '--port', String(port), ...flags, '--', process.execPath, FAKE, String(port), '--grandchild'])
   const clk = clock()
-  const h = { port, home, o, mem, clock: clk, portBusy: 0, children: [], order: [], lines: [], states: [], stops: [], kills: [], claims: [], logs: [], done: false }
+  const h = { port, home, o, mem, clock: clk, portBusy: 0, children: [], order: [], lines: [], states: [], stops: [], stopRuns: [], claims: [], logs: [], done: false }
   const ours = new Set()
-  const exec = (file, args) => {
-    if (/taskkill/i.test(file)) {
-      h.kills.push(args)
-      // A test's taskkill never reaches a process the test didn't start, whatever the code under test asks.
-      if (!(args.length === 4 && args.slice(0, 3).join(' ') === '/T /F /PID' && ours.has(Number(args[3])))) return Promise.resolve({ code: 1, stdout: '', stderr: 'refused by the test' })
-      h.portBusy = linger
-    }
-    return mod.exec(file, args)
-  }
+  const exec = guardedExec(mod, ours, h.stopRuns)
   const spawnChild = (file, args, opts) => {
     const free = clk.hold() // a start takes no time on the runner's clock
     const child = spawn(file, args, opts)
     ours.add(child.pid)
     h.children.push({ child, pid: child.pid, at: clk.now(), portBusy: h.portBusy > 0, grandchild: null, ready: false, free })
     h.order.push('spawn')
-    child.once('exit', free)
+    child.once('exit', () => {
+      free()
+      h.portBusy = linger
+    })
     child.once('error', free)
     return child
   }
@@ -135,7 +146,7 @@ async function harness(mod, { name, flags = [], mem = 10, limitMin = 90, linger 
   runner.events.on('line', line => {
     h.lines.push(line)
     let m
-    if ((m = /^grandchild (\d+)/.exec(line))) h.children.at(-1).grandchild = Number(m[1])
+    if ((m = /^grandchild (\d+)/.exec(line))) ours.add((h.children.at(-1).grandchild = Number(m[1])))
     else if ((m = /ready on \d+, pid (\d+)/.exec(line))) {
       const c = h.children.find(c => c.pid === Number(m[1]))
       c.ready = true
@@ -248,10 +259,12 @@ async function ownTreeScenario(mod) {
   try {
     await Promise.all([a.ready(1), b.ready(1)])
     const [ca, cb] = [a.children[0], b.children[0]]
+    b.clock.hold() // b's time stands still while a stops, so b doesn't reach its own restart meanwhile
     a.runner.requestStop('test: stop a')
     await a.result
-    assert.deepEqual(a.kills, [['/T', '/F', '/PID', String(ca.pid)]], 'taskkill by its own PID, with its tree')
-    // A grandchild left behind ends itself 5 s after its parent, so gone within 2 s means the tree kill.
+    // The root through its handle, then its detached child, the only process it started, by id.
+    assert.deepEqual(a.stopRuns, [{ pids: [ca.grandchild], ok: true }], 'only the by-id stop script, on its own tree')
+    // A grandchild left behind ends itself 5 s after its parent, so gone within 2 s means the walk.
     await until(() => !alive(ca.pid) && !alive(ca.grandchild), "a's server and its child to be gone", 2000)
     assert.ok(alive(cb.pid) && alive(cb.grandchild), "b's server and its child still run")
     assert.equal((await b.get('/')).pid, cb.pid)
@@ -385,7 +398,7 @@ test('Ctrl+C stops the server tree, and the runner ends with 130', { skip }, asy
     const c = h.children[0]
     signals.emit('SIGINT')
     assert.equal(await h.result, 130)
-    assert.deepEqual(h.kills, [['/T', '/F', '/PID', String(c.pid)]])
+    assert.deepEqual(h.stopRuns, [{ pids: [c.grandchild], ok: true }])
     await until(() => !alive(c.pid) && !alive(c.grandchild), 'the tree to be gone', 2000)
     assert.deepEqual([h.status().state, h.status().lastReason], ['stopped', 'SIGINT'])
   } finally {
@@ -407,7 +420,8 @@ test('a runner killed outright leaves no server, even behind a .cmd shim: its gu
   cli.stdout.on('data', d => (out += d))
   cli.stderr.on('data', d => (out += d))
   try {
-    await until(() => /ready on \d+, pid \d+/.test(out), 'the server')
+    // The runner logs the start once its guard knows the root and its start time.
+    await until(() => /ready on \d+, pid \d+/.test(out) && /\] started pid \d+, started \d{4}-/.test(out), 'the server')
     const pid = Number(/ready on \d+, pid (\d+)/.exec(out)[1])
     const grandchild = Number(/grandchild (\d+)/.exec(out)[1])
     cli.kill() // TerminateProcess: no handler of the runner's runs
@@ -417,8 +431,9 @@ test('a runner killed outright leaves no server, even behind a .cmd shim: its gu
     await until(() => !alive(grandchild), "the server's child to go with it", 2000)
     const home = join(local, 'claude-self-tools', 'dev-run')
     await until(() => JSON.parse(readFileSync(join(home, 'cli.json'), 'utf8')).state === 'stopped', 'the status to say stopped', 5000)
-    assert.match(JSON.parse(readFileSync(join(home, 'cli.json'), 'utf8')).lastReason, /^runner \d+ ended; its guard stopped pid \d+$/)
-    assert.match(readFileSync(join(home, 'cli.log'), 'utf8'), /guard: runner \d+ ended without stopping its server: taskkill \/T \/F \/PID \d+ answered 0/)
+    // cmd.exe went with the runner; the guard walked from it: the server's child, then the server.
+    assert.equal(JSON.parse(readFileSync(join(home, 'cli.json'), 'utf8')).lastReason.replace(/^runner \d+/, 'runner'), `runner ended; its guard stopped pid ${grandchild}, ${pid}`)
+    assert.match(readFileSync(join(home, 'cli.log'), 'utf8'), new RegExp(`guard: runner \\d+ ended without stopping its server, pid \\d+: stopped ${grandchild}, stopped ${pid}`))
   } finally {
     if (cli.exitCode === null) cli.kill()
   }
@@ -445,6 +460,64 @@ test("a claim through the real heavy-slot.sh, in a slot folder of its own: held,
   assert.ok(notes.some(l => l.startsWith('[heavy-slot] holding .gate-lock for: read -r DEV_RUN_HOLD')))
 })
 
+// The tree walk on a made-up process table. Windows keeps a dead parent's id on its orphans, so a
+// process older than the root can carry the root's id as its parent: never the root's.
+async function orphanTableScenario(mod) {
+  const row = (pid, ppid, created) => [pid, { pid, ppid, created: BigInt(created) }]
+  // R (100) started C (200), which started G (300). O (400) and its child (500) are older than R:
+  // orphans of an earlier owner of id 100. S (600) is someone else's.
+  const table = new Map([row(100, 1, 1000), row(200, 100, 1100), row(300, 200, 1200), row(400, 100, 900), row(500, 400, 950), row(600, 50, 800)])
+  assert.deepEqual(mod.treeOf(table, 100, 1000n).map(t => t.pid), [300, 200], "R's tree, deepest first, without the older orphan")
+  assert.deepEqual(mod.treeOf(table, 100, 1000n, { includeRoot: true }).map(t => t.pid), [300, 200, 100])
+  // R gone and its id taken by X (created 5000), which started Y: of R's, only C is left.
+  const later = new Map([row(100, 9, 5000), row(700, 100, 5100), row(200, 100, 1100), row(400, 100, 900)])
+  assert.deepEqual(mod.treeOf(later, 100, 1000n, { includeRoot: true }).map(t => t.pid), [200], 'neither the older orphan nor the new owner and its child')
+}
+
+// The walk on live processes: harmless sleepers this test starts, each child detached so that only
+// the walk ends it. Every stop script is checked as in the harness.
+async function liveWalkScenario(mod) {
+  const procs = []
+  const ours = new Set()
+  const runs = []
+  const run = guardedExec(mod, ours, runs)
+  const start = async depth => {
+    const p = spawn(process.execPath, [SLEEPER, String(depth)], { stdio: ['pipe', 'pipe', 'ignore'], windowsHide: true })
+    procs.push(p)
+    let out = ''
+    p.stdout.on('data', d => (out += d))
+    await until(() => (out.match(/^sleeper /gm) ?? []).length === depth + 1, 'the sleepers', 10_000)
+    const pids = [...out.matchAll(/^sleeper (\d+) \d+\r?$/gm)].map(m => Number(m[1]))
+    pids.forEach(pid => ours.add(pid))
+    return { p, pids }
+  }
+  const end = p => (p.kill(), until(() => p.exitCode !== null || p.signalCode !== null, 'a sleeper to end', 5000))
+  try {
+    const { pids: [older] } = await start(0)
+    // P starts O, then P ends: O, an orphan, keeps P's id as its parent id.
+    const { p: P, pids: [pPid, oPid] } = await start(1)
+    await end(P)
+    // R starts C, which starts G. R is ended through its handle, as the runner does.
+    const { p: R, pids: [rPid, cPid, gPid] } = await start(2)
+    const rCreated = await mod.processCreated(rPid, run)
+    await end(R)
+    const mine = await mod.killTree(rPid, rCreated, { run })
+    assert.deepEqual(mine.targets.map(t => t.pid), [gPid, cPid], "R's tree, deepest first")
+    assert.deepEqual(mine.results, [`stopped ${gPid}`, `stopped ${cPid}`])
+    await until(() => !alive(gPid) && !alive(cPid), 'C and G to end', 3000)
+    // A root created after O, holding P's old id: O is older than it, so not its child.
+    const taken = await mod.killTree(pPid, rCreated, { includeRoot: true, run })
+    assert.ok(!taken.targets.some(t => t.pid === oPid), 'the older orphan is not in the tree')
+    assert.ok(alive(oPid) && alive(older), 'the orphan and the older process live on')
+    assert.ok(runs.every(r => r.ok), 'every stop script was the by-id one, on processes this test started')
+  } finally {
+    for (const p of procs) if (p.exitCode === null && p.signalCode === null) p.kill()
+  }
+}
+
+test('the tree walk never takes a process older than its parent: an orphan carrying the root id', { skip }, () => orphanTableScenario(real))
+test('live: the walk stops exactly the tree it started, deepest first, and nothing older', { skip }, () => liveWalkScenario(real))
+
 // Planted faults: a copy of dev-run.mjs with one line changed. Each must make its scenario fail.
 let mutants = 0
 async function mutant(find, replace) {
@@ -460,7 +533,9 @@ const FAULTS = [
   ['a restart does not wait for the port', 'const clear = await this.waitPortFree()', 'const clear = true', restartScenario, /the next start waited for the port/],
   ['the stop floor is ignored', 'if (free < o.stopGb)', 'if (false)', stopFloorScenario, /stop floor\$\/\. Input:\s+'scheduled restart after 10 min'/],
   ['idle never fires (each start resets the idle clock)', 'this.idleAnchor += now - this.downSince', 'this.idleAnchor = now', idleScenario, /\+ 'test deadline'\s+- 'idle: no request for 20 min'/],
-  ['kill by name instead of by PID', "['/T', '/F', '/PID', String(pid)]", "['/T', '/F', '/IM', 'node.exe']", ownTreeScenario, /taskkill by its own PID/],
+  ['kill by name instead of by PID', 'Stop-Process -InputObject $p -Force', 'Stop-Process -Name $p.ProcessName -Force', ownTreeScenario, /only the by-id stop script/],
+  ['the walk takes an orphan older than its parent (process table)', 'if (c.created < created) continue', 'if (false) continue', orphanTableScenario, /without the older orphan/],
+  ['the walk takes an orphan older than its parent (live)', 'if (c.created < created) continue', 'if (false) continue', liveWalkScenario, /older orphan is not in the tree|R's tree, deepest first|every stop script/],
   ['the heavy slot is never released', 'if (!claim) return', 'return', slotCompileScenario, /ended \(test deadline\) before the slot to be released/],
   ['the heavy slot is released before the compile', ' && this.compiledRe.test(line)', '', slotCompileScenario, /still held once the server is ready/],
 ]

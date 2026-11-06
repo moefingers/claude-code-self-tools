@@ -1,6 +1,6 @@
 // A stand-in for `next dev` in dev-run's tests: an HTTP server on the port it is given, answering
 // {pid, port} and printing a Next-style request line for each request. With --grandchild it starts a
-// child of its own first, so a test can see a tree kill reach it. Every copy ends by itself after two
+// detached child of its own first, so a test can see the tree walk reach it. Every copy ends by itself after two
 // minutes, and a grandchild 5 s after its parent is gone, so a failing test leaves nothing running.
 //
 //   node fake-server.mjs <port> [--grandchild]
@@ -17,7 +17,8 @@ if (flags.includes('--sleeper')) {
   process.stdin.resume()
 } else {
   if (flags.includes('--grandchild')) {
-    const g = spawn(process.execPath, [fileURLToPath(import.meta.url), '0', '--sleeper'], { stdio: ['pipe', 'ignore', 'ignore'], windowsHide: true })
+    // Detached: out of Node's job, so it outlives this server unless dev-run's walk stops it.
+    const g = spawn(process.execPath, [fileURLToPath(import.meta.url), '0', '--sleeper'], { detached: true, stdio: ['pipe', 'ignore', 'ignore'], windowsHide: true })
     console.log(`grandchild ${g.pid}`)
   }
   const server = createServer((req, res) => {
