@@ -5,10 +5,15 @@ Runs one dev server for a Claude Code session on a shared Windows machine, in pl
 Windows only. Node 24 or later; no dependencies.
 
 ```
-node tools/dev-run/dev-run.mjs --name web-3271 --dir /path/to/project --port 3271 -- node node_modules/next/dist/bin/next dev -p 3271
+node tools/dev-run/dev-run.mjs --name web-3271 --dir /path/to/project --port 3271 -- node node_modules/next/dist/bin/next dev -H 127.0.0.1 -p 3271
 ```
 
-Everything after `--` is the server's command, run in `--dir` as an argument list, with no shell. Call the program itself where you can (`node node_modules/next/dist/bin/next dev`): a `.cmd` shim such as `pnpm` works too, through `cmd.exe /d /s /c`, but an argument with a character `cmd.exe` would read (`" % ! ^ & | < >`) is refused. The command must listen on `--port`; dev-run watches that port, and doesn't set it.
+Everything after `--` is the server's command, run in `--dir` as an argument list, with no shell.
+
+- **Finding the program:** a bare name like `node` or `pnpm` is looked up on PATH only, never in `--dir`, so a `node.cmd` in the project can't stand in for node. A path like `node_modules/.bin/next.cmd` is taken from `--dir`.
+- **Call the program itself where you can** (`node node_modules/next/dist/bin/next dev`). A `.cmd` shim such as `pnpm` works too, through `cmd.exe /d /s /c`, but an argument with a character `cmd.exe` would read (`" % ! ^ & | < >`) is refused.
+- **Listen on 127.0.0.1** (`-H 127.0.0.1`): `next dev` listens on every interface by default, and a request from another machine on the network would count as activity and keep the server from its idle exit.
+- **The port:** the command must listen on `--port`. dev-run watches that port, and doesn't set it.
 
 | Option | Default | |
 | :- | :- | :- |
@@ -21,7 +26,7 @@ Everything after `--` is the server's command, run in `--dir` as an argument lis
 | `--compile-floor-gb <n>` | 9 | GiB free before each start's first compile. The larger of the two floors applies before every spawn. |
 | `--stop-gb <n>` | 4 | Stop the server when free memory falls under n GiB, then wait for the floor again. |
 | `--slot[=compile\|life\|off]` | `compile` | Claim a heavy-slot slot for each start's first compile, for each whole run, or not at all. See [Heavy slots](#heavy-slots). |
-| `--slot-script <path>` | found | `heavy-slot.sh`. By default, the first one in `--dir` or a folder above it. |
+| `--slot-script <path>` | found | `heavy-slot.sh`. By default `$HEAVY_SLOT_SCRIPT`, else the first one in a folder above the repository that holds `--dir` (or above `--dir`, outside a repository). Never one inside the served repository, which a project could carry, or an old worktree keep. |
 | `--hit <regex>` | Next's request line | A server output line that counts as a request: ` GET /path 200 in 12ms`. |
 | `--compiled <regex>` | see below | A line that ends a start's first compile. |
 
@@ -65,7 +70,7 @@ Under `%LOCALAPPDATA%\claude-self-tools\dev-run\`:
 
 `heavy-slot.sh` lets at most two heavy jobs (commits, builds, tests) run on the machine at once. Each takes a slot directory first, in turn, and once free memory allows. Its own notes leave long-lived `next dev` out. A dev server's heavy moment is its first compile, which takes several GiB at once. Its first page compiles only when that page is first requested.
 
-- **`--slot` (`compile`, the default):** before each spawn, at the floor, dev-run claims a slot through `heavy-slot.sh` itself, and spawns once heavy-slot says it holds one. It releases the slot at the first line matching `--compiled`, or 3 minutes after the spawn, whichever comes first, or when the server stops before that. The default `--compiled` is a request line with a 2xx or 3xx status, or a `Compiled` line other than middleware's, proxy's or instrumentation's, which compile before the page. Next's `Ready` line doesn't count: Next prints it once it listens, before it has compiled anything. If memory fell under the floor while it waited for the slot, it gives the slot back and waits for the floor again.
+- **`--slot` (`compile`, the default):** before each spawn, at the floor, dev-run claims a slot through `heavy-slot.sh` itself, and spawns once heavy-slot says it holds one. It releases the slot at the first line matching `--compiled`, or 3 minutes after the spawn, whichever comes first, or when the server stops before that. The default `--compiled`, read case-sensitively, is a request line with a 2xx or 3xx status, or Next's own ` ✓ Compiled …` line, at the line's start, other than middleware's, proxy's or instrumentation's, which compile before the page. So neither a request for `/compiled` nor the app's own output saying "compiled" releases the slot early. Next's `Ready` line doesn't count: Next prints it once it listens, before it has compiled anything. If memory fell under the floor while it waited for the slot, it gives the slot back and waits for the floor again.
 - **`--slot=life`:** holds the slot from before each spawn until that server stops. Every restart gives it back and claims it again, so no hold outlasts `--restart-min`.
 - **`--slot=off`:** no slot.
 

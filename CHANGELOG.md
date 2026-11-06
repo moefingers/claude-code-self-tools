@@ -8,7 +8,8 @@ Each entry names a plugin and its version, as `version` in `plugins/<name>/.clau
   - It starts the server at a free-memory floor (6 GiB, 9 before a compile) and restarts it every 10 minutes (at most 10) on the same port, once the port is free.
   - It stops the server under 4 GiB free and waits for the floor again, and stops for good after 20 minutes of server time with no request.
   - It stops only what it started: the root through Node's handle, then, from one process snapshot, each process the root started (a child only when created at or after its parent), deepest first, by id, after re-checking its start time. Never `taskkill /T`, never by name.
-  - It claims a heavy-slot slot for each start's first compile (`--slot`; `=life` for the whole run, `=off` for none).
+  - It claims a heavy-slot slot for each start's first compile (`--slot`; `=life` for the whole run, `=off` for none). The slot is released at a 2xx/3xx request line or Next's own `Compiled` line, read case-sensitively at the line's start.
+  - It finds heavy-slot.sh in `$HEAVY_SLOT_SCRIPT`, else above the repository that holds `--dir`, never inside it. It looks a bare command name up on PATH only, never in `--dir`.
   - It writes a log and an atomic status file under `%LOCALAPPDATA%\claude-self-tools\dev-run\`.
   - A detached guard stops the server if the runner is killed outright.
   - Its tests, run by `scripts/test-all.mjs`, use a fake server, a live check on harmless processes, and seven planted faults.

@@ -12,7 +12,7 @@ import { execFile, spawn } from 'node:child_process'
 import { EventEmitter, once } from 'node:events'
 import { appendFileSync, closeSync, existsSync, fstatSync, mkdirSync, openSync, readFileSync, readSync, renameSync, statSync, writeFileSync } from 'node:fs'
 import { freemem, homedir } from 'node:os'
-import { delimiter, dirname, extname, join, resolve } from 'node:path'
+import { delimiter, dirname, extname, isAbsolute, join, resolve } from 'node:path'
 import { createInterface } from 'node:readline'
 import { StringDecoder } from 'node:string_decoder'
 import { fileURLToPath } from 'node:url'
@@ -23,10 +23,11 @@ export const SLOT_COMPILE_MS = 3 * 60_000
 const METHODS = 'GET|HEAD|POST|PUT|PATCH|DELETE|OPTIONS'
 // A request line as Next prints it: " GET /path 200 in 12ms".
 export const HIT_RE = String.raw`^\s*(?:${METHODS})\s+\S+\s+\d{3}\s+in\b`
-// The end of a first compile: a 2xx/3xx request line, or a "Compiled" line other than middleware's
-// (or proxy's, or instrumentation's), which come before the page's own. Not "Ready": Next prints it
-// once it listens, before it has compiled anything.
-export const COMPILED_RE = String.raw`^\s*(?:${METHODS})\s+\S+\s+[23]\d\d\s+in\b|\bcompiled\b(?!\s+\/(?:middleware|proxy|instrumentation)\b)`
+// The end of a first compile, read case-sensitively: a 2xx/3xx request line, or Next's own
+// " ✓ Compiled ..." line, at its start, other than middleware's (or proxy's, or instrumentation's),
+// which come before the page's own. So neither a request for /compiled nor the app's own output
+// that says "compiled" counts. Not "Ready": Next prints it once it listens, before it compiles anything.
+export const COMPILED_RE = String.raw`^\s*(?:${METHODS})\s+\S+\s+[23]\d\d\s+in\b|^\s*(?:\S{1,2}\s+)?Compiled\b(?!\s+\/(?:middleware|proxy|instrumentation)\b)`
 const ANSI = /\x1b\[[0-9;?]*[ -/]*[@-~]/g
 const SYS = join(process.env.SystemRoot || 'C:\\Windows', 'System32')
 const NETSTAT = join(SYS, 'NETSTAT.EXE')
@@ -46,7 +47,8 @@ export const USAGE = `usage: node dev-run.mjs --name <label> --dir <folder> --po
   --stop-gb <n>             stop the server under n GiB free, then wait for the floor again (default 4)
   --slot[=compile|life|off] claim a heavy-slot slot for each start's first compile (the default), for
                             each whole run, or not at all
-  --slot-script <path>      heavy-slot.sh (default: the first found in --dir or a folder above it)
+  --slot-script <path>      heavy-slot.sh (default: $HEAVY_SLOT_SCRIPT, else the first found in a
+                            folder above the repository that holds --dir)
   --hit <regex>             an output line that counts as a request (default: " GET /path 200 in 12ms")
   --compiled <regex>        an output line that ends the first compile (default: a 2xx/3xx request
                             line, or a "Compiled" line other than middleware's)`
@@ -93,8 +95,8 @@ export function parseArgs(argv, env = process.env) {
   }
   if (!SLOT_MODES.includes(o.slot)) throw new UsageError(`--slot takes ${SLOT_MODES.join(', ')}`)
   if (o.slot !== 'off') {
-    o.slotScript ??= findSlotScript(o.dir)
-    if (!o.slotScript) throw new UsageError('no heavy-slot.sh in --dir or a folder above it: pass --slot-script <path>, or --slot=off')
+    o.slotScript ??= findSlotScript(o.dir, env)
+    if (!o.slotScript) throw new UsageError('no heavy-slot.sh: set HEAVY_SLOT_SCRIPT, pass --slot-script <path>, or --slot=off')
     o.bash = findBash(env)
     if (!o.bash) throw new UsageError('no Git Bash to run heavy-slot.sh: install Git for Windows, or pass --slot=off')
   }
@@ -108,7 +110,9 @@ export function resolveCommand(command, args, cwd, env = process.env) {
   if (!['.exe', '.com'].includes(extname(command).toLowerCase())) {
     // Only PATHEXT names: npm's extensionless shim beside a .cmd is a shell script Windows can't run.
     const exts = extname(command) ? [''] : (env.PATHEXT || '.COM;.EXE;.BAT;.CMD').split(';').filter(Boolean)
-    const dirs = /[\\/]/.test(command) ? [''] : [cwd, ...(env.PATH || '').split(delimiter).filter(Boolean)]
+    // A bare name through PATH only, as PowerShell does, so a node.cmd in the project can't stand in
+    // for node; a path is taken from --dir.
+    const dirs = /[\\/]/.test(command) ? [''] : (env.PATH || '').split(delimiter).filter(d => isAbsolute(d))
     const found = dirs.flatMap(d => exts.map(e => resolve(cwd, d, command + e))).find(p => statSync(p, { throwIfNoEntry: false })?.isFile())
     if (found) file = found
   }
@@ -120,8 +124,23 @@ export function resolveCommand(command, args, cwd, env = process.env) {
   return { file: env.ComSpec || join(SYS, 'cmd.exe'), fileArgs: ['/d', '/s', '/c', `"${line.join(' ')}"`], verbatim: true }
 }
 
-export function findSlotScript(dir) {
-  for (let d = resolve(dir); ; d = dirname(d)) {
+/**
+ * heavy-slot.sh: $HEAVY_SLOT_SCRIPT, else the first one in a folder above the repository that holds
+ * `dir` (or above `dir`, outside a repository). Never one inside the served repository, which a
+ * project could carry, or an old worktree keep.
+ */
+export function findSlotScript(dir, env = process.env) {
+  if (env.HEAVY_SLOT_SCRIPT) return env.HEAVY_SLOT_SCRIPT
+  let from = resolve(dir)
+  for (let d = from; ; d = dirname(d)) {
+    if (existsSync(join(d, '.git'))) {
+      if (dirname(d) === d) return null
+      from = dirname(d)
+      break
+    }
+    if (dirname(d) === d) break
+  }
+  for (let d = from; ; d = dirname(d)) {
     if (existsSync(join(d, 'heavy-slot.sh'))) return join(d, 'heavy-slot.sh')
     if (dirname(d) === d) return null
   }
@@ -342,7 +361,7 @@ export class DevRun {
     this.outPath = join(this.d.home, `${o.name}.out`)
     this.events = new EventEmitter()
     this.hitRe = new RegExp(o.hit, 'i')
-    this.compiledRe = new RegExp(o.compiled, 'i')
+    this.compiledRe = new RegExp(o.compiled) // case-sensitive: Next's "Compiled", not any "compiled"
     Object.assign(this, { state: 'waiting', child: null, pid: null, startedAt: null, lastHitAt: null, restarts: 0, lastReason: null })
     Object.assign(this, { idleAnchor: null, downSince: null, quickExits: 0, claim: null, slotName: null, stopReq: null, dirty: false })
     this.stopSignal = new Promise(r => (this.wake = r))

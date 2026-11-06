@@ -7,7 +7,7 @@
 import assert from 'node:assert/strict'
 import { spawn } from 'node:child_process'
 import { EventEmitter } from 'node:events'
-import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { createServer } from 'node:net'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
@@ -307,13 +307,44 @@ test('--name is a-z, 0-9 and -, from a letter or digit, up to 40 characters; the
   assert.throws(() => real.resolveCommand(shim, ['a&b'], TMP), real.UsageError)
 })
 
+test('a bare command name comes from PATH, never --dir; a path comes from --dir', { skip }, () => {
+  const project = mkdtempSync(join(TMP, 'project-'))
+  writeFileSync(join(project, 'node.cmd'), '@echo off\r\n')
+  writeFileSync(join(project, 'tool.cmd'), '@echo off\r\n')
+  const env = { ...process.env, PATH: [dirname(process.execPath), '.', 'relative\\bin'].join(';') }
+  assert.equal(real.resolveCommand('node', [], project, env).file.toLowerCase(), process.execPath.toLowerCase(), "the project's node.cmd doesn't stand in for node")
+  assert.equal(real.resolveCommand('tool', [], project, env).file, 'tool', "not found on PATH, so not taken from the project (or a relative PATH entry)")
+  assert.match(real.resolveCommand('.\\tool.cmd', ['x'], project, env).fileArgs.at(-1), /tool\.cmd" x"$|tool\.cmd x"$/)
+})
+
+test('heavy-slot.sh: $HEAVY_SLOT_SCRIPT first, else the first above the served repository, never one inside it', { skip }, () => {
+  const top = mkdtempSync(join(TMP, 'slots-top-'))
+  const repo = join(top, 'repo')
+  const app = join(repo, 'apps', 'web')
+  mkdirSync(app, { recursive: true })
+  mkdirSync(join(repo, '.git'))
+  writeFileSync(join(top, 'heavy-slot.sh'), '')
+  writeFileSync(join(repo, 'heavy-slot.sh'), '') // the project's own: never taken
+  writeFileSync(join(app, 'heavy-slot.sh'), '')
+  assert.equal(real.findSlotScript(app, {}), join(top, 'heavy-slot.sh'))
+  assert.equal(real.findSlotScript(app, { HEAVY_SLOT_SCRIPT: '/x/heavy-slot.sh' }), '/x/heavy-slot.sh')
+  // A worktree's .git is a file; outside any repository the walk starts at --dir.
+  rmSync(join(repo, '.git'), { recursive: true })
+  writeFileSync(join(repo, '.git'), 'gitdir: elsewhere\n')
+  assert.equal(real.findSlotScript(app, {}), join(top, 'heavy-slot.sh'))
+  rmSync(join(repo, '.git'))
+  assert.equal(real.findSlotScript(app, {}), join(app, 'heavy-slot.sh'))
+  assert.equal(real.parseArgs(['--name', 'web', '--dir', app, '--port', '3999', '--', process.execPath], { ...process.env, HEAVY_SLOT_SCRIPT: '/x/heavy-slot.sh' }).slotScript, '/x/heavy-slot.sh')
+})
+
 test('the request and first-compile patterns read Next lines', { skip }, () => {
   const hit = new RegExp(real.HIT_RE, 'i')
-  const compiled = new RegExp(real.COMPILED_RE, 'i')
+  const compiled = new RegExp(real.COMPILED_RE) // as the runner reads it: case-sensitive
   for (const l of [' GET / 200 in 12ms', ' POST /api/x 404 in 3ms', ' GET /a 200 in 1.2s (compile: 1s, render: 200ms)']) assert.ok(hit.test(l), l)
   for (const l of [' ✓ Ready in 2.1s', ' ○ Compiling / ...', 'GET request failed']) assert.ok(!hit.test(l), l)
-  for (const l of [' GET / 200 in 12ms', ' GET /old 307 in 4ms', ' ✓ Compiled / in 3.1s (812 modules)', ' ✓ Compiled in 300ms']) assert.ok(compiled.test(l), l)
-  for (const l of [' GET / 404 in 5ms', ' GET / 500 in 5ms', ' ✓ Ready in 2.1s', ' ○ Compiling / ...', ' ✓ Compiled /middleware in 210ms', ' ⨯ Failed to compile'])
+  for (const l of [' GET / 200 in 12ms', ' GET /old 307 in 4ms', ' ✓ Compiled / in 3.1s (812 modules)', ' ✓ Compiled in 300ms', 'Compiled in 300ms']) assert.ok(compiled.test(l), l)
+  for (const l of [' GET / 404 in 5ms', ' GET / 500 in 5ms', ' ✓ Ready in 2.1s', ' ○ Compiling / ...', ' ✓ Compiled /middleware in 210ms', ' ⨯ Failed to compile',
+    ' GET /compiled 404 in 5ms', ' HEAD /docs/compiled 500 in 2ms', 'the app compiled 3 files', 'compiled successfully', 'build: Compiled', 'unCompiled'])
     assert.ok(!compiled.test(l), l)
 })
 
