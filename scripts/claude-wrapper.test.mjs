@@ -474,10 +474,12 @@ async function runsPlainly(shell, wrapper = WRAPPER) {
 }
 
 const SLOT_RUNNER = join(ROOT, 'plugins', 'self-switch', 'slot', 'claude-slot.ps1')
+const LAUNCHER = join(ROOT, 'plugins', 'self-switch', 'slot', 'claude-launch.ps1')
 
 /**
- * The three copies of the last look, each as a function Get-Live($id, $configDirs): the wrapper's,
- * the slot runner's, and RECHECK as the window and the in-place check run it.
+ * The four copies of the last look, each as a function Get-Live($id, $configDirs): the wrapper's,
+ * the slot runner's, claude-launch.ps1's (by hand too), and RECHECK as the window and the in-place
+ * check run it.
  */
 function lastLooks(wrapperText = readFileSync(WRAPPER, 'utf8'), recheck = machine.RECHECK) {
   const cut = (text, open, close) => {
@@ -490,6 +492,7 @@ function lastLooks(wrapperText = readFileSync(WRAPPER, 'utf8'), recheck = machin
   return {
     wrapper: cut(wrapperText, '  function Get-Live(', '  }'),
     slot: cut(readFileSync(SLOT_RUNNER, 'utf8'), 'function Get-Live(', '}'),
+    launcher: cut(readFileSync(LAUNCHER, 'utf8'), 'function Get-Live(', '}'),
     window: ['function Get-Live($id, $configDirs) {', '  try {', ...recheck.map(line => `    ${line}`), "  } catch { $live = 'unreadable: ' + $_.Exception.Message }", '  return $live', '}'].join('\n'),
   }
 }
@@ -636,14 +639,16 @@ describe('the claude wrapper, in each PowerShell', { skip: !isWindows && 'Window
 })
 
 describe('the last look, in the slot runner and the window too (Windows PowerShell 5.1)', { skip: !isWindows && 'Windows only' }, () => {
-  test("the slot runner's and RECHECK's pass over a process that has exited, and hold on one alive; the three copies are one", () => {
+  test("the slot runner's, claude-launch.ps1's and RECHECK's pass over a process that has exited, and hold on one alive; the four copies are one", () => {
     const looks = lastLooks()
     assert.deepEqual(looksRight(lastLook(WINDOWS_POWERSHELL, looks.slot)), [])
+    assert.deepEqual(looksRight(lastLook(WINDOWS_POWERSHELL, looks.launcher)), [])
     assert.deepEqual(looksRight(lastLook(WINDOWS_POWERSHELL, looks.window)), [])
-    // The wrapper's and the slot runner's are RECHECK, line for line.
+    // The wrapper's, the slot runner's and claude-launch.ps1's are RECHECK, line for line.
     for (const line of machine.RECHECK) {
       assert.ok(looks.wrapper.includes(`      ${line}\n`), `the wrapper's last look: ${line}`)
       assert.ok(looks.slot.includes(`  ${line}\n`), `the slot runner's last look: ${line}`)
+      assert.ok(looks.launcher.includes(`    ${line}\n`), `claude-launch.ps1's last look: ${line}`)
     }
   })
 })

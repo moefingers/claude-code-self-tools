@@ -7,9 +7,18 @@
 // ticket for its run from %STUB_PLAN%\<run>.json, if there is one, with {TOKEN} replaced by its
 // CLAUDE_PANE_TOKEN and "{NOW}", "{OLD}" and "{AHEAD}" by the time now, 200 s ago and 60 s ahead, in
 // milliseconds. It sleeps %STUB_SLEEP_MS% and exits with %STUB_EXIT%, when they are set.
+//
+// For the scripts a plugin runs under its own claude.exe (scripts/launch-live.test.mjs and
+// scripts/left-record.test.mjs), before all that: with %STUB_SELF%, it first writes there its process id
+// and its creation time, a FILETIME as the probe reads one (`{"pid":..,"created":".."}`); with
+// %STUB_CHILD_EXE%, it runs that program with %STUB_CHILD_ARGS% as its own child, as Claude Code runs a
+// plugin's script: it waits (up to 30 s) for %STUB_CHILD_STDIN% to be there, hands the child that file's
+// bytes on standard input, and writes the child's standard output and error, as UTF-8, to
+// %STUB_CHILD_OUT% and %STUB_CHILD_ERR%. The script can so be written once this process is known.
 using System;
 using System.Collections;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO;
 using System.Text;
 using System.Threading;
@@ -26,7 +35,44 @@ public static class ClaudeStub {
     return b.Append('"').ToString();
   }
 
+  static void RunChild(string exe) {
+    string input = Environment.GetEnvironmentVariable("STUB_CHILD_STDIN");
+    string output = Environment.GetEnvironmentVariable("STUB_CHILD_OUT");
+    string error = Environment.GetEnvironmentVariable("STUB_CHILD_ERR");
+    for (int i = 0; i < 600 && !string.IsNullOrEmpty(input) && !File.Exists(input); i++) Thread.Sleep(50);
+    ProcessStartInfo info = new ProcessStartInfo(exe, Environment.GetEnvironmentVariable("STUB_CHILD_ARGS") ?? "");
+    info.UseShellExecute = false;
+    info.CreateNoWindow = true;
+    info.RedirectStandardInput = true;
+    info.RedirectStandardOutput = true;
+    info.RedirectStandardError = true;
+    info.StandardOutputEncoding = new UTF8Encoding(false);
+    info.StandardErrorEncoding = new UTF8Encoding(false);
+    using (Process child = Process.Start(info)) {
+      string err = "";
+      Thread reader = new Thread(() => { err = child.StandardError.ReadToEnd(); });
+      reader.Start();
+      byte[] bytes = string.IsNullOrEmpty(input) || !File.Exists(input) ? new byte[0] : File.ReadAllBytes(input);
+      child.StandardInput.BaseStream.Write(bytes, 0, bytes.Length);
+      child.StandardInput.Close();
+      string got = child.StandardOutput.ReadToEnd();
+      reader.Join();
+      child.WaitForExit();
+      if (!string.IsNullOrEmpty(output)) File.WriteAllText(output, got, new UTF8Encoding(false));
+      if (!string.IsNullOrEmpty(error)) File.WriteAllText(error, err, new UTF8Encoding(false));
+    }
+  }
+
   public static int Main(string[] args) {
+    string self = Environment.GetEnvironmentVariable("STUB_SELF");
+    if (!string.IsNullOrEmpty(self)) {
+      Process me = Process.GetCurrentProcess();
+      // Whole, by a move: the test reads it as soon as it is there.
+      File.WriteAllText(self + ".tmp", "{\"pid\":" + me.Id + ",\"created\":\"" + me.StartTime.ToFileTimeUtc() + "\"}");
+      File.Move(self + ".tmp", self);
+    }
+    string childExe = Environment.GetEnvironmentVariable("STUB_CHILD_EXE");
+    if (!string.IsNullOrEmpty(childExe)) RunChild(childExe);
     string log = Environment.GetEnvironmentVariable("STUB_LOG");
     string plan = Environment.GetEnvironmentVariable("STUB_PLAN");
     string token = Environment.GetEnvironmentVariable("CLAUDE_PANE_TOKEN");

@@ -29,7 +29,8 @@
 //   that checks the claim and takes the last look. A ticket for the wrapper naming the probe's claim,
 //   written whole and moved into place, then `/exit`; the wrapper deletes the ticket, checks it (the
 //   claim lock must still name its claim; right before claude runs, RECHECK), and resumes `to` in its
-//   folder, in the same tab. Taken back, the ticket is overwritten as withdrawn;
+//   folder, in the same tab. Taken back, the ticket is overwritten as withdrawn, if it is there and
+//   still names this switch's claim;
 // - a new window otherwise, which waits for this process to exit, checks again, and runs
 //   claude-launch.ps1 for `to`; then `/exit`. When this pane runs a slot runner that can't be used
 //   (its script can't be hashed, or has another hash), the leaving row, the toast and the arrival say
@@ -37,12 +38,18 @@
 // The slot's record, the tab's ticket and the window are each placed by one run of the shared launcher
 // (launch, machine.ts), which checks this is the claude.exe the probe judged and takes the claim again.
 // S10w: a wake-up armed with self-wake for this conversation holds the switch, read from self-wake's
-// marker (readWake); self-wake on with no marker, or one that can't be read, holds too. Other pending
-// wake-ups are dropped by every transport (an in-place `/resume` swaps `$.state`; an exit ends them):
-// the tool's result, the leaving row and the arrival say so, so they can be set again.
+// marker (readWake) at the call, at the run, and once more right before the final command (a wake-up
+// set in the same turn is marked as that turn ends, which nothing orders before the first read);
+// self-wake on with no marker, or one that can't be read, holds too. The conversation it is read for
+// is the one the last SessionStart named, as self-wake keys its markers: while `$.session.id()` reads
+// another, the switch waits. A session cron (CronCreate, /loop, ScheduleWakeup, read with CronList)
+// holds a switch that ends this process (a slot, a tab, a window); one that can't be read holds too.
+// Other pending wake-ups are dropped by every transport (an in-place `/resume` swaps `$.state`; an
+// exit ends them): the tool's result, the leaving row and the arrival say so, so they can be set again.
 // The left record (\u00a73.4): this plugin writes one for the conversation it leaves, in place from the
 // classic SessionStart of the one it arrives at (LEFT_SETTLE_MS after, keyed by the event's id), and on
-// exit right before its own `/exit`; never for a typed `/exit`, a crash or a kill. Its probe reads the
+// exit right before its own `/exit`, taken back (written over as withdrawn) when that `/exit` then
+// doesn't run; never for a typed `/exit`, a crash or a kill. Its probe reads the
 // target's record, which may waive L3 and L5 (a return trip soon after a switch), and the last look
 // in place, in the window or in a tab of pane file version 3 checks the transcript against it; this
 // pane's slot runner doesn't until slots v2, nor does an older wrapper, so a move that rests on a record
@@ -74,7 +81,12 @@ import type { EngineInterface, Register, Timer } from 'claude-code'
 import type { Heartbeat, Queued, Ticket } from '../types'
 import type { AgentLike, LaunchInput, LeftStat, Pane, Probe, ProcessRef, Transport } from './machine'
 import {
-  BUSY_AGENTS,
+  blockersText,
+  exitBlockers,
+  isBusyAgent,
+  LAUNCH_RUN_MS,
+  leftPath,
+  readCrons,
   paneFallback,
   paneNoLeft,
   paneReads,
@@ -150,8 +162,6 @@ const SETTLE_MS = 500
 const CHECK_MS = 5000
 /** How long the probe may take. */
 const PROBE_MS = 60_000
-/** How long the launcher may take to open the window. */
-const LAUNCH_MS = 30_000
 /** How long releasing a claim lock may take. */
 const RELEASE_MS = 15_000
 /** A ticket older than this is dropped, not delivered: the switch failed, and it came back later by hand. */
@@ -173,7 +183,7 @@ const MAX_KEPT = 50
 
 const DESCRIPTION = [
   "Switches this terminal to another conversation once the current turn ends: this conversation ends here, its context untouched, and conversation `to` (a session id, as claude --resume takes) is resumed in its place: in this same process when both live in one project folder, else in this pane's slot (a Windows Terminal pane running self-switch's claude-slot.ps1), else in this same tab when Claude Code was started through the claude wrapper (the `claude` function from claude-code-self-tools in the person's PowerShell profile), else in a new window.",
-  "For the person's own use: call it only when they ask you to switch to another conversation, at a finished break (never mid-merge, mid-push or mid-task), with your notes written first. Stop Monitor tasks first. A wake-up pending from wake_after holds the switch: cancel it (cancel_wake) or wait for it; wake-ups of any other kind are dropped by the switch, so set them again in the conversation switched to if they are still needed.",
+  "For the person's own use: call it only when they ask you to switch to another conversation, at a finished break (never mid-merge, mid-push or mid-task), with your notes written first. Stop Monitor tasks first. A wake-up pending from wake_after holds the switch: cancel it (cancel_wake) or wait for it. A session cron (CronCreate, /loop, ScheduleWakeup) holds a switch that ends this process (to a slot, a tab or a window): delete it (CronDelete) first. Wake-ups of any other kind are dropped by the switch, so set them again in the conversation switched to if they are still needed.",
   'Where the coordinator runs, switches come from it: this tool refuses there.',
   '`reason` and `notes` (where your notes are) are required; both are recorded in this conversation and in the one resumed. `resume` is the message that starts the resumed conversation\'s first turn.',
   'Before anything runs it checks, and refuses saying why: when `to` is open, or may be open, anywhere on this machine; when anything still runs under this session (subagents, background Bash or Monitor jobs, git, builds, dev servers, a heavy slot); when an in-place switch would leave changes made since this conversation started uncommitted in the checkout both share; when a worktree named in `trees`, or the one this session works in, has uncommitted changes; within 2 minutes of a switch. Windows only, in a terminal.',
@@ -213,6 +223,8 @@ let startFolder: string | undefined
  * yet. A `/clear` carries the S11 baseline of this conversation to the one it starts.
  */
 let current: string | undefined
+/** Whether `current` was named by a classic SessionStart (else by a session.start, from `$.session.id()`). */
+let currentFromEvent = false
 /** The registry keys not in REGISTRY_KEYS already logged by this process: each is logged once. */
 const seenKeys = new Set<string>()
 /** When old heartbeats were last looked for. */
@@ -290,10 +302,50 @@ async function sessionId($: EngineInterface): Promise<string | undefined> {
   }
 }
 
+/**
+ * Why the conversation this process holds is unclear now, or undefined when it isn't: `$.session.id()`
+ * reads `own`, but the last main-loop SessionStart named another (`current`, the event's own id, which
+ * self-wake keys its markers by). Right after an in-place move the id lags its event; a switch then
+ * would read another conversation's wake marker and write another's exit record, so it waits.
+ */
+function idsDisagree(own: string): string | undefined {
+  if (current === undefined || current === own) return undefined
+  return `this session's id reads ${own}, but its last SessionStart named ${current}: it is moving between conversations, so which one it would leave is unclear`
+}
+
+/**
+ * Writes `{"v":1,"cancelled":true}` over a ticket or a slot's record at `path`, read first, only while it
+ * is still this launch's (`ours`): nothing there (a run that wrote nothing), or one a newer launch wrote,
+ * is left as it is. A plugin can't delete a file; one left is honoured only within 120 seconds, and
+ * only with its claim, which the caller releases.
+ */
+async function withdrawIfOurs($: EngineInterface, path: string | undefined, ours: (raw: Record<string, unknown>) => boolean): Promise<void> {
+  if (path === undefined) return
+  try {
+    const text = await $.fs.read(path)
+    if (typeof text !== 'string') return
+    const raw: unknown = JSON.parse(text.charCodeAt(0) === 0xfeff ? text.slice(1) : text)
+    if (!isRecord(raw) || !ours(raw)) return
+    await $.fs.write(path, JSON.stringify({ v: 1, cancelled: true }))
+  } catch {
+    // Not there, or not of its shape: nothing of this launch's to take back.
+  }
+}
+
+/**
+ * Takes back the exit record this process wrote for conversation `id` right before an /exit that then
+ * didn't end it: written over as withdrawn (`{"v":1,"cancelled":true}`, which reads as not of its shape
+ * and waives nothing), read first, only while it is still that record (how `exit`, this process). Else
+ * a later /exit typed by hand within 10 minutes could pass for the switch's.
+ */
+async function withdrawLeft($: EngineInterface, state: string, id: string, leaving: ProcessRef): Promise<void> {
+  await withdrawIfOurs($, leftPath(state, id), raw => raw.how === 'exit' && raw.id === id && raw.pid === String(leaving.pid) && raw.created === leaving.created)
+}
+
 /** The agents still to report, by their task's description; undefined when the list can't be read. */
 async function busyAgents($: EngineInterface): Promise<string[] | undefined> {
   try {
-    return (await $.agent.list()).filter(a => BUSY_AGENTS.includes(a.status)).map(a => (a.description.trim() === '' ? a.type : a.description))
+    return (await $.agent.list()).filter(a => isBusyAgent(a.status)).map(a => (a.description.trim() === '' ? a.type : a.description))
   } catch {
     return undefined
   }
@@ -694,7 +746,7 @@ async function placeLaunch($: EngineInterface, input: LaunchInput, cwd: string):
     return { said: `the launch can't be made: ${why(err)}`, unclean: false }
   }
   try {
-    const run = await $.process.run(call.argv, { stdin: call.stdin, cwd, timeoutMs: LAUNCH_MS })
+    const run = await $.process.run(call.argv, { stdin: call.stdin, cwd, timeoutMs: LAUNCH_RUN_MS })
     const answer = parseLaunch(run.stdout)
     if (run.exitCode === 0 && 'launched' in answer) return undefined
     const said = 'refused' in answer ? answer.refused.why : brief(`${run.stdout} ${run.stderr}`)
@@ -854,6 +906,10 @@ async function switchNow($: EngineInterface, value: Queued): Promise<void> {
   if ('refusal' in ctx) return notRun(ctx.refusal)
   const moved = movedOn(value, ctx.own)
   if (moved !== undefined) return movedAway($, value, moved)
+  // The conversation this switch leaves is the one the last SessionStart named, as self-wake keys its
+  // marker (S10w) and as the exit record names it: with `$.session.id()` reading another, it waits.
+  const torn = idsDisagree(ctx.own)
+  if (torn !== undefined) return notRun(torn)
   const gateSaid = (gated: string): string => (gated === COORDINATED ? 'the coordinator runs switches in this session; ask the merger or the owner for a wrap-up' : gated)
   const gated = await gateRefusal($, ctx.state, ctx.own, await $.clock.now())
   if (gated !== undefined) return notRun(gateSaid(gated))
@@ -953,6 +1009,13 @@ async function switchNow($: EngineInterface, value: Queued): Promise<void> {
   const own: ProcessRef | undefined = found.session === null ? undefined : { pid: found.session.pid, created: found.session.created }
   // A tab with a token that a new window is used instead of: why, for the log.
   const tabPassed = pick.transport !== 'window' || tab === undefined ? undefined : 'why' in tab ? tab.why : (tabNoLeft ?? paneFallback(found, tab.pane) ?? paneReads(tab.pane, ctx.configDirs.length))
+  // A move that ends this process (a slot, a tab, a window) ends its session crons with it (CronCreate,
+  // /loop, ScheduleWakeup), and its /exit would stop to ask about one: it holds on one, or on crons
+  // that can't be read (the shared reader, CronList, as self-exit's and self-restart's pre-check).
+  if (pick.transport !== 'in-place') {
+    const crons = exitBlockers({ crons: await readCrons($), agents: [] })
+    if (crons.length > 0) return held(`this switch ends this process, and with it the session's crons: ${blockersText(crons)}`)
+  }
   // S11: the start folder (in place: the next conversation works in it) against its baseline; the named
   // worktrees, and the session's own folder when it is another tree, always.
   const git = await readGit($, { start: ctx.folder, trees: value.trees ?? [], cwd: ctx.cwd, folders: [ctx.cwd], dirty: pick.transport === 'in-place' })
@@ -975,15 +1038,13 @@ async function switchNow($: EngineInterface, value: Queued): Promise<void> {
   }
   await tellModel($, leaving(ctx.own, value, at, fallback))
   await keepTicket($, to, ticket)
-  /** The ticket or the slot's record written over as withdrawn: a plugin can't delete a file. */
-  const withdraw = async (record: string | undefined): Promise<void> => {
-    if (record === undefined) return
-    try {
-      await $.fs.write(record, JSON.stringify({ v: 1, cancelled: true }))
-    } catch {
-      // A record left there is honoured only within 120 seconds, and only with the claim, which is released now.
-    }
-  }
+  /**
+   * The ticket or the slot's record written over as withdrawn, only while it is this switch's: a ticket
+   * naming this launch's claim, a slot's record resuming `to`. One a newer launch wrote is kept.
+   */
+  const withdraw = (record: string | undefined): Promise<void> => withdrawIfOurs($, record, raw => (pick.transport === 'pane' ? raw.by === named : raw.resume === to))
+  /** Whether this switch wrote its exit record (right before its /exit): taken back with the rest. */
+  let wroteLeft = false
   /**
    * Takes it all back: the lock, the ticket, the slot's record; says the switch didn't happen. After a
    * launch that failed (`again`), once more LAUNCH_RETRY_MS later: a run killed at its timeout may still
@@ -994,6 +1055,7 @@ async function switchNow($: EngineInterface, value: Queued): Promise<void> {
   const undo = async (said: string, record?: string, again = false): Promise<void> => {
     if (armed === value) armed = undefined
     await withdraw(record)
+    if (wroteLeft && own !== undefined) await withdrawLeft($, ctx.state, ctx.own, own)
     await free()
     await keepTicket($, to, null)
     if (again) {
@@ -1014,6 +1076,10 @@ async function switchNow($: EngineInterface, value: Queued): Promise<void> {
     const still = await claimStill($, ctx, to, by, left)
     if (still !== undefined) return undo(still)
     if (armed !== value) return undo('a new turn started')
+    // S10w once more, right before the command: a wake-up set in the turn that queued the switch is
+    // marked by self-wake as that turn ends, which nothing orders before the first read.
+    const wakeNow = wakeHold(await readWake($, ctx.state, ctx.own))
+    if (wakeNow !== undefined) return undo(wakeNow)
     await noteRecent($, ctx.own)
     $.ui.log(`Switching in place to ${to}: ${value.reason}`)
     // Taken back right before the command, after the last wait: a turn that starts up to here stops it.
@@ -1070,13 +1136,17 @@ async function switchNow($: EngineInterface, value: Queued): Promise<void> {
     const failed = await placeLaunch($, { ...base, where: { window: true }, ...(left === undefined ? {} : { left }) }, pick.folder)
     if (failed !== undefined) return undo(`no window opened (${failed.said})`, undefined, failed.unclean)
   }
-  // Right before the exit: a turn that started meanwhile, or a subagent, stops it; the released claim
-  // then turns away the window or the slot.
-  const late = armed !== value ? 'a new turn started' : blocked(await busyAgents($))
+  // Right before the exit: a turn that started meanwhile, a subagent, or a wake-up marked since the
+  // first read (S10w again: one set in the same turn as the switch is marked as that turn ends, which
+  // nothing orders before the first read) stops it; the released claim then turns away the window or
+  // the slot.
+  const late = armed !== value ? 'a new turn started' : (blocked(await busyAgents($)) ?? wakeHold(await readWake($, ctx.state, ctx.own)))
   if (late !== undefined) return undo(late, record)
   // The left record of this conversation, how: exit, written by the leaving side right before its
   // /exit: the conversation switched back to soon after reads not live once this process has gone.
+  // Taken back (undo) if the exit then doesn't run.
   await writeLeft($, ctx.own, 'exit', own)
+  wroteLeft = true
   await noteRecent($, ctx.own)
   const where =
     pick.transport === 'slot'
@@ -1144,7 +1214,9 @@ export const register: Register = (on, options) => {
     const { value: first } = await $.state.get(folderKey)
     if (typeof first !== 'string' || first === '') await $.state.set(folderKey, e.cwd)
     startFolder = typeof first === 'string' && first !== '' ? first : e.cwd
-    if (current === undefined) {
+    // Unknown, or known only from an earlier start: a new session in the same load (a /clear, a
+    // resume) starts with its own id. One a SessionStart named stands: `$.session.id()` may lag it.
+    if (current === undefined || !currentFromEvent) {
       const own = await sessionId($)
       if (own !== undefined && SESSION_ID.test(own)) current = own
     }
@@ -1193,7 +1265,10 @@ export const register: Register = (on, options) => {
     const id = e.session_id
     // The conversation this process held until now, and the one it holds from here, by the event's id.
     const previous = current
-    if (e.agent_id === undefined && typeof id === 'string' && SESSION_ID.test(id)) current = id
+    if (e.agent_id === undefined && typeof id === 'string' && SESSION_ID.test(id)) {
+      current = id
+      currentFromEvent = true
+    }
     if (e.agent_id !== undefined || (e.source !== 'resume' && e.source !== 'startup' && e.source !== 'clear')) return done
     if (typeof id !== 'string' || !SESSION_ID.test(id)) return done
     // In place (a /resume or /clear, this plugin's switch or one the person typed): this process left
@@ -1236,6 +1311,8 @@ export const register: Register = (on, options) => {
       return { deny: "Not queued: this session's id can't be read, so the switch can't be tied to this conversation. Try again; if it persists, switch by hand." }
     }
     if (own === to) return { deny: `This session is already conversation ${to}.` }
+    const torn = idsDisagree(own)
+    if (torn !== undefined) return { deny: `Not queued: ${torn}. Try again in a moment.` }
     const stop = blocked(await busyAgents($))
     if (stop !== undefined) return { deny: `Not queued: ${stop}. Wait for them to report, or stop them, then call again.` }
     // S10w at the call: a pending wake-up, or one whose state can't be read, holds the switch.
@@ -1261,7 +1338,7 @@ export const register: Register = (on, options) => {
     await $.state.set(queued, resume === undefined ? asked : { ...asked, resume })
     $.ui.status('switch queued for when this turn ends')
     return {
-      result: `Queued. Once this turn ends, this terminal switches to conversation ${to}: this conversation ends here, untouched, and ${to} resumes in this process, in this pane's slot, in this tab (when Claude Code was started through the claude wrapper), or in a new window, whichever applies. First the plugin checks that ${to} is open nowhere on this machine and that nothing runs under this session; if anything is, nothing moves and you are told on your next turn. If this pane runs a slot that can't be used, the switch says why, in the leaving row, a toast and the arrival, and a new window opens. A wake-up set with wake_after holds the switch until it is cancelled or has fired; other pending wake-ups are dropped by the switch: set them again in ${to} if they are still needed. Reason: ${quoted(reason)}. Notes: ${quoted(notes)}.`,
+      result: `Queued. Once this turn ends, this terminal switches to conversation ${to}: this conversation ends here, untouched, and ${to} resumes in this process, in this pane's slot, in this tab (when Claude Code was started through the claude wrapper), or in a new window, whichever applies. First the plugin checks that ${to} is open nowhere on this machine and that nothing runs under this session; if anything is, nothing moves and you are told on your next turn. If this pane runs a slot that can't be used, the switch says why, in the leaving row, a toast and the arrival, and a new window opens. A wake-up set with wake_after holds the switch until it is cancelled or has fired, and a session cron (CronCreate, /loop, ScheduleWakeup) holds one that ends this process until it is deleted; other pending wake-ups are dropped by the switch: set them again in ${to} if they are still needed. Reason: ${quoted(reason)}. Notes: ${quoted(notes)}.`,
     }
   }).catch(($, e, next) => (next.called ? next(e) : { deny: 'self-switch: queuing the switch failed; nothing is queued.' }))
 

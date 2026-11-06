@@ -1,7 +1,8 @@
 // Embeds plugins/self-switch/slot/claude-launch.ps1 in shared/hooks/machine.ts as LAUNCH_SCRIPT_TEXT
-// (one JSON string per line, right after launchScriptPath), replacing the copy there, and prints the
-// script's SHA-256 for LAUNCH_SCRIPT_SHA256. Run after any edit to the script, then
-// `node scripts/sync-shared.mjs`; scripts/claude-launch.test.mjs holds the three equal.
+// (one JSON string per line, right after launchHandPath), replacing the copy there, and writes the
+// script's SHA-256 into LAUNCH_SCRIPT_SHA256 and its version line (`# claude-launch version <n>`) into
+// LAUNCH_SCRIPT_VERSION. Run after any edit to the script, with its version line one higher, then
+// `node scripts/sync-shared.mjs`; scripts/claude-launch.test.mjs holds the four equal.
 import { createHash } from 'node:crypto'
 import { readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
@@ -9,10 +10,13 @@ import { ROOT } from './sync-shared.mjs'
 
 const ps1 = readFileSync(join(ROOT, 'plugins', 'self-switch', 'slot', 'claude-launch.ps1'), 'utf8')
 if (/[^\x00-\x7f]/.test(ps1) || ps1.includes('\r')) throw new Error('claude-launch.ps1 must be ASCII with LF line ends')
+const version = /^# claude-launch version (\d{1,6})$/m.exec(ps1)?.[1]
+if (version === undefined) throw new Error('claude-launch.ps1 has no `# claude-launch version <n>` line')
+const sha = createHash('sha256').update(ps1).digest('hex')
 const file = join(ROOT, 'shared', 'hooks', 'machine.ts')
 let text = readFileSync(file, 'utf8')
-const anchor = "export const launchScriptPath = (state: string): string => `${state}\\\\claude-launch.ps1`\n"
-if (!text.includes(anchor)) throw new Error('launchScriptPath is not where this script expects it')
+const anchor = "export const launchHandPath = (state: string): string => `${state}\\\\claude-launch.ps1`\n"
+if (!text.includes(anchor)) throw new Error('launchHandPath is not where this script expects it')
 const head = '\n/** claude-launch.ps1 as this release ships it'
 const tail = "].join('\\n')\n"
 const begin = text.indexOf(head)
@@ -25,6 +29,12 @@ const block = [
   "].join('\\n')",
   '',
 ].join('\n')
-text = text.replace(anchor, anchor + block)
+// Functions, never strings, as the replacements: the script's text holds `$'` and the like, which a
+// replacement string would read as patterns.
+text = text.replace(anchor, () => anchor + block)
+const shaLine = /^export const LAUNCH_SCRIPT_SHA256 = '[0-9a-f]{64}'$/m
+const versionLine = /^export const LAUNCH_SCRIPT_VERSION = \d{1,6}$/m
+if (!shaLine.test(text) || !versionLine.test(text)) throw new Error('LAUNCH_SCRIPT_SHA256 or LAUNCH_SCRIPT_VERSION is not where this script expects it')
+text = text.replace(shaLine, () => `export const LAUNCH_SCRIPT_SHA256 = '${sha}'`).replace(versionLine, () => `export const LAUNCH_SCRIPT_VERSION = ${version}`)
 writeFileSync(file, text)
-console.log(`LAUNCH_SCRIPT_TEXT embedded; LAUNCH_SCRIPT_SHA256 = '${createHash('sha256').update(ps1).digest('hex')}'`)
+console.log(`LAUNCH_SCRIPT_TEXT embedded; LAUNCH_SCRIPT_SHA256 = '${sha}'; LAUNCH_SCRIPT_VERSION = ${version}`)

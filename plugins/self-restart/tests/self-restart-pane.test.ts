@@ -6,7 +6,7 @@
 import { expect, mock, test } from 'claude-code/testing'
 import type { On } from 'claude-code'
 import { launchScriptText } from '../hooks/launcher'
-import { checkPaneTicket, type LaunchInput, panePath, quoted } from '../hooks/machine'
+import { checkPaneTicket, type LaunchInput, panePath, paneTicketPath, quoted, SLOT_SCRIPT_SHA256, slotRecordPath } from '../hooks/machine'
 
 const TOOL = 'mcp__self-restart__restart_after_turn'
 const HOUR = 60 * 60 * 1000
@@ -52,14 +52,17 @@ type Options = {
   pane?: string | null
   /** What the probe answers. */
   probe?: string
-  /** What the pane script does: writes the ticket, finds the claim held, or fails after taking it. */
-  paneScript?: 'writes' | 'held' | 'fails'
+  /** What the pane script does: writes the ticket, finds the claim held, fails after taking it, or fails after writing the ticket too. */
+  paneScript?: 'writes' | 'held' | 'fails' | 'wrote-fails'
   /** The session's crons, as CronList lists them. */
   crons?: readonly { readonly id: string; readonly humanSchedule?: string }[]
   /** What /exit does. */
   exit?: 'exits' | 'refused'
-  /** What the launcher leaves: a window (`launched`) or this pane's slot a record (`slot`). */
-  launcher?: 'window' | 'slot'
+  /**
+   * What the launcher leaves: a window (`launched`) or this pane's slot a record (`slot`); or its run
+   * times out after writing this pane's slot a record (`slot-late`: `$.process.run` throws, no answer).
+   */
+  launcher?: 'window' | 'slot' | 'slot-late'
   /** A subagent starts while the pane script or the launcher runs: the restart stops right before its exit. */
   agentDuring?: boolean
 }
@@ -78,6 +81,8 @@ function engine(on: On, { token = TOKEN, pane = PANE, probe = probeOf(), paneScr
   const toasts: string[] = []
   const logs: string[] = []
   const writes: { path: string; text: string }[] = []
+  /** The files the scripts wrote, and the plugin wrote over: what fs.read finds. */
+  const files = new Map<string, string>()
   const held = new Map<string, unknown>()
   const world = { probe }
   const clock = mock.clock(on, { now: 1_000_000 })
@@ -87,9 +92,10 @@ function engine(on: On, { token = TOKEN, pane = PANE, probe = probeOf(), paneScr
   on('tool.call', { tool: 'CronList' }, (_, e) =>
     ('input' in e ? { isError: true, result: 'InputValidationError', text: 'InputValidationError' } : { result: { jobs: crons }, text: `${crons.length} scheduled jobs.` }) as never,
   )
-  on('fs.read', (_, e) => (e.path === panePath(STATE, TOKEN) && pane !== null ? { value: pane } : { deny: `ENOENT: ${e.path}` }))
+  on('fs.read', (_, e) => (files.has(e.path) ? { value: files.get(e.path) as string } : e.path === panePath(STATE, TOKEN) && pane !== null ? { value: pane } : { deny: `ENOENT: ${e.path}` }))
   on('fs.write', (_, e) => {
     writes.push({ path: e.path, text: e.text })
+    files.set(e.path, e.text)
     return { value: undefined }
   })
   on('store.get', (_, e) => ({ value: held.get(e.key) }))
@@ -134,9 +140,18 @@ function engine(on: On, { token = TOKEN, pane = PANE, probe = probeOf(), paneScr
     if (agentDuring) agents.push({ id: 'a1', type: 'general-purpose', description: 'Lint', status: 'running' })
     // The launch takes the claim its script names, and says so, as it does on the machine.
     const by = /^\$by = '(launch:[0-9a-f-]{36})'$/m.exec(script)?.[1] ?? 'none'
+    if (kind === 'launcher' && launcher === 'slot-late') {
+      // The record went in, then the run was killed at its timeout: no answer at all.
+      files.set(slotRecordPath(STATE, SLOT), JSON.stringify({ v: 1, resume: ID, folder: REPO, at: AT, configDirs: ['C:\\Users\\u\\.claude'] }))
+      return { deny: 'the process timed out after 30000 ms' }
+    }
     if (kind === 'launcher') return ok(launcher === 'slot' ? `claim slot:${SLOT}\r\nlaunched slot ${SLOT}\r\n` : `claim ${by}\r\nlaunched window - 17716\r\n`)
     if (answer === 'held') return ok('refused claim self-restart: another switch, restart or launch holds the claim on this conversation\r\n')
     if (answer === 'fails') return ok(`claim ${by}\r\n`, 1)
+    if (answer === 'wrote-fails') {
+      files.set(paneTicketPath(STATE, TOKEN) ?? '', /^\s*\$text = '(\{.+\})'$/m.exec(script)?.[1] ?? '')
+      return ok(`claim ${by}\r\n`, 1)
+    }
     return ok(`claim ${by}\r\nlaunched pane ${TOKEN}\r\n`)
   })
   on('command.run', async (_, e, next) => {
@@ -147,7 +162,7 @@ function engine(on: On, { token = TOKEN, pane = PANE, probe = probeOf(), paneScr
   })
   /** The rows the model reads, as text. */
   const rows = () => session.appended().flatMap(row => ((row as { message?: { content?: { text?: unknown }[] } }).message?.content ?? []).map(block => String(block.text)))
-  return { scripts, kinds, described, commands, toasts, logs, writes, held, world, clock, session, rows, prompts }
+  return { scripts, kinds, described, commands, toasts, logs, writes, files, held, world, clock, session, rows, prompts }
 }
 
 const start = { cwd: REPO, surface: 'terminal', isInteractive: true } as const
@@ -280,8 +295,8 @@ test('the claim held by another switch or restart: no ticket, nothing exits, and
   expect(held.get('restarts')).toEqual({})
 })
 
-test("a ticket that isn't written after the claim was taken: the claim is given back at once, and nothing exits", async ($, on) => {
-  const { kinds, scripts, commands, clock } = engine(on, { paneScript: 'fails' })
+test("a ticket that isn't written after the claim was taken: the claim is given back at once, nothing exits, and no withdrawn ticket is left where none was written (N3)", async ($, on) => {
+  const { kinds, scripts, commands, writes, clock } = engine(on, { paneScript: 'fails' })
   await $.session.start(start)
   await $.tool.call({ tool: TOOL, reason: 'Switched accounts.' })
   await $.turn.complete(answered)
@@ -289,6 +304,40 @@ test("a ticket that isn't written after the claim was taken: the claim is given 
   expect(kinds).toEqual(['pane', 'release'])
   expect(scripts[1]).toContain(`$lock.by -cne '${claimOf(scripts[0])}'`)
   expect(commands).toEqual([])
+  // The next /exit typed in this tab would otherwise be told its ticket was withdrawn.
+  await clock.advance(4000)
+  expect(writes.filter(w => w.path === paneTicketPath(STATE, TOKEN))).toEqual([])
+})
+
+test('a ticket written by a run that then gave no clean answer: written over as withdrawn, being this launch\'s (N3)', async ($, on) => {
+  const { kinds, writes, clock } = engine(on, { paneScript: 'wrote-fails' })
+  await $.session.start(start)
+  await $.tool.call({ tool: TOOL, reason: 'Switched accounts.' })
+  await $.turn.complete(answered)
+  await clock.advance(1000)
+  expect(kinds).toEqual(['pane', 'release'])
+  expect(writes.filter(w => w.path === paneTicketPath(STATE, TOKEN))).toEqual([{ path: paneTicketPath(STATE, TOKEN), text: '{"v":1,"cancelled":true}' }])
+})
+
+test("an 'auto' run that timed out after this pane's slot was verified: the slot's record written over as withdrawn, and the slot's claim released with this launch's (N4)", async ($, on) => {
+  const slotted = probeOf().replace(
+    '"slot":null',
+    `"slot":${JSON.stringify({ pid: 20, created: SHELL_STARTED, id: SLOT, path: 'C:\\Users\\u\\AppData\\Local\\claude-self-tools\\claude-slot.ps1', sha256: SLOT_SCRIPT_SHA256 })}`,
+  )
+  const { kinds, scripts, writes, commands, clock } = engine(on, { token: '', probe: slotted, launcher: 'slot-late' })
+  await $.session.start(start)
+  await $.tool.call({ tool: TOOL, reason: 'Switched accounts.' })
+  await $.turn.complete(answered)
+  await clock.advance(1000)
+  expect(commands).toEqual([])
+  expect(kinds).toEqual(['launcher', 'release', 'release'])
+  expect(scripts[1]).toContain(`$lock.by -cne '${claimOf(scripts[0])}'`)
+  expect(scripts[2]).toContain(`$lock.by -cne 'slot:${SLOT}'`)
+  expect(writes.filter(w => w.path === slotRecordPath(STATE, SLOT))).toEqual([{ path: slotRecordPath(STATE, SLOT), text: '{"v":1,"cancelled":true}' }])
+  // Once more 3 s later: both claims again; the record, withdrawn already, is not written again.
+  await clock.advance(4000)
+  expect(kinds).toEqual(['launcher', 'release', 'release', 'release', 'release'])
+  expect(writes.filter(w => w.path === slotRecordPath(STATE, SLOT))).toHaveLength(1)
 })
 
 test('the full safe point holds first: a background job under the session, there by the time it is armed, writes no ticket and exits nothing', async ($, on) => {

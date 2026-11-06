@@ -16,7 +16,7 @@ import {
   probeScript,
   RECHECK,
 } from '../hooks/machine'
-import { entry, ft, LAUNCH, leftExit, machine, NOW, PROJECT, type RawProbe, T, W } from './fixtures'
+import { entry, ft, LAUNCH, leftExit, machine, NOW, PROJECT, type RawProbe, T, W, X } from './fixtures'
 
 const STATE = 'C:\\Users\\u\\AppData\\Local\\claude-self-tools'
 const CONFIG = 'C:\\Users\\u\\.claude'
@@ -156,6 +156,25 @@ describe("liveness's self: a lane restart's own conversation (\u00a77.4)", () =>
   test('an unknown is still unknown', () => {
     expect(liveness(own(p => p.procs.push({ pid: 903, ppid: 10, created: ft(7), name: 'claude.exe' })), W, NOW, { self: { pid: 100, created: ft(2) } }).verdict).toBe('unknown')
   })
+
+  test('a self whose own current registry entry names another conversation waives nothing: a fresh transcript of the id still reads live (S1-4)', () => {
+    // This process moved in place to X a minute ago; W, still on its command line, was written 30 s ago
+    // by a holder the probe doesn't see. L1 and L2 are clean; L3 must stand.
+    const moved = own(p => (p.registry = p.registry.map(r => (r.file === 100 ? entry(100, X, ft(2)) : r))))
+    const live = liveness(moved, W, NOW, { heartbeat: { at: NOW - 1000 }, self: { pid: 100, created: ft(2) } })
+    expect(live.verdict).toBe('live')
+    expect(live.evidence).toContain('L3: its transcript was written 30 s ago')
+    expect(live.evidence).toContain('L5: its heartbeat is 1 s old')
+    expect(live.evidence).toContain(`L3 and L5 are read: this process's own current registry entry (claude.exe 100) doesn't name ${W}, so it isn't known to be its own conversation`)
+    // Its own entry naming W: waived, as before.
+    expect(liveness(own(), W, NOW, { heartbeat: { at: NOW - 1000 }, self: { pid: 100, created: ft(2) } }).verdict).toBe('not-live')
+  })
+
+  test('a self the probe doesn\'t see running with that start waives nothing either (S1-4)', () => {
+    const live = liveness(own(), W, NOW, { self: { pid: 100, created: ft(9) } })
+    expect(live.evidence.some(line => line.startsWith('L3 and L5 are read: this process (claude.exe 100, started '))).toBe(true)
+    expect(live.evidence).toContain('L3: its transcript was written 30 s ago')
+  })
 })
 
 describe('the last look checks the record again (LR12)', () => {
@@ -190,8 +209,13 @@ describe('the scripts that write and read it, as text', () => {
   const write = leftScript({ stateDir: STATE, id: W, how: 'in-place', configDirs: [CONFIG], by: 'self-switch' })
   const read = probeScript({ ids: [W, T], configDirs: [CONFIG], stateDir: STATE, left: true })
 
-  test('LR14: left.key is created with CreateNew only, so a second creation never replaces it; 32 bytes from RandomNumberGenerator', () => {
-    expect(write).toContain('$keyStream = [IO.File]::Open($leftKeyPath, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)')
+  test('LR14: left.key is made whole under another name (CreateNew) and moved into place, which a key already there refuses: never replaced, never torn where it is read; 32 bytes from RandomNumberGenerator', () => {
+    expect(write).toContain('$keyStream = [IO.File]::Open($keyTmp, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)')
+    expect(write).toContain('    [IO.File]::Move($keyTmp, $leftKeyPath)')
+    expect(write.indexOf('$keyStream.Write($fresh, 0, 32); $keyStream.Flush($true)')).toBeLessThan(write.indexOf('[IO.File]::Move($keyTmp, $leftKeyPath)'))
+    expect(write).not.toMatch(/Replace\(\$keyTmp|Delete\(\$leftKeyPath/)
+    // A key of another length (one torn by an earlier version) is said, with how to start again (S1-11).
+    expect(write).toMatch(/'refused key the left key \(' \+ \$leftKeyPath \+ '\) can not be read as 32 bytes: .+delete it, and the next record makes a new one/)
     expect(write).toContain('$rng = [Security.Cryptography.RandomNumberGenerator]::Create(); try { $rng.GetBytes($fresh) }')
     expect(write).toContain('$fresh = New-Object byte[] 32')
     expect(write).not.toMatch(/FileMode\]::(Create|OpenOrCreate|Truncate)\b(?!New)/)

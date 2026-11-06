@@ -568,6 +568,13 @@ describe('the safe point', () => {
     })
   })
 
+  test('a subagent holds it until it has ended: idle (a teammate between turns), and a status this code does not know, hold too (S1-8)', () => {
+    expect(point(undefined, CLEAN, [{ status: 'idle', description: 'A teammate' }, { status: 'paused', description: 'A later status' }, { status: 'failed', description: 'Lint' }, { status: 'killed', description: 'Build' }])).toEqual({
+      verdict: 'hold',
+      reasons: ['S1: 2 subagents are still running (A teammate; A later status)'],
+    })
+  })
+
   test("anything that can't be read holds it, and says why", () => {
     expect(point(undefined, CLEAN, 'the agent list is not available')).toEqual({ verdict: 'hold', reasons: ["S1: the session's subagents can't be read (the agent list is not available)"] })
     expect(point(undefined, { isReadable: false, why: 'git status in C:\\work\\repo exited 128' })).toEqual({
@@ -1087,8 +1094,9 @@ describe('the scripts, as text', () => {
 
   test('no permission flag of any kind, in any script', () => {
     for (const script of [probe, restart, window, release]) for (const flag of PERMISSION_FLAGS) expect(script).not.toContain(flag)
-    // claude-launch.ps1 runs with -Resume and the id, -Dir and the folder, and nothing else.
-    for (const script of [restart, window]) expect(script.split(/\r?\n/).filter(line => line.includes('& $launchPath'))).toEqual(['& $launchPath -Resume $id -Dir $folder'])
+    // claude-launch.ps1 runs with -Resume and the id, -Dir and the folder, -ConfigDir and the config folders
+    // the launch read (its own last look reads them again), and nothing else.
+    for (const script of [restart, window]) expect(script.split(/\r?\n/).filter(line => line.includes('& $launchPath'))).toEqual(['  & $launchPath -Resume $id -Dir $folder -ConfigDir $configDirs'])
   })
 
   test('the release removes the lock only when it names the claimant', () => {

@@ -3,16 +3,17 @@
 // that key (LR14); leftReadScript checks the record's MAC inside the script and says only whether it
 // matched; a record changed on disk no longer matches (LR1); and the canary never reaches any output,
 // the record or an error (LR13). leftScript finds the claude.exe it runs under by walking up its
-// parents: run outside a Claude Code session, the live tests skip. Run with
-// `node --test "scripts/*.test.mjs"`.
+// parents: it runs here under the stub claude.exe (scripts/stub.mjs), as under Claude Code, so it finds
+// one in every run, and nothing is skipped. Run with `node --test "scripts/*.test.mjs"`.
 import assert from 'node:assert/strict'
 import { spawn } from 'node:child_process'
 import { randomBytes, randomUUID } from 'node:crypto'
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { after, before, describe, test } from 'node:test'
 import { pathToFileURL } from 'node:url'
+import { compileStub, underStub } from './stub.mjs'
 import { ROOT } from './sync-shared.mjs'
 
 const machine = await import(pathToFileURL(join(ROOT, 'shared', 'hooks', 'machine.ts')).href)
@@ -20,9 +21,12 @@ const isWindows = process.platform === 'win32'
 const POWERSHELL = `${process.env.SystemRoot ?? 'C:\\Windows'}\\System32\\WindowsPowerShell\\v1.0\\powershell.exe`
 
 let work
+let stub
 
 before(() => {
-  if (isWindows) work = mkdtempSync(join(tmpdir(), 'left-record-test-'))
+  if (!isWindows) return
+  work = mkdtempSync(join(tmpdir(), 'left-record-test-'))
+  stub = compileStub(work)
 })
 
 after(() => {
@@ -47,6 +51,13 @@ function run(script) {
   })
 }
 
+/** leftScript run as self-switch runs it, under its session's claude.exe: here the stub's. Output and errors both kept. */
+async function write(script) {
+  const ran = await underStub({ stub, work, env: { ...process.env, LOCALAPPDATA: join(work, 'local'), USERPROFILE: join(work, 'home') }, script })
+  assert.ok(!ran.stdout.includes('refused session'), 'the stub is the claude.exe above the script')
+  return { code: 0, stdout: ran.stdout, stderr: ran.stderr }
+}
+
 /** A state folder, a config folder with conversation `id`'s transcript, and the canary key in place. */
 function lab() {
   const root = mkdtempSync(join(work, 'run-'))
@@ -67,12 +78,11 @@ function lab() {
 const canaryForms = key => [key.toString('hex'), key.toString('hex').toUpperCase(), key.toString('base64'), [...key].join(' '), [...key].join(','), [...key].map(b => b.toString(16).padStart(2, '0')).join('-').toUpperCase()]
 
 describe('the left record, written and read for real', { skip: !isWindows && 'Windows only', concurrency: false }, () => {
-  test('written under the key in place, which it never replaces (LR14); read back with its MAC matched; the key nowhere in any output (LR13)', async t => {
+  test('written under the key in place, which it never replaces (LR14); read back with its MAC matched; the key nowhere in any output (LR13)', async () => {
     const dirs = lab()
-    const write = await run(machine.leftScript({ stateDir: dirs.state, id: dirs.id, how: 'exit', configDirs: [dirs.config], by: 'self-switch' }))
-    if (write.stdout.includes('refused session')) return t.skip('no claude.exe above this test: run it under a Claude Code session')
-    assert.equal(write.code, 0, write.stderr)
-    assert.equal(machine.LEFT_WRITTEN.exec(write.stdout)?.[1], dirs.id, write.stdout)
+    const written = await write(machine.leftScript({ stateDir: dirs.state, id: dirs.id, how: 'exit', configDirs: [dirs.config], by: 'self-switch' }))
+    assert.equal(written.code, 0, written.stderr)
+    assert.equal(machine.LEFT_WRITTEN.exec(written.stdout)?.[1], dirs.id, written.stdout)
     // The key is the canary still: CreateNew found it there and left it.
     assert.deepEqual(readFileSync(join(dirs.state, 'left.key')), dirs.key)
     const recordText = readFileSync(join(dirs.state, 'left', `${dirs.id}.json`), 'utf8')
@@ -100,21 +110,20 @@ describe('the left record, written and read for real', { skip: !isWindows && 'Wi
     assert.equal(entry.transcript.size, '{"type":"user"}\n'.length)
 
     for (const form of canaryForms(dirs.key)) {
-      for (const [name, text] of [['the writer\'s output', write.stdout + write.stderr], ['the reader\'s output', read.stdout + read.stderr], ['the record', recordText]]) {
+      for (const [name, text] of [['the writer\'s output', written.stdout + written.stderr], ['the reader\'s output', read.stdout + read.stderr], ['the record', recordText]]) {
         assert.ok(!text.includes(form), `the canary key reached ${name}`)
       }
     }
 
     // A second record: the key stays the canary (LR14, a second creation never replaces it).
-    const again = await run(machine.leftScript({ stateDir: dirs.state, id: dirs.id, how: 'in-place', configDirs: [dirs.config], by: 'self-switch' }))
+    const again = await write(machine.leftScript({ stateDir: dirs.state, id: dirs.id, how: 'in-place', configDirs: [dirs.config], by: 'self-switch' }))
     assert.equal(again.code, 0, again.stderr)
     assert.deepEqual(readFileSync(join(dirs.state, 'left.key')), dirs.key)
   })
 
-  test('a record changed on disk no longer matches its MAC (LR1); one under another key neither; no key at all: none matches', async t => {
+  test('a record changed on disk no longer matches its MAC (LR1); one under another key neither; no key at all: none matches', async () => {
     const dirs = lab()
-    const write = await run(machine.leftScript({ stateDir: dirs.state, id: dirs.id, how: 'exit', configDirs: [dirs.config], by: 'self-switch' }))
-    if (write.stdout.includes('refused session')) return t.skip('no claude.exe above this test: run it under a Claude Code session')
+    const written = await write(machine.leftScript({ stateDir: dirs.state, id: dirs.id, how: 'exit', configDirs: [dirs.config], by: 'self-switch' }))
     const path = join(dirs.state, 'left', `${dirs.id}.json`)
     const record = JSON.parse(readFileSync(path, 'utf8'))
     const readOne = async () => {
@@ -140,16 +149,33 @@ describe('the left record, written and read for real', { skip: !isWindows && 'Wi
     assert.deepEqual(await readOne(), { asked: dirs.id, ok: false })
   })
 
-  test('no transcript of it, or two: nothing written', async t => {
+  test('no transcript of it, or two: nothing written', async () => {
     const dirs = lab()
     const second = join(dirs.root, 'config2')
     mkdirSync(join(second, 'projects', 'C--elsewhere'), { recursive: true })
     writeFileSync(join(second, 'projects', 'C--elsewhere', `${dirs.id}.jsonl`), '')
-    const two = await run(machine.leftScript({ stateDir: dirs.state, id: dirs.id, how: 'exit', configDirs: [dirs.config, second], by: 'self-switch' }))
-    if (two.stdout.includes('refused session')) return t.skip('no claude.exe above this test: run it under a Claude Code session')
+    const two = await write(machine.leftScript({ stateDir: dirs.state, id: dirs.id, how: 'exit', configDirs: [dirs.config, second], by: 'self-switch' }))
     assert.match(two.stdout, /refused transcript 2 transcripts of it are on this machine, not one/)
     assert.ok(!existsSync(join(dirs.state, 'left', `${dirs.id}.json`)))
-    const none = await run(machine.leftScript({ stateDir: dirs.state, id: randomUUID(), how: 'exit', configDirs: [dirs.config], by: 'self-switch' }))
+    const none = await write(machine.leftScript({ stateDir: dirs.state, id: randomUUID(), how: 'exit', configDirs: [dirs.config], by: 'self-switch' }))
     assert.match(none.stdout, /refused transcript 0 transcripts/)
+  })
+
+  test('no key yet: one is made, 32 bytes, whole under another name and moved in; nothing else left (S1-11)', async () => {
+    const dirs = lab()
+    rmSync(join(dirs.state, 'left.key'))
+    const written = await write(machine.leftScript({ stateDir: dirs.state, id: dirs.id, how: 'exit', configDirs: [dirs.config], by: 'self-switch' }))
+    assert.equal(machine.LEFT_WRITTEN.exec(written.stdout)?.[1], dirs.id, written.stdout + written.stderr)
+    assert.equal(readFileSync(join(dirs.state, 'left.key')).length, 32)
+    assert.deepEqual(readdirSync(dirs.state).filter(name => name.endsWith('.tmp')), [])
+  })
+
+  test('a key cut short when it was made: refused, saying to delete it, and never replaced (S1-11)', async () => {
+    const dirs = lab()
+    writeFileSync(join(dirs.state, 'left.key'), randomBytes(16))
+    const written = await write(machine.leftScript({ stateDir: dirs.state, id: dirs.id, how: 'exit', configDirs: [dirs.config], by: 'self-switch' }))
+    assert.match(written.stdout, /refused key the left key \(.+left\.key\) can not be read as 32 bytes: .+delete it, and the next record makes a new one/)
+    assert.equal(readFileSync(join(dirs.state, 'left.key')).length, 16)
+    assert.ok(!existsSync(join(dirs.state, 'left', `${dirs.id}.json`)))
   })
 })

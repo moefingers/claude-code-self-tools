@@ -98,10 +98,19 @@ function innerOf(script) {
   return script.slice(start, i).split("''").join("'")
 }
 
-test("the window's own command line: the inner script GZip-compressed in a fixed unpacking bootstrap, under 24,000 characters", () => {
-  for (const [name, script] of [["a switch's window", window], ["self-restart's window", restart]]) {
+test("the window's own command line, every argument Start-Process gives it: the inner script GZip-compressed in a fixed unpacking bootstrap, under 24,000 characters", () => {
+  for (const [name, script, runs] of [
+    ["a switch's window", window, '& $launchPath -Resume $id -Dir $folder -ConfigDir $configDirs'],
+    ["self-restart's window", restart, '& $launchPath -Resume $id -Dir $folder -ConfigDir $configDirs'],
+    ['a start, its name the longest', start, '& $launchPath -Start $id -Name $name -Dir $folder -ConfigDir $configDirs'],
+  ]) {
     const inner = innerOf(script)
-    assert.ok(inner.includes(`$id = '${T}'`) && inner.includes('& $launchPath -Resume $id -Dir $folder'), `${name}: the inner script`)
+    assert.ok(inner.includes(`$id = '${T}'`) && inner.includes(runs), `${name}: the inner script`)
+    // The arguments as Start-Process passes them, read off its own line (-ExecutionPolicy among them).
+    const given = /-ArgumentList ((?:'[^']*', )+)\$encoded -PassThru/.exec(script)?.[1]
+    assert.ok(given !== undefined, `${name}: the Start-Process line`)
+    const args = given.split(', ').filter(Boolean).map(arg => arg.slice(1, -1))
+    assert.deepEqual(args, ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-EncodedCommand'], name)
     // The window is started with the unpacking bootstrap, never the inner script itself.
     assert.ok(script.includes('$encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($unpack))'), name)
     const unpackLine = script
@@ -112,10 +121,19 @@ test("the window's own command line: the inner script GZip-compressed in a fixed
     const payload = gzipSync(Buffer.from(inner, 'utf8')).toString('base64')
     const unpack = unpackLine.slice('$unpack = "'.length, -1).replace('$payload', payload)
     const encoded = Buffer.from(unpack, 'utf16le').toString('base64')
-    const length = commandLine([`C:${B}Windows${B}System32${B}WindowsPowerShell${B}v1.0${B}powershell.exe`, '-NoProfile', '-EncodedCommand', encoded]).length
+    const length = commandLine([POWERSHELL, ...args, encoded]).length
     assert.ok(length < LIMIT, `${name}: ${length} characters (the inner script ${inner.length})`)
     // Left on the command line as it was, it would have been far longer.
     assert.ok(Buffer.from(inner, 'utf16le').toString('base64').length > length, name)
+  }
+})
+
+test('a launch runs for LAUNCH_RUN_MS, the machine code\'s, 10 s past LAUNCH_DEADLINE_MS: no plugin keeps a number of its own (N10)', () => {
+  assert.equal(machine.LAUNCH_RUN_MS - machine.LAUNCH_DEADLINE_MS, 10_000)
+  for (const plugin of ['self-switch', 'self-restart']) {
+    const text = readFileSync(join(ROOT, 'plugins', plugin, 'hooks', 'register.ts'), 'utf8')
+    assert.ok(/timeoutMs: LAUNCH_RUN_MS\b/.test(text), `${plugin} runs the launch for LAUNCH_RUN_MS`)
+    assert.ok(!/\bLAUNCH_MS\b/.test(text), `${plugin} keeps no LAUNCH_MS of its own`)
   }
 })
 

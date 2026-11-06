@@ -84,11 +84,16 @@ describe('lanesUpdateScript: one entry merged under a lock, the file replaced wh
     // A writer that can't have it within 40 tries, 250 ms apart, writes nothing.
     expect(script).toContain('for ($try = 0; $try -lt 40 -and $null -eq $lock; $try++) {')
     expect(script).toContain("if ($null -eq $lock) { 'refused lock another writer held lanes.json for 10 seconds'; exit 0 }")
+    // A lock file being deleted (closed while a scanner has it open) refuses access: waited for too (S1-12).
+    expect(script).toContain('$_.Exception -is [UnauthorizedAccessException] -or $_.Exception.InnerException -is [UnauthorizedAccessException])) { throw }; Start-Sleep -Milliseconds 250 }')
   })
 
-  test('every other entry is kept as it is; a file not of its shape is left alone; the write is a temporary file and a Replace, never a write in place', () => {
-    expect(script).toContain('foreach ($p in $doc.lanes.PSObject.Properties) { if ($p.Name -cne $name) { $lanes[$p.Name] = $p.Value } }')
-    expect(script).toContain("'refused file lanes.json is not of its shape, so it is left as it is'; exit 0")
+  test('every other entry is kept as it is, names compared exactly (S1-12); a file not of its shape is left alone, saying how to start again; the write is a temporary file and a Replace, never a write in place', () => {
+    // An ordinal dictionary: a hand-written `Foo` beside this `foo` stays its own entry, never folded into one.
+    expect(script).toContain('$lanes = [Collections.Specialized.OrderedDictionary]::new([StringComparer]::Ordinal)')
+    expect(script).not.toContain('[ordered]@{}')
+    expect(script).toContain("foreach ($p in $doc.lanes.PSObject.Properties) { if ($p.Name -cne $name -and $p.Name -cmatch '^[a-z0-9][a-z0-9-]{0,39}\\z') { $lanes[$p.Name] = $p.Value } }")
+    expect(script).toContain("'refused file lanes.json is not of its shape, so it is left as it is: not JSON, not version 1, no lanes object, or two names in it that differ only in case. Fix it by hand, or move it aside (rename it lanes.json.bad), and the next write starts a new one'; exit 0")
     expect(script).toContain('[IO.File]::WriteAllText($temp, $text)')
     expect(script).toContain('[IO.File]::Replace($temp, $final, [NullString]::Value)')
     expect(script).not.toMatch(/WriteAllText\(\$path|WriteAllText\(\$final|Set-Content|Out-File/)

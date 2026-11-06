@@ -1,6 +1,6 @@
 import { describe, expect, mock, test } from 'claude-code/testing'
 import type { On } from 'claude-code'
-import { readWakeMarker, wakeMarker, wakePath } from '../hooks/machine'
+import { readWakeMarker, WAKE_REMOVED, wakeMarker, wakePath, wakeRemoveScript } from '../hooks/machine'
 
 const WAKE = 'mcp__self-wake__wake_after'
 const CANCEL = 'mcp__self-wake__cancel_wake'
@@ -160,22 +160,41 @@ describe("the wake marker (S10w's read): wake\\<conversation>.json, { v: 1, arme
   const W = '00000000-0000-4000-a000-00000000000a'
   const T = '00000000-0000-4000-a000-00000000000b'
 
-  /** The engine with %LOCALAPPDATA%, the session's id and the file writes: each marker as written, by conversation. */
-  function marked(on: On) {
+  /**
+   * The engine with %LOCALAPPDATA%, the session's id and the file writes: each marker as written, by
+   * conversation. `failArmed`: that many writes of an armed marker fail (a scanner holding the file);
+   * `removal`: what the removal script answers, `removed` or `kept`; `scripts`, each script it was run with.
+   */
+  function marked(on: On, { failArmed = 0, removal = 'removed' }: { failArmed?: number; removal?: 'removed' | 'kept' } = {}) {
     const base = engine(on)
     const writes: { path: string; text: string }[] = []
-    const world = { id: W }
-    mock.env(on, { LOCALAPPDATA: LOCAL })
+    const failed: string[] = []
+    const scripts: string[] = []
+    const logs: string[] = []
+    const world = { id: W, failArmed }
+    mock.env(on, { LOCALAPPDATA: LOCAL, SystemRoot: 'C:\\Windows', OS: 'Windows_NT' })
     on('session.id', () => ({ value: world.id }))
     on('classic.SessionStart', () => ({}))
-    on('ui.log', () => ({ value: undefined }))
+    on('ui.log', (_, e) => {
+      logs.push(String(e.text))
+      return { value: undefined }
+    })
     on('fs.write', (_, e) => {
+      if (world.failArmed > 0 && readWakeMarker(e.text)?.armed === true) {
+        world.failArmed -= 1
+        failed.push(e.path)
+        return { deny: 'EBUSY: resource busy or locked' }
+      }
       writes.push({ path: e.path, text: e.text })
       return { value: undefined }
     })
+    on('process.run', (_, e) => {
+      scripts.push(String(e.init?.stdin ?? ''))
+      return { value: { exitCode: 0, stdout: removal === 'removed' ? 'removed\r\n' : 'kept The process cannot access the file\r\n', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+    })
     /** The markers written for `id`, parsed, oldest first. */
     const markers = (id: string) => writes.filter(w => w.path === wakePath(STATE, id)).map(w => readWakeMarker(w.text))
-    return { ...base, writes, world, markers }
+    return { ...base, writes, failed, scripts, logs, world, markers }
   }
 
   test('at the start: not armed; armed: armed, with when it is due; fired: not armed', async ($, on) => {
@@ -235,6 +254,74 @@ describe("the wake marker (S10w's read): wake\\<conversation>.json, { v: 1, arme
     // The timer runs out: W's marker says not armed.
     await clock.advance(6 * MINUTE)
     expect(markers(W).at(-1)?.armed).toBe(false)
+  })
+
+  test('a wake-up keeps the conversation it was armed in: after a reload, a move to another and back finds its marker armed, never handed to the other (S1-1)', async ($, on) => {
+    const { markers, clock } = marked(on)
+    await $.session.start(start)
+    await $.tool.call({ tool: WAKE, minutes: 10, note: 'check W' })
+    await $.turn.complete({ ...answered, turnId: 't1' })
+    await clock.settle()
+    expect(markers(W).at(-1)?.armed).toBe(true)
+    // A reload: session.start again, the wake-up still in $.state; no SessionStart has named a
+    // conversation since, so the module doesn't know the one it holds but by the wake-up's own record.
+    await $.session.start(start)
+    await clock.settle()
+    expect(markers(W).at(-1)?.armed).toBe(true)
+    // /resume T in place: the first SessionStart after the reload. T is not the wake-up's.
+    await $.classic.SessionStart({ source: 'resume', session_id: T })
+    await clock.settle()
+    expect(markers(T).at(-1)?.armed).toBe(false)
+    // And back to W: its marker says armed, so a switch from W holds on it.
+    await $.classic.SessionStart({ source: 'resume', session_id: W })
+    await clock.settle()
+    expect(markers(W).at(-1)?.armed).toBe(true)
+    expect(markers(T).at(-1)?.armed).toBe(false)
+  })
+
+  test('an armed marker whose first write fails is written again, before the turn\'s end returns (S1-2)', async ($, on) => {
+    const { markers, failed, scripts, toasts } = marked(on, { failArmed: 1 })
+    await $.session.start(start)
+    await $.tool.call({ tool: WAKE, minutes: 5, note: 'check the deploy' })
+    await $.turn.complete({ ...answered, turnId: 't1' })
+    // Awaited by the turn's end: a switch queued in the same turn reads it after.
+    expect(failed).toEqual([wakePath(STATE, W)])
+    expect(markers(W).at(-1)?.armed).toBe(true)
+    expect(scripts).toEqual([])
+    expect(toasts.some(t => /marker/.test(t))).toBe(false)
+  })
+
+  test('an armed marker that can\'t be written twice: the marker saying none is removed, so it reads unknown and holds, and a toast says so (S1-2)', async ($, on) => {
+    const { markers, scripts, toasts, logs, clock } = marked(on, { failArmed: 2 })
+    await $.session.start(start)
+    await clock.settle()
+    expect(markers(W).at(-1)?.armed).toBe(false)
+    await $.tool.call({ tool: WAKE, minutes: 5, note: 'check the deploy' })
+    await $.turn.complete({ ...answered, turnId: 't1' })
+    await clock.settle()
+    // The marker left there would read as none: removed, by the fixed script for W alone.
+    expect(markers(W).at(-1)?.armed).toBe(false)
+    expect(scripts).toEqual([wakeRemoveScript({ stateDir: STATE, id: W })])
+    expect(WAKE_REMOVED.exec('removed\r\n')?.[1]).toBe('removed')
+    expect(toasts).toContain("Wake-up set, but its marker couldn't be written, so it was removed: a switch or a go here reads this wake-up as unknown, and holds, until it fires or is cancelled.")
+    expect(logs.some(l => l.startsWith("self-wake: the wake marker for ") && l.includes("the marker there before, if any, still stands"))).toBe(true)
+  })
+
+  test('one that can\'t be removed either: the toast says a switch may not see it, and how to stop that (S1-2)', async ($, on) => {
+    const { toasts, clock } = marked(on, { failArmed: 2, removal: 'kept' })
+    await $.session.start(start)
+    await $.tool.call({ tool: WAKE, minutes: 5, note: 'check the deploy' })
+    await $.turn.complete({ ...answered, turnId: 't1' })
+    await clock.settle()
+    expect(toasts).toContain("Wake-up set, but its marker couldn't be written or removed: a switch or a go here may not see this wake-up. Cancel it (cancel_wake) before switching away, or set it again.")
+  })
+
+  test('the removal script: the marker by the path wakePath builds, deleted, tried 3 times; any other id refused before it is built', () => {
+    const script = wakeRemoveScript({ stateDir: STATE, id: W })
+    expect(script).toContain(`$path = '${wakePath(STATE, W)}'`)
+    expect(script).toContain('[IO.File]::Delete($path)')
+    expect(script).not.toMatch(/Remove-Item|-Recurse|Delete\(\$state/)
+    for (const id of ['..\\x', W.toUpperCase(), `${W}\\..\\x`, '']) expect(() => wakeRemoveScript({ stateDir: STATE, id })).toThrow()
   })
 
   test('a conversation whose id is not a session id gets no marker, and nothing else is written', async ($, on) => {

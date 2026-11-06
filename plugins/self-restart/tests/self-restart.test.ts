@@ -1,7 +1,7 @@
 import { describe, expect, mock, test } from 'claude-code/testing'
 import type { AgentStatus, On } from 'claude-code'
 import { encodeCommand, launchScriptText, SESSION_MARKERS } from '../hooks/launcher'
-import { LAUNCH_ENV_CLEAR, type LaunchInput, STDIN_BOOTSTRAP } from '../hooks/machine'
+import { LAUNCH_ENV_CLEAR, LAUNCH_SCRIPT_SHA256, type LaunchInput, STDIN_BOOTSTRAP } from '../hooks/machine'
 
 const TOOL = 'mcp__self-restart__restart_after_turn'
 const HOUR = 60 * 60 * 1000
@@ -327,7 +327,8 @@ test('the launch script: quiet progress, parents older than their children, valu
   expect(script).toContain('$code = $LASTEXITCODE')
   expect(script).toContain('if ($code -ne 0 -or ((Get-Date) - $started).TotalSeconds -lt 10) {')
   expect(script).toContain('"Once it is safe, resume it yourself: " + "claude-launch.ps1 -Resume " + $id + " -Dir " + $folder')
-  expect(script.split('Read-Host "Press Enter to close this window"').length - 1).toBe(2)
+  // Three pauses: a refusal, a run of claude-launch.ps1 that stops on an error (caught), and an end within seconds.
+  expect(script.split('Read-Host "Press Enter to close this window"').length - 1).toBe(3)
   expect(script).not.toContain('-NoExit')
 })
 
@@ -358,8 +359,8 @@ test("the window leaves the launch environment to claude-launch.ps1: it clears a
   // The window sets and clears nothing: no marker, no NO_COLOR, no WT_SESSION or WT_PROFILE_ID, no REAP.
   expect(script).not.toContain('SetEnvironmentVariable')
   for (const name of [...SESSION_MARKERS, 'WT_SESSION', 'WT_PROFILE_ID', 'CLAUDE_CODE_DISABLE_BG_SHELL_PRESSURE_REAP', 'CLAUDE_CODE_FORCE_SESSION_PERSISTENCE']) expect(script).not.toContain(name)
-  // claude-launch.ps1, from its pinned place, after the wait and the last look.
-  expect(script).toContain("$launchPath = 'C:\\Users\\u\\AppData\\Local\\claude-self-tools\\claude-launch.ps1'")
+  // claude-launch.ps1, from its pinned place (its hash's own name), after the wait and the last look.
+  expect(script).toContain(`$launchPath = 'C:\\Users\\u\\AppData\\Local\\claude-self-tools\\claude-launch-${LAUNCH_SCRIPT_SHA256.slice(0, 8)}.ps1'`)
   expect(script.indexOf('& $launchPath -Resume $id -Dir $folder')).toBeGreaterThan(script.indexOf('Wait-Process'))
 })
 

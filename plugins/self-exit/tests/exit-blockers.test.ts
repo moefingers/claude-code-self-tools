@@ -69,6 +69,22 @@ describe('exitBlockers', () => {
     expect(exitBlockers({ crons: [], busy: probeOf(), agents: [{ id: 'a1', status: 'completed', description: 'Lint' }] })).toEqual([])
   })
 
+  test('a subagent stands until it has ended: idle (a teammate the exit would end without a word), and a status this code does not know; completed, failed and killed do not (S1-8)', () => {
+    const found = exitBlockers({
+      crons: [],
+      busy: probeOf(),
+      agents: [
+        { id: 'a1', status: 'idle', description: 'A teammate' },
+        { id: 'a2', status: 'paused', description: 'A status from a later Claude Code' },
+        { id: 'a3', status: 'completed', description: 'Lint' },
+        { id: 'a4', status: 'failed', description: 'Build' },
+        { id: 'a5', status: 'killed', description: 'Watch' },
+      ],
+    })
+    expect(found.map(b => b.id)).toEqual(['a1', 'a2'])
+    expect(found[0]).toEqual({ kind: 'subagent', id: 'a1', what: "a subagent hasn't ended (A teammate; idle)", howToStop: 'wait for it to report, or stop it with TaskStop (a1)' })
+  })
+
   test('a cron, a background shell, a Monitor, a subagent and a wake-up are each listed with how to stop it', () => {
     const found = exitBlockers({
       crons: [CRON],

@@ -30,9 +30,11 @@
 //   that checks, takes the claim and places the launch in the same run: a ticket for the claude
 //   wrapper's tab, a record for this pane's slot, or a new window. The window waits for the old
 //   process when asked, reads the registry and process table again, checks the claim, and runs
-//   claude-launch.ps1 (plugins/self-switch/slot/claude-launch.ps1, LAUNCH_SCRIPT_SHA256), the only
-//   script that starts claude: it alone clears LAUNCH_ENV_CLEAR and sets LAUNCH_ENV_SET right before
-//   claude, passes claude only --resume, or --session-id and --name, and never a permission flag.
+//   claude-launch.ps1 (plugins/self-switch/slot/claude-launch.ps1, LAUNCH_SCRIPT_SHA256, installed by
+//   its hash's name: launchScriptPath), the only script that starts claude: it takes the same last look
+//   again, by hand too, then alone clears LAUNCH_ENV_CLEAR and LAUNCH_ENV_DROP and sets LAUNCH_ENV_SET
+//   right before claude, passes claude only --resume, or --session-id and --name, and never a
+//   permission flag.
 // - The left record (leftScript, the probe's `left`, liveness's waiver): a record, MAC'd under a local
 //   key that never leaves the scripts, that a plugin moved its own process off a conversation; it
 //   waives L3 and L5 for that conversation only, and the last look checks its transcript again.
@@ -222,6 +224,9 @@ const ID_FILES = {
 /** The kinds of file named by an id. */
 export type IdFile = keyof typeof ID_FILES
 
+/** The folders under the state folder whose files are named by an id, each once: what scripts/id-paths.test.mjs scans for. */
+export const ID_FOLDERS: readonly string[] = [...new Set(Object.values(ID_FILES).map(file => file.folder))]
+
 /**
  * The one way a path is built from an id: `<state>\<folder>\<id><ending>`, after the id is checked to
  * be of its folder's shape. Throws on anything else (`..\x`, `..%5cx`, an absolute path, a too-long
@@ -356,8 +361,15 @@ export const GATE_MS = 24 * 60 * 60 * 1000
 /** How long each git read may take. */
 export const GIT_TIMEOUT_MS = 5000
 
-/** An agent in one of these is still to report. */
-export const BUSY_AGENTS: readonly string[] = ['pending', 'running', 'waiting']
+/**
+ * An agent in one of these has ended: `completed`, `failed` or `killed`. Every other status is still to
+ * report: `pending`, `running`, `waiting`, `idle` (a teammate between turns, which an exit ends without
+ * a word), and any status a later Claude Code adds, so an unknown one holds rather than passes.
+ */
+export const AGENT_DONE: readonly string[] = ['completed', 'failed', 'killed']
+
+/** Whether an agent of this status is still to report: any status but AGENT_DONE's. */
+export const isBusyAgent = (status: string): boolean => !AGENT_DONE.includes(status)
 
 /**
  * Every key a session registry file (`<config>\sessions\<pid>.json`) was seen to hold on Claude Code
@@ -415,22 +427,48 @@ export const SLOT_SCRIPT_SHA256 = 'db33bcf242ac2df21be9ab6c3de382d8dca45b712eacb
 /**
  * The SHA-256 of plugins/self-switch/slot/claude-launch.ps1, as it is committed: the only script that
  * starts claude. A window runs it only from launchScriptPath, with this hash, checked by .NET just
- * before it runs.
+ * before it runs. scripts/embed-launch.mjs writes it.
  */
-export const LAUNCH_SCRIPT_SHA256 = '8a137a6168aab1cbef6ef3e6938ff2f2b8cb46f8b04aef9802a7d71504dd5e3a'
+export const LAUNCH_SCRIPT_SHA256 = '6b07b88166e4042d374ebb1221754cd8468a7e2a3764dd6e7154b58fd40a3778'
 
-/** Where claude-launch.ps1 is copied, beside the slot runner: never a path read off a command line. */
-export const launchScriptPath = (state: string): string => `${state}\\claude-launch.ps1`
+/**
+ * claude-launch.ps1's version, its `# claude-launch version <n>` line: one more with every change to the
+ * script. The copy kept for use by hand (launchHandPath) is replaced only by a higher one, so plugins of
+ * two versions never trade it back and forth. scripts/embed-launch.mjs writes it from the script.
+ */
+export const LAUNCH_SCRIPT_VERSION = 1
+
+/**
+ * Where a launch puts claude-launch.ps1 and a window runs it from: beside the slot runner, named by the
+ * first 8 hex digits of its SHA-256 (`claude-launch-<sha8>.ps1`), so each version of the plugins has a
+ * file of its own and never overwrites another's, however long sessions of two versions run side by
+ * side. Never a path read off a command line. Throws on a `sha` that isn't a SHA-256 in hex.
+ */
+export function launchScriptPath(state: string, sha: string = LAUNCH_SCRIPT_SHA256): string {
+  if (!/^[0-9a-f]{64}$/.test(sha)) throw new Error(`not a SHA-256: ${JSON.stringify(sha)}`)
+  return `${state}\\claude-launch-${sha.slice(0, 8)}.ps1`
+}
+
+/**
+ * The copy of claude-launch.ps1 kept for use by hand, under the name the README gives: the highest
+ * version any launch has put there (LAUNCH_SCRIPT_VERSION). A window never runs it.
+ */
+export const launchHandPath = (state: string): string => `${state}\\claude-launch.ps1`
 
 /** claude-launch.ps1 as this release ships it, byte for byte (ASCII, LF line ends): the copy a launch puts at launchScriptPath when the one there is missing or has another SHA-256. scripts/claude-launch.test.mjs holds it equal to plugins/self-switch/slot/claude-launch.ps1 and to LAUNCH_SCRIPT_SHA256; after an edit to the script, run `node scripts/embed-launch.mjs`. */
 export const LAUNCH_SCRIPT_TEXT = [
   "# claude-launch.ps1: starts Claude Code as a top-level session. The one script in",
   "# claude-code-self-tools that runs claude: every launch (a restart's or a switch's window, the",
   "# coordinator's go, a steward's launch, and you by hand) comes through it.",
+  "# claude-launch version 1",
   "#",
-  "# Part of self-switch (claude-code-self-tools, plugins/self-switch/slot/claude-launch.ps1). Copy it,",
-  "# unchanged, beside the slot runner: %LOCALAPPDATA%\\claude-self-tools\\claude-launch.ps1. The plugins",
-  "# run it only from there, and only when its SHA-256 is the one they ship (LAUNCH_SCRIPT_SHA256).",
+  "# Part of self-switch (claude-code-self-tools, plugins/self-switch/slot/claude-launch.ps1). Nobody",
+  "# copies it: a launch that opens a window puts the copy it carries in %LOCALAPPDATA%\\claude-self-tools,",
+  "# as claude-launch-<the first 8 hex digits of its SHA-256>.ps1, one file per version of the plugins,",
+  "# and the window runs it from there only when its SHA-256 is the one the plugins ship",
+  "# (LAUNCH_SCRIPT_SHA256), checked right before it runs. The same launch keeps claude-launch.ps1 there",
+  "# for you to run by hand: the highest version any launch has carried (the version line above). A",
+  "# window never runs that one.",
   "#",
   "# By hand, in a terminal:",
   "#   claude-launch.ps1 -Resume <session id> [-Dir <folder>]               resume a conversation",
@@ -438,35 +476,50 @@ export const LAUNCH_SCRIPT_TEXT = [
   "#   claude-launch.ps1 -Lane <name>                                        resume a session's current",
   "#                                                                         conversation, by its name",
   "#   claude-launch.ps1 [-Dir <folder>]                                     start a new session",
+  "# With -Resume, -Start or -Lane, -ConfigDir <folder>[,<folder>...] names other config folders whose",
+  "# session registries the last look reads too (a launch's window names every one it read). With -Resume,",
+  "# -LeftSize <bytes> -LeftMtime <ms>, or -LeftExitAt <ms>, is a left record's stat, which the last look",
+  "# checks the transcript against (a window passes it when its move rests on a left record).",
   "#",
   "# What it does, in order:",
   "# 1. It checks its arguments: a session id is a lowercase UUID; a name is lowercase letters, digits and",
-  "#    hyphens; a folder is an absolute folder with no quote, control character or ';', and is there.",
-  "#    -Lane reads lanes.json in the config folder (CLAUDE_CONFIG_DIR, else %USERPROFILE%\\.claude), and",
-  "#    takes that name's conversation and folder from its entry; it never reads a transcript. Anything",
-  "#    else stops it, saying why, before it changes anything.",
+  "#    hyphens; a folder is an absolute folder of the shape the plugins take (no quote, control character,",
+  "#    < > | ? * / or ';', no '.' or '..' part, no empty part, no part with spaces at either end), and is",
+  "#    there; an argument given empty refuses. -Lane reads lanes.json in the config folder",
+  "#    (CLAUDE_CONFIG_DIR, else %USERPROFILE%\\.claude), takes that name's conversation and folder from its",
+  "#    entry, and says which; it never reads a transcript. Anything else stops it, saying why, before it",
+  "#    changes anything.",
   "# 2. In Windows PowerShell 5.1, it sets PSModulePath to 5.1's own module folders: in a tab whose",
   "#    environment puts PowerShell 7's first, 5.1 loads 7's modules and loses cmdlets.",
   "# 3. It goes to the folder, and finds claude: %USERPROFILE%\\.local\\bin\\claude.exe when it is there,",
   "#    else the first claude application on PATH.",
-  "# 4. Right before claude, the launch environment. It removes the variables Claude Code sets in the",
+  "# 4. The last look, for -Resume, -Lane and -Start, as a launch's window and the claude wrapper take it",
+  "#    (RECHECK and LEFT_RECHECK in the plugins' machine code, line for line): no running Claude Code holds",
+  "#    the conversation, read again from the session registry of the config folder and of each -ConfigDir,",
+  "#    and from every process's command line; with a left record's stat, its transcript unchanged since.",
+  "#    Anything it can't read counts as held. Held, it stops, saying by what, and starts nothing: two",
+  "#    copies would both write the conversation.",
+  "# 5. Right before claude, the launch environment. It removes the variables Claude Code sets in the",
   "#    processes it starts (a claude that inherits them is nested, and saves no transcript), NO_COLOR",
-  "#    among them, and PSExecutionPolicyPreference (an -ExecutionPolicy on the command line that ran this",
-  "#    script was for this script alone). It sets CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1 and",
-  "#    CLAUDE_CODE_DISABLE_BG_SHELL_PRESSURE_REAP=1. It never touches WT_SESSION or WT_PROFILE_ID: Claude",
-  "#    Code reads WT_SESSION to draw its prompt and its links.",
-  "# 5. It runs claude with --resume <id>, or --session-id <id> --name <name>, or nothing else: never a",
+  "#    among them; PSExecutionPolicyPreference (an -ExecutionPolicy on the command line that ran this",
+  "#    script was for this script alone); and CLAUDE_PANE_TOKEN (the claude wrapper's token for the tab a",
+  "#    session ran in: one resumed here has no tab of its own). It sets",
+  "#    CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1 and CLAUDE_CODE_DISABLE_BG_SHELL_PRESSURE_REAP=1. It never",
+  "#    touches WT_SESSION or WT_PROFILE_ID: Claude Code reads WT_SESSION to draw its prompt and its links.",
+  "# 6. It runs claude with --resume <id>, or --session-id <id> --name <name>, or nothing else: never a",
   "#    permission flag, so the session starts in the mode a new one would. Its exit code is claude's.",
   "",
-  "param([string]$Resume, [string]$Start, [string]$Name, [string]$Dir, [string]$Lane)",
+  "param([string]$Resume, [string]$Start, [string]$Name, [string]$Dir, [string]$Lane, [string[]]$ConfigDir, [string]$LeftSize, [string]$LeftMtime, [string]$LeftExitAt)",
   "",
   "$ErrorActionPreference = 'Stop'",
   "$ProgressPreference = 'SilentlyContinue'",
   "",
   "$SessionId = '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\\z'",
   "$AreaName = '^[a-z0-9][a-z0-9-]{0,39}\\z'",
-  "# The launch environment: LAUNCH_ENV_CLEAR and LAUNCH_ENV_SET in the plugins' machine code.",
+  "$Whole = '^\\d{1,15}\\z'",
+  "# The launch environment: LAUNCH_ENV_CLEAR, LAUNCH_ENV_DROP and LAUNCH_ENV_SET in the plugins' machine code.",
   "$Clear = 'CLAUDE_CODE_CHILD_SESSION', 'CLAUDECODE', 'CLAUDE_CODE_SESSION_ID', 'CLAUDE_PID', 'CLAUDE_EFFORT', 'CLAUDE_CODE_BRIDGE_SESSION_ID', 'CLAUDE_CODE_MESSAGING_SOCKET', 'CLAUDE_CODE_MESSAGING_TOKEN', 'CLAUDE_CODE_REMOTE', 'CLAUDE_CODE_REMOTE_SESSION_ID', 'CLAUDE_JOB_DIR', 'AI_AGENT', 'CLAUDE_CODE_ENTRYPOINT', 'CLAUDE_CODE_EXECPATH', 'CLAUDE_CODE_SESSION_ATTENDED', 'CLAUDE_CODE_SSE_PORT', 'NO_COLOR'",
+  "$Drop = 'PSExecutionPolicyPreference', 'CLAUDE_PANE_TOKEN'",
   "$Set = [ordered]@{ CLAUDE_CODE_FORCE_SESSION_PERSISTENCE = '1'; CLAUDE_CODE_DISABLE_BG_SHELL_PRESSURE_REAP = '1' }",
   "",
   "function Stop-Launch($why) {",
@@ -474,23 +527,110 @@ export const LAUNCH_SCRIPT_TEXT = [
   "  exit 2",
   "}",
   "",
-  "# An absolute folder with no quote, control character or ';', no . or .. part, at most 240 characters, that is there.",
-  "function Test-Folder($path) {",
+  "# An absolute folder of the shape the plugins take (isSafeFolder in their machine code): a drive, a",
+  "# colon and a backslash first; at most 240 characters; no quote of any kind, control character,",
+  "# < > | ? * or /, and no second colon; no '.' or '..' part, no empty part but a last one, and no part",
+  "# with spaces at either end.",
+  "function Test-Shape($path) {",
   "  if ($path -isnot [string] -or $path.Length -lt 3 -or $path.Length -gt 240) { return $false }",
-  "  if ($path -cnotmatch '^[A-Za-z]:\\\\' -or $path -match '[\\x00-\\x1f\\x22\\x27\\u2018-\\u201e<>|?*;/]' -or $path.IndexOf(':', 2) -ge 0) { return $false }",
-  "  foreach ($part in $path.Substring(3).Split('\\')) { if ($part -eq '.' -or $part -eq '..') { return $false } }",
-  "  return (Test-Path -LiteralPath $path -PathType Container)",
+  "  if ($path -cnotmatch '^[A-Za-z]:\\\\' -or $path -match '[\\x00-\\x1f\\x7f\\x22\\x27\\u2018-\\u201e<>|?*/]' -or $path.IndexOf(':', 2) -ge 0) { return $false }",
+  "  $parts = $path.Substring(3).Split('\\')",
+  "  for ($i = 0; $i -lt $parts.Count; $i++) {",
+  "    if ($parts[$i] -eq '') { if ($i -ne $parts.Count - 1) { return $false } }",
+  "    elseif ($parts[$i] -eq '.' -or $parts[$i] -eq '..' -or $parts[$i] -match '^[\\s\\ufeff]|[\\s\\ufeff]$') { return $false }",
+  "  }",
+  "  return $true",
+  "}",
+  "",
+  "# A folder a launch takes: of that shape, with no ';', and there.",
+  "function Test-Folder($path) { return ((Test-Shape $path) -and $path.IndexOf(';') -lt 0 -and (Test-Path -LiteralPath $path -PathType Container)) }",
+  "",
+  "# Whether a running Claude Code holds conversation $id now: $null when none does, else why. RECHECK in",
+  "# the plugins' machine code, line for line: the session registries of $configDirs and every process's",
+  "# command line, read again. Anything it can't read counts as held.",
+  "function Get-Live($id, $configDirs) {",
+  "  try {",
+  "    $live = $null",
+  "    function Test-Exited($p) { $h = $null; try { $h = [Diagnostics.Process]::GetProcessById([int]$p.ProcessId); return $h.HasExited } catch { return ($_.Exception -is [ArgumentException] -or $_.Exception.InnerException -is [ArgumentException]) } finally { if ($null -ne $h) { $h.Dispose() } } }",
+  "    $procs = @{}",
+  "    foreach ($p in (Get-CimInstance -ClassName Win32_Process -Property ProcessId, Name, CreationDate, CommandLine)) { $procs[[int]$p.ProcessId] = $p }",
+  "    $snapshotFt = [DateTime]::UtcNow.ToFileTimeUtc()",
+  "    $elsewhere = @{}",
+  "    foreach ($dir in $configDirs) {",
+  "      $reg = Join-Path $dir \"sessions\"",
+  "      if ($null -ne $live -or -not (Test-Path -LiteralPath $reg -PathType Container)) { continue }",
+  "      foreach ($f in @(Get-ChildItem -LiteralPath $reg -Filter \"*.json\" -File -Force)) {",
+  "        $p = $null",
+  "        if ($f.BaseName -match \"^\\d{1,10}\\z\") { $p = $procs[[int]$f.BaseName] }",
+  "        if ($null -eq $p -or $p.Name -ne \"claude.exe\") { continue }",
+  "        if (Test-Exited $p) { continue }",
+  "        $e = $null",
+  "        for ($try = 1; $try -le 3 -and $null -eq $e; $try++) {",
+  "          try { $e = Get-Content -LiteralPath $f.FullName -Raw -Encoding UTF8 | ConvertFrom-Json } catch { $e = $null }",
+  "          if ($null -ne $e -and ($e.sessionId -isnot [string] -or $null -eq $e.procStart)) { $e = $null }",
+  "          if ($null -eq $e -and $try -lt 3) { Start-Sleep -Milliseconds 250 }",
+  "        }",
+  "        if ($null -eq $e) { $live = \"whether it is open elsewhere is unknown: the registry file of Claude Code $($f.BaseName) could not be read, three times, or has another shape\"; break }",
+  "        $near = $false",
+  "        try { $near = [math]::Abs([double]$p.CreationDate.ToFileTimeUtc() - [double]$e.procStart) -le 10000 } catch { $near = $false }",
+  "        if ($e.sessionId -eq $id) {",
+  "          if ($near) { $live = \"it is open elsewhere: Claude Code $($f.BaseName) holds it (L1)\" } else { $live = \"it may be open elsewhere: the registry file of running Claude Code $($f.BaseName) names it, though its procStart is not that process start time (a stale file, or a format this check does not know)\" }",
+  "          break",
+  "        }",
+  "        $named = $false",
+  "        foreach ($prop in $e.PSObject.Properties) { if ($prop.Name -cne \"sessionId\" -and $prop.Name -cne \"cwd\" -and $prop.Name -cne \"name\" -and \"$(ConvertTo-Json -InputObject $prop.Value -Compress -Depth 8)\".IndexOf($id, [StringComparison]::OrdinalIgnoreCase) -ge 0) { $named = $true } }",
+  "        if ($named) { $live = \"it may be open elsewhere: the registry file of running Claude Code $($f.BaseName) names it outside its sessionId\"; break }",
+  "        $pidOk = $false",
+  "        try { $pidOk = [long]$e.pid -eq [long]$p.ProcessId } catch { $pidOk = $false }",
+  "        if ($near -and $pidOk -and ($snapshotFt - [long]$p.CreationDate.ToFileTimeUtc()) -gt 600000000 -and $e.sessionId -match \"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\\z\") { $elsewhere[[int]$p.ProcessId] = $true }",
+  "      }",
+  "    }",
+  "    if ($null -eq $live) { foreach ($p in $procs.Values) { if ($null -eq $live -and $p.ProcessId -ne $PID -and -not $elsewhere.ContainsKey([int]$p.ProcessId) -and \"$($p.CommandLine)\" -match \"(^|[\\s\\x22])(--resume|--session-id|-r)(\\s+|=)[\\x22\\x27]?$id\" -and -not (Test-Exited $p)) { $live = \"it is open elsewhere: process $($p.ProcessId) names it on its command line (L2)\" } } }",
+  "  } catch { $live = 'whether it is open elsewhere is unknown: the registry or the process table could not be read (' + $_.Exception.Message + ')' }",
+  "  return $live",
+  "}",
+  "",
+  "# Whether conversation $id's transcript changed since its left record's stat: $null when it didn't,",
+  "# else why. LEFT_RECHECK in the plugins' machine code, line for line, after Get-Live found nothing.",
+  "# Anything it can't read counts as changed.",
+  "function Test-Left($id, $configDirs, $leftSize, $leftMtime, $leftExitAt) {",
+  "  $live = $null",
+  "  try {",
+  "    if ($null -eq $live) {",
+  "      $seen = @(foreach ($dir in $configDirs) { $projects = Join-Path $dir \"projects\"; if (Test-Path -LiteralPath $projects -PathType Container) { foreach ($d in @(Get-ChildItem -LiteralPath $projects -Directory -Force)) { $tx = Join-Path $d.FullName ($id + \".jsonl\"); if (Test-Path -LiteralPath $tx -PathType Leaf) { Get-Item -LiteralPath $tx -Force } } } })",
+  "      if ($seen.Count -ne 1) { $live = \"its transcript is not one file on this machine now (\" + $seen.Count + \" found), so whether it changed since it was left is unknown\" }",
+  "      elseif ($null -ne $leftExitAt) { if (([DateTimeOffset]$seen[0].LastWriteTimeUtc).ToUnixTimeMilliseconds() -gt ([long]$leftExitAt + 10000)) { $live = \"its transcript was written after it was left (another process may have resumed it)\" } }",
+  "      elseif ([long]$seen[0].Length -ne [long]$leftSize -or ([DateTimeOffset]$seen[0].LastWriteTimeUtc).ToUnixTimeMilliseconds() -ne [long]$leftMtime) { $live = \"its transcript changed since it was left (another process may have resumed it)\" }",
+  "    }",
+  "  } catch { $live = 'whether its transcript changed since it was left is unknown (' + $_.Exception.Message + ')' }",
+  "  return $live",
   "}",
   "",
   "# 1. The arguments, each checked before anything changes.",
+  "foreach ($k in 'Resume', 'Start', 'Name', 'Dir', 'Lane', 'LeftSize', 'LeftMtime', 'LeftExitAt') {",
+  "  if ($PSBoundParameters.ContainsKey($k) -and [string]::IsNullOrEmpty($PSBoundParameters[$k])) { Stop-Launch ('-' + $k + ' was given empty.') }",
+  "}",
   "$modes = 0",
   "foreach ($given in $Resume, $Start, $Lane) { if ($given) { $modes++ } }",
   "if ($modes -gt 1) { Stop-Launch 'give one of -Resume, -Start and -Lane.' }",
   "if ($Name -and -not $Start) { Stop-Launch '-Name goes with -Start.' }",
+  "if ($PSBoundParameters.ContainsKey('ConfigDir')) {",
+  "  if ($modes -eq 0) { Stop-Launch '-ConfigDir goes with -Resume, -Start or -Lane.' }",
+  "  if (@($ConfigDir).Count -lt 1 -or @($ConfigDir).Count -gt 8) { Stop-Launch '-ConfigDir takes 1 to 8 config folders.' }",
+  "  foreach ($c in @($ConfigDir)) { if (-not (Test-Shape $c)) { Stop-Launch '-ConfigDir takes absolute folders, with no quote, control character, < > | ? * or /, and no . or .. part.' } }",
+  "}",
+  "$leftGiven = [bool]($LeftSize -or $LeftMtime -or $LeftExitAt)",
+  "if ($leftGiven) {",
+  "  if (-not $Resume) { Stop-Launch 'a left record''s stat goes with -Resume.' }",
+  "  if ($LeftExitAt) { if ($LeftSize -or $LeftMtime -or $LeftExitAt -cnotmatch $Whole) { Stop-Launch '-LeftExitAt goes alone, a whole number.' } }",
+  "  elseif (-not $LeftSize -or -not $LeftMtime -or $LeftSize -cnotmatch $Whole -or $LeftMtime -cnotmatch $Whole) { Stop-Launch '-LeftSize and -LeftMtime go together, whole numbers.' }",
+  "}",
+  "$config = $null",
+  "if ($env:CLAUDE_CONFIG_DIR) { $config = $env:CLAUDE_CONFIG_DIR } elseif ($env:USERPROFILE) { $config = Join-Path $env:USERPROFILE '.claude' }",
   "if ($Lane) {",
   "  if ($Dir) { Stop-Launch '-Lane takes its folder from lanes.json: give no -Dir.' }",
   "  if ($Lane -cnotmatch $AreaName) { Stop-Launch 'a session name is lowercase letters, digits and hyphens.' }",
-  "  $config = if ($env:CLAUDE_CONFIG_DIR) { $env:CLAUDE_CONFIG_DIR } else { Join-Path $env:USERPROFILE '.claude' }",
+  "  if ($null -eq $config) { Stop-Launch 'no config folder is known here (CLAUDE_CONFIG_DIR, else %USERPROFILE%\\.claude).' }",
   "  $lanesFile = Join-Path $config 'lanes.json'",
   "  if (-not (Test-Path -LiteralPath $lanesFile -PathType Leaf)) { Stop-Launch ('there is no ' + $lanesFile + '.') }",
   "  $doc = $null",
@@ -501,16 +641,27 @@ export const LAUNCH_SCRIPT_TEXT = [
   "  if ($null -eq $entry) { Stop-Launch ('lanes.json names no session ' + $Lane + '.') }",
   "  if ($entry.session -isnot [string] -or $entry.session -cnotmatch $SessionId) { Stop-Launch ('the entry for ' + $Lane + ' names no conversation by its id.') }",
   "  if (-not (Test-Folder $entry.folder)) { Stop-Launch ('the entry for ' + $Lane + ' names no folder that is there.') }",
-  "  # The conversation and its folder come from the entry, never from the name.",
+  "  # The conversation and its folder come from the entry, never from the name; said, so you know which.",
   "  $Resume = $entry.session",
   "  $Dir = $entry.folder",
+  "  Write-Host ('claude-launch: -Lane ' + $Lane + ' is conversation ' + $Resume + ', in ' + $Dir + '.')",
   "}",
   "if ($Resume -and $Resume -cnotmatch $SessionId) { Stop-Launch '-Resume takes a session id (a lowercase UUID).' }",
   "if ($Start) {",
   "  if ($Start -cnotmatch $SessionId) { Stop-Launch '-Start takes a session id (a lowercase UUID).' }",
   "  if (-not $Name -or $Name -cnotmatch $AreaName) { Stop-Launch '-Start takes -Name: lowercase letters, digits and hyphens.' }",
   "}",
-  "if ($Dir -and -not (Test-Folder $Dir)) { Stop-Launch '-Dir takes an absolute folder that is there, with no quote, control character or semicolon.' }",
+  "if ($Dir -and -not (Test-Folder $Dir)) { Stop-Launch '-Dir takes an absolute folder that is there, with no quote, control character, semicolon, < > | ? * or /, and no . or .. part.' }",
+  "# The config folders the last look reads: this one first, then each -ConfigDir, each once.",
+  "$lookIn = @()",
+  "if ($Resume -or $Start) {",
+  "  if (-not (Test-Shape $config)) { Stop-Launch 'the config folder (CLAUDE_CONFIG_DIR, else %USERPROFILE%\\.claude) is not an absolute folder the last look can read.' }",
+  "  foreach ($c in @($config) + @($ConfigDir | Where-Object { $null -ne $_ })) {",
+  "    $plain = $c",
+  "    if ($plain.Length -gt 3) { $plain = $plain.TrimEnd([char]92) }",
+  "    if (@($lookIn | Where-Object { $_ -ieq $plain }).Count -eq 0) { $lookIn += $plain }",
+  "  }",
+  "}",
   "",
   "# 2. Windows PowerShell 5.1's own module folders.",
   "if ($PSVersionTable.PSEdition -ne 'Core') {",
@@ -530,13 +681,26 @@ export const LAUNCH_SCRIPT_TEXT = [
   "}",
   "if ($null -eq $exe) { Stop-Launch 'no claude.exe was found (in %USERPROFILE%\\.local\\bin, or on PATH).' }",
   "",
-  "# 4. The launch environment, right before claude. Removed, not set to empty: [NullString]::Value, since",
+  "# 4. The last look, right before the environment and claude.",
+  "if ($Resume -or $Start) {",
+  "  $lookId = $Resume",
+  "  if ($Start) { $lookId = $Start }",
+  "  $why = Get-Live $lookId $lookIn",
+  "  if ($null -eq $why -and $leftGiven) {",
+  "    $size = $null; $mtime = $null; $exitAt = $null",
+  "    if ($LeftExitAt) { $exitAt = [long]$LeftExitAt } else { $size = [long]$LeftSize; $mtime = [long]$LeftMtime }",
+  "    $why = Test-Left $lookId $lookIn $size $mtime $exitAt",
+  "  }",
+  "  if ($null -ne $why) { Stop-Launch ('conversation ' + $lookId + ' is not run here, so that two copies never write it: ' + $why + '.') }",
+  "}",
+  "",
+  "# 5. The launch environment, right before claude. Removed, not set to empty: [NullString]::Value, since",
   "# PowerShell passes $null to a .NET string as \"\", and PowerShell 7 keeps a variable set to \"\".",
   "foreach ($n in $Clear) { [Environment]::SetEnvironmentVariable($n, [NullString]::Value, [EnvironmentVariableTarget]::Process) }",
-  "[Environment]::SetEnvironmentVariable('PSExecutionPolicyPreference', [NullString]::Value, [EnvironmentVariableTarget]::Process)",
+  "foreach ($n in $Drop) { [Environment]::SetEnvironmentVariable($n, [NullString]::Value, [EnvironmentVariableTarget]::Process) }",
   "foreach ($n in $Set.Keys) { [Environment]::SetEnvironmentVariable($n, $Set[$n], [EnvironmentVariableTarget]::Process) }",
   "",
-  "# 5. claude, and its exit code.",
+  "# 6. claude, and its exit code.",
   "if ($Resume) { & $exe --resume $Resume }",
   "elseif ($Start) { & $exe --session-id $Start --name $Name }",
   "else { & $exe }",
@@ -608,6 +772,16 @@ export const LAUNCH_ENV_SET: Readonly<Record<string, string>> = {
   CLAUDE_CODE_FORCE_SESSION_PERSISTENCE: '1',
   CLAUDE_CODE_DISABLE_BG_SHELL_PRESSURE_REAP: '1',
 }
+
+/**
+ * Removed by claude-launch.ps1 as well, after LAUNCH_ENV_CLEAR, and not by the slot runner and the claude
+ * wrapper, which keep their own lists until slots v2: PSExecutionPolicyPreference (an -ExecutionPolicy on
+ * the command line that ran the launcher was for it alone), and CLAUDE_PANE_TOKEN (the claude wrapper's
+ * token for the tab a session ran in, which every process under that claude inherits: a session resumed
+ * in a window or a slot has no tab of its own, and an inherited token would point its later restarts at
+ * that tab's pane file).
+ */
+export const LAUNCH_ENV_DROP: readonly string[] = ['PSExecutionPolicyPreference', 'CLAUDE_PANE_TOKEN']
 
 /** How long after a classic SessionStart for another conversation the arriving side writes the left record. */
 export const LEFT_SETTLE_MS = 3000
@@ -1637,8 +1811,10 @@ export type ProcessRef = { readonly pid: number; readonly created: string }
  * - `lane`: the coordinator's word (L4); `heartbeat`: the conversation's last beat (L5); `mine`: the
  *   claim this caller took (L6 passes over it);
  * - `self`: this very process, by its pid and creation time, when `id` is its own conversation (a lane
- *   restart, self-restart): its own registry entry, command line, transcript writes and heartbeat are
- *   no evidence against it. Any other holder still is, and an unknown stays unknown;
+ *   restart, self-restart): its own registry entry and command line are no evidence against it, and its
+ *   transcript writes and heartbeat (L3, L5) aren't read, but only while the probe sees it running with
+ *   that start and its own current registry entry names `id`; otherwise L3 and L5 are read, saying why.
+ *   Any other holder still is evidence, and an unknown stays unknown;
  * - `left`: take the probe's left record for `id` into account (\u00a73.4): it waives L3 and L5, and only
  *   those, under all six of its conditions; otherwise it is ignored, saying why.
  */
@@ -1746,10 +1922,21 @@ export function liveness(probe: Probe, id: string, now: number, opts: LivenessOp
   if (transcripts.length === 0) unknown.push(`unknown: no transcript of ${id} is on this machine`)
   if (transcripts.length > 1) unknown.push(`unknown: ${transcripts.length} project folders hold a transcript of ${id}`)
   // L3 and L5, unless waived: by this very process (its own writes and beats), or by a left record.
+  // `self` waives them only when this process is running, by its pid and its start, and its own current
+  // registry entry names `id`: a process that moved in place to another conversation since, or one the
+  // probe doesn't see, proves nothing about who wrote `id`'s transcript last.
   const waivers: string[] = []
   let waived = false
-  if (opts.self !== undefined) waivers.push(`L3 and L5 are not read: ${id} is this process's own conversation (claude.exe ${opts.self.pid})`)
-  else if (opts.left === true) {
+  const selfHolds = opts.self !== undefined && isSelf(opts.self.pid) && (holds.get(opts.self.pid) ?? []).includes(id)
+  if (selfHolds && opts.self !== undefined) waivers.push(`L3 and L5 are not read: ${id} is this process's own conversation (claude.exe ${opts.self.pid})`)
+  else if (opts.self !== undefined) {
+    waivers.push(
+      isSelf(opts.self.pid)
+        ? `L3 and L5 are read: this process's own current registry entry (claude.exe ${opts.self.pid}) doesn't name ${id}, so it isn't known to be its own conversation`
+        : `L3 and L5 are read: this process (claude.exe ${opts.self.pid}, started ${when(opts.self.created)} UTC) isn't running with that start, so ${id} isn't known to be its own conversation`,
+    )
+  }
+  if (!selfHolds && opts.left === true) {
     const records = (probe.left ?? []).filter(l => l.asked === id)
     const record = records[0]
     if (probe.errors.some(e => e.source === 'left')) waivers.push("left record ignored: the left records can't be read")
@@ -1761,7 +1948,7 @@ export function liveness(probe: Probe, id: string, now: number, opts: LivenessOp
       } else waivers.push(`left record ignored: ${why ?? 'it is not of its shape'}`)
     }
   }
-  const readsL3L5 = opts.self === undefined && !waived
+  const readsL3L5 = !selfHolds && !waived
   if (readsL3L5) for (const t of transcripts) if (now - t.mtime < TRANSCRIPT_LIVE_MS) live.push(`L3: its transcript was written ${ago(now - t.mtime)} ago`)
   if (opts.lane === 'unreachable') unknown.push("unknown: the coordinator can't be reached")
   else if (opts.lane?.isLive === true) live.push(`L4: ${opts.lane.why ?? 'the coordinator has its lane live'}`)
@@ -1851,7 +2038,7 @@ export function safePoint(probe: Probe | string, git: GitState, agents: readonly
   const reasons: string[] = []
   if (typeof agents === 'string') reasons.push(`S1: the session's subagents can't be read (${agents})`)
   else {
-    const busy = agents.filter(a => BUSY_AGENTS.includes(a.status)).map(a => (a.description?.trim() ? a.description.trim() : (a.type ?? 'an agent')))
+    const busy = agents.filter(a => isBusyAgent(a.status)).map(a => (a.description?.trim() ? a.description.trim() : (a.type ?? 'an agent')))
     if (busy.length > 0) reasons.push(`S1: ${busy.length === 1 ? 'a subagent is' : `${busy.length} subagents are`} still running (${busy.join('; ')})`)
   }
   if (typeof probe === 'string') reasons.push(`the machine probe failed (${probe}), so what runs under this session is unknown`)
@@ -2168,13 +2355,15 @@ export function pickTransport(
 // process named); checks what the caller asked for (NOT LIVE right now, a new id); takes the claim lock
 // on the conversation; and places the launch:
 // - `pane`: a ticket for the claude wrapper's tab, which resumes the conversation in the same tab once
-//   the caller's claude has exited (its own checks: the claim, RECHECK);
+//   the caller's claude has exited (its own checks: the claim, RECHECK); a ticket naming more than one
+//   config folder, or a left record's stat, only for a wrapper of pane file version 3, read here;
 // - `slot`: a record for this pane's slot runner, which resumes it in the same pane once the caller's
 //   claude has exited (its own checks: the claim, the project, RECHECK);
 // - `window`: a new window (Start-Process, Windows PowerShell by its known path), whose script waits for
 //   the caller's process when asked, then RECHECKs (and the left record's stat), checks the claim and
-//   the folder, checks claude-launch.ps1's SHA-256, and runs it: claude-launch.ps1 is the only script
-//   that starts claude, the only place that holds the launch environment;
+//   the folder, checks claude-launch.ps1's SHA-256, and runs it, with every config folder and the stat,
+//   so that its own last look is the same: claude-launch.ps1 is the only script that starts claude, the
+//   only place that holds the launch environment. It is put in place first, at its hash's own name;
 // - `auto`: this pane's slot when its runner is verified and takes the folder, else the window, decided
 //   in the script (self-restart's choice).
 // It answers `launched <transport> <label> [<pid>]`, or `refused <code> <why>` (a lock it took given
@@ -2307,11 +2496,12 @@ export const GET_SHA256 = [
 ]
 
 /**
- * Puts claude-launch.ps1 in place when it is missing or has another SHA-256 than `$sha`: the copy the
- * launch carries (`$b64`, LAUNCH_SCRIPT_TEXT's bytes) written whole under another name in the same
- * folder (CreateNew), checked, then moved over the file there ([IO.File]::Replace, or Move when there
- * is none), and read back. Returns $null when the file at `$path` has `$sha` (already, or now), else
- * why not; a write another launch made meanwhile with the same bytes counts. Needs Get-Sha256.
+ * Puts claude-launch.ps1 in place at its own name (launchScriptPath: no other version writes it) when it
+ * is missing or has another SHA-256 than `$sha` (an edited copy): the copy the launch carries (`$b64`,
+ * LAUNCH_SCRIPT_TEXT's bytes) written whole under another name in the same folder (CreateNew), checked,
+ * then moved over the file there ([IO.File]::Replace, or Move when there is none), and read back.
+ * Returns $null when the file at `$path` has `$sha` (already, or now), else why not; a write another
+ * launch of the same version made meanwhile counts. Needs Get-Sha256.
  */
 export const INSTALL_LAUNCHER = [
   'function Install-Launcher($path, $b64, $sha) {',
@@ -2331,6 +2521,36 @@ export const INSTALL_LAUNCHER = [
   '  if ((Get-Sha256 $path) -ceq $sha) { return $null }',
   '  if ($null -eq $why) { $why = "it was written, but reads back with another SHA-256" }',
   '  return $why',
+  '}',
+]
+
+/**
+ * Keeps the copy for use by hand (`$hand`, launchHandPath) at the highest version any launch carries:
+ * when it is missing, has no `# claude-launch version <n>` line, or says less than `$version`, the
+ * installed script at `$from` (just checked by its hash) is copied there whole: a new file under another
+ * name (CreateNew), the old one deleted, the new one moved in. Never [IO.File]::Replace, which would keep
+ * a downloaded file's mark (Zone.Identifier) on the copy. One of the same or a higher version is left as
+ * it is, so plugins of two versions never trade it back and forth. It never refuses a launch: whatever
+ * goes wrong here, the window runs its own hashed copy all the same.
+ */
+export const INSTALL_HAND_COPY = [
+  'function Install-HandCopy($hand, $from, $version) {',
+  '  try {',
+  '    $have = -1',
+  '    if (Test-Path -LiteralPath $hand -PathType Leaf) {',
+  '      $have = 0',
+  String.raw`      if ([IO.FileInfo]::new($hand).Length -le 65536 -and [IO.File]::ReadAllText($hand) -cmatch '(?m)^# claude-launch version (\d{1,6})\r?$') { $have = [int]$Matches[1] }`,
+  '    }',
+  '    if ($have -ge $version) { return }',
+  '    $tmp = $hand + "." + [guid]::NewGuid().ToString("N") + ".tmp"',
+  '    try {',
+  '      $bytes = [IO.File]::ReadAllBytes($from)',
+  '      $stream = [IO.File]::Open($tmp, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)',
+  '      try { $stream.Write($bytes, 0, $bytes.Length); $stream.Flush($true) } finally { $stream.Dispose() }',
+  '      if ($have -ge 0) { [IO.File]::Delete($hand) }',
+  '      [IO.File]::Move($tmp, $hand)',
+  '    } finally { if ([IO.File]::Exists($tmp)) { [IO.File]::Delete($tmp) } }',
+  '  } catch { }',
   '}',
 ]
 
@@ -2499,12 +2719,18 @@ function checkLaunch(input: LaunchInput) {
  * for the caller's process when asked; then, right before claude, reads the registry and the process
  * table again (RECHECK) and the left record's stat, and for a start that no transcript appeared;
  * checks that the claim lock still names this launch and that the folder is there; checks
- * claude-launch.ps1's SHA-256; and runs it. Values only as single-quoted literals or checked numbers.
+ * claude-launch.ps1's SHA-256; and runs it, handing it every config folder this launch read and the
+ * left record's stat, so that its own last look, right before claude, is this one again. A run that
+ * throws (a Group Policy execution policy, a claude.exe an update holds) is caught and said, with the
+ * way to resume by hand, never a window that closes on it. Values only as single-quoted literals or
+ * checked numbers.
  */
 function windowScript(v: { id: string; kind: 'resume' | 'start'; name?: string; folder: string; state: string; configDirs: readonly string[]; by: string; waitFor?: ProcessRef; left?: LeftStat }): string {
   const resume = v.kind === 'resume'
   const byHand = resume ? '"claude-launch.ps1 -Resume " + $id + " -Dir " + $folder' : '"claude-launch.ps1 -Start " + $id + " -Name " + $name + " -Dir " + $folder'
-  const runs = resume ? '& $launchPath -Resume $id -Dir $folder' : '& $launchPath -Start $id -Name $name -Dir $folder'
+  // The numbers were checked whole (leftRecheck) before they reach here.
+  const leftArgs = v.left === undefined ? '' : 'size' in v.left ? ` -LeftSize '${v.left.size}' -LeftMtime '${v.left.mtime}'` : ` -LeftExitAt '${v.left.exitAt}'`
+  const runs = resume ? `& $launchPath -Resume $id -Dir $folder -ConfigDir $configDirs${leftArgs}` : '& $launchPath -Start $id -Name $name -Dir $folder -ConfigDir $configDirs'
   return [
     '$ErrorActionPreference = "Stop"',
     '$ProgressPreference = "SilentlyContinue"',
@@ -2557,8 +2783,16 @@ function windowScript(v: { id: string; kind: 'resume' | 'start'; name?: string; 
     '  exit 1',
     '}',
     '$started = Get-Date',
-    runs,
-    '$code = $LASTEXITCODE',
+    '$code = 1',
+    'try {',
+    `  ${runs}`,
+    '  $code = $LASTEXITCODE',
+    '} catch {',
+    `  Write-Host ("claude-launch.ps1 stopped on an error, so the session may not have ${resume ? 'resumed' : 'started'} here: " + $_.Exception.Message)`,
+    `  Write-Host ("Once it is safe, ${resume ? 'resume' : 'start'} it yourself: " + ${byHand})`,
+    '  Read-Host "Press Enter to close this window" | Out-Null',
+    '  exit 1',
+    '}',
     // An error, or an end within seconds: the resume didn't take. Say how to resume by hand, and wait.
     `if ($code -ne 0 -or ((Get-Date) - $started).TotalSeconds -lt ${SHORT_RUN_SECONDS}) {`,
     '  Write-Host "Claude Code ended (exit code $code)."',
@@ -2599,8 +2833,12 @@ export function launchScriptText(input: LaunchInput): string {
     '$payload = [Convert]::ToBase64String($packed.ToArray())',
     `$unpack = "& ([scriptblock]::Create([IO.StreamReader]::new([IO.Compression.GZipStream]::new([IO.MemoryStream]::new([Convert]::FromBase64String('$payload')), [IO.Compression.CompressionMode]::Decompress), [Text.Encoding]::UTF8).ReadToEnd()))"`,
     '$encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($unpack))',
-    // -ExecutionPolicy RemoteSigned for this window's scripts alone (claude-launch.ps1 clears it again before claude).
-    `$window = Start-Process -FilePath ${literal(input.powershell)} -ArgumentList '-NoProfile', '-ExecutionPolicy', 'RemoteSigned', '-EncodedCommand', $encoded -PassThru`,
+    // -ExecutionPolicy Bypass, for this window's scripts alone (claude-launch.ps1 clears it again before
+    // claude): the window runs claude-launch.ps1 only with the SHA-256 it pins, checked right before, a
+    // stronger check than RemoteSigned's; under RemoteSigned, a downloaded file's mark (Zone.Identifier)
+    // on the script would make the run throw after the old process has gone. A Group Policy execution
+    // policy still wins over the command line: the window's catch then says so, and how to resume by hand.
+    `$window = Start-Process -FilePath ${literal(input.powershell)} -ArgumentList '-NoProfile', '-ExecutionPolicy', 'Bypass', '-EncodedCommand', $encoded -PassThru`,
     `$placed = "window - " + $window.Id`,
   ]
   /** The slot's record, written whole: the conversation, its folder, when, and the config folders the runner's re-check also reads. */
@@ -2645,6 +2883,7 @@ export function launchScriptText(input: LaunchInput): string {
     `$by = '${input.claim}'`,
     `$claimPath = ${literal(claimPath(v.state, v.id))}`,
     `$launchPath = ${literal(launchScriptPath(v.state))}`,
+    `$handPath = ${literal(launchHandPath(v.state))}`,
     '$taken = $false',
     '$final = $null',
     ...RELEASE_CLAIM,
@@ -2682,16 +2921,29 @@ export function launchScriptText(input: LaunchInput): string {
         : transport === 'window'
           ? ["$transport = 'window'"]
           : []),
-    // claude-launch.ps1 in place, with the shipped hash, before anything is taken or opened: the copy
-    // this launch carries is put there when the file is missing or has another hash; refused only when
-    // it can't be.
+    // A tab whose ticket names more than one config folder, or carries a left record's stat, needs the
+    // wrapper of pane file version 3, whose last look reads them: read here, whatever the caller judged
+    // (a wrapper of version 2 reads its own config folder alone and checks no left record).
+    ...(where !== 'auto' && 'pane' in where && (v.configDirs.length > 1 || input.left !== undefined)
+      ? [
+          `$paneFile = ${literal(panePath(v.state, where.pane.token) ?? '')}`,
+          '$paneV = $null',
+          'try { $paneDoc = [IO.File]::ReadAllText($paneFile) | ConvertFrom-Json; if ($paneDoc.v -is [ValueType]) { $paneV = [long]$paneDoc.v } } catch { $paneV = $null }',
+          `if ($null -eq $paneV -or $paneV -lt ${PANE_VERSION}) { Refuse 'pane' ($tool + ': this tab' + [char]39 + 's claude wrapper is not of pane file version ${PANE_VERSION}, whose last look reads every config folder its ticket names and checks a left record, and this move needs that: copy the current claude-wrapper.ps1 into place') }`,
+        ]
+      : []),
+    // claude-launch.ps1 in place at its own name, with the shipped hash, before anything is taken or
+    // opened: the copy this launch carries is put there when the file is missing or has another hash;
+    // refused only when it can't be. Then the copy kept for use by hand, never refused on.
     ...(usesWindow
       ? [
           `$launcherCopy = '${asciiBase64(LAUNCH_SCRIPT_TEXT)}'`,
           ...INSTALL_LAUNCHER,
+          ...INSTALL_HAND_COPY,
           "if ($transport -eq 'window') {",
           `  $installWhy = Install-Launcher $launchPath $launcherCopy '${LAUNCH_SCRIPT_SHA256}'`,
           "  if ($null -ne $installWhy) { Refuse 'launcher' ($tool + ': claude-launch.ps1 is not at ' + $launchPath + ' with the SHA-256 this plugin ships, and the copy it carries could not be put there: ' + $installWhy) }",
+          `  Install-HandCopy $handPath $launchPath ${LAUNCH_SCRIPT_VERSION}`,
           '}',
         ]
       : []),
@@ -2743,18 +2995,24 @@ export function launchScriptText(input: LaunchInput): string {
  * the claude wrapper (its pane file's PowerShell is this claude.exe's own parent); else this pane's
  * slot, its script of the shipped hash; else a new window, `fallback` saying why a slot runner found
  * here wasn't used. A launch that doesn't replace its caller has no transport in this version: a slot
- * elsewhere, a tab and placement's window come with slots v2, and it waits. `needsLeft`: the verdict
- * rests on a left record (it waived L3 and L5), so only a place whose last look checks it: a tab of
- * pane file version 3, or a window (never this pane's slot, until slots v2, saying so). A pure function.
+ * elsewhere, a tab and placement's window come with slots v2, and it waits. Both are required, never
+ * defaulted, so a caller can't leave out what weakens a tab's last look: `configCount`, how many config
+ * folders the launch reads (1 to 8: a tab of pane file version 2 reads one alone); `needsLeft`, whether
+ * the verdict rests on a left record (it waived L3 and L5: `live.waived` set and the verdict without the
+ * record not `not-live`), so only a place whose last look checks it: a tab of pane file version 3, or a
+ * window (never this pane's slot, until slots v2, saying so). The launch itself refuses a tab of
+ * version 2 for either all the same. A pure function; throws on a count that isn't 1 to 8.
  */
 export function pickLaunchTransport(
   probe: Probe,
-  opts: { readonly replacing: boolean; readonly pane?: { readonly token: string; readonly pane: Pane }; readonly configCount?: number; readonly needsLeft?: boolean },
+  opts: { readonly replacing: boolean; readonly pane?: { readonly token: string; readonly pane: Pane }; readonly configCount: number; readonly needsLeft: boolean },
 ): { readonly where: LaunchWhere; readonly fallback?: string } | { readonly wait: string } {
+  if (!Number.isInteger(opts.configCount) || opts.configCount < 1 || opts.configCount > 8) throw new Error(`a launch reads 1 to 8 config folders, not ${JSON.stringify(opts.configCount)}`)
+  if (typeof opts.needsLeft !== 'boolean') throw new Error('needsLeft says whether the verdict rests on a left record: true or false')
   if (!opts.replacing) return { wait: 'a launch of another process needs an idle slot, a tab or a window, which come with slots v2 (S2)' }
   const tab = opts.pane
-  const needsLeft = opts.needsLeft === true
-  if (tab !== undefined && PANE_TOKEN.test(tab.token) && paneFallback(probe, tab.pane) === undefined && paneReads(tab.pane, opts.configCount ?? 1) === undefined && (!needsLeft || paneNoLeft(tab.pane) === undefined)) return { where: { pane: { token: tab.token } } }
+  const needsLeft = opts.needsLeft
+  if (tab !== undefined && PANE_TOKEN.test(tab.token) && paneFallback(probe, tab.pane) === undefined && paneReads(tab.pane, opts.configCount) === undefined && (!needsLeft || paneNoLeft(tab.pane) === undefined)) return { where: { pane: { token: tab.token } } }
   const slot = probe.slot
   if (slot !== null && slot.sha256 === SLOT_SCRIPT_SHA256) return needsLeft ? { where: { window: true }, fallback: SLOT_NO_LEFT } : { where: { slot: slot.id } }
   if (slot !== null) return { where: { window: true }, fallback: slotFallback(slot) }
@@ -3372,14 +3630,14 @@ export function exitBlockers(input: ExitInputs): ExitBlocker[] {
   if (typeof input.agents === 'string') unknown(`whether a subagent is still running: the session's subagents can't be read (${oneLine(input.agents, 300)})`)
   else {
     for (const agent of input.agents) {
-      if (!BUSY_AGENTS.includes(agent.status)) continue
+      if (!isBusyAgent(agent.status)) continue
       const described = agent.description?.trim() ?? ''
       const name = oneLine(described !== '' ? described : (agent.type ?? 'an agent'), 120)
       const id = typeof agent.id === 'string' && agent.id !== '' ? agent.id : undefined
       found.push({
         kind: 'subagent',
         ...(id === undefined ? {} : { id }),
-        what: `a subagent is still running (${name})`,
+        what: agent.status === 'running' ? `a subagent is still running (${name})` : `a subagent hasn't ended (${name}; ${oneLine(agent.status, 40)})`,
         howToStop: `wait for it to report, or stop it with TaskStop${id === undefined ? '' : ` (${idText(id)})`}`,
       })
     }
@@ -3688,15 +3946,23 @@ export function leftScript(input: LeftInput): string {
     '}',
     'if ($found.Count -ne 1) { "refused transcript " + $found.Count + " transcripts of it are on this machine, not one"; exit 0 }',
     '$one = $found[0]',
-    // The key: created once, with CreateNew, so a second creation never replaces it; then read.
+    // The key: created once, never replaced. Its 32 bytes are written whole under another name (CreateNew),
+    // then moved into place, which a key already there refuses: so a crash part way never leaves a torn
+    // key where the records look for it. Then read.
     '[void][IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($leftKeyPath))',
+    '$keyTmp = $leftKeyPath + "." + [guid]::NewGuid().ToString("N") + ".tmp"',
     'try {',
-    '  $keyStream = [IO.File]::Open($leftKeyPath, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)',
-    '  try { $fresh = New-Object byte[] 32; $rng = [Security.Cryptography.RandomNumberGenerator]::Create(); try { $rng.GetBytes($fresh) } finally { $rng.Dispose() }; $keyStream.Write($fresh, 0, 32) } finally { $keyStream.Dispose(); $fresh = $null }',
-    `} catch { if (-not ${IS_IO}) { throw } }`,
+    '  if (-not (Test-Path -LiteralPath $leftKeyPath -PathType Leaf)) {',
+    '    $keyStream = [IO.File]::Open($keyTmp, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)',
+    '    try { $fresh = New-Object byte[] 32; $rng = [Security.Cryptography.RandomNumberGenerator]::Create(); try { $rng.GetBytes($fresh) } finally { $rng.Dispose() }; $keyStream.Write($fresh, 0, 32); $keyStream.Flush($true) } finally { $keyStream.Dispose(); $fresh = $null }',
+    '    [IO.File]::Move($keyTmp, $leftKeyPath)',
+    '  }',
+    `} catch { if (-not ${IS_IO}) { throw } } finally { try { if ([IO.File]::Exists($keyTmp)) { [IO.File]::Delete($keyTmp) } } catch { } }`,
     '$leftKey = $null',
     'for ($try = 0; $try -lt 3 -and $null -eq $leftKey; $try++) { if ($try -gt 0) { Start-Sleep -Milliseconds 100 }; try { $leftKey = [IO.File]::ReadAllBytes($leftKeyPath) } catch { $leftKey = $null } }',
-    "if ($null -eq $leftKey -or $leftKey.Length -ne 32) { $leftKey = $null; 'refused key the left key can not be read as 32 bytes'; exit 0 }",
+    // A key of another length was cut short when it was made (by a version that wrote it in place): it
+    // is never replaced, so it is said how to start again.
+    "if ($null -eq $leftKey -or $leftKey.Length -ne 32) { $leftKey = $null; 'refused key the left key (' + $leftKeyPath + ') can not be read as 32 bytes: if it is there and not 32 bytes long, it was cut short when it was made; delete it, and the next record makes a new one (records made under it then waive nothing)'; exit 0 }",
     // The fields, each a string, as the reader checks them; then the MAC over them, and the key let go.
     '$f = [ordered]@{ id = $id; how = $how; pid = ([string][long]$session.ProcessId); created = (Get-Created $session); at = ([string][DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()); dir = $one.dir; project = $one.project; size = ([string][long]$one.item.Length); mtime = ([string]([DateTimeOffset]$one.item.LastWriteTimeUtc).ToUnixTimeMilliseconds()); by = $by; go = $go }',
     '$mac = Get-LeftMac $leftKey (Get-LeftText $f)',
@@ -3746,6 +4012,13 @@ export function readWakeMarker(text: string): WakeMarker | undefined {
   return 'due' in raw ? undefined : { armed: false, at: raw.at }
 }
 
+/**
+ * The way out of an unknown S10w when self-wake is new enough already: a self-wake updated on disk but
+ * not loaded yet writes no marker until /reload-plugins; one whose write failed writes it again at
+ * cancel_wake.
+ */
+const WAKE_WAY_OUT = `if it is ${SELF_WAKE_MARKER_VERSION} or later already, run /reload-plugins (a self-wake updated but not yet loaded writes no marker), or call cancel_wake, which writes the marker again (and cancels any wake-up set)`
+
 /** S10w's read of a conversation's wake-up: pending (and when), none (and why), or unknown (and why), which holds as pending does. */
 export type WakeRead = { readonly wake: 'pending'; readonly due: number } | { readonly wake: 'none'; readonly why: string } | { readonly wake: 'unknown'; readonly why: string }
 
@@ -3767,14 +4040,54 @@ export async function readWake($: EngineInterface, state: string, id: string): P
   if (!present) return { wake: 'none', why: 'self-wake is not in this session' }
   let text: unknown
   try {
-    if (!(await $.fs.exists(path))) return { wake: 'unknown', why: `self-wake is on, but its marker for this conversation isn't there (${path}): update self-wake to ${SELF_WAKE_MARKER_VERSION} or later, which writes one` }
+    if (!(await $.fs.exists(path))) return { wake: 'unknown', why: `self-wake is on, but its marker for this conversation isn't there (${path}): update self-wake to ${SELF_WAKE_MARKER_VERSION} or later, which writes one; ${WAKE_WAY_OUT}` }
     text = await $.fs.read(path)
   } catch (err) {
-    return { wake: 'unknown', why: `self-wake's marker for this conversation can't be read (${errorLine(err)}): self-wake ${SELF_WAKE_MARKER_VERSION} or later writes one this plugin reads` }
+    return { wake: 'unknown', why: `self-wake's marker for this conversation can't be read (${errorLine(err)}): self-wake ${SELF_WAKE_MARKER_VERSION} or later writes one this plugin reads; ${WAKE_WAY_OUT}` }
   }
   const marker = typeof text === 'string' ? readWakeMarker(text) : undefined
-  if (marker === undefined) return { wake: 'unknown', why: `self-wake's marker for this conversation is not of its shape: update self-wake to ${SELF_WAKE_MARKER_VERSION} or later` }
+  if (marker === undefined) return { wake: 'unknown', why: `self-wake's marker for this conversation is not of its shape: update self-wake to ${SELF_WAKE_MARKER_VERSION} or later; ${WAKE_WAY_OUT}` }
   return marker.armed && marker.due !== undefined ? { wake: 'pending', due: marker.due } : { wake: 'none', why: 'no wake-up is armed' }
+}
+
+/** The wake marker removal's answer: `removed` (no marker there now), or `kept <why>`. */
+export const WAKE_REMOVED = /^(removed|kept)(?: (.{1,600}?))?\s*$/m
+
+/**
+ * Removes conversation `id`'s wake marker, so that S10w reads its wake-up as unknown, which holds: for
+ * self-wake when it couldn't write the marker saying a wake-up is armed, and the marker left there says
+ * none is (read as none, it would let a switch drop the wake-up). A plugin can't delete a file; this one
+ * fixed script does, by the path wakePath builds. Throws on an id that isn't a session id.
+ */
+export function wakeRemoveScript(input: { readonly stateDir: string; readonly id: string }): string {
+  const state = checkFolder('the state folder', input.stateDir)
+  const path = wakePath(state, checkId(input.id))
+  return [
+    "$ErrorActionPreference = 'Stop'",
+    "$ProgressPreference = 'SilentlyContinue'",
+    PSMODULEPATH_RESET,
+    `$path = ${literal(path)}`,
+    '$why = "it is still there"',
+    'for ($try = 0; $try -lt 3 -and [IO.File]::Exists($path); $try++) { if ($try -gt 0) { Start-Sleep -Milliseconds 200 }; try { [IO.File]::Delete($path) } catch { $why = $_.Exception.Message } }',
+    'if ([IO.File]::Exists($path)) { "kept " + (("" + $why) -split "\\r?\\n")[0] } else { "removed" }',
+  ].join('\r\n')
+}
+
+/** How long removing a wake marker may take. */
+export const WAKE_REMOVE_MS = 15_000
+
+/**
+ * Runs wakeRemoveScript for conversation `id` under `state`, with Windows PowerShell by its known
+ * path: whether no marker is there now. Never throws; anything that goes wrong is a marker kept.
+ */
+export async function removeWakeMarker($: EngineInterface, powershell: string, state: string, id: string): Promise<boolean> {
+  try {
+    const call = powershellCall(powershell, wakeRemoveScript({ stateDir: state, id }))
+    const run = await $.process.run(call.argv, { stdin: call.stdin, timeoutMs: WAKE_REMOVE_MS })
+    return run.exitCode === 0 && WAKE_REMOVED.exec(run.stdout)?.[1] === 'removed'
+  } catch {
+    return false
+  }
 }
 
 /** S10w as a reason a go or a switch holds, or undefined when it doesn't. */
@@ -3853,9 +4166,11 @@ export const LANES_WRITTEN = /^lanes ([a-z0-9][a-z0-9-]{0,39})\s*$/m
  * (lanes.json.lock) held as a handle no one else may open, with DeleteOnClose, from before the read to
  * after the write: a second writer waits for it (40 tries, 250 ms apart), and a writer that dies lets
  * it go with its process, so no lock is ever stale; a lock file another left behind is simply opened.
- * Read, merge this entry, write a temporary file, [IO.File]::Replace over the old one: a reader never
- * sees half a file. A lanes.json not of its shape is left as it is (refused). Throws on a name, id,
- * folder, window, tab or workspace that isn't of its shape.
+ * Read, merge this entry (names compared exactly; one that isn't a session's name dropped), write a
+ * temporary file, [IO.File]::Replace over the old one: a reader never sees half a file. A lanes.json
+ * not of its shape is left as it is (refused, saying how to start again). Throws on a name, id, folder,
+ * window, tab or workspace that isn't of its shape. The coordinator writes through this script too:
+ * another lock of its own would not keep out this one's writers.
  */
 export function lanesUpdateScript(input: { readonly configDir: string; readonly name: string; readonly entry: LaneEntry }): string {
   const configDir = checkFolder('the config folder', input.configDir)
@@ -3874,16 +4189,21 @@ export function lanesUpdateScript(input: { readonly configDir: string; readonly 
     '$lock = $null',
     'for ($try = 0; $try -lt 40 -and $null -eq $lock; $try++) {',
     '  try { $lock = [IO.FileStream]::new($lockPath, [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None, 4096, [IO.FileOptions]::DeleteOnClose) }',
-    `  catch { if (-not ${IS_IO}) { throw }; Start-Sleep -Milliseconds 250 }`,
+    // A lock file being deleted (another writer's, closed while a scanner still has it open) refuses
+    // access rather than sharing: waited for, as a held one is.
+    `  catch { if (-not (${IS_IO} -or $_.Exception -is [UnauthorizedAccessException] -or $_.Exception.InnerException -is [UnauthorizedAccessException])) { throw }; Start-Sleep -Milliseconds 250 }`,
     '}',
     "if ($null -eq $lock) { 'refused lock another writer held lanes.json for 10 seconds'; exit 0 }",
     'try {',
-    '  $lanes = [ordered]@{}',
+    // Names compared exactly, as readLanes does: a hashtable would fold a hand-written `Foo` and this
+    // `foo` into one entry under the first spelling, which readLanes then drops.
+    '  $lanes = [Collections.Specialized.OrderedDictionary]::new([StringComparer]::Ordinal)',
     '  if (Test-Path -LiteralPath $path -PathType Leaf) {',
     '    $doc = $null',
     '    try { $doc = [IO.File]::ReadAllText($path, [Text.Encoding]::UTF8) | ConvertFrom-Json } catch { $doc = $null }',
-    "    if ($doc -isnot [Management.Automation.PSCustomObject] -or $doc.v -isnot [ValueType] -or $doc.v -ne 1 -or $doc.lanes -isnot [Management.Automation.PSCustomObject]) { 'refused file lanes.json is not of its shape, so it is left as it is'; exit 0 }",
-    '    foreach ($p in $doc.lanes.PSObject.Properties) { if ($p.Name -cne $name) { $lanes[$p.Name] = $p.Value } }',
+    "    if ($doc -isnot [Management.Automation.PSCustomObject] -or $doc.v -isnot [ValueType] -or $doc.v -ne 1 -or $doc.lanes -isnot [Management.Automation.PSCustomObject]) { 'refused file lanes.json is not of its shape, so it is left as it is: not JSON, not version 1, no lanes object, or two names in it that differ only in case. Fix it by hand, or move it aside (rename it lanes.json.bad), and the next write starts a new one'; exit 0 }",
+    // Every other entry kept as it is, but one whose name isn't a session's name: readLanes drops it anyway.
+    String.raw`    foreach ($p in $doc.lanes.PSObject.Properties) { if ($p.Name -cne $name -and $p.Name -cmatch '^[a-z0-9][a-z0-9-]{0,39}\z') { $lanes[$p.Name] = $p.Value } }`,
     '  }',
     '  $lanes[$name] = $entryText | ConvertFrom-Json',
     '  $final = $path',

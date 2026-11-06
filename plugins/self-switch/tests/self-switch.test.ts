@@ -2,7 +2,7 @@
 // from fixtures; /resume and /exit are recorded, never run. Nothing here starts a process.
 import { describe, expect, mock, test } from 'claude-code/testing'
 import type { AgentStatus, On } from 'claude-code'
-import { claimPath, gatePath, launchScriptText, type LaunchInput, MAX_UNTRACKED, paneNoLeft, panePath, paneTicketPath, quoted, SLOT_NO_LEFT, SLOT_NOT_RECOGNISED, SLOT_SCRIPT_SHA256, slotRecordPath, STDIN_BOOTSTRAP, wakeMarker, wakePath } from '../hooks/machine'
+import { claimPath, gatePath, launchScriptText, type LaunchInput, leftPath, MAX_UNTRACKED, paneNoLeft, panePath, paneTicketPath, quoted, SLOT_NO_LEFT, SLOT_NOT_RECOGNISED, SLOT_SCRIPT_SHA256, slotRecordPath, STDIN_BOOTSTRAP, wakeMarker, wakePath } from '../hooks/machine'
 import { decode, ELSEWHERE, elsewhere, entry, ft, inSlot, LAUNCH, leftExit, machine, NOW, OTHER, PERMISSION_FLAGS, PROJECT, type RawProbe, REPO, T, under, W, X } from './fixtures'
 
 const TOOL = 'mcp__self-switch__switch_after_turn'
@@ -83,8 +83,16 @@ type Options = {
   launcher?: 'opens' | 'fails' | 'refuses'
   /** The claude wrapper's pane file for TOKEN, when there is one (the session carries CLAUDE_PANE_TOKEN only when `env` says so). */
   pane?: string
-  /** What the pane script does: writes the ticket, fails, or writes it while a subagent starts. */
-  paneScript?: 'writes' | 'fails' | 'agent'
+  /**
+   * What the pane script does: writes the ticket, fails (writing nothing), writes it and then fails
+   * (a run killed after its write), writes it while a subagent starts, or (`other`) a newer launch's
+   * ticket, naming another claim, is there when a subagent starts.
+   */
+  paneScript?: 'writes' | 'fails' | 'wrote-fails' | 'agent' | 'other'
+  /** The session's crons, as CronList lists them; `asks`: CronList's permission would ask, so they can't be read. */
+  crons?: { id: string; humanSchedule?: string; prompt?: string }[] | 'asks'
+  /** A wake-up marked armed while the switch runs: when a script of this kind runs, the marker becomes this. */
+  markOn?: { kind: Run['kind']; marker: string }
   /** What the in-place claim check reads: the lock still this switch's, another's, or none. */
   claim?: 'ours' | 'not-ours' | 'absent'
   /** What the in-place last look's re-check finds holding the conversation now, if anything. */
@@ -131,6 +139,8 @@ function engine(
     checkLive,
     cwd = REPO,
     wake = { present: false },
+    crons = [],
+    markOn,
   }: Options = {},
 ) {
   const runs: Run[] = []
@@ -140,7 +150,9 @@ function engine(
   const logs: string[] = []
   const writes: { path: string; text: string }[] = []
   const described: string[] = []
-  const world = { id, agents, probe: probe ?? machine(), gate, worktrees: git.worktrees ?? [REPO], diffs: {} as Record<string, string>, untrackedTime: NOW - HOUR, cwd, wake }
+  const world = { id, agents, probe: probe ?? machine(), gate, worktrees: git.worktrees ?? [REPO], diffs: {} as Record<string, string>, untrackedTime: NOW - HOUR, cwd, wake, crons }
+  /** The files the scripts wrote (a ticket, a slot's record, a left record) and the plugin wrote over, by path: what fs.read finds. */
+  const files = new Map<string, string>()
   const key = (path: string) => path.replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase()
   const held = new Map<string, unknown>(Object.entries(store))
   // A fingerprint's hash (crypto.subtle.digest, in the shared machine code) finishes outside the
@@ -230,13 +242,18 @@ function engine(
   })
   on('turn.start', (_, e) => ({ turnId: e.turnId }))
   on('turn.complete', () => ({ text: 'done' }))
+  // CronList, as the engine answers it (self-exit's live check SS2): its permission, then `{ result: { jobs }, text }`.
+  on('tool.check', { tool: 'CronList' }, () => answer(world.crons === 'asks' ? { decision: 'ask' as const, reason: 'a rule says so' } : { decision: 'allow' as const }))
+  on('tool.call', { tool: 'CronList' }, () => answer({ result: { jobs: world.crons === 'asks' ? [] : world.crons }, text: '' } as never))
   // self-wake, when it is in this session: its tool listed, and its marker for this conversation read.
   on('tool.list', () => answer({ value: world.wake.present ? [{ name: 'mcp__self-wake__wake_after', description: 'Wakes this session later.', mcp: true }] : [] }))
   const MARKER = wakePath(STATE, W)
-  on('fs.exists', (_, e) => answer({ value: e.path === GATE ? world.gate !== undefined : e.path === MARKER ? world.wake.marker !== undefined : false }))
+  on('fs.exists', (_, e) => answer({ value: e.path === GATE ? world.gate !== undefined : e.path === MARKER ? world.wake.marker !== undefined : files.has(e.path) }))
   on('fs.read', (_, e) =>
     answer(
-      e.path === GATE && world.gate !== undefined
+      files.has(e.path)
+        ? { value: files.get(e.path) as string }
+        : e.path === GATE && world.gate !== undefined
         ? { value: world.gate }
         : e.path === panePath(STATE, TOKEN) && pane !== undefined
           ? { value: pane }
@@ -247,6 +264,7 @@ function engine(
   )
   on('fs.write', (_, e) => {
     writes.push({ path: e.path, text: e.text })
+    files.set(e.path, e.text)
     return answer({ value: undefined })
   })
   // An untracked file's stat is one of a fingerprint's reads: a hash still to come stays to come.
@@ -304,6 +322,9 @@ function engine(
                   ? 'check'
                   : 'other'
     runs.push({ argv, init, script, kind })
+    if (markOn !== undefined && markOn.kind === kind) world.wake = { present: world.wake.present, marker: markOn.marker }
+    /** A single-quoted PowerShell literal the script sets, unquoted. */
+    const literalOf = (name: string): string | undefined => new RegExp(`^\\s*\\$${name} = '((?:[^']|'')*)'$`, 'm').exec(script)?.[1]?.split("''").join("'")
     if (kind === 'probe') {
       if (probeFails !== undefined) return ok(probeFails, 1)
       const found = typeof world.probe === 'function' ? world.probe(script) : world.probe
@@ -313,14 +334,28 @@ function engine(
     const by = /^\$by = '((?:launch|slot):[0-9a-f-]{1,40})'$/m.exec(script)?.[1] ?? 'none'
     if (kind === 'launcher' && launcher === 'refuses') return ok('refused launcher self-switch: claude-launch.ps1 is not where it must be\r\n')
     if (kind === 'launcher') return launcher === 'opens' ? ok(`claim ${by}\r\nlaunched window - 100\r\n`) : ok('self-switch: no claude on PATH\r\n', 4)
-    if (kind === 'slot') return ok(`claim ${by}\r\nlaunched slot ${by.slice('slot:'.length)}\r\n`)
+    if (kind === 'slot') {
+      const final = literalOf('final')
+      if (final !== undefined) files.set(final, JSON.stringify({ v: 1, resume: literalOf('id'), folder: literalOf('folder'), at: NOW }))
+      return ok(`claim ${by}\r\nlaunched slot ${by.slice('slot:'.length)}\r\n`)
+    }
     if (kind === 'pane') {
       if (paneAnswer === 'fails') return ok('', 1)
+      const final = literalOf('final')
+      const ticket = literalOf('text')
+      if (final !== undefined && ticket !== undefined) files.set(final, paneAnswer === 'other' ? ticket.replace(by, 'launch:00000000-0000-4000-a000-000000000009') : ticket)
+      if (paneAnswer === 'wrote-fails') return ok('', 1)
       // A subagent that starts while the ticket is written stops the switch right before its exit.
-      if (paneAnswer === 'agent') world.agents = [...world.agents, { description: 'Lint', status: 'running' }]
+      if (paneAnswer === 'agent' || paneAnswer === 'other') world.agents = [...world.agents, { description: 'Lint', status: 'running' }]
       return ok(`claim ${by}\r\nlaunched pane ${TOKEN}\r\n`)
     }
-    if (kind === 'left') return ok(`left ${/^\$id = '([0-9a-f-]{36})'$/m.exec(script)?.[1] ?? ''}\r\n`)
+    if (kind === 'left') {
+      const left = /^\$id = '([0-9a-f-]{36})'$/m.exec(script)?.[1] ?? ''
+      const how = literalOf('how')
+      // The record as leftScript writes it (its MAC aside), by this session's claude.exe 100.
+      if (SESSION_ID_SHAPE.test(left)) files.set(leftPath(STATE, left), JSON.stringify({ v: 1, id: left, how, pid: '100', created: ft(2), at: String(NOW), by: 'self-switch', mac: '0'.repeat(64) }))
+      return ok(`left ${left}\r\n`)
+    }
     if (kind === 'release') return ok(`${released}\r\n`)
     if (kind === 'check') return ok(checkLive === undefined ? `${claim}\r\n` : `live ${checkLive}\r\n`)
     return ok('', 1)
@@ -342,8 +377,11 @@ function engine(
   // The left record's runs are their own: lefts() (and the tests of the left record) read them.
   const kinds = () => runs.map(r => r.kind).filter(k => k !== 'git' && k !== 'left')
   const lefts = () => runs.filter(r => r.kind === 'left')
-  return { runs, commands, prompts, toasts, logs, writes, described, clock, session, world, held, tickets, kinds, lefts }
+  return { runs, commands, prompts, toasts, logs, writes, files, described, clock, session, world, held, tickets, kinds, lefts }
 }
+
+/** A session id's shape, for the fake's own parsing. */
+const SESSION_ID_SHAPE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
 
 const start = { cwd: REPO, surface: 'terminal', isInteractive: true } as const
 const answered = { answer: 'done', durationMs: 1, turnId: 't1', isAborted: false, reason: 'answer' } as const
@@ -373,7 +411,7 @@ describe('transports', () => {
 
     const queued = await $.tool.call({ ...call, reason: ` The billing piece is next. ${HOSTILE} `, resume: ` Pick up the invoice tests. ${HOSTILE} ` })
     expect(queued.deny).toBeUndefined()
-    expect(queued.result).toContain(`A wake-up set with wake_after holds the switch until it is cancelled or has fired; other pending wake-ups are dropped by the switch: set them again in ${T} if they are still needed.`)
+    expect(queued.result).toContain(`A wake-up set with wake_after holds the switch until it is cancelled or has fired, and a session cron (CronCreate, /loop, ScheduleWakeup) holds one that ends this process until it is deleted; other pending wake-ups are dropped by the switch: set them again in ${T} if they are still needed.`)
     expect(queued.result).toContain("If this pane runs a slot that can't be used, the switch says why, in the leaving row, a toast and the arrival, and a new window opens.")
     // Nothing runs while the turn does, however long it goes on.
     await clock.advance(MINUTE)
@@ -706,13 +744,14 @@ describe("the claude wrapper's tab", () => {
     expect(commands).toEqual([])
   })
 
-  test('a ticket that is not written: nothing exits, the ticket is withdrawn and the claim released', async ($, on) => {
+  test('a ticket that is not written: nothing exits, the claim is released, and no withdrawn ticket is left where none was written (N3)', async ($, on) => {
     const { kinds, commands, writes, tickets, session, clock } = engine(on, { env: WRAPPED, pane: PANE, probe: machine(elsewhere), store: THERE, paneScript: 'fails' })
     await $.session.start(start)
     await switchNow($, clock)
     expect(kinds()).toEqual(['probe', 'pane', 'release'])
     expect(commands).toEqual([])
-    expect(writes).toEqual([{ path: paneTicketPath(STATE, TOKEN), text: '{"v":1,"cancelled":true}' }])
+    // The next /exit typed in this tab would otherwise be told its ticket was withdrawn.
+    expect(writes).toEqual([])
     expect(tickets()).toEqual({})
     expect(rows(session)).toContain("didn't happen after all: this tab's ticket wasn't written (the launcher exited 1: failed)")
   })
@@ -726,6 +765,16 @@ describe("the claude wrapper's tab", () => {
     expect(writes).toEqual([{ path: paneTicketPath(STATE, TOKEN), text: '{"v":1,"cancelled":true}' }])
   })
 
+  test('a ticket a newer launch wrote, naming another claim, is never written over (N3)', async ($, on) => {
+    const { kinds, commands, writes, files, clock } = engine(on, { env: WRAPPED, pane: PANE, probe: machine(elsewhere), store: THERE, paneScript: 'other' })
+    await $.session.start(start)
+    await switchNow($, clock)
+    expect(kinds()).toEqual(['probe', 'pane', 'release'])
+    expect(commands).toEqual([])
+    expect(writes).toEqual([])
+    expect(files.get(paneTicketPath(STATE, TOKEN) ?? '')).toContain('launch:00000000-0000-4000-a000-000000000009')
+  })
+
   test("the tool's description names the tab, through the claude wrapper", async ($, on) => {
     const { described } = engine(on)
     await $.session.start(start)
@@ -737,7 +786,7 @@ test("the tool's description says a wake_after wake-up holds the switch, and oth
   const { described } = engine(on)
   await $.session.start(start)
   expect(described).toHaveLength(1)
-  expect(described[0]).toContain('Stop Monitor tasks first. A wake-up pending from wake_after holds the switch: cancel it (cancel_wake) or wait for it; wake-ups of any other kind are dropped by the switch, so set them again in the conversation switched to if they are still needed.')
+  expect(described[0]).toContain('Stop Monitor tasks first. A wake-up pending from wake_after holds the switch: cancel it (cancel_wake) or wait for it. A session cron (CronCreate, /loop, ScheduleWakeup) holds a switch that ends this process (to a slot, a tab or a window): delete it (CronDelete) first. Wake-ups of any other kind are dropped by the switch, so set them again in the conversation switched to if they are still needed.')
   expect(described[0]).not.toMatch(/carries this process's timers/)
 })
 
@@ -1756,7 +1805,7 @@ describe("S10w: a wake-up armed with self-wake holds the switch (self-wake's mar
     const { kinds, commands, clock } = engine(on, { wake: { present: true } })
     await $.session.start(start)
     const refused = await $.tool.call(call)
-    expect(refused.deny).toMatch(/^Not queued: S10w: whether a wake-up is pending is unknown, and unknown holds: self-wake is on, but its marker for this conversation isn't there \(.+\): update self-wake to 0\.2\.0 or later, which writes one\.$/)
+    expect(refused.deny).toMatch(/^Not queued: S10w: whether a wake-up is pending is unknown, and unknown holds: self-wake is on, but its marker for this conversation isn't there \(.+\): update self-wake to 0\.2\.0 or later, which writes one; if it is 0\.2\.0 or later already, run \/reload-plugins \(a self-wake updated but not yet loaded writes no marker\), or call cancel_wake, which writes the marker again \(and cancels any wake-up set\)\.$/)
     await $.turn.complete(answered)
     await clock.advance(1000)
     expect(kinds()).toEqual([])
@@ -1782,6 +1831,68 @@ describe("S10w: a wake-up armed with self-wake holds the switch (self-wake's mar
     await $.session.start(start)
     await switchNow($, none.clock)
     expect(none.commands).toEqual([{ command: 'resume', args: T }])
+  })
+
+  test('a wake-up marked after the first read (set in the same turn) holds right before /resume: S10w read again (S1-5)', async ($, on) => {
+    const { commands, kinds, session, clock } = engine(on, { wake: { present: true, marker: IDLE }, markOn: { kind: 'check', marker: ARMED } })
+    await $.session.start(start)
+    await switchNow($, clock)
+    expect(commands).toEqual([])
+    expect(kinds()).toEqual(['probe', 'check', 'release'])
+    expect(rows(session)).toContain("didn't happen after all: S10w: a wake-up is pending (due 2026-11-03 12:10 UTC): cancel it with cancel_wake, or wait for it.")
+  })
+
+  test('a wake-up marked after the first read holds right before /exit too: the window placed is taken back (S1-5)', async ($, on) => {
+    const THERE = { [`alive:${T}`]: { at: NOW - HOUR, folder: ELSEWHERE, project: 'C--work-other' } }
+    const { commands, kinds, lefts, session, clock } = engine(on, { probe: machine(elsewhere), store: THERE, wake: { present: true, marker: IDLE }, markOn: { kind: 'launcher', marker: ARMED } })
+    await $.session.start(start)
+    await switchNow($, clock)
+    expect(commands).toEqual([])
+    expect(kinds()).toEqual(['probe', 'launcher', 'release'])
+    expect(lefts()).toEqual([])
+    expect(rows(session)).toContain("didn't happen after all: S10w: a wake-up is pending (due 2026-11-03 12:10 UTC)")
+  })
+
+  test('the conversation it is read for is the one the last SessionStart named: while $.session.id() reads another, nothing is queued (S1-6)', async ($, on) => {
+    const { kinds, clock } = engine(on, { wake: { present: true, marker: IDLE } })
+    await $.session.start(start)
+    // An in-place move to X: its SessionStart has come, and $.session.id() still reads W.
+    await $.classic.SessionStart({ source: 'resume', session_id: X })
+    const refused = await $.tool.call(call)
+    expect(refused.deny).toBe(`Not queued: this session's id reads ${W}, but its last SessionStart named ${X}: it is moving between conversations, so which one it would leave is unclear. Try again in a moment.`)
+    await $.turn.complete(answered)
+    await clock.advance(1000)
+    expect(kinds()).toEqual([])
+  })
+})
+
+describe('session crons: a switch that ends this process holds on one (S1-7)', () => {
+  const THERE = { [`alive:${T}`]: { at: NOW - HOUR, folder: ELSEWHERE, project: 'C--work-other' } }
+  const CRON = { id: '7f3a9c21', humanSchedule: 'Every 5 minutes', prompt: 'check the deploy' }
+
+  test('a window (or a slot, or a tab): held, naming the cron and how to stop it; the claim given back, nothing placed', async ($, on) => {
+    const { commands, kinds, session, clock } = engine(on, { probe: machine(elsewhere), store: THERE, crons: [CRON] })
+    await $.session.start(start)
+    await switchNow($, clock)
+    expect(commands).toEqual([])
+    expect(kinds()).toEqual(['probe', 'release'])
+    expect(rows(session)).toContain("didn't run: this switch ends this process, and with it the session's crons: cron 7f3a9c21 (Every 5 minutes: \u00abcheck the deploy\u00bb) is set to wake this session: delete it with CronDelete (id 7f3a9c21).")
+  })
+
+  test("crons that can't be read hold too: unknown is never none", async ($, on) => {
+    const { commands, kinds, session, clock } = engine(on, { probe: machine(elsewhere), store: THERE, crons: 'asks' })
+    await $.session.start(start)
+    await switchNow($, clock)
+    expect(commands).toEqual([])
+    expect(kinds()).toEqual(['probe', 'release'])
+    expect(rows(session)).toContain("can't tell whether a session cron is set (CronList would ask for permission here: a rule says so)")
+  })
+
+  test('in place, the process goes on: no hold', async ($, on) => {
+    const { commands, clock } = engine(on, { crons: [CRON] })
+    await $.session.start(start)
+    await switchNow($, clock)
+    expect(commands).toEqual([{ command: 'resume', args: T }])
   })
 })
 
@@ -1819,13 +1930,16 @@ describe('the left record (\u00a73.4)', () => {
   })
 
   test('a /resume or a /clear the person typed writes it too; a startup or a resume of the same conversation does not', async ($, on) => {
-    const { lefts, clock } = engine(on)
+    const { lefts, world, clock } = engine(on)
     await $.session.start(start)
     await $.classic.SessionStart({ source: 'startup', session_id: W })
     await $.classic.SessionStart({ source: 'resume', session_id: W })
     await clock.advance(5000)
     expect(lefts()).toEqual([])
     await $.classic.SessionStart({ source: 'clear', session_id: X })
+    // As the engine does once the hooks have returned: $.session.id() reads X now. The record is still
+    // W's, the conversation the event's own id says was left (S1-13: a lagging id can't pass for it).
+    world.id = X
     await clock.advance(5000)
     expect(lefts().map(r => /^\$id = '(.+)'$/m.exec(r.script ?? '')?.[1])).toEqual([W])
   })
@@ -1849,6 +1963,16 @@ describe('the left record (\u00a73.4)', () => {
     await switchNow($, clock)
     expect(commands).toEqual([])
     expect(lefts()).toEqual([])
+  })
+
+  test('an /exit that does not run after the exit record: the record is written over as withdrawn, so a typed /exit later gets none (S1-10)', async ($, on) => {
+    const { commands, lefts, writes, session, clock } = engine(on, { probe: machine(elsewhere), store: THERE, exit: 'refused' })
+    await $.session.start(start)
+    await switchNow($, clock)
+    expect(commands).toEqual([{ command: 'exit' }])
+    expect(lefts()).toHaveLength(1)
+    expect(writes).toContainEqual({ path: leftPath(STATE, W), text: '{"v":1,"cancelled":true}' })
+    expect(rows(session)).toMatch(/didn't happen after all: the exit didn't run/)
   })
 
   test('a return trip: a left record waives L3 in place, and the last look checks the transcript against it (LR12)', async ($, on) => {
@@ -1993,18 +2117,30 @@ describe('a run the switch gave up on can leave nothing behind (the coordinator\
     expect(runs.find(r => r.kind === 'pane')?.init?.timeoutMs).toBe(30_000)
   })
 
-  test('a ticket that is not written (no clean answer): withdrawn and its claim released at once, and again 3 s later', async ($, on) => {
-    const { kinds, writes, clock } = engine(on, { env: WRAPPED, pane: PANE, probe: machine(elsewhere), store: THERE, paneScript: 'fails' })
+  test('a run that wrote its ticket and gave no clean answer: the ticket withdrawn and its claim released at once; 3 s later the claim again, and a ticket written late', async ($, on) => {
+    const { kinds, writes, files, clock } = engine(on, { env: WRAPPED, pane: PANE, probe: machine(elsewhere), store: THERE, paneScript: 'wrote-fails' })
     await $.session.start(start)
     await switchNow($, clock)
     expect(kinds()).toEqual(['probe', 'pane', 'release'])
-    expect(writes).toEqual([{ path: paneTicketPath(STATE, TOKEN), text: '{"v":1,"cancelled":true}' }])
+    const ticket = paneTicketPath(STATE, TOKEN) ?? ''
+    expect(writes).toEqual([{ path: ticket, text: '{"v":1,"cancelled":true}' }])
+    // The run, killed at its timeout, wrote its ticket once more after that: the second look finds it.
+    files.set(ticket, JSON.stringify({ v: 1, token: TOKEN, resume: T, by: LAUNCH, dir: ELSEWHERE, at: NOW }))
     await clock.advance(4000)
     expect(kinds()).toEqual(['probe', 'pane', 'release', 'release'])
     expect(writes).toEqual([
-      { path: paneTicketPath(STATE, TOKEN), text: '{"v":1,"cancelled":true}' },
-      { path: paneTicketPath(STATE, TOKEN), text: '{"v":1,"cancelled":true}' },
+      { path: ticket, text: '{"v":1,"cancelled":true}' },
+      { path: ticket, text: '{"v":1,"cancelled":true}' },
     ])
+  })
+
+  test('a run that wrote nothing and gave no clean answer: its claim released at once and 3 s later, and nothing written over (N3)', async ($, on) => {
+    const { kinds, writes, clock } = engine(on, { env: WRAPPED, pane: PANE, probe: machine(elsewhere), store: THERE, paneScript: 'fails' })
+    await $.session.start(start)
+    await switchNow($, clock)
+    await clock.advance(4000)
+    expect(kinds()).toEqual(['probe', 'pane', 'release', 'release'])
+    expect(writes).toEqual([])
   })
 
   test('a window that the launcher refused cleanly is not taken back again: the script gave back its own', async ($, on) => {

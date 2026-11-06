@@ -63,7 +63,7 @@ import type { EngineInterface, Register } from 'claude-code'
 import type { Queued, Restart } from '../types'
 import { launch as buildLaunch, parseLaunch, powershellPath, RELEASED, releaseScript, SESSION_ID, stateFolder, SYSTEM_ROOT, WAIT_SECONDS } from './launcher'
 import type { LaunchInput, PendingKind, Probe } from './machine'
-import { blockersText, exitBlockers, isSafeFolder, LAUNCH_DEADLINE_MS, LAUNCH_RETRY_MS, launchFolderFault, launchFolderSaid, markPending, oneLine, paneFallback, paneTicketPath, powershellCall, quoted, readExit, readGit, readPane, safePoint } from './machine'
+import { blockersText, exitBlockers, isBusyAgent, isSafeFolder, LAUNCH_DEADLINE_MS, LAUNCH_RETRY_MS, LAUNCH_RUN_MS, launchFolderFault, launchFolderSaid, markPending, oneLine, paneFallback, paneTicketPath, powershellCall, quoted, readExit, readGit, readPane, safePoint, SLOT_SCRIPT_SHA256, idPathOrNone } from './machine'
 import { configureUpdateCheck, loadUpdateCheck, withUpdateNotice } from './update-check'
 
 const queued = { plugin: 'self-restart', key: 'queued' } as const
@@ -82,8 +82,6 @@ const RECENT = 'recentRestarts'
 const SETTLE_MS = 500
 /** How long after the exit command to look whether the session is still here. */
 const CHECK_MS = 5000
-/** How long the launcher may take to open the window. */
-const LAUNCH_MS = 30_000
 /** How long releasing the claim lock may take. */
 const RELEASE_MS = 15_000
 /** How long a slot honours the record the launcher left it, in seconds. */
@@ -94,9 +92,6 @@ const STALE_MS = 15 * 60 * 1000
 const MAX_KEPT = 50
 /** A second restart of one session sooner than this after the first is refused: no restart loop. */
 const LOOP_MS = 2 * 60 * 1000
-
-/** An agent in one of these is still to report. */
-const BUSY: readonly string[] = ['pending', 'running', 'waiting']
 
 const DESCRIPTION = [
   "Restarts this session once the current turn ends: when Claude Code was started through the claude wrapper (the `claude` function from claude-code-self-tools in the person's PowerShell profile), it restarts in this same terminal tab; otherwise it opens a new terminal window in the folder this session started in. This session exits, and the tab or the window resumes it (claude --resume <this session's id>) once this process has gone. The conversation carries on there.",
@@ -149,6 +144,25 @@ const entry = (reason: string, resume: string | undefined): Queued => (resume ==
 
 const isRecord = (value: unknown): value is Record<string, unknown> => typeof value === 'object' && value !== null && !Array.isArray(value)
 
+/**
+ * Writes `{"v":1,"cancelled":true}` over a ticket or a slot's record at `path`, read first, only while it
+ * is still this launch's (`ours`): nothing there (a run that wrote nothing), or one a newer launch wrote,
+ * is left as it is. A plugin can't delete a file; one left is honoured only within 120 seconds, and
+ * only with its claim, which the caller releases.
+ */
+async function withdrawIfOurs($: EngineInterface, path: string | undefined, ours: (raw: Record<string, unknown>) => boolean): Promise<void> {
+  if (path === undefined) return
+  try {
+    const text = await $.fs.read(path)
+    if (typeof text !== 'string') return
+    const raw: unknown = JSON.parse(text.charCodeAt(0) === 0xfeff ? text.slice(1) : text)
+    if (!isRecord(raw) || !ours(raw)) return
+    await $.fs.write(path, JSON.stringify({ v: 1, cancelled: true }))
+  } catch {
+    // Not there, or not of its shape: nothing of this launch's to take back.
+  }
+}
+
 /** Tells the model on its next turn, in a row it reads and the person doesn't see as typed. */
 async function tellModel($: EngineInterface, note: string): Promise<void> {
   try {
@@ -170,7 +184,7 @@ async function sendResume($: EngineInterface, said: string, resume: string): Pro
 /** The agents still to report, by their task's description; undefined when the list can't be read. */
 async function busyAgents($: EngineInterface): Promise<string[] | undefined> {
   try {
-    return (await $.agent.list()).filter(a => BUSY.includes(a.status)).map(a => (a.description.trim() === '' ? a.type : a.description))
+    return (await $.agent.list()).filter(a => isBusyAgent(a.status)).map(a => (a.description.trim() === '' ? a.type : a.description))
   } catch {
     return undefined
   }
@@ -468,7 +482,7 @@ async function restartNow($: EngineInterface, value: Queued): Promise<void> {
       const run = await $.process.run(call.argv, {
         stdin: call.stdin,
         cwd: launch.cwd,
-        timeoutMs: LAUNCH_MS,
+        timeoutMs: LAUNCH_RUN_MS,
       })
       const answer = parseLaunch(run.stdout)
       claim = answer.claim
@@ -495,20 +509,23 @@ async function restartNow($: EngineInterface, value: Queued): Promise<void> {
     // its own already). After a run that ended without a clean answer, a ticket that may be there is
     // written over as withdrawn and this launch's claim released, and once more LAUNCH_RETRY_MS later: a
     // run killed at its timeout may still have been writing (its own deadline check takes back what it
-    // placed late; this catches a write that slipped past it). Only this launch's own claim, never a slot's.
+    // placed late; this catches a write that slipped past it). This launch's own claim; and the slot's,
+    // on this conversation, when 'auto' may have gone to this pane's slot (the run printed nothing).
     if (opened !== undefined && claim !== undefined && claim !== ours) await release($, launch.id, claim)
     if (opened !== undefined && !unclean && claim === ours) await release($, launch.id, ours)
     if (opened !== undefined && unclean) {
       const ticket = pane !== undefined && 'token' in pane ? paneTicketPath(site.state, pane.token) : undefined
+      // 'auto' may have gone to this pane's slot (verified on the probe that judged): its record, and the
+      // slot's claim the script took on this conversation, taken back too.
+      const autoSlot = ticket === undefined && judged.probe.slot !== null && judged.probe.slot.sha256 === SLOT_SCRIPT_SHA256 ? judged.probe.slot.id : undefined
+      const autoRecord = autoSlot === undefined ? undefined : idPathOrNone(site.state, 'slotRecord', autoSlot)
       const takeBack = async (): Promise<void> => {
-        if (ticket !== undefined) {
-          try {
-            await $.fs.write(ticket, JSON.stringify({ v: 1, cancelled: true }))
-          } catch {
-            // Honoured only with the claim, which is released here.
-          }
-        }
+        // Each only while it is still this launch's: a ticket naming its claim, a record resuming this
+        // conversation. A run that wrote nothing leaves nothing to withdraw.
+        await withdrawIfOurs($, ticket, raw => raw.by === ours)
+        await withdrawIfOurs($, autoRecord, raw => raw.resume === launch.id)
         await release($, launch.id, ours)
+        if (autoSlot !== undefined) await release($, launch.id, `slot:${autoSlot}`)
       }
       await takeBack()
       $.clock.after(LAUNCH_RETRY_MS, () => void takeBack())
