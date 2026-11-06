@@ -12,13 +12,16 @@
 //   file as it is. The loader reads only names ending in `-hook-<n>.sh`, so neither is inlined.
 // - The file is read again right before the rewrite and left as it is when it changed. That narrows
 //   the window for a write by someone else; `$.fs.write` is no atomic rename, so it can't close it.
-// - After the rewrite the file is read back. Anything but exactly what was written (another write
-//   landed in between, a write that failed half-way) puts the text first read back, and checks that.
+// - After the rewrite the file is read back. Exactly what was written, or that followed only by whole
+//   plain assignment lines (another writer's append, landing between the write and the read), is
+//   kept, the append with it. Anything else (a write that failed half-way, a torn tail) puts the
+//   text first read back, and checks that.
 // - A stop flag, checked before every write: once the caller's deadline has passed, no write starts.
+//   A write already under way, and putting a file back after it, can still land after it.
 // - It never prints or keeps a value: names, counts and lengths only. Text from outside the plugin
 //   (another plugin's refusal of a read or a write) is kept apart, as `error`, for the caller to quote.
 import type { EngineInterface } from 'claude-code'
-import { DEDUPE_OVER, DEDUPED_FILE, dedupe, HOOK_FILE, byLoadOrder, inlinedLength } from './env-rules'
+import { DEDUPE_OVER, DEDUPED_FILE, dedupe, HOOK_FILE, byLoadOrder, inlinedLength, isPlainAppend } from './env-rules'
 import { isSafeFolder, oneLine, SESSION_ID } from './machine'
 
 /** One hook file: its name, path and size in bytes, as the folder lists it. */
@@ -90,7 +93,7 @@ export type LeftReason =
  * why, in the plugin's words (`why`), and any error text from outside the plugin (`error`).
  */
 export type FileOutcome =
-  | { readonly name: string; readonly before: number; readonly after: number }
+  | { readonly name: string; readonly before: number; readonly after: number; readonly appended?: number }
   | { readonly name: string; readonly left: LeftReason; readonly why?: string; readonly error?: string }
 
 /** What a dedupe of a folder did: nothing (its dedupable files total `bytes`, at or under the threshold), or each file's outcome. */
@@ -145,7 +148,10 @@ async function dedupeFile($: EngineInterface, file: HookFile, stop: Stop): Promi
   let error: string | undefined
   try {
     await $.fs.write(file.path, result.text)
-    if ((await $.fs.read(file.path)) === result.text) return { name, before: text.length, after: result.text.length }
+    const back = await $.fs.read(file.path)
+    if (back === result.text) return { name, before: text.length, after: result.text.length }
+    // Whole plain assignment lines after ours: another writer's append, which is kept.
+    if (back.startsWith(result.text) && isPlainAppend(back.slice(result.text.length))) return { name, before: text.length, after: result.text.length, appended: back.length - result.text.length }
   } catch (err) {
     error = errorText(err)
   }
@@ -185,7 +191,7 @@ export const refusedFiles = (outcome: DedupeOutcome): string[] =>
 export function outcomeLine(outcome: DedupeOutcome): string {
   if (outcome.kind === 'under') return `session env: ${outcome.bytes} bytes of setup and sessionstart files, at or under ${DEDUPE_OVER}: left as they are`
   const parts = outcome.files.map(f => {
-    if ('before' in f) return `${f.name} ${f.before} -> ${f.after}`
+    if ('before' in f) return `${f.name} ${f.before} -> ${f.after}${f.appended === undefined ? '' : ` (and ${f.appended} appended meanwhile, kept)`}`
     const why = [f.why, f.error === undefined ? undefined : oneLine(f.error, 160)].filter(part => part !== undefined).join(': ')
     return `${f.name} left (${f.left}${why === '' ? '' : `: ${why}`})`
   })

@@ -32,6 +32,8 @@ const AFTER_DEDUPE =
   "Claude Code still holds the old copy: now move the PowerShell tool's directory away and back, in two calls in the main session (`Set-Location ..`, then `Set-Location` to the folder it was in), then retry Bash"
 const REFUSED_HINT =
   "A file the Bash env line says was left as it was must not be edited by hand, with Bash, PowerShell or an edit tool: the dedupe couldn't show that a rewrite keeps the environment the same, and a wrong edit breaks every Bash call. Tell the person which file it is, so they can find the plugin that writes it."
+const DAMAGED_HINT =
+  "An env file the Bash env line says may be damaged can break every Bash call, and a restart or a resume reads it again, so neither repairs it. Don't rewrite it by hand: tell the person, naming the file and its .bak (its text before the failed rewrite), so they can put it back."
 const RESTART_HINT =
   "A fresh process usually repairs a dead tool: restart_after_turn (self-restart; it needs a safe point). Where the coordinator runs, the merger can restart this lane (`next: 'restart'`)."
 
@@ -94,10 +96,12 @@ type World = {
   slowRead?: { name: string; nth: number; ms: number }
   /** A file whose `nth` read is refused, by another plugin, with `text`. */
   deniedRead?: { name: string; nth: number; text: string }
-  /** A file whose first rewrite fails half-way: `keep` characters land, then it is refused (ENOSPC). */
-  failedWrite?: { name: string; keep: number }
-  /** A file whose first rewrite lands with another write's tail after it. */
+  /** A file whose first `times` (1 unless said) writes fail half-way: `keep` characters land, then it is refused (ENOSPC). */
+  failedWrite?: { name: string; keep: number; times?: number }
+  /** A file whose first rewrite lands with a torn tail after it: a fragment of another write. */
   garbledWrite?: string
+  /** A file whose first rewrite is followed at once by another writer's whole line. */
+  appendAfterWrite?: string
 }
 
 /** The engine beneath the plugin, a fake file system under ROOT, and what the plugin did. */
@@ -197,11 +201,12 @@ function engine(on: On, world: World = {}) {
     const name = e.path.slice(base.length + 1)
     const n = (rewrites.get(e.path) ?? 0) + 1
     rewrites.set(e.path, n)
-    if (world.failedWrite !== undefined && name === world.failedWrite.name && n === 1) {
+    if (world.failedWrite !== undefined && name === world.failedWrite.name && n <= (world.failedWrite.times ?? 1)) {
       disk.set(e.path, e.text.slice(0, world.failedWrite.keep))
       return { deny: 'ENOSPC: no space left on device, write' }
     }
-    disk.set(e.path, world.garbledWrite !== undefined && name === world.garbledWrite && n === 1 ? `${e.text}MODE="1"\n` : e.text)
+    const tail = name === world.garbledWrite && n === 1 ? 'E="1\n' : name === world.appendAfterWrite && n === 1 ? 'export FAKE_LATE=1\n' : ''
+    disk.set(e.path, `${e.text}${tail}`)
     if (world.appendBetween !== undefined && name === `${world.appendBetween}.bak`) {
       const path = `${base}\\${world.appendBetween}`
       disk.set(path, `${disk.get(path) ?? ''}export FAKE_LATE=1\n`)
@@ -500,13 +505,41 @@ test('a rewrite that fails half-way is put back: the file reads as it did before
   expect(logs.some(line => line.includes('sessionstart-hook-1.sh left (restored: the rewrite failed: ') && line.includes('ENOSPC'))).toBe(true)
 })
 
-test("a rewrite that doesn't read back as written (another write's tail after it) is put back", async ($, on) => {
+test('another writer\'s whole line landing right after the rewrite is kept, with the rewrite', async ($, on) => {
+  const { file, logs } = engine(on, { files: { 'sessionstart-hook-1.sh': rounds(12) }, appendAfterWrite: 'sessionstart-hook-1.sh' })
+  await $.session.start(start)
+  await $.classic.SessionStart({ source: 'compact', session_id: ID })
+  expect(file('sessionstart-hook-1.sh')).toBe(`${round(51)}export FAKE_LATE=1\n`)
+  expect(logs.some(line => line.includes('(and 19 appended meanwhile, kept)'))).toBe(true)
+})
+
+test("a rewrite that doesn't read back as written (a torn tail after it) is put back", async ($, on) => {
   const before = rounds(12)
   const { file, logs } = engine(on, { files: { 'sessionstart-hook-1.sh': before }, garbledWrite: 'sessionstart-hook-1.sh' })
   await $.session.start(start)
   await $.classic.SessionStart({ source: 'compact', session_id: ID })
   expect(file('sessionstart-hook-1.sh')).toBe(before)
   expect(logs.some(line => line.includes("sessionstart-hook-1.sh left (restored: it didn't read back as written)"))).toBe(true)
+})
+
+test('a rewrite and putting it back both failing: a toast names the file and its backups, and a check says it may be damaged, never to restart', async ($, on) => {
+  const before = rounds(12)
+  const name = 'sessionstart-hook-1.sh'
+  const { file, toasts, disk } = engine(on, { files: { [name]: before }, failedWrite: { name, keep: 7, times: 2 }, bash: 'empty' })
+  await $.session.start(start)
+  await $.classic.SessionStart({ source: 'compact', session_id: ID })
+  expect(file(name)).toBe('export ')
+  expect(toasts).toEqual([
+    `self-check: the env file ${name} may be damaged: the dedupe's rewrite failed, and so did putting it back. Its earlier text is in ${name}.orig and ${name}.bak. Every Bash call may fail until it is put back.`,
+  ])
+  const damaged = `${name} may be damaged (a dedupe's rewrite and putting it back both failed; its earlier text is in ${name}.orig and ${name}.bak)`
+  // What is left measures small and OK, and Bash is dead: the damage is said, not a restart.
+  expect((await check($)).split('\n')).toEqual(['self-check: 1 failed (Bash).', 'Bash: failed: no output', `${envHead('OK', 6)}. ${damaged}`, 'PowerShell: ok', DAMAGED_HINT])
+  // Once the person puts it back, the note goes.
+  disk.set(`${FOLDER}\\${name}`, before)
+  const after = (await check($)).split('\n')
+  expect(after.some(line => line.includes('may be damaged'))).toBe(false)
+  expect(after).not.toContain(DAMAGED_HINT)
 })
 
 test('a backup path that is a link, or a folder, leaves the file as it is: nothing is written through it', async ($, on) => {

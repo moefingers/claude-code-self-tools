@@ -123,6 +123,22 @@ export function dedupe(text: string): Deduped {
   return { text: kept.length === 0 ? '' : `${kept.join('\n')}\n`, lines: lines.length, kept: kept.length }
 }
 
+/**
+ * Whether `tail` is whole plain assignment lines and nothing else (each ending in a newline, each
+ * `NAME=value` by PLAIN, none ending in white space a shell keeps): what another writer appending
+ * after a rewrite leaves. A fragment (a line cut mid-quote, text with no newline) is not.
+ */
+export function isPlainAppend(tail: string): boolean {
+  if (tail === '' || !tail.endsWith('\n') || tail.includes('�')) return false
+  return tail
+    .slice(0, -1)
+    .split('\n')
+    .every(line => {
+      const m = PLAIN.exec(line.trimEnd())
+      return m !== null && m[1] !== undefined && !ODD_SPACE.test(line.slice(line.trimEnd().length))
+    })
+}
+
 /** `n` with a comma every three digits. */
 export const grouped = (n: number): string => `${n < 0 ? '-' : ''}${String(Math.abs(Math.trunc(n))).replace(/\B(?=(\d{3})+(?!\d))/g, ',')}`
 

@@ -39,7 +39,7 @@ import type { EngineInterface, Register, ToolInfo } from 'claude-code'
 import type { CheckLine, EnvVerdict } from '../types'
 import { dedupeFolder, envFolder, outcomeLine, readEnv, refusedFiles, rewritten } from './env-guard'
 import type { DedupeOutcome, EnvReading } from './env-guard'
-import { DEDUPE_OVER, GIT_BASH_LIMIT, grouped, roomPhrase, verdictOf } from './env-rules'
+import { DEDUPE_OVER, dedupe, GIT_BASH_LIMIT, grouped, roomPhrase, verdictOf } from './env-rules'
 import { isSafeFolder, oneLine, quoted, selfcheckPath, selfcheckRecord, stateFolder, within } from './machine'
 import { configureUpdateCheck, loadUpdateCheck, withUpdateNotice } from './update-check'
 
@@ -80,6 +80,9 @@ const AFTER_DEDUPE =
 /** What an env at risk adds when the dedupe refused a file: never a rewrite by hand. */
 const REFUSED_HINT =
   "A file the Bash env line says was left as it was must not be edited by hand, with Bash, PowerShell or an edit tool: the dedupe couldn't show that a rewrite keeps the environment the same, and a wrong edit breaks every Bash call. Tell the person which file it is, so they can find the plugin that writes it."
+/** What a check adds when an env file may be damaged: a restart reads it again, so the person puts it back. */
+const DAMAGED_HINT =
+  "An env file the Bash env line says may be damaged can break every Bash call, and a restart or a resume reads it again, so neither repairs it. Don't rewrite it by hand: tell the person, naming the file and its .bak (its text before the failed rewrite), so they can put it back."
 /** What a failed MCP server adds: a reconnect may be all it needs. */
 const MCP_HINT = 'An MCP server that failed may need only a reconnect: reconnect_mcp_after_turn (self-mcp).'
 
@@ -97,6 +100,12 @@ const SUBAGENT =
 let checkAtResume = true
 let envDedupe = true
 let probes: readonly string[] = []
+
+/**
+ * The env files a dedupe may have left damaged (its rewrite and putting the file back both failed),
+ * by env folder: a check says so, in place of the fresh-process hint, which can't repair them.
+ */
+const damaged = new Map<string, Set<string>>()
 
 /** Whether a main-loop turn is running now: the quiet check waits for it to end. */
 let inTurn = false
@@ -237,7 +246,7 @@ async function servers($: EngineInterface, tools: readonly ToolInfo[] | string):
  * The Bash env line of a check: the verdict on the env as Bash runs with it now (before any dedupe
  * the check makes), or no verdict when it couldn't be measured; `said` is the line.
  */
-type EnvLine = { readonly verdict: EnvVerdict | undefined; readonly said: string; readonly hasRefused?: boolean }
+type EnvLine = { readonly verdict: EnvVerdict | undefined; readonly said: string; readonly hasRefused?: boolean; readonly damaged?: readonly string[] }
 
 /** The files a dedupe left as they were, and why, as a phrase; empty when it left none. */
 function leftAlone(outcome: DedupeOutcome): string {
@@ -253,9 +262,40 @@ function leftAlone(outcome: DedupeOutcome): string {
 
 /**
  * Measures the env script of the session whose env folder is `folder`, and when it is AT RISK or
- * BROKEN and the envDedupe setting is on, dedupes the folder (over 2 KB only) and says so.
+ * BROKEN and the envDedupe setting is on, dedupes the folder (over 2 KB only) and says so; then names
+ * each env file a dedupe may have left damaged, until it reads as plain assignments again.
  */
 async function measureEnv($: EngineInterface, folder: string): Promise<EnvLine> {
+  const line = await measureNow($, folder)
+  const known = damaged.get(folder)
+  for (const name of [...(known ?? [])]) {
+    const text = await $.fs.read(`${folder}\\${name}`).catch(() => undefined)
+    if (text !== undefined && !('refused' in dedupe(text))) known?.delete(name)
+  }
+  const names = [...(known ?? [])]
+  if (names.length === 0) return line
+  const note = names.map(name => `${name} may be damaged (a dedupe's rewrite and putting it back both failed; its earlier text is in ${name}.orig and ${name}.bak)`)
+  return { ...line, damaged: names, said: `${line.said}. ${note.join('; ')}` }
+}
+
+/**
+ * Records the files a dedupe of `folder` may have left damaged, and says so at once in a toast
+ * naming each and its backups: every Bash call may fail until it is put back.
+ */
+function noteDamaged($: EngineInterface, folder: string, outcome: DedupeOutcome): void {
+  if (outcome.kind !== 'done') return
+  const names = outcome.files.flatMap(f => ('left' in f && f.left === 'restore-failed' ? [f.name] : []))
+  if (names.length === 0) return
+  const known = damaged.get(folder) ?? new Set<string>()
+  for (const name of names) known.add(name)
+  damaged.set(folder, known)
+  for (const name of names) {
+    $.ui.toast(`self-check: the env file ${name} may be damaged: the dedupe's rewrite failed, and so did putting it back. Its earlier text is in ${name}.orig and ${name}.bak. Every Bash call may fail until it is put back.`)
+  }
+}
+
+/** The env line from what the env script measures now, and what a dedupe did about it. */
+async function measureNow($: EngineInterface, folder: string): Promise<EnvLine> {
   let now: EnvReading
   try {
     now = await readEnv($, folder)
@@ -274,6 +314,7 @@ async function measureEnv($: EngineInterface, folder: string): Promise<EnvLine> 
   }
   if (outcome === undefined) return { verdict, said: `${head}. The dedupe didn't finish within ${(ENV_MS + ENV_GRACE_MS) / 1000} s; it starts no write after ${ENV_MS / 1000} s` }
   $.ui.log(outcomeLine(outcome), { to: 'debug' })
+  noteDamaged($, folder, outcome)
   if (outcome.kind === 'under') return { verdict, said: `${head}. Not deduped: its setup and sessionstart files hold ${grouped(outcome.bytes)} bytes, at or under ${grouped(DEDUPE_OVER)}` }
   const hasRefused = refusedFiles(outcome).length > 0
   if (rewritten(outcome).length === 0) {
@@ -361,10 +402,12 @@ function answer({ lines, env }: Checked): string {
   const head = failed.length === 0 ? 'self-check: no tool failed.' : `self-check: ${failed.length} failed (${failed.map(l => l.name).join(', ')}).`
   const isBashDead = failed.some(l => l.name === 'Bash')
   const isEnvAtRisk = env?.verdict === 'AT RISK' || env?.verdict === 'BROKEN'
+  const isDamaged = (env?.damaged?.length ?? 0) > 0
   const hints = [
+    ...(isDamaged ? [DAMAGED_HINT] : []),
     ...(isEnvAtRisk || (isBashDead && envSuspect(env)) ? [ENV_HINT] : []),
     ...(isEnvAtRisk && env?.hasRefused === true ? [REFUSED_HINT] : []),
-    ...(failed.some(l => l.name !== 'Bash') || (isBashDead && !envSuspect(env)) ? [RESTART_HINT] : []),
+    ...(failed.some(l => l.name !== 'Bash') || (isBashDead && !envSuspect(env) && !isDamaged) ? [RESTART_HINT] : []),
     ...(failed.some(l => l.name.startsWith('mcp:')) ? [MCP_HINT] : []),
   ]
   const said = lines.flatMap(l => (l.name === 'Bash' && env !== undefined ? [l.said, env.said] : [l.said]))
@@ -378,7 +421,10 @@ async function guardAtStart($: EngineInterface, id: string | undefined): Promise
     if (folder === undefined) return
     const outcome = await boundedDedupe($, folder)
     if (outcome === undefined) $.ui.log(`session env: the dedupe didn't finish within ${(ENV_MS + ENV_GRACE_MS) / 1000} s; it starts no write after ${ENV_MS / 1000} s`, { to: 'debug' })
-    else if (outcome.kind === 'done') $.ui.log(outcomeLine(outcome), { to: 'debug' })
+    else if (outcome.kind === 'done') {
+      $.ui.log(outcomeLine(outcome), { to: 'debug' })
+      noteDamaged($, folder, outcome)
+    }
   } catch (err) {
     $.ui.log(`session env: the dedupe failed (${why(err)})`, { to: 'debug' })
   }
@@ -422,7 +468,9 @@ async function atIdle($: EngineInterface, id: string): Promise<void> {
   if (failed.length === 0) return
   const names = failed.map(l => l.name).join(', ')
   $.ui.toast(
-    failed.some(l => l.name === 'Bash') && envSuspect(checked.env)
+    failed.some(l => l.name === 'Bash') && (checked.env?.damaged?.length ?? 0) > 0
+      ? `self-check at resume: ${names} failed. An env file may be damaged; the note Claude reads names it.`
+      : failed.some(l => l.name === 'Bash') && envSuspect(checked.env)
       ? `self-check at resume: ${names} failed. Bash's session env may have grown too long; the note Claude reads says how to repair it.`
       : `self-check at resume: ${names} failed. A fresh process usually repairs a dead tool (restart_after_turn).`,
   )
@@ -437,6 +485,7 @@ export const register: Register = (on, options) => {
   configureUpdateCheck('self-check', options)
   checkAtResume = options.checkAtResume !== 'off'
   envDedupe = options.envDedupe !== 'off'
+  damaged.clear()
   probes = Array.isArray(options.probes) ? options.probes.filter((p): p is string => typeof p === 'string') : []
 
   // First, so it is outermost on this plugin's tools: it sees each answer, and adds the update

@@ -86,6 +86,9 @@ export FAKE_D="x\"y\\"
   ['exported, another variable, then set without export: refused', [['sessionstart-hook-1.sh', 'export FAKE_G=1\nFAKE_H=1\nFAKE_G=2\n']], 0],
   ['comments holding an =', [['sessionstart-hook-1.sh', '# FAKE_C=9\nexport FAKE_C=1\n# FAKE_C=8\nexport FAKE_C=2\n# the end\n']], 1],
   ['CRLF lines', [['sessionstart-hook-1.sh', 'export FAKE_R=1\r\nexport FAKE_R=2\r\n']], 1],
+  // The CR the dedupe allows at a line's end: once the comment goes, the kept line is the file's last,
+  // and only Git Bash dropping CR from a `-c` string keeps the two runs alike.
+  ['CRLF lines before a trailing comment', [['sessionstart-hook-1.sh', 'export FAKE_R=1\r\nexport FAKE_R=2\r\n# a note\r\n']], 1],
   ['a BOM before a comment on line 1', [['sessionstart-hook-1.sh', '\uFEFF# a note\nexport FAKE_B=1\nexport FAKE_B=2\n']], 1],
   ['a BOM before an assignment on line 1: refused', [['sessionstart-hook-1.sh', '\uFEFFexport FAKE_B=1\nexport FAKE_B=2\n']], 0],
   [
