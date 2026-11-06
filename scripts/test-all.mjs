@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Every check the repository has, in one run: the shared-copies test, then for each plugin
+// Every check the repository has, in one run: the shared-copies test, the tools' tests, then for each plugin
 // `claude plugin validate --strict` and `claude plugin test`, then the marketplace file. Exits 1
 // when any of them fails.
 //
@@ -10,6 +10,7 @@ import { plugins, ROOT } from './sync-shared.mjs'
 
 const steps = [
   ['node', ['--test', 'scripts/*.test.mjs']],
+  ['node', ['--test', 'tools/dev-run/dev-run.test.mjs']],
   ...plugins().flatMap(plugin => [
     ['claude', ['plugin', 'validate', join('plugins', plugin), '--strict']],
     ['claude', ['plugin', 'test', join('plugins', plugin)]],
