@@ -10,7 +10,10 @@ node tools/dev-run/dev-run.mjs --name web-3271 --dir /path/to/project --port 327
 
 Everything after `--` is the server's command, run in `--dir` as an argument list, with no shell.
 
-- **Finding the program:** a bare name like `node` or `pnpm` is looked up on PATH only, never in `--dir`, so a `node.cmd` in the project can't stand in for node. A path like `node_modules/.bin/next.cmd` is taken from `--dir`.
+- **Finding the program:** every command is resolved to a full path before the spawn, so the spawn never searches a folder itself.
+  - A bare name like `node`, `node.exe` or `pnpm` is looked up on PATH only (its absolute entries), never in `--dir`, so a `node.cmd` or `node.exe` in the project can't stand in for node.
+  - A path like `node_modules/.bin/next.cmd` is taken from `--dir`.
+  - A command that isn't found is refused.
 - **Call the program itself where you can** (`node node_modules/next/dist/bin/next dev`). A `.cmd` shim such as `pnpm` works too, through `cmd.exe /d /s /c`, but an argument with a character `cmd.exe` would read (`" % ! ^ & | < >`) is refused.
 - **Listen on 127.0.0.1** (`-H 127.0.0.1`): `next dev` listens on every interface by default, and a request from another machine on the network would count as activity and keep the server from its idle exit.
 - **The port:** the command must listen on `--port`. dev-run watches that port, and doesn't set it.
@@ -26,7 +29,7 @@ Everything after `--` is the server's command, run in `--dir` as an argument lis
 | `--compile-floor-gb <n>` | 9 | GiB free before each start's first compile. The larger of the two floors applies before every spawn. |
 | `--stop-gb <n>` | 4 | Stop the server when free memory falls under n GiB, then wait for the floor again. |
 | `--slot[=compile\|life\|off]` | `compile` | Claim a heavy-slot slot for each start's first compile, for each whole run, or not at all. See [Heavy slots](#heavy-slots). |
-| `--slot-script <path>` | found | `heavy-slot.sh`. By default `$HEAVY_SLOT_SCRIPT`, else the first one in a folder above the repository that holds `--dir` (or above `--dir`, outside a repository). Never one inside the served repository, which a project could carry, or an old worktree keep. |
+| `--slot-script <path>` | found | `heavy-slot.sh`, which must exist. By default it is `$HEAVY_SLOT_SCRIPT`, a full Windows path such as `C:\path\to\heavy-slot.sh`. Otherwise it is the first one found in a folder above the outermost repository that holds `--dir`, or above `--dir` itself outside any repository. It is never one inside the served repository, which a project could carry or an old worktree keep. A worktree or submodule nested in another repository, as Claude Code's `.claude/worktrees` are, counts as inside that one. |
 | `--hit <regex>` | Next's request line | A server output line that counts as a request: ` GET /path 200 in 12ms`. |
 | `--compiled <regex>` | see below | A line that ends a start's first compile. |
 
@@ -73,7 +76,15 @@ Under `%LOCALAPPDATA%\claude-self-tools\dev-run\`:
 
 `heavy-slot.sh` lets at most two heavy jobs (commits, builds, tests) run on the machine at once. Each takes a slot directory first, in turn, and once free memory allows. Its own notes leave long-lived `next dev` out. A dev server's heavy moment is its first compile, which takes several GiB at once. Its first page compiles only when that page is first requested.
 
-- **`--slot` (`compile`, the default):** before each spawn, at the floor, dev-run claims a slot through `heavy-slot.sh` itself, and spawns once heavy-slot says it holds one. It releases the slot at the first line matching `--compiled`, or 3 minutes after the spawn, whichever comes first, or when the server stops before that. The default `--compiled`, read case-sensitively, is a request line with a 2xx or 3xx status, or Next's own ` ✓ Compiled …` line, at the line's start, other than middleware's, proxy's or instrumentation's, which compile before the page. So neither a request for `/compiled` nor the app's own output saying "compiled" releases the slot early. Next's `Ready` line doesn't count: Next prints it once it listens, before it has compiled anything. If memory fell under the floor while it waited for the slot, it gives the slot back and waits for the floor again.
+- **`--slot` (`compile`, the default):** before each spawn, at the floor, dev-run claims a slot through `heavy-slot.sh` itself, and spawns once heavy-slot says it holds one. It releases the slot at the first line matching `--compiled`, or 3 minutes after the spawn, whichever comes first, or when the server stops before that. If memory fell under the floor while it waited for the slot, it gives the slot back and waits for the floor again.
+
+  **What ends a first compile.** The default `--compiled` is read case-sensitively:
+  - **Next 16:** it prints `○ Compiling / ...` while it compiles, and for a first compile no `Compiled` line at all, only the request line once the page answers: ` GET / 200 in 1.2s (compile: 1.1s, render: 120ms)`. So a request line with a 2xx status ends it.
+  - **Not a 3xx.** A redirect, for example a proxy's 307 from `/` to `/login`, is answered before any page has compiled.
+  - **Older Next (webpack):** it prints ` ✓ Compiled / in 3.1s`, and that line counts too, at the line's start. Middleware's, proxy's and instrumentation's lines don't, since they compile before the page.
+  - **Not "Ready":** Next prints it once it listens, before it has compiled anything.
+  - **Not other text:** neither a request for `/compiled` nor the app's own output saying "compiled" releases the slot early.
+  - **A project that logs no requests** (`logging: { incomingRequests: false }` in `next.config`, or an `ignore` pattern matching its pages) prints no request line. Such a server holds the slot for the full 3 minutes at each start. Worse, `--hit` never matches either, so the idle exit comes 20 minutes into the server's time whatever its use. Give it a `--hit` that matches a line it does print, or keep request logging on.
 - **`--slot=life`:** holds the slot from before each spawn until that server stops. Every restart gives it back and claims it again, so no hold outlasts `--restart-min`.
 - **`--slot=off`:** no slot.
 
@@ -118,6 +129,7 @@ Planted faults are each run through the same scenarios, which must fail, each on
 - a walk that takes an orphan older than its parent (on the made-up table, and live);
 - a start time kept though it was read after the root ended (in a run, and in a queued claim);
 - a dead root's walk with no bound at its end;
+- a slot-script walk that stops at the innermost repository;
 - a guard that ignores a root whose start time it wasn't told;
 - a slot never released;
 - a slot released before the compile.

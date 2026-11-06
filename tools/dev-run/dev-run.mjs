@@ -23,11 +23,14 @@ export const SLOT_COMPILE_MS = 3 * 60_000
 const METHODS = 'GET|HEAD|POST|PUT|PATCH|DELETE|OPTIONS'
 // A request line as Next prints it: " GET /path 200 in 12ms".
 export const HIT_RE = String.raw`^\s*(?:${METHODS})\s+\S+\s+\d{3}\s+in\b`
-// The end of a first compile, read case-sensitively: a 2xx/3xx request line, or Next's own
-// " ✓ Compiled ..." line, at its start, other than middleware's (or proxy's, or instrumentation's),
-// which come before the page's own. So neither a request for /compiled nor the app's own output
-// that says "compiled" counts. Not "Ready": Next prints it once it listens, before it compiles anything.
-export const COMPILED_RE = String.raw`^\s*(?:${METHODS})\s+\S+\s+[23]\d\d\s+in\b|^\s*(?:\S{1,2}\s+)?Compiled\b(?!\s+\/(?:middleware|proxy|instrumentation)\b)`
+// The end of a first compile, read case-sensitively. Next 16 prints "○ Compiling / ..." and then,
+// for the first compile, only the request line: " GET / 200 in 1.2s (compile: ..., render: ...)".
+// So a 2xx request line, not a 3xx (a redirect, say from a proxy to /login, comes before any page has
+// compiled). Older Next (webpack) also prints " ✓ Compiled / in 3.1s", matched at the line's start,
+// other than middleware's (or proxy's, or instrumentation's), which come before the page's own. So
+// neither a request for /compiled nor the app's own output saying "compiled" counts. Not "Ready":
+// Next prints it once it listens, before it compiles anything.
+export const COMPILED_RE = String.raw`^\s*(?:${METHODS})\s+\S+\s+2\d\d\s+in\b|^\s*(?:\S{1,2}\s+)?Compiled\b(?!\s+\/(?:middleware|proxy|instrumentation)\b)`
 const ANSI = /\x1b\[[0-9;?]*[ -/]*[@-~]/g
 const SYS = join(process.env.SystemRoot || 'C:\\Windows', 'System32')
 const NETSTAT = join(SYS, 'NETSTAT.EXE')
@@ -95,8 +98,12 @@ export function parseArgs(argv, env = process.env) {
   }
   if (!SLOT_MODES.includes(o.slot)) throw new UsageError(`--slot takes ${SLOT_MODES.join(', ')}`)
   if (o.slot !== 'off') {
-    o.slotScript ??= findSlotScript(o.dir, env)
+    if (o.slotScript !== null) o.slotScript = resolve(o.slotScript)
+    else if (env.HEAVY_SLOT_SCRIPT && !/^(?:[A-Za-z]:[\\/]|\\\\)/.test(env.HEAVY_SLOT_SCRIPT))
+      throw new UsageError(`HEAVY_SLOT_SCRIPT must be a full Windows path, like C:\\path\\to\\heavy-slot.sh, not ${env.HEAVY_SLOT_SCRIPT}`)
+    else o.slotScript = findSlotScript(o.dir, env)
     if (!o.slotScript) throw new UsageError('no heavy-slot.sh: set HEAVY_SLOT_SCRIPT, pass --slot-script <path>, or --slot=off')
+    if (!statSync(o.slotScript, { throwIfNoEntry: false })?.isFile()) throw new UsageError(`no heavy-slot.sh at ${o.slotScript}${env.HEAVY_SLOT_SCRIPT && o.slotScript === env.HEAVY_SLOT_SCRIPT ? ' (HEAVY_SLOT_SCRIPT)' : ''}`)
     o.bash = findBash(env)
     if (!o.bash) throw new UsageError('no Git Bash to run heavy-slot.sh: install Git for Windows, or pass --slot=off')
   }
@@ -104,18 +111,20 @@ export function parseArgs(argv, env = process.env) {
   return o
 }
 
-/** The program to spawn, without a shell: an .exe as it is; a .cmd or .bat shim through cmd.exe. */
+/**
+ * The program to spawn, as a full path, without a shell: an .exe as it is; a .cmd or .bat shim
+ * through cmd.exe. A bare name is looked up on PATH only, as PowerShell does, never in --dir: so a
+ * node.cmd or node.exe in the project can't stand in for node, and the spawn never searches its
+ * working folder. A path is taken from --dir. Not found is refused.
+ */
 export function resolveCommand(command, args, cwd, env = process.env) {
-  let file = command
-  if (!['.exe', '.com'].includes(extname(command).toLowerCase())) {
-    // Only PATHEXT names: npm's extensionless shim beside a .cmd is a shell script Windows can't run.
-    const exts = extname(command) ? [''] : (env.PATHEXT || '.COM;.EXE;.BAT;.CMD').split(';').filter(Boolean)
-    // A bare name through PATH only, as PowerShell does, so a node.cmd in the project can't stand in
-    // for node; a path is taken from --dir.
-    const dirs = /[\\/]/.test(command) ? [''] : (env.PATH || '').split(delimiter).filter(d => isAbsolute(d))
-    const found = dirs.flatMap(d => exts.map(e => resolve(cwd, d, command + e))).find(p => statSync(p, { throwIfNoEntry: false })?.isFile())
-    if (found) file = found
-  }
+  // Only PATHEXT names when none is given: npm's extensionless shim beside a .cmd is a shell script
+  // Windows can't run.
+  const exts = extname(command) ? [''] : (env.PATHEXT || '.COM;.EXE;.BAT;.CMD').split(';').filter(Boolean)
+  const bare = !/[\\/]/.test(command)
+  const dirs = bare ? (env.PATH || '').split(delimiter).filter(d => isAbsolute(d)) : ['']
+  const file = dirs.flatMap(d => exts.map(e => resolve(cwd, d, command + e))).find(p => statSync(p, { throwIfNoEntry: false })?.isFile())
+  if (!file) throw new UsageError(bare ? `${command} is not on PATH (a program in --dir is never taken by its bare name; give its path)` : `no program at ${resolve(cwd, command)}`)
   if (!/\.(cmd|bat)$/i.test(file)) return { file, fileArgs: args, verbatim: false }
   const line = [file, ...args].map(a => {
     if (/["%!^&|<>\r\n]/.test(a)) throw new UsageError(`«${a}» has a character cmd.exe would read; run the program itself (for Next: node node_modules/next/dist/bin/next dev -p <port>)`)
@@ -125,22 +134,20 @@ export function resolveCommand(command, args, cwd, env = process.env) {
 }
 
 /**
- * heavy-slot.sh: $HEAVY_SLOT_SCRIPT, else the first one in a folder above the repository that holds
- * `dir` (or above `dir`, outside a repository). Never one inside the served repository, which a
- * project could carry, or an old worktree keep.
+ * heavy-slot.sh: $HEAVY_SLOT_SCRIPT, else the first one in a folder above the outermost repository
+ * that holds `dir` (or above `dir`, outside any repository). Never one inside the served repository,
+ * which a project could carry, or an old worktree keep: a worktree or submodule nested in another
+ * repository (as Claude Code's .claude/worktrees are) is inside that one too.
  */
 export function findSlotScript(dir, env = process.env) {
   if (env.HEAVY_SLOT_SCRIPT) return env.HEAVY_SLOT_SCRIPT
-  let from = resolve(dir)
-  for (let d = from; ; d = dirname(d)) {
-    if (existsSync(join(d, '.git'))) {
-      if (dirname(d) === d) return null
-      from = dirname(d)
-      break
-    }
+  let top = null
+  for (let d = resolve(dir); ; d = dirname(d)) {
+    if (existsSync(join(d, '.git'))) top = d
     if (dirname(d) === d) break
   }
-  for (let d = from; ; d = dirname(d)) {
+  if (top !== null && dirname(top) === top) return null
+  for (let d = top === null ? resolve(dir) : dirname(top); ; d = dirname(d)) {
     if (existsSync(join(d, 'heavy-slot.sh'))) return join(d, 'heavy-slot.sh')
     if (dirname(d) === d) return null
   }

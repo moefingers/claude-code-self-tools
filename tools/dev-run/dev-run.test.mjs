@@ -25,6 +25,8 @@ const TMP = mkdtempSync(join(tmpdir(), 'dev-run-test-'))
 const REQUEST = /^\s*GET \S+ 200 in/
 const MIN = 60_000
 const skip = process.platform !== 'win32' && 'dev-run is Windows only'
+const DUMMY_SLOT = join(TMP, 'heavy-slot.sh') // a slot script that exists, for tests whose claims are injected
+writeFileSync(DUMMY_SLOT, '')
 after(() => {
   // A fake server a failed run left behind can hold a folder for up to two minutes; leave it then.
   try {
@@ -343,7 +345,7 @@ async function ownTreeScenario(mod) {
 }
 
 async function slotCompileScenario(mod) {
-  const h = await harness(mod, { name: 'slot-compile', flags: ['--slot-script', 'heavy-slot.sh'], limitMin: 5 })
+  const h = await harness(mod, { name: 'slot-compile', flags: ['--slot-script', DUMMY_SLOT], limitMin: 5 })
   try {
     await h.ready(1)
     assert.deepEqual(h.order.slice(0, 3), ['claim', 'taken', 'spawn'], 'the slot is taken before the spawn')
@@ -367,7 +369,7 @@ test('--name is a-z, 0-9 and -, from a letter or digit, up to 40 characters; the
   for (const bad of [['--restart-min', '11'], ['--restart-min', '0'], ['--floor-gb', '3'], ['--port', '0'], ['--idle-min', 'x'], ['--bogus', '1'], ['--slot=sometimes'], ['--hit', '(']])
     assert.throws(() => real.parseArgs(args('web', ...bad)), real.UsageError, bad.join(' '))
   assert.throws(() => real.parseArgs(['--name', 'web', '--dir', FIXTURES, '--port', '3999']), /after --/)
-  assert.equal(real.parseArgs([...args('web').slice(0, -2), '--slot', '--slot-script', 'x.sh', '--', process.execPath]).slot, 'compile')
+  assert.equal(real.parseArgs([...args('web').slice(0, -2), '--slot', '--slot-script', DUMMY_SLOT, '--', process.execPath]).slot, 'compile')
   // A .cmd shim runs through cmd.exe, and an argument cmd.exe would read is refused.
   const shim = join(TMP, 'shim.cmd')
   writeFileSync(shim, '@echo off\r\n')
@@ -375,14 +377,17 @@ test('--name is a-z, 0-9 and -, from a letter or digit, up to 40 characters; the
   assert.throws(() => real.resolveCommand(shim, ['a&b'], TMP), real.UsageError)
 })
 
-test('a bare command name comes from PATH, never --dir; a path comes from --dir', { skip }, () => {
+test('every command resolves to a full path: a bare name from PATH only, never --dir, and a path from --dir', { skip }, () => {
   const project = mkdtempSync(join(TMP, 'project-'))
-  writeFileSync(join(project, 'node.cmd'), '@echo off\r\n')
-  writeFileSync(join(project, 'tool.cmd'), '@echo off\r\n')
+  for (const name of ['node.cmd', 'node.exe', 'tool.cmd', 'tool.exe']) writeFileSync(join(project, name), '')
   const env = { ...process.env, PATH: [dirname(process.execPath), '.', 'relative\\bin'].join(';') }
-  assert.equal(real.resolveCommand('node', [], project, env).file.toLowerCase(), process.execPath.toLowerCase(), "the project's node.cmd doesn't stand in for node")
-  assert.equal(real.resolveCommand('tool', [], project, env).file, 'tool', "not found on PATH, so not taken from the project (or a relative PATH entry)")
+  for (const name of ['node', 'node.exe'])
+    assert.equal(real.resolveCommand(name, [], project, env).file.toLowerCase(), process.execPath.toLowerCase(), `the project's own doesn't stand in for ${name}`)
+  // Not on PATH (a relative PATH entry is skipped too): refused, so the spawn never searches --dir.
+  for (const name of ['tool', 'tool.exe']) assert.throws(() => real.resolveCommand(name, [], project, env), /tool(\.exe)? is not on PATH/)
   assert.match(real.resolveCommand('.\\tool.cmd', ['x'], project, env).fileArgs.at(-1), /tool\.cmd" x"$|tool\.cmd x"$/)
+  assert.equal(real.resolveCommand('.\\tool.exe', [], project, env).file, join(project, 'tool.exe'))
+  assert.throws(() => real.resolveCommand('.\\missing.cmd', [], project, env), /no program at/)
 })
 
 test('heavy-slot.sh: $HEAVY_SLOT_SCRIPT first, else the first above the served repository, never one inside it', { skip }, () => {
@@ -395,24 +400,44 @@ test('heavy-slot.sh: $HEAVY_SLOT_SCRIPT first, else the first above the served r
   writeFileSync(join(repo, 'heavy-slot.sh'), '') // the project's own: never taken
   writeFileSync(join(app, 'heavy-slot.sh'), '')
   assert.equal(real.findSlotScript(app, {}), join(top, 'heavy-slot.sh'))
-  assert.equal(real.findSlotScript(app, { HEAVY_SLOT_SCRIPT: '/x/heavy-slot.sh' }), '/x/heavy-slot.sh')
   // A worktree's .git is a file; outside any repository the walk starts at --dir.
   rmSync(join(repo, '.git'), { recursive: true })
   writeFileSync(join(repo, '.git'), 'gitdir: elsewhere\n')
   assert.equal(real.findSlotScript(app, {}), join(top, 'heavy-slot.sh'))
   rmSync(join(repo, '.git'))
   assert.equal(real.findSlotScript(app, {}), join(app, 'heavy-slot.sh'))
-  assert.equal(real.parseArgs(['--name', 'web', '--dir', app, '--port', '3999', '--', process.execPath], { ...process.env, HEAVY_SLOT_SCRIPT: '/x/heavy-slot.sh' }).slotScript, '/x/heavy-slot.sh')
+  // HEAVY_SLOT_SCRIPT wins, as a full Windows path to a file that exists; anything else is refused.
+  const parse = env => real.parseArgs(['--name', 'web', '--dir', app, '--port', '3999', '--', process.execPath], { ...process.env, ...env })
+  assert.equal(parse({ HEAVY_SLOT_SCRIPT: DUMMY_SLOT }).slotScript, DUMMY_SLOT)
+  assert.throws(() => parse({ HEAVY_SLOT_SCRIPT: 'heavy-slot.sh' }), /HEAVY_SLOT_SCRIPT must be a full Windows path/)
+  assert.throws(() => parse({ HEAVY_SLOT_SCRIPT: '/o/heavy-slot.sh' }), /HEAVY_SLOT_SCRIPT must be a full Windows path/)
+  assert.throws(() => parse({ HEAVY_SLOT_SCRIPT: join(top, 'missing.sh') }), /no heavy-slot.sh at .*missing\.sh \(HEAVY_SLOT_SCRIPT\)/)
+  assert.throws(() => real.parseArgs(['--name', 'web', '--dir', app, '--port', '3999', '--slot-script', join(top, 'nope.sh'), '--', process.execPath]), /no heavy-slot.sh at/)
 })
+
+// DR-6: a worktree or submodule nested inside another repository, as Claude Code's .claude/worktrees
+// are: the walk starts above the outermost repository, so the main checkout's copies never shadow.
+async function nestedRepoScenario(mod) {
+  const top = mkdtempSync(join(TMP, 'slots-nested-'))
+  const main = join(top, 'main')
+  const tree = join(main, '.claude', 'worktrees', 'feature')
+  const app = join(tree, 'apps', 'web')
+  mkdirSync(app, { recursive: true })
+  mkdirSync(join(main, '.git'))
+  writeFileSync(join(tree, '.git'), 'gitdir: ../../../.git/worktrees/feature\n')
+  for (const d of [top, main, join(main, '.claude')]) writeFileSync(join(d, 'heavy-slot.sh'), '')
+  assert.equal(mod.findSlotScript(app, {}), join(top, 'heavy-slot.sh'), "above the outermost repository, not the main checkout's copy")
+}
+test('DR-6: a nested worktree or submodule never takes the enclosing repository\'s heavy-slot.sh', { skip }, () => nestedRepoScenario(real))
 
 test('the request and first-compile patterns read Next lines', { skip }, () => {
   const hit = new RegExp(real.HIT_RE, 'i')
   const compiled = new RegExp(real.COMPILED_RE) // as the runner reads it: case-sensitive
   for (const l of [' GET / 200 in 12ms', ' POST /api/x 404 in 3ms', ' GET /a 200 in 1.2s (compile: 1s, render: 200ms)']) assert.ok(hit.test(l), l)
   for (const l of [' ✓ Ready in 2.1s', ' ○ Compiling / ...', 'GET request failed']) assert.ok(!hit.test(l), l)
-  for (const l of [' GET / 200 in 12ms', ' GET /old 307 in 4ms', ' ✓ Compiled / in 3.1s (812 modules)', ' ✓ Compiled in 300ms', 'Compiled in 300ms']) assert.ok(compiled.test(l), l)
+  for (const l of [' GET / 200 in 12ms', ' GET / 200 in 1.2s (compile: 1.1s, render: 120ms)', ' ✓ Compiled / in 3.1s (812 modules)', ' ✓ Compiled in 300ms', 'Compiled in 300ms']) assert.ok(compiled.test(l), l)
   for (const l of [' GET / 404 in 5ms', ' GET / 500 in 5ms', ' ✓ Ready in 2.1s', ' ○ Compiling / ...', ' ✓ Compiled /middleware in 210ms', ' ⨯ Failed to compile',
-    ' GET /compiled 404 in 5ms', ' HEAD /docs/compiled 500 in 2ms', 'the app compiled 3 files', 'compiled successfully', 'build: Compiled', 'unCompiled'])
+    ' GET /old 307 in 4ms', ' GET / 302 in 9ms', ' GET /compiled 404 in 5ms', ' HEAD /docs/compiled 500 in 2ms', 'the app compiled 3 files', 'compiled successfully', 'build: Compiled', 'unCompiled'])
     assert.ok(!compiled.test(l), l)
 })
 
@@ -423,7 +448,7 @@ test('kills only its own tree, by PID: a second server and its child live on', {
 test('takes the heavy slot before the spawn, and releases it at the first compiled response', { skip }, () => slotCompileScenario(real))
 
 test('with no compiled response, releases the slot after 3 minutes and keeps the server', { skip }, async () => {
-  const h = await harness(real, { name: 'slot-timeout', flags: ['--slot-script', 'heavy-slot.sh'] })
+  const h = await harness(real, { name: 'slot-timeout', flags: ['--slot-script', DUMMY_SLOT] })
   try {
     await h.ready(1)
     await h.until(() => h.claims[0].dropped !== null, 'the timeout')
@@ -438,7 +463,7 @@ test('with no compiled response, releases the slot after 3 minutes and keeps the
 })
 
 test('--slot=life holds the slot for the whole run, and claims it again for the next', { skip }, async () => {
-  const h = await harness(real, { name: 'slot-life', flags: ['--slot=life', '--slot-script', 'heavy-slot.sh'] })
+  const h = await harness(real, { name: 'slot-life', flags: ['--slot=life', '--slot-script', DUMMY_SLOT] })
   try {
     await h.ready(1)
     await h.get('/')
@@ -453,7 +478,7 @@ test('--slot=life holds the slot for the whole run, and claims it again for the 
 })
 
 test('each start waits for the 9 GiB compile floor before it claims a slot or spawns', { skip }, async () => {
-  const h = await harness(real, { name: 'compile-floor', flags: ['--slot-script', 'heavy-slot.sh'], mem: 8 })
+  const h = await harness(real, { name: 'compile-floor', flags: ['--slot-script', DUMMY_SLOT], mem: 8 })
   try {
     const waiting = 'waiting for memory: 8.0 GiB free, under the 9 GiB start floor'
     await h.until(() => h.logs.filter(l => l === waiting).length >= 2, 'the wait')
@@ -752,6 +777,7 @@ const FAULTS = [
   ['DR-4: a start time read after the root ended is kept', 'if (child.exitCode !== null || child.signalCode !== null) this.rootCreated = null', '', earlyExitScenario, /no process table read/],
   ['DR-4: a queued claim keeps a start time read after it ended', 'if (child.exitCode !== null || child.signalCode !== null) created = null', '', earlyDropScenario, /no process table read/],
   ['DR-5: a dead root takes children started after its end', 'alive ? null : endedAt]', 'null]', deadRootTableScenario, /nothing started after the root ended/],
+  ['DR-6: the slot-script walk stops at the innermost repository', "if (existsSync(join(d, '.git'))) top = d", "if (top === null && existsSync(join(d, '.git'))) top = d", nestedRepoScenario, /not the main checkout's copy/],
   ["DR-7: the guard ignores a root whose start time it wasn't told", 'const from = child ?? spawned', 'const from = child', guardScenario, /deep-equal|the guard to stop the server/],
   ['the heavy slot is never released', 'if (!claim) return', 'return', slotCompileScenario, /ended \(test deadline\) before the slot to be released/],
   ['the heavy slot is released before the compile', ' && this.compiledRe.test(line)', '', slotCompileScenario, /still held once the server is ready/],
