@@ -255,3 +255,21 @@ test('a subagent is refused, and nothing is queued', async ($, on) => {
   await clock.advance(1000)
   expect(commands).toEqual([])
 })
+
+test('a subagent that has not ended holds, whatever its status: an idle teammate, and a status this plugin does not know; it says how to clear one that will not report; one that has ended does not hold', async ($, on) => {
+  const { world } = engine(on)
+  await $.session.start(start)
+  for (const status of ['idle', 'paused']) {
+    world.agents = [{ status, description: 'A teammate' }] as never
+    const refused = await $.tool.call({ tool: TOOL, why: 'complete', handoff: 'Go on.' })
+    expect(refused.deny).toContain('A teammate')
+    expect(refused.deny).toContain(status)
+    expect(refused.deny).toContain('TaskStop')
+  }
+  world.agents = [{ status: 'running', description: 'Lint' }] as never
+  expect((await $.tool.call({ tool: TOOL, why: 'complete', handoff: 'Go on.' })).deny).toContain('Lint')
+  for (const status of ['completed', 'failed', 'killed']) {
+    world.agents = [{ status, description: 'Lint' }] as never
+    expect((await $.tool.call({ tool: TOOL, why: 'complete', handoff: 'Go on.' })).deny).toBeUndefined()
+  }
+})

@@ -1,5 +1,6 @@
 import { expect, mock, test } from 'claude-code/testing'
 import type { AgentStatus, On } from 'claude-code'
+import { wakeMarker } from '../hooks/machine'
 
 const TOOL = 'mcp__self-exit__exit_after_turn'
 const HOUR = 60 * 60 * 1000
@@ -76,12 +77,16 @@ function engine(on: On, { exit = 'exits', agents = [], env = {}, id = ID, crons 
   /** What each `$.tool.check` of CronList put under `input`, and the keys each `$.tool.call` of it carried. */
   const checkInputs: unknown[] = []
   const callShapes: string[][] = []
-  const world = { agents, crons, cronCheck, cronList, probe }
+  // self-wake: undefined, not in this session; null, on with no marker; else its marker's text.
+  const world: { agents: typeof agents; crons: typeof crons; cronCheck: typeof cronCheck; cronList: typeof cronList; probe: typeof probe; wake?: string | null } = { agents, crons, cronCheck, cronList, probe }
   const clock = mock.clock(on, { now: 1_000_000 })
   const session = mock.session(on)
   mock.env(on, env)
   on('session.start', (_, e) => ({ cwd: e.cwd }))
   on('session.id', () => ({ value: id }))
+  on('tool.list', () => ({ value: world.wake === undefined ? [] : [{ name: 'mcp__self-wake__wake_after', description: 'Wakes this session later.', mcp: true }] }))
+  on('fs.exists', () => ({ value: world.wake !== null && world.wake !== undefined }))
+  on('fs.read', () => (typeof world.wake === 'string' ? { value: world.wake } : { deny: 'ENOENT' }))
   on('tool.register', (_, e) => {
     described.push(String(e.description))
     return { value: { tool: TOOL } }
@@ -464,4 +469,29 @@ test("the tool's description names what it refuses on, and how to stop each", as
   expect(text).toContain('a session cron (delete it with CronDelete)')
   expect(text).toContain('a background Bash, PowerShell or Monitor job (stop it with TaskStop)')
   expect(text).toContain("while any of that can't be read")
+})
+
+test('a wake-up pending, by self-wake\'s marker, refuses the exit at the call and when armed (S1-9)', async ($, on) => {
+  const { commands, world, clock } = engine(on, { env: WINDOWS })
+  world.wake = wakeMarker({ armed: true, due: 2_000_000, at: 1 })
+  await $.session.start(start)
+  const refused = await $.tool.call({ tool: TOOL, reason: 'done' })
+  expect(refused.deny).toContain('a wake-up is pending')
+  expect(refused.deny).toContain('cancel_wake')
+  // None armed: it goes.
+  world.wake = wakeMarker({ armed: false, at: 1 })
+  expect((await $.tool.call({ tool: TOOL, reason: 'done' })).deny).toBeUndefined()
+  // Armed after the call: the run holds.
+  world.wake = wakeMarker({ armed: true, due: 2_000_000, at: 2 })
+  await $.turn.complete(answered)
+  await clock.advance(1000)
+  expect(commands).toEqual([])
+})
+
+test('self-wake on with no marker holds: unknown holds (S1-9)', async ($, on) => {
+  const { world } = engine(on, { env: WINDOWS })
+  world.wake = null
+  await $.session.start(start)
+  const refused = await $.tool.call({ tool: TOOL, reason: 'done' })
+  expect(refused.deny).toContain('whether a wake-up is pending')
 })

@@ -37,7 +37,6 @@ import {
   RECHECK,
   releaseScript,
   selfcheckPath,
-  SLOT_NO_LEFT,
   SLOT_NOT_RECOGNISED,
   SLOT_SCRIPT_SHA256,
   STDIN_BOOTSTRAP,
@@ -74,17 +73,25 @@ function noWait(change: Partial<LaunchInput> = {}): LaunchInput {
 }
 
 /** A start's launch: a new id and name in a window, its id checked new, after nothing. */
-const START = noWait({ kind: 'start', name: 'dealerwrap', checks: { fresh: true } })
+const START = noWait({ kind: 'start', name: 'dealerwrap', checks: { fresh: true, floor: true, input: true } })
+
+/** The checks a launch of another process must ask for. */
+const ANOTHER = { floor: true, input: true, live: true }
 
 /** Every place a launch goes in this version, one script each. */
 const SCRIPTS: [string, string][] = [
   ['the window', launchScriptText(input())],
   ['the window, a left record checked', launchScriptText(input({ left: { exitAt: NOW - 60_000 } }))],
-  ['the window, not waiting, NOT LIVE checked now', launchScriptText(noWait({ checks: { live: true } }))],
+  ['the window, not waiting, NOT LIVE checked now', launchScriptText(noWait({ checks: ANOTHER }))],
   ['the window, a start', launchScriptText(START)],
   ['this tab', launchScriptText(input({ where: { pane: { token: TOKEN } }, now: NOW }))],
   ["this pane's slot", launchScriptText(input({ where: { slot: SLOT }, claim: `slot:${SLOT}` }))],
   ["'auto' (self-restart's)", launchScriptText(input({ id: W, folder: REPO, where: 'auto' }))],
+  ['an idle slot elsewhere, a resume', launchScriptText(noWait({ where: { slot: SLOT }, claim: `slot:${SLOT}`, checks: ANOTHER, left: { size: 12, mtime: 34 } }))],
+  ['an idle slot elsewhere, a start', launchScriptText(noWait({ kind: 'start', name: 'dealerwrap', where: { slot: SLOT }, claim: `slot:${SLOT}`, checks: { fresh: true, floor: true, input: true }, heavySlotRoot: 'O:\\heavy' }))],
+  ['a tab, a resume that waits', launchScriptText(input({ where: { tab: { window: 'claude-1', title: 'tab one' } }, claim: `launch:${T}`, left: { exitAt: NOW - 60_000 } }))],
+  ['a tab, a start', launchScriptText(noWait({ kind: 'start', name: 'dealerwrap', where: { tab: { window: 'claude-4', title: 'dealerwrap', pos: [960, 540], size: [160, 42] } }, claim: `launch:${T}`, checks: { fresh: true, floor: true, input: true } }))],
+  ['a named window', launchScriptText(noWait({ where: { window: { name: 'claude-overflow', pos: [1920, 0], size: [140, 60] } }, claim: `launch:${T}`, checks: ANOTHER }))],
 ]
 
 /** The window's own script, as it is put in the launch script: one single-quoted literal, its quotes doubled. */
@@ -142,7 +149,9 @@ describe('launch(): one powershellCall, the script on standard input', () => {
   test('nothing but claude-launch.ps1 is ever started as claude: no claude.exe, no Get-Command claude, no call but & $launchPath', () => {
     for (const [name, script] of SCRIPTS) {
       expect(script).not.toMatch(/Get-Command -Name ['"]?claude/)
-      const calls = script.match(/&\s+(\$\w+|'[^'\r\n]*'|"[^"\r\n]*")/g) ?? []
+      // A line that says how to run it by hand is words, not a call.
+      const code = script.split(/\r?\n/).filter(line => !line.includes('Write-Host')).join('\n')
+      const calls = code.match(/&\s+(\$\w+|'[^'\r\n]*'|"[^"\r\n]*")/g) ?? []
       expect([name, calls.filter(call => call !== '& $launchPath')]).toEqual([name, []])
       // And no flag of claude's at all: claude-launch.ps1 takes -Resume/-Start, -Name and -Dir.
       expect(script).not.toMatch(/&\s+\$launchPath[^\r\n]*--/)
@@ -165,7 +174,7 @@ describe('launch(): one powershellCall, the script on standard input', () => {
     expect(inner.lastIndexOf('try {', run)).toBeGreaterThan(inner.indexOf('$started = Get-Date'))
     const caught = inner.indexOf('} catch {', run)
     expect(caught).toBeGreaterThan(run)
-    expect(inner.slice(caught)).toMatch(/^\} catch \{\r\n  Write-Host \("claude-launch\.ps1 stopped on an error, so the session may not have resumed here: " \+ \$_\.Exception\.Message\)\r\n  Write-Host \("Once it is safe, resume it yourself: " \+ "claude-launch\.ps1 -Resume " \+ \$id \+ " -Dir " \+ \$folder\)\r\n  Read-Host "Press Enter to close this window" \| Out-Null\r\n  exit 1\r\n\}/)
+    expect(inner.slice(caught)).toMatch(/^\} catch \{\r\n  Write-Host \("claude-launch\.ps1 stopped on an error, so the session may not have resumed here: " \+ \$_\.Exception\.Message\)\r\n  Write-Host \("Once it is safe, resume it yourself: " \+ "& '" \+ \$handPath \+ "' -Resume " \+ \$id \+ " -Dir '" \+ \$folder \+ "'"\)\r\n  Release-Claim\r\n  Read-Host "Press Enter to close this window" \| Out-Null\r\n  exit 1\r\n\}/)
   })
 
   test('no environment is changed but PSModulePath: the launch environment is claude-launch.ps1\'s alone', () => {
@@ -173,7 +182,8 @@ describe('launch(): one powershellCall, the script on standard input', () => {
       expect(script).not.toContain('SetEnvironmentVariable')
       expect(script).not.toMatch(/Remove-Item[^\r\n]*Env:|Set-Item[^\r\n]*Env:/)
       const sets = script.match(/\$env:\w+\s*=/g) ?? []
-      expect(sets.every(set => set === '$env:PSModulePath =')).toBe(true)
+      // But the stamps a tab's process forwards to it: named, never a variable of the launch environment.
+      expect(sets.every(set => ['$env:PSModulePath =', '$env:CLAUDE_SELF_TOOLS_WT_WINDOW =', '$env:CLAUDE_SELF_TOOLS_WT_TAB ='].includes(set))).toBe(true)
       for (const name of ['WT_SESSION', 'WT_PROFILE_ID', 'NO_COLOR', 'CLAUDECODE', 'CLAUDE_CODE_DISABLE_BG_SHELL_PRESSURE_REAP']) expect(script).not.toContain(name)
     }
   })
@@ -195,14 +205,13 @@ describe('launch(): one powershellCall, the script on standard input', () => {
       for (const line of INSTALL_LAUNCHER) expect(script).toContain(line)
       for (const line of INSTALL_HAND_COPY) expect(script).toContain(line)
       // The copy for use by hand after the launcher is in place, and never refused on.
-      const hand = script.indexOf(`  Install-HandCopy $handPath $launchPath ${LAUNCH_SCRIPT_VERSION}`)
-      expect(hand).toBeGreaterThan(script.indexOf("  if ($null -ne $installWhy) { Refuse 'launcher'"))
+      const hand = script.indexOf(`Install-HandCopy $handPath $launchPath ${LAUNCH_SCRIPT_VERSION}`)
+      expect(hand).toBeGreaterThan(script.indexOf("if ($null -ne $installWhy) { Refuse 'launcher'"))
       expect(script.slice(hand, script.indexOf('\r\n', hand))).not.toContain('Refuse')
       expect(INSTALL_HAND_COPY.join('\n')).not.toContain('Replace(')
-      const install = script.indexOf(`  $installWhy = Install-Launcher $launchPath $launcherCopy '${LAUNCH_SCRIPT_SHA256}'`)
-      const early = script.indexOf("  if ($null -ne $installWhy) { Refuse 'launcher'")
+      const install = script.indexOf(`$installWhy = Install-Launcher $launchPath $launcherCopy '${LAUNCH_SCRIPT_SHA256}'`)
+      const early = script.indexOf("if ($null -ne $installWhy) { Refuse 'launcher'")
       expect(install).toBeGreaterThan(0)
-      expect(script.indexOf("if ($transport -eq 'window') {")).toBeLessThan(install)
       expect(early).toBeGreaterThan(install)
       expect(early).toBeLessThan(script.indexOf('$taken = New-Claim $claimPath $claimText'))
       // Written whole under another name, checked, then moved over: never written in place.
@@ -215,7 +224,7 @@ describe('launch(): one powershellCall, the script on standard input', () => {
       expect(script).toContain('[Security.Cryptography.SHA256]::Create()')
       expect(script).not.toContain('Get-FileHash')
     }
-    // The tab and the slot start nothing of their own: the wrapper and the slot runner do, after this process.
+    // This tab and this pane's slot start nothing of their own: the wrapper and the slot runner do, after this process.
     for (const script of [SCRIPTS[4]?.[1] ?? '', SCRIPTS[5]?.[1] ?? '']) {
       expect(script).not.toContain('Start-Process')
       expect(script).not.toContain('& $launchPath')
@@ -235,7 +244,7 @@ describe('launch(): one powershellCall, the script on standard input', () => {
 
 describe('the checks, the claim and the place, in one run, in that order', () => {
   test('the process waited for is this script\'s own claude.exe, by its pid and its start, before anything else is done', () => {
-    for (const [, script] of SCRIPTS.filter(([name]) => !name.includes('not waiting') && !name.includes('a start'))) {
+    for (const [, script] of SCRIPTS.filter(([name]) => !name.includes('not waiting') && !name.includes('a start') && !name.includes('elsewhere') && !name.includes('named window'))) {
       const wait = script.indexOf(`if ([long]$session.ProcessId -ne 100 -or [math]::Abs([long](Get-Created $session) - [long]'${ft(2)}') -gt 10000) { Refuse 'wait'`)
       expect(wait).toBeGreaterThan(0)
       expect(wait).toBeLessThan(script.indexOf('$taken = New-Claim'))
@@ -251,7 +260,7 @@ describe('the checks, the claim and the place, in one run, in that order', () =>
     expect(inner.indexOf('$lock.by -cne $by')).toBeGreaterThan(inner.indexOf(`    ${RECHECK[RECHECK.length - 1]}`))
     expect(inner.indexOf('& $launchPath')).toBeGreaterThan(inner.indexOf('$lock.by -cne $by'))
     // waitForExit skipped: no wait, no last look after it. A test that plants it must fail here.
-    expect(innerOf(launchScriptText(noWait({ checks: { live: true } })))).not.toContain('Wait-Process')
+    expect(innerOf(launchScriptText(noWait({ checks: ANOTHER })))).not.toContain('Wait-Process')
   })
 
   test('a launch that does not wait checks NOT LIVE now (and the left record), before the claim; one that waits is refused that check', () => {
@@ -276,7 +285,7 @@ describe('the checks, the claim and the place, in one run, in that order', () =>
     expect(script).toContain("if ($null -ne $fresh) { Refuse 'fresh' $fresh }")
     expect(script).toContain("$name = ''dealerwrap''")
     for (const name of ['', 'Dealerwrap', 'deal wrap', "x'; calc", '-x', 'a'.repeat(41)]) expect(() => launchScriptText({ ...START, name })).toThrow()
-    expect(() => launchScriptText({ ...START, checks: {} })).toThrow(/checks\.fresh/)
+    expect(() => launchScriptText({ ...START, checks: { floor: true, input: true } })).toThrow(/checks\.fresh/)
     expect(() => launchScriptText({ ...START, where: { pane: { token: TOKEN } }, now: NOW })).toThrow(/window/)
   })
 
@@ -310,7 +319,7 @@ describe('the checks, the claim and the place, in one run, in that order', () =>
     expect(script).toContain("$placed = 'pane " + TOKEN + "'")
     expect(() => launchScriptText(input({ where: { pane: { token: TOKEN } } }))).toThrow(/time/)
     expect(() => launchScriptText(input({ where: { pane: { token: 'not-a-token' } }, now: NOW }))).toThrow()
-    expect(() => launchScriptText(noWait({ where: { pane: { token: TOKEN } }, now: NOW }))).toThrow(/replaces its caller/)
+    expect(() => launchScriptText(noWait({ where: { pane: { token: TOKEN } }, now: NOW, checks: ANOTHER }))).toThrow(/replaces its caller/)
     // A move that rests on a left record: the ticket carries its stat, for the wrapper's last look (pane file version 3).
     const withLeft = launchScriptText(input({ where: { pane: { token: TOKEN } }, now: NOW, left: { exitAt: NOW - 60_000 } }))
     const leftTicket = paneTicket({ token: TOKEN, resume: T, by: LAUNCH, dir: ELSEWHERE, at: NOW, configDirs: [CONFIG, OTHER_CONFIG], left: { exitAt: NOW - 60_000 } })
@@ -342,16 +351,20 @@ describe('the checks, the claim and the place, in one run, in that order', () =>
     expect(check).toBeGreaterThan(0)
     expect(check).toBeLessThan(script.indexOf('$taken = New-Claim'))
     expect(script).toContain(`$final = '${STATE}\\slots\\${SLOT}.next.json'`)
-    expect(script).toContain('$text = [ordered]@{ v = 1; resume = $id; folder = $folder; at = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds(); configDirs = [object[]]$configDirs } | ConvertTo-Json -Compress')
+    expect(script).toContain('$text = [ordered]@{ v = 1; resume = $id; folder = $folder; at = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds(); configDirs = [object[]]$configDirs; launcher = \'' + LAUNCH_SCRIPT_SHA256 + "' } | ConvertTo-Json -Compress -Depth 3")
     expect(() => launchScriptText(input({ where: { slot: SLOT } }))).toThrow(/slot's claim/)
     expect(() => launchScriptText(input({ where: { slot: '..\\x' }, claim: 'slot:1-2' }))).toThrow()
-    expect(() => launchScriptText(input({ where: { slot: SLOT }, claim: `slot:${SLOT}`, left: { exitAt: NOW } }))).toThrow(/slots v2/)
+    // A verified runner is version 2: its last look checks a left record, carried in the record.
+    expect(launchScriptText(input({ where: { slot: SLOT }, claim: `slot:${SLOT}`, left: { exitAt: NOW } }))).toContain(`; left = [ordered]@{ exitAt = ${NOW} } } | ConvertTo-Json -Compress -Depth 3`)
   })
 
-  test('slots v2 is not in this version: the floor and input checks, and a window by placement, are refused, never skipped', () => {
-    expect(() => launchScriptText(input({ checks: { floor: true } }))).toThrow(/slots v2/)
-    expect(() => launchScriptText(input({ checks: { input: true } }))).toThrow(/slots v2/)
-    expect(() => launchScriptText(input({ where: { window: { name: 'claude-1' } } as never }))).toThrow(/slots v2/)
+  test('a launch of another process must ask for the floor and the input idle, and a resume for NOT LIVE: never a launch that skips them', () => {
+    expect(() => launchScriptText(noWait({ checks: { live: true } }))).toThrow(/checks the floor and the input idle/)
+    expect(() => launchScriptText(noWait({ checks: { live: true, floor: true } }))).toThrow(/checks the floor and the input idle/)
+    expect(() => launchScriptText(noWait({ checks: { floor: true, input: true } }))).toThrow(/NOT LIVE/)
+    // One that replaces its caller adds no process: no floor, and it may ask for the input idle.
+    expect(launchScriptText(input())).not.toContain("Refuse 'memory'")
+    expect(launchScriptText(input({ checks: { input: true } }))).toContain("Refuse 'input'")
   })
 
   test('every input is checked: ids, folders (quotes, a semicolon), config folders, claimants, names', () => {
@@ -437,44 +450,40 @@ describe('pickLaunchTransport: the coordinating note\'s order, for a launch that
   const PANE = { token: TOKEN, pane: { pid: 20, started: ft(1), v: 3 as const } }
 
   test('this tab first (its wrapper is claude.exe\'s parent), then this pane\'s slot, then a window saying why a slot runner was passed over', () => {
-    expect(pickLaunchTransport(probeOf(), { replacing: true, pane: PANE, configCount: 1, needsLeft: false })).toEqual({ where: { pane: { token: TOKEN } } })
-    expect(pickLaunchTransport(probeOf(p => inSlot(p)), { replacing: true, configCount: 1, needsLeft: false })).toEqual({ where: { slot: SLOT } })
-    expect(pickLaunchTransport(probeOf(), { replacing: true, configCount: 1, needsLeft: false })).toEqual({ where: { window: true } })
-    expect(pickLaunchTransport(probeOf(p => inSlot(p, 'e'.repeat(64))), { replacing: true, configCount: 1, needsLeft: false })).toEqual({
+    expect(pickLaunchTransport(probeOf(), null, { replacing: true, pane: PANE, configCount: 1, needsLeft: false })).toEqual({ where: { pane: { token: TOKEN } } })
+    expect(pickLaunchTransport(probeOf(p => inSlot(p)), null, { replacing: true, configCount: 1, needsLeft: false })).toEqual({ where: { slot: SLOT } })
+    expect(pickLaunchTransport(probeOf(), null, { replacing: true, configCount: 1, needsLeft: false })).toEqual({ where: { window: true } })
+    expect(pickLaunchTransport(probeOf(p => inSlot(p, 'e'.repeat(64))), null, { replacing: true, configCount: 1, needsLeft: false })).toEqual({
       where: { window: true },
       fallback: "this pane's claude-slot.ps1 has another SHA-256 than the one shipped (an edited or older copy: copy the shipped script and restart the pane)",
     })
-    expect(pickLaunchTransport(probeOf(p => (p.slotSeen = true)), { replacing: true, configCount: 1, needsLeft: false })).toEqual({ where: { window: true }, fallback: SLOT_NOT_RECOGNISED })
+    expect(pickLaunchTransport(probeOf(p => (p.slotSeen = true)), null, { replacing: true, configCount: 1, needsLeft: false })).toEqual({ where: { window: true }, fallback: SLOT_NOT_RECOGNISED })
     // A pane file of another PowerShell: not this tab.
-    expect(pickLaunchTransport(probeOf(), { replacing: true, pane: { token: TOKEN, pane: { pid: 21, started: ft(1), v: 3 } }, configCount: 1, needsLeft: false })).toEqual({ where: { window: true } })
+    expect(pickLaunchTransport(probeOf(), null, { replacing: true, pane: { token: TOKEN, pane: { pid: 21, started: ft(1), v: 3 } }, configCount: 1, needsLeft: false })).toEqual({ where: { window: true } })
     // A wrapper of version 2 reads its own config folder alone: not for a launch that reads two.
     const older = { token: TOKEN, pane: { pid: 20, started: ft(1), v: 2 as const } }
-    expect(pickLaunchTransport(probeOf(), { replacing: true, pane: older, configCount: 1, needsLeft: false })).toEqual({ where: { pane: { token: TOKEN } } })
-    expect(pickLaunchTransport(probeOf(), { replacing: true, pane: older, configCount: 2, needsLeft: false })).toEqual({ where: { window: true } })
-    expect(pickLaunchTransport(probeOf(), { replacing: true, pane: PANE, configCount: 2, needsLeft: false })).toEqual({ where: { pane: { token: TOKEN } } })
+    expect(pickLaunchTransport(probeOf(), null, { replacing: true, pane: older, configCount: 1, needsLeft: false })).toEqual({ where: { pane: { token: TOKEN } } })
+    expect(pickLaunchTransport(probeOf(), null, { replacing: true, pane: older, configCount: 2, needsLeft: false })).toEqual({ where: { window: true } })
+    expect(pickLaunchTransport(probeOf(), null, { replacing: true, pane: PANE, configCount: 2, needsLeft: false })).toEqual({ where: { pane: { token: TOKEN } } })
   })
 
-  test("a launch that rests on a left record: a tab of pane file version 3, else never this pane's slot (until slots v2) but a window, saying why", () => {
-    expect(pickLaunchTransport(probeOf(), { replacing: true, pane: PANE, configCount: 1, needsLeft: true })).toEqual({ where: { pane: { token: TOKEN } } })
+  test("a launch that rests on a left record: a tab of pane file version 3, or this pane's slot, whose runner of the shipped hash is version 2; else a window", () => {
+    expect(pickLaunchTransport(probeOf(), null, { replacing: true, pane: PANE, configCount: 1, needsLeft: true })).toEqual({ where: { pane: { token: TOKEN } } })
     const older = { token: TOKEN, pane: { pid: 20, started: ft(1), v: 2 as const } }
-    expect(pickLaunchTransport(probeOf(), { replacing: true, pane: older, configCount: 1, needsLeft: true })).toEqual({ where: { window: true } })
-    expect(pickLaunchTransport(probeOf(p => inSlot(p)), { replacing: true, configCount: 1, needsLeft: true })).toEqual({ where: { window: true }, fallback: SLOT_NO_LEFT })
+    expect(pickLaunchTransport(probeOf(), null, { replacing: true, pane: older, configCount: 1, needsLeft: true })).toEqual({ where: { window: true } })
+    expect(pickLaunchTransport(probeOf(p => inSlot(p)), null, { replacing: true, configCount: 1, needsLeft: true })).toEqual({ where: { slot: SLOT } })
     expect(paneNoLeft(older.pane)).toMatch(/pane file is version 2/)
     expect(paneNoLeft(PANE.pane)).toBeUndefined()
   })
 
   test('configCount and needsLeft are required, never defaulted: a caller that leaves either out is refused, not given a weaker tab (F4)', () => {
-    expect(() => pickLaunchTransport(probeOf(), { replacing: true, pane: PANE } as never)).toThrow(/1 to 8 config folders/)
-    expect(() => pickLaunchTransport(probeOf(), { replacing: true, pane: PANE, configCount: 2 } as never)).toThrow(/needsLeft/)
-    expect(() => pickLaunchTransport(probeOf(), { replacing: true, configCount: 0, needsLeft: false })).toThrow(/1 to 8/)
-    expect(() => pickLaunchTransport(probeOf(), { replacing: true, configCount: 9, needsLeft: false })).toThrow(/1 to 8/)
-    expect(() => pickLaunchTransport(probeOf(), { replacing: true, configCount: 1.5, needsLeft: false })).toThrow(/1 to 8/)
+    expect(() => pickLaunchTransport(probeOf(), null, { replacing: true, pane: PANE } as never)).toThrow(/1 to 8 config folders/)
+    expect(() => pickLaunchTransport(probeOf(), null, { replacing: true, pane: PANE, configCount: 2 } as never)).toThrow(/needsLeft/)
+    expect(() => pickLaunchTransport(probeOf(), null, { replacing: true, configCount: 0, needsLeft: false })).toThrow(/1 to 8/)
+    expect(() => pickLaunchTransport(probeOf(), null, { replacing: true, configCount: 9, needsLeft: false })).toThrow(/1 to 8/)
+    expect(() => pickLaunchTransport(probeOf(), null, { replacing: true, configCount: 1.5, needsLeft: false })).toThrow(/1 to 8/)
   })
 
-  test('a launch of another process waits: an idle slot, a tab and placement\'s window come with slots v2', () => {
-    const waits = pickLaunchTransport(probeOf(), { replacing: false, pane: PANE, configCount: 1, needsLeft: false })
-    expect('wait' in waits && /slots v2/.test(waits.wait)).toBe(true)
-  })
 })
 
 describe('every path named by an id is built by one helper, which refuses any other id before joining', () => {

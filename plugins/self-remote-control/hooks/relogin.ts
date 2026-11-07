@@ -41,7 +41,8 @@
 //      followed by another until a person types: the loop-breaker. A rewind past the cut-off turn
 //      isn't seen (the API gives no cheap mark of the newest message, and $.session.messages()
 //      copies up to 4096 of them): the 6-hour limit bounds it.
-//   3. One toast saying what happened (one only while the reconnect cap holds).
+//   3. One toast saying what happened (one only while the reconnect cap holds). A resume names the error
+//      kind its turn ended on and how long ago, there and in a debug line, so it can be checked after.
 import type { EngineInterface, PluginOptions, Timer } from 'claude-code'
 import type { Login, Pending, Resumes, Turn } from '../types'
 import { readNow, runRemoteControl, sessionTitle, why } from './connection'
@@ -537,7 +538,18 @@ async function jitter($: EngineInterface): Promise<number> {
   }
 }
 
-/** The resume step: sends RESUME to a turn that was cut off; says what it did. */
+/** How long ago, as a resume's line says it: seconds, then minutes, then hours. */
+function agoText(ms: number): string {
+  const seconds = Math.max(0, Math.round(ms / 1000))
+  if (seconds < 120) return `${seconds} s`
+  const minutes = Math.round(seconds / 60)
+  return minutes < 120 ? `${minutes} min` : `${Math.round(minutes / 60)} h`
+}
+
+/** A resume's words: the error kind its turn ended on, and how long ago, so a resume can be checked after the fact. */
+export const resumedSaid = (error: string | undefined, ms: number): string => `resumed: the turn ended on ${error ?? 'an error'} ${agoText(ms)} ago`
+
+/** The resume step: sends RESUME to a turn that was cut off; says what it did, in the toast's words and the debug log. */
 async function resume($: EngineInterface, held: Login, p: Pending, now: number): Promise<string> {
   if (!settings.resume) return 'no resume (resumeAfterLoginChange is off)'
   if (p.resumed === true) return 'the interrupted turn was resumed'
@@ -546,10 +558,12 @@ async function resume($: EngineInterface, held: Login, p: Pending, now: number):
   if (!isCutOff(turn, now)) return 'no turn was cut off'
   await $.state.set(loginRef, { ...held, pending: { ...p, resumed: true } })
   await $.state.set(resumesRef, { ...((await getResumes($)) ?? {}), sentAt: now })
+  const said = resumedSaid(turn?.error, now - (turn?.at ?? now))
+  $.ui.log(`self-remote-control: ${said}`, { to: 'debug' })
   try {
     const sent = await within($, $.prompt.submit({ text: RESUME }), SUBMIT_WAIT_MS)
-    if (sent === 'late') return 'the resume is queued, to run once the session is idle'
-    return sent.drop === undefined ? 'resumed the interrupted turn' : `resume not sent: ${sent.drop}`
+    if (sent === 'late') return `the resume is queued, to run once the session is idle (${said})`
+    return sent.drop === undefined ? said : `resume not sent: ${sent.drop}`
   } catch (err) {
     return `resume not sent: ${why(err)}`
   }
@@ -611,7 +625,7 @@ export async function move($: EngineInterface): Promise<void> {
       ...(p.rc === 'capped' ? { cappedAt: isCapToldAlready ? (latest.cappedAt as number) : now } : latest.cappedAt === undefined ? {} : { cappedAt: latest.cappedAt }),
     }
     await $.state.set(loginRef, settled)
-    if (isCapToldAlready && resumed !== 'resumed the interrupted turn') return
+    if (isCapToldAlready && !resumed.startsWith('resumed:')) return
     $.ui.toast(`Login changed; ${rcSaid(p)}; ${resumed}.`)
   } catch {
     // The next tick tries again.

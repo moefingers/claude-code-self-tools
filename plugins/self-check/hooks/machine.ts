@@ -28,7 +28,8 @@
 // - The launcher (launch, parseLaunch): the one function every plugin calls to start a Claude Code
 //   process, for a restart, a switch, the coordinator's go or a steward's launch. It builds one script
 //   that checks, takes the claim and places the launch in the same run: a ticket for the claude
-//   wrapper's tab, a record for this pane's slot, or a new window. The window waits for the old
+//   wrapper's tab, a record for a slot (this pane's, or an idle one elsewhere), a named tab or window of
+//   Windows Terminal running the slot runner, or a new window. The window waits for the old
 //   process when asked, reads the registry and process table again, checks the claim, and runs
 //   claude-launch.ps1 (plugins/self-switch/slot/claude-launch.ps1, LAUNCH_SCRIPT_SHA256, installed by
 //   its hash's name: launchScriptPath), the only script that starts claude: it takes the same last look
@@ -49,7 +50,12 @@
 //   ticket for the claude wrapper's tab).
 //   It is stale when its creator (pid and creation time) isn't running and it is older than 15 minutes.
 // - The slot runner's hash (SLOT_SCRIPT_SHA256): plugins/self-switch/slot/claude-slot.ps1, byte for
-//   byte. A pane is used as a slot only when the script its parent runs has this hash.
+//   byte. A pane is used as a slot only when the script its parent runs has this hash. The probe's
+//   slots mode reads every slot runner, its beacon, memory, heavy-slot, the session count and the
+//   machine's input idle; floorOk and pickLaunchTransport judge them.
+// - Placement (readPlacement, placementPath): the file the person edits, which the layout script reads too.
+// - The trampoline (goStep, goRun, goAnswer, GO_VIA): a final command queued through a command of the plugin's own, whose
+//   handler checks again when it is dequeued. It ships as 'direct'.
 // - The claude wrapper's tab (tools/claude-wrapper/claude-wrapper.ps1, a `claude` function in the
 //   person's PowerShell profile): its token and pane file (readPane, parsePane), whether this
 //   claude.exe runs right under it (paneFallback), and the ticket it resumes from (paneTicket to build
@@ -81,7 +87,7 @@ export const CLAIM_BY = /^(?:slot:\d{1,10}-\d{1,20}|launch:[0-9a-f]{8}-[0-9a-f]{
 const SINGLE_QUOTES = /['\u2018\u2019\u201a\u201b]/g
 
 /** Characters a folder given to a script may not hold: quotes of any kind, control characters, and what Windows refuses in a name. */
-const UNSAFE = /["'\u2018\u2019\u201a\u201b\u201c\u201d\u201e<>|?*\u0000-\u001f\u007f]/
+const UNSAFE = /["'\u2018\u2019\u201a\u201b\u201c\u201d\u201e<>|?*\u0000-\u001f\u007f-\u009f]/
 
 /**
  * Whether `path` is fit to reach a script: a drive-absolute Windows path (C:\...), at most 240
@@ -102,7 +108,7 @@ export function folderFault(path: unknown): string | undefined {
   if (typeof path !== 'string') return 'is not text'
   if (path.length > 240) return 'is longer than 240 characters'
   if (path.length < 3 || !/^[A-Za-z]:\\/.test(path)) return 'is not an absolute folder (a drive letter, a colon and a backslash first)'
-  if (/[\u0000-\u001f\u007f]/.test(path)) return 'holds a control character'
+  if (/[\u0000-\u001f\u007f-\u009f]/.test(path)) return 'holds a control character'
   if (/["'\u2018-\u201e]/.test(path)) return 'holds a quote (straight or typographic)'
   if (/[<>|?*/]/.test(path) || path.indexOf(':', 2) !== -1) return 'holds a character Windows does not take in a folder name (< > | ? * / or a second colon)'
   return "has a '.' or '..' part, an empty part, or a part with spaces at either end"
@@ -111,6 +117,16 @@ export function folderFault(path: unknown): string | undefined {
 /** Why a launch never takes `path` as the conversation's folder, naming the class at fault: folderFault's, or a semicolon. */
 export function launchFolderFault(path: unknown): string | undefined {
   return folderFault(path) ?? ((path as string).includes(';') ? 'holds a semicolon (;)' : undefined)
+}
+
+/**
+ * Why a folder or path never reaches Windows Terminal's command line, naming the class at fault:
+ * launchFolderFault's, or a percent sign: WT expands environment variables in a tab's starting directory
+ * and its command line, so a folder with % would name another folder than the one checked. A folder
+ * that reaches no wt string (a slot's record, a plain window) may hold one.
+ */
+export function wtFolderFault(path: unknown): string | undefined {
+  return launchFolderFault(path) ?? ((path as string).includes('%') ? 'holds a percent sign (%), which Windows Terminal expands' : undefined)
 }
 
 /** launchFolderFault as one sentence: what is wrong, and what a launch takes. */
@@ -252,6 +268,15 @@ export const claimPath = (state: string, id: string): string => idPath(state, 'c
 
 /** The record a slot runner reads when its claude exits, by the runner's id (`<pid>-<created>`). Throws on another id. */
 export const slotRecordPath = (state: string, slot: string): string => idPath(state, 'slotRecord', slot)
+
+/** The beacon a slot runner keeps, by the runner's id. Throws on another id. */
+export const slotBeaconPath = (state: string, slot: string): string => idPath(state, 'slotBeacon', slot)
+
+/** The one place the slot script is run from, by a tab, a window or the layout: never a path read off a command line (review gap 10). */
+export const slotScriptPath = (state: string): string => `${state}\\claude-slot.ps1`
+
+/** The file the person edits: which windows and tabs there are, and where a launch or a restart goes. */
+export const placementPath = (state: string): string => `${state}\\placement.json`
 
 /** The coordinator's gate file for conversation `id`. Throws on an id that isn't a session id. */
 export const gatePath = (state: string, id: string): string => idPath(state, 'gate', id)
@@ -458,27 +483,55 @@ export const REGISTRY_VERSION_MARKERS = ['v', 'schema', 'schemaVersion', 'format
 export const LAUNCH_LINE_TRUSTED_AFTER_MS = 60_000
 
 /** The SHA-256 of plugins/self-switch/slot/claude-slot.ps1, as it is committed. */
-export const SLOT_SCRIPT_SHA256 = 'db33bcf242ac2df21be9ab6c3de382d8dca45b712eacbb4429cce49dddee6a43'
+export const SLOT_SCRIPT_SHA256 = 'a4d7a5ac0ac6afb70d2d50d4bc5a02a4988a14537404c664a767668e2b675f09'
+
+/**
+ * The SHA-256 of plugins/self-switch/slot/claude-layout.ps1, as it is committed: a release pin, tested and
+ * printed in the README for the person to compare. Nothing runs that script but the person, by hand.
+ */
+export const LAYOUT_SCRIPT_SHA256 = '9c8cecc81b87618c68fb70fef671998969ea3af970c2a511fa2344fd44f15bdf'
+
+/** Input idle for this long before any launch of another process (PM2): a null reading is not idle. */
+export const INPUT_IDLE_MS = 60_000
+
+/** A slot takes a launch only once its beacon has said idle for this long. */
+export const SLOT_IDLE_MIN_MS = 10_000
+
+/** A launch of another process leaves at least this free (PM5). */
+export const FLOOR_MIN_GB = 6
+
+/** The largest running session's private bytes plus this must be free too: heavy-slot's own floor. */
+export const HEAVY_FLOOR_GB = 4
+
+/** The largest session, when no claude.exe's private bytes could be read. */
+export const LARGEST_UNREAD_GB = 2
+
+/** What the slot runner holds a start to, and a launch's cap, when placement.json names no limits. */
+export const LIMITS_DEFAULT = { minFreeGb: 5, maxSessions: 12 } as const
+
+/** The Windows Terminal a flag needs: names, pos and size, and a tab's stamps (it forwards the environment). */
+export const WT_MIN = { names: '1.8', pos: '1.17', stamps: '1.19' } as const
 
 /**
  * The SHA-256 of plugins/self-switch/slot/claude-launch.ps1, as it is committed: the only script that
  * starts claude. A window runs it only from launchScriptPath, with this hash, checked by .NET just
  * before it runs. scripts/embed-launch.mjs writes it.
  */
-export const LAUNCH_SCRIPT_SHA256 = '6b07b88166e4042d374ebb1221754cd8468a7e2a3764dd6e7154b58fd40a3778'
+export const LAUNCH_SCRIPT_SHA256 = '1546411d0dd1bb041de9f59e8c5f86bbb1cefcbb630ae3e1bb76e9c1a0892bb5'
 
 /**
  * claude-launch.ps1's version, its `# claude-launch version <n>` line: one more with every change to the
  * script. The copy kept for use by hand (launchHandPath) is replaced only by a higher one, so plugins of
  * two versions never trade it back and forth. scripts/embed-launch.mjs writes it from the script.
  */
-export const LAUNCH_SCRIPT_VERSION = 1
+export const LAUNCH_SCRIPT_VERSION = 2
 
 /**
  * Where a launch puts claude-launch.ps1 and a window runs it from: beside the slot runner, named by the
  * first 8 hex digits of its SHA-256 (`claude-launch-<sha8>.ps1`), so each version of the plugins has a
  * file of its own and never overwrites another's, however long sessions of two versions run side by
- * side. Never a path read off a command line. Throws on a `sha` that isn't a SHA-256 in hex.
+ * side. A slot runner runs it from there too, by the SHA-256 its record or argument names, so a new
+ * launcher needs no new runner. Never a path read off a command line. Throws on a `sha` that isn't a SHA-256 in hex.
  */
 export function launchScriptPath(state: string, sha: string = LAUNCH_SCRIPT_SHA256): string {
   if (!/^[0-9a-f]{64}$/.test(sha)) throw new Error(`not a SHA-256: ${JSON.stringify(sha)}`)
@@ -487,7 +540,8 @@ export function launchScriptPath(state: string, sha: string = LAUNCH_SCRIPT_SHA2
 
 /**
  * The copy of claude-launch.ps1 kept for use by hand, under the name the README gives: the highest
- * version any launch has put there (LAUNCH_SCRIPT_VERSION). A window never runs it.
+ * version any launch has put there (LAUNCH_SCRIPT_VERSION). It is the person's alone: a window or a slot
+ * runner never runs it, only ever naming it in a line printed for the person.
  */
 export const launchHandPath = (state: string): string => `${state}\\claude-launch.ps1`
 
@@ -495,16 +549,17 @@ export const launchHandPath = (state: string): string => `${state}\\claude-launc
 export const LAUNCH_SCRIPT_TEXT = [
   "# claude-launch.ps1: starts Claude Code as a top-level session. The one script in",
   "# claude-code-self-tools that runs claude: every launch (a restart's or a switch's window, the",
-  "# coordinator's go, a steward's launch, and you by hand) comes through it.",
-  "# claude-launch version 1",
+  "# coordinator's go, a steward's launch, a slot runner's every start, and you by hand) comes through it.",
+  "# claude-launch version 2",
   "#",
   "# Part of self-switch (claude-code-self-tools, plugins/self-switch/slot/claude-launch.ps1). Nobody",
   "# copies it: a launch that opens a window puts the copy it carries in %LOCALAPPDATA%\\claude-self-tools,",
   "# as claude-launch-<the first 8 hex digits of its SHA-256>.ps1, one file per version of the plugins,",
   "# and the window runs it from there only when its SHA-256 is the one the plugins ship",
-  "# (LAUNCH_SCRIPT_SHA256), checked right before it runs. The same launch keeps claude-launch.ps1 there",
-  "# for you to run by hand: the highest version any launch has carried (the version line above). A",
-  "# window never runs that one.",
+  "# (LAUNCH_SCRIPT_SHA256), checked right before it runs: that is the verified copy. The same launch keeps",
+  "# claude-launch.ps1 there, once a first launch has run: the highest version any launch has carried (the",
+  "# version line above), for you to run by hand. A slot runner runs the verified copy too, by the SHA-256 its",
+  "# record or argument names. A window or a slot runner never runs the copy for use by hand.",
   "#",
   "# By hand, in a terminal:",
   "#   claude-launch.ps1 -Resume <session id> [-Dir <folder>]               resume a conversation",
@@ -552,7 +607,7 @@ export const LAUNCH_SCRIPT_TEXT = [
   "",
   "$SessionId = '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\\z'",
   "$AreaName = '^[a-z0-9][a-z0-9-]{0,39}\\z'",
-  "$Whole = '^\\d{1,15}\\z'",
+  "$Whole = '^\\d{1,16}\\z'",
   "# The launch environment: LAUNCH_ENV_CLEAR, LAUNCH_ENV_DROP and LAUNCH_ENV_SET in the plugins' machine code.",
   "$Clear = 'CLAUDE_CODE_CHILD_SESSION', 'CLAUDECODE', 'CLAUDE_CODE_SESSION_ID', 'CLAUDE_PID', 'CLAUDE_EFFORT', 'CLAUDE_CODE_BRIDGE_SESSION_ID', 'CLAUDE_CODE_MESSAGING_SOCKET', 'CLAUDE_CODE_MESSAGING_TOKEN', 'CLAUDE_CODE_REMOTE', 'CLAUDE_CODE_REMOTE_SESSION_ID', 'CLAUDE_JOB_DIR', 'AI_AGENT', 'CLAUDE_CODE_ENTRYPOINT', 'CLAUDE_CODE_EXECPATH', 'CLAUDE_CODE_SESSION_ATTENDED', 'CLAUDE_CODE_SSE_PORT', 'NO_COLOR'",
   "$Drop = 'PSExecutionPolicyPreference', 'CLAUDE_PANE_TOKEN'",
@@ -569,7 +624,7 @@ export const LAUNCH_SCRIPT_TEXT = [
   "# with spaces at either end.",
   "function Test-Shape($path) {",
   "  if ($path -isnot [string] -or $path.Length -lt 3 -or $path.Length -gt 240) { return $false }",
-  "  if ($path -cnotmatch '^[A-Za-z]:\\\\' -or $path -match '[\\x00-\\x1f\\x7f\\x22\\x27\\u2018-\\u201e<>|?*/]' -or $path.IndexOf(':', 2) -ge 0) { return $false }",
+  "  if ($path -cnotmatch '^[A-Za-z]:\\\\' -or $path -match '[\\x00-\\x1f\\x7f-\\x9f\\x22\\x27\\u2018-\\u201e<>|?*/]' -or $path.IndexOf(':', 2) -ge 0) { return $false }",
   "  $parts = $path.Substring(3).Split('\\')",
   "  for ($i = 0; $i -lt $parts.Count; $i++) {",
   "    if ($parts[$i] -eq '') { if ($i -ne $parts.Count - 1) { return $false } }",
@@ -766,8 +821,8 @@ export const PSMODULEPATH_RESET =
  * CLAUDE_CODE_EXECPATH, CLAUDE_CODE_SESSION_ATTENDED. And CLAUDE_CODE_SSE_PORT, which an IDE's terminal sets:
  * a session restarted or switched out of one would hand the old process's IDE link to the new one.
  * And NO_COLOR, which Claude Code sets to 1 in its tool shells: a session started from one would draw
- * no colour. claude-launch.ps1 clears these (LAUNCH_ENV_CLEAR), and no other; the slot runner and the
- * claude wrapper keep the same list until they call it. Never one a person sets otherwise; never
+ * no colour. claude-launch.ps1 clears these (LAUNCH_ENV_CLEAR), and no other; the claude wrapper and the
+ * layout script keep the same list (it is the person's own `claude`, and its tabs start idle). Never one a person sets otherwise; never
  * CLAUDE_CODE_DISABLE_BG_SHELL_PRESSURE_REAP (LAUNCH_ENV_SET keeps it on: Mo's choice); never
  * WT_SESSION or WT_PROFILE_ID (Claude Code's terminal detection reads WT_SESSION on Windows to draw its
  * Unicode prompt and its links: cleared, a resumed session showed `>` and no links).
@@ -810,8 +865,8 @@ export const LAUNCH_ENV_SET: Readonly<Record<string, string>> = {
 }
 
 /**
- * Removed by claude-launch.ps1 as well, after LAUNCH_ENV_CLEAR, and not by the slot runner and the claude
- * wrapper, which keep their own lists until slots v2: PSExecutionPolicyPreference (an -ExecutionPolicy on
+ * Removed by claude-launch.ps1 as well, after LAUNCH_ENV_CLEAR (the slot runner, which runs it in its own
+ * process, puts the first back for its next run): PSExecutionPolicyPreference (an -ExecutionPolicy on
  * the command line that ran the launcher was for it alone), and CLAUDE_PANE_TOKEN (the claude wrapper's
  * token for the tab a session ran in, which every process under that claude inherits: a session resumed
  * in a window or a slot has no tab of its own, and an inherited token would point its later restarts at
@@ -920,6 +975,11 @@ const TAKE_CLAIM = [
   `      $running = $null -ne $creator -and $null -ne $creator.CreationDate -and [math]::Abs([long]$creator.CreationDate.ToFileTimeUtc() - [long]"$($old.created)") -le ${PROC_START_TOLERANCE}`,
   `      $over = ($running -and [long]$old.pid -eq [long]$session.ProcessId) -or ((-not $running) -and ($nowMs - [double]$old.at) -gt ${CLAIM_STALE_MS})`,
   `    } else { $over = $age -gt ${CLAIM_STALE_MS} }`,
+  // A process the lock was re-owned to (relockScript): the lock stands while it runs, whoever made it.
+  '    if ($null -ne $old -and $null -ne $old.holder -and $old.holder.pid -is [ValueType] -and "$($old.holder.created)" -match "^\\d{1,20}\\z") {',
+  '      $holds = $table[[int]$old.holder.pid]',
+  `      if ($null -ne $holds -and $null -ne $holds.CreationDate -and [math]::Abs([long]$holds.CreationDate.ToFileTimeUtc() - [long]"$($old.holder.created)") -le ${PROC_START_TOLERANCE}) { $over = $false }`,
+  '    }',
   '    if (-not $over) { return $false }',
   '    $bytes = [Text.Encoding]::UTF8.GetBytes($text)',
   '    $stream.SetLength(0)',
@@ -1066,6 +1126,115 @@ const GET_CLASS = [
   '}',
 ]
 
+/**
+ * The machine's input idle, by GetLastInputInfo (Add-Type: a plugin's child reads the session's desktop):
+ * `$inputIdleSec`, whole seconds, or $null when it can't be read, which no launch takes as idle.
+ */
+const READ_INPUT_IDLE = [
+  '$inputIdleSec = $null',
+  'try {',
+  `  Add-Type -ErrorAction Stop -TypeDefinition 'using System; using System.Runtime.InteropServices; public static class ClaudeSelfToolsInput { [StructLayout(LayoutKind.Sequential)] struct Last { public uint cbSize; public uint dwTime; } [DllImport("user32.dll")] static extern bool GetLastInputInfo(ref Last last); public static long IdleMs() { Last last = new Last(); last.cbSize = (uint)Marshal.SizeOf(typeof(Last)); if (!GetLastInputInfo(ref last)) return -1; return unchecked((uint)Environment.TickCount - last.dwTime); } }'`,
+  '  $idleMs = [ClaudeSelfToolsInput]::IdleMs()',
+  '  if ($idleMs -ge 0) { $inputIdleSec = [long][math]::Floor($idleMs / 1000) }',
+  '} catch { $inputIdleSec = $null }',
+]
+
+/** A heavy-slot ticket or holder older than this is stale, as heavy-slot.sh's HEAVY_SLOT_STALE_SECS says. */
+const HEAVY_STALE_SECS = 3600
+
+/**
+ * heavy-slot's state, from its folders under `$heavyRoot`, by PowerShell alone (never bash, never MSYS):
+ * `$heavyWaiters`, the live tickets in .gate-queue, and `$heavyBusy`, the slots held (0 to 2). A ticket
+ * names its waiter by an MSYS pid, which Windows can't look up: it counts while a heavy-slot shell runs at
+ * all (the process table) and it is under an hour old, so a ticket a dead waiter left holds a launch only
+ * while another job runs, which clears it. A slot counts as held while the Windows pid it names runs, or,
+ * with none named, while it is under an hour old. Needs `$table`; throws when the folders can't be read.
+ */
+const READ_HEAVY = [
+  '$heavyWaiters = 0',
+  '$heavyBusy = 0',
+  String.raw`$heavyShells = @($table.Values | Where-Object { "$($_.CommandLine)" -match "heavy-slot\.sh" }).Count`,
+  '$heavyNow = [DateTime]::UtcNow',
+  '$heavyQueue = Join-Path $heavyRoot ".gate-queue"',
+  `if ($heavyShells -gt 0 -and (Test-Path -LiteralPath $heavyQueue -PathType Container)) { foreach ($t in @(Get-ChildItem -LiteralPath $heavyQueue -File -Force)) { if ($t.Name -match "^\\d+-\\d+\\z" -and ($heavyNow - $t.LastWriteTimeUtc).TotalSeconds -lt ${HEAVY_STALE_SECS}) { $heavyWaiters++ } } }`,
+  'foreach ($s in ".gate-lock", ".gate-lock-2") {',
+  '  $d = Join-Path $heavyRoot $s',
+  '  if (-not (Test-Path -LiteralPath $d -PathType Container)) { continue }',
+  '  $wf = Join-Path $d "winpid"',
+  '  $w = $null',
+  String.raw`  if (Test-Path -LiteralPath $wf -PathType Leaf) { $w = "$(Get-Content -LiteralPath $wf -Raw)".Trim(); if ($w -notmatch "^\d{1,10}\z") { $w = $null } }`,
+  `  if ($null -ne $w) { if ($null -ne $table[[int]$w]) { $heavyBusy++ } } elseif (($heavyNow - [IO.Directory]::GetLastWriteTimeUtc($d)).TotalSeconds -lt ${HEAVY_STALE_SECS}) { $heavyBusy++ }`,
+  '}',
+]
+
+/**
+ * The sessions running: every claude.exe but one running a Claude Code command (Get-Cli), and but one
+ * another claude.exe started (a helper of its own, or what a command started). `$room`. Needs `$table`,
+ * Get-Parent and Get-Cli.
+ */
+const COUNT_SESSIONS = [
+  '$room = 0',
+  'foreach ($p in @($table.Values)) { if ($p.Name -ne "claude.exe" -or (Get-Cli $p)) { continue }; $above = Get-Parent $p; if ($null -ne $above -and $above.Name -eq "claude.exe") { continue }; $room++ }',
+]
+
+/** The fields of a beacon a reader takes, each checked; `$null` for one not of its shape. */
+const GET_BEACON = [
+  'function Get-Beacon($b) {',
+  '  if ($b -isnot [Management.Automation.PSCustomObject] -or $b.v -isnot [ValueType] -or $b.v -ne 1) { return $null }',
+  '  if (($b.state -cne "idle" -and $b.state -cne "running") -or $b.since -isnot [ValueType] -or $b.configDir -isnot [string] -or $b.configDir.Length -gt 240) { return $null }',
+  '  $o = [ordered]@{ state = $b.state; since = [long]$b.since; configDir = $b.configDir }',
+  String.raw`  if ($b.window -is [string] -and $b.window -cmatch "^[A-Za-z0-9_-]{1,40}\z") { $o["window"] = $b.window }`,
+  String.raw`  if ($b.tab -is [string] -and $b.tab -cmatch "^[A-Za-z0-9 ._-]{1,40}\z") { $o["tab"] = $b.tab }`,
+  '  return $o',
+  '}',
+]
+
+/**
+ * Every slot runner on the machine: each powershell.exe whose command line runs `-File <absolute>\claude-slot.ps1`
+ * (its path stays here, read to be hashed, one .NET SHA-256 per distinct path), with its id, the claude.exe
+ * it runs now, and its beacon, read only for a runner found running, by its own pid and creation time, so
+ * a closed tab's beacon is never read. `$slotsOut`. Needs `$table`, `$state`, Get-Created, Get-Parent,
+ * Get-Sha256 and Get-Beacon.
+ */
+const READ_SLOTS = [
+  '$slotsOut = New-Object System.Collections.ArrayList',
+  '$hashes = @{}',
+  '$childOf = @{}',
+  'foreach ($p in @($table.Values)) { if ($p.Name -eq "claude.exe") { $above = Get-Parent $p; if ($null -ne $above) { $childOf[[int]$above.ProcessId] = [long]$p.ProcessId } } }',
+  'foreach ($p in @($table.Values)) {',
+  String.raw`  if ($p.Name -ne "powershell.exe" -or "$($p.CommandLine)" -notmatch "-File\s+(\x22?)(?<path>[A-Za-z]:\\[^\x22]*?\\claude-slot\.ps1)\1(\s|\z)") { continue }`,
+  '  $slotPath = $Matches["path"]',
+  '  if (-not $hashes.ContainsKey($slotPath)) { $slotHash = $null; try { $slotHash = Get-Sha256 $slotPath } catch { $slotHash = $null }; $hashes[$slotPath] = $slotHash }',
+  '  $runnerCreated = Get-Created $p',
+  '  $runnerId = "$($p.ProcessId)-$runnerCreated"',
+  '  $runnerChild = $null',
+  '  if ($childOf.ContainsKey([int]$p.ProcessId)) { $runnerChild = $childOf[[int]$p.ProcessId] }',
+  '  $beacon = $null',
+  '  if ($null -ne $state) { try { $beaconFile = Join-Path $state ("slots\\" + $runnerId + ".state.json"); if (Test-Path -LiteralPath $beaconFile -PathType Leaf) { $beacon = Get-Beacon ([IO.File]::ReadAllText($beaconFile, [Text.Encoding]::UTF8) | ConvertFrom-Json) } } catch { $beacon = $null } }',
+  '  [void]$slotsOut.Add([ordered]@{ pid = [long]$p.ProcessId; created = $runnerCreated; id = $runnerId; sha256 = $hashes[$slotPath]; child = $runnerChild; beacon = $beacon })',
+  '}',
+]
+
+/**
+ * The claude.exe that hold a claim lock (relockScript: a launch stuck at a dialog keeps it, review gap 7):
+ * for every lock on the machine, its `holder`, when that process runs with that start. `$holdersOut`, each
+ * `{ id, pid, created }`. Needs `$table`, `$state`, `$errors` and Get-Created.
+ */
+const READ_HOLDERS = [
+  '$holdersOut = New-Object System.Collections.ArrayList',
+  'if ($null -ne $state) { try {',
+  '  $claims = Join-Path $state "claims"',
+  '  if (Test-Path -LiteralPath $claims -PathType Container) { foreach ($f in @(Get-ChildItem -LiteralPath $claims -Filter "*.lock" -File -Force)) {',
+  String.raw`    if ($f.BaseName -cnotmatch "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\z") { continue }`,
+  '    $l = $null',
+  '    try { $l = [IO.File]::ReadAllText($f.FullName, [Text.Encoding]::UTF8) | ConvertFrom-Json } catch { $l = $null }',
+  String.raw`    if ($null -eq $l -or $null -eq $l.holder -or $l.holder.pid -isnot [ValueType] -or "$($l.holder.created)" -notmatch "^\d{1,20}\z") { continue }`,
+  '    $held = $table[[int]$l.holder.pid]',
+  `    if ($null -ne $held -and $held.Name -eq "claude.exe" -and [math]::Abs([long](Get-Created $held) - [long]"$($l.holder.created)") -le ${PROC_START_TOLERANCE}) { [void]$holdersOut.Add([ordered]@{ id = $f.BaseName; pid = [long]$held.ProcessId; created = (Get-Created $held) }) }`,
+  '  } }',
+  '} catch { [void]$errors.Add("locks:") } }',
+]
+
 // ---------------------------------------------------------------------------------------------
 // The probe.
 
@@ -1083,6 +1252,12 @@ export type ProbeInput = {
   readonly heavySlotRoot?: string
   /** Read the left record of each asked-about conversation (needs `stateDir`), its MAC checked inside the script. */
   readonly left?: boolean
+  /**
+   * The steward's reading of the machine: every slot runner and its beacon, each claude.exe's private
+   * bytes, heavy-slot's waiters and busy slots, the sessions running, the input idle, and every claim
+   * lock's holder. Never a command line, a cwd or a name. Without it, the answer is as it always was.
+   */
+  readonly slots?: boolean
 }
 
 /**
@@ -1224,6 +1399,7 @@ export function probeScript(input: ProbeInput): string {
   if (input.left === true && state === undefined) throw new Error('the probe reads left records only with the state folder')
   // Each asked-about conversation's left record, its path built here from the checked id.
   const leftRead = input.left === true && state !== undefined ? leftReadLines(state, ids) : []
+  const slots = input.slots === true
   return [
     "$ErrorActionPreference = 'Stop'",
     "$ProgressPreference = 'SilentlyContinue'",
@@ -1237,12 +1413,13 @@ export function probeScript(input: ProbeInput): string {
     '$errors = New-Object System.Collections.ArrayList',
     // Every process once, by id: everything below reads only this table.
     '$table = @{}',
-    'foreach ($p in (Get-CimInstance -ClassName Win32_Process -Property ProcessId, ParentProcessId, Name, CreationDate, CommandLine)) { $table[[int]$p.ProcessId] = $p }',
+    `foreach ($p in (Get-CimInstance -ClassName Win32_Process -Property ProcessId, ParentProcessId, Name, CreationDate, CommandLine${slots ? ', PrivatePageCount' : ''})) { $table[[int]$p.ProcessId] = $p }`,
     ...READ_BLANK_AGAIN,
     ...GET_PARENT,
     ...GET_CREATED,
     ...GET_CLASS,
     ...GET_CLI,
+    ...(slots ? [...GET_SHA256, ...GET_BEACON] : []),
     // This session's claude.exe: the nearest above the probe, then the top of an unbroken run of
     // claude.exe parents, so a helper process of the session's own is never taken for the session.
     '$session = $null',
@@ -1270,6 +1447,7 @@ export function probeScript(input: ProbeInput): string {
     '  $cls = Get-Class $p',
     '  if ($null -ne $cls) { $o["cls"] = $cls }',
     '  if (Get-Cli $p) { $o["cli"] = $true }',
+    ...(slots ? ['  if ($p.Name -eq "claude.exe" -and $null -ne $p.PrivatePageCount) { $o["privateBytes"] = [long]$p.PrivatePageCount }'] : []),
     '  $found = @([regex]::Matches("$($p.CommandLine)", $named, "IgnoreCase") | ForEach-Object { $_.Groups[4].Value.ToLowerInvariant() } | Select-Object -Unique)',
     '  if ($found.Count -gt 0) { $o["ids"] = [object[]]$found }',
     '  [void]$procs.Add($o)',
@@ -1346,6 +1524,19 @@ export function probeScript(input: ProbeInput): string {
     '}',
     '$freeKb = $null',
     'try { $freeKb = [long](Get-CimInstance -ClassName Win32_OperatingSystem -Property FreePhysicalMemory).FreePhysicalMemory } catch { [void]$errors.Add("memory:") }',
+    ...(slots
+      ? [
+          ...READ_SLOTS,
+          '$heavyWaiters = $null',
+          '$heavyBusy = $null',
+          'if ($null -ne $heavyRoot) { try {',
+          ...READ_HEAVY.map(line => `  ${line}`),
+          '} catch { $heavyWaiters = $null; $heavyBusy = $null; if (-not $errors.Contains("heavy:")) { [void]$errors.Add("heavy:") } } }',
+          ...COUNT_SESSIONS,
+          ...READ_INPUT_IDLE,
+          ...READ_HOLDERS,
+        ]
+      : []),
     // The claim, last but one: taken in this run, after everything above was read, so the snapshot
     // it is judged on and the lock are one. A slot runner of a verified script is named by its id;
     // otherwise one launch, by a fresh UUID.
@@ -1371,6 +1562,7 @@ export function probeScript(input: ProbeInput): string {
     '    if ($l -is [Management.Automation.PSCustomObject]) {',
     '      $o["ok"] = $true',
     '      foreach ($key in "by", "pid", "created", "at", "transport") { $v = $l.$key; if ($v -is [string] -or $v -is [ValueType]) { $o[$key] = $v } }',
+    String.raw`      if ($null -ne $l.holder -and $l.holder.pid -is [ValueType] -and "$($l.holder.created)" -match "^\d{1,20}\z") { $o["holder"] = [ordered]@{ pid = [long]$l.holder.pid; created = "$($l.holder.created)" } }`,
     '    }',
     '    [void]$locks.Add($o)',
     '  }',
@@ -1381,6 +1573,7 @@ export function probeScript(input: ProbeInput): string {
     '$result = [ordered]@{ v = 1; self = [long]$PID; session = $sessionOut; slot = $slot; procs = $procs; registry = $registry; transcripts = $transcripts; locks = $locks; claim = $claim; heavy = $heavy; freeKb = $freeKb; errors = $errors }',
     'if ($slotSeen) { $result["slotSeen"] = $true }',
     ...(leftRead.length > 0 ? ['$result["left"] = $leftOut'] : []),
+    ...(slots ? ['$result["slots"] = $slotsOut', '$result["heavyWaiters"] = $heavyWaiters', '$result["heavyBusy"] = $heavyBusy', '$result["room"] = $room', '$result["inputIdleSec"] = $inputIdleSec', '$result["holders"] = $holdersOut'] : []),
     '$result | ConvertTo-Json -Compress -Depth 6',
   ].join('\r\n')
 }
@@ -1398,6 +1591,8 @@ export type ProcessEntry = {
   readonly cls?: ProcessClass
   readonly ids?: readonly string[]
   readonly cli?: true
+  /** A claude.exe's private bytes (Win32_Process.PrivatePageCount), from a probe in slots mode. */
+  readonly privateBytes?: number
 }
 
 /** A registry file, as its shape was judged: `ok` holds what L1 reads; `bad` says what's wrong with it. */
@@ -1441,9 +1636,19 @@ export type LeftEntry =
       readonly macOk: boolean
     }
 
+/** `holder`: the process the lock was re-owned to (relockScript): it isn't stale while that one runs. */
 export type LockEntry =
-  | { readonly id: string; readonly mtime: number; readonly ok: true; readonly by: string; readonly pid: number; readonly created: string; readonly at: number; readonly transport: string }
+  | { readonly id: string; readonly mtime: number; readonly ok: true; readonly by: string; readonly pid: number; readonly created: string; readonly at: number; readonly transport: string; readonly holder?: ProcessRef }
   | { readonly id: string; readonly mtime: number; readonly ok: false }
+
+/** A slot runner's beacon, each field checked: idle or running, since when, its stamp when it has one, and its config folder. */
+export type SlotBeacon = { readonly state: 'idle' | 'running'; readonly since: number; readonly window?: string; readonly tab?: string; readonly configDir: string }
+
+/** A slot runner found running: its pid and creation FILETIME, its id, its script's hash, the claude.exe it runs now, and its beacon. */
+export type SlotRunner = { readonly pid: number; readonly created: string; readonly id: string; readonly sha256: string | null; readonly child: number | null; readonly beacon: SlotBeacon | null }
+
+/** A claude.exe a claim lock names as its holder, running with that start: it holds that lock's id. */
+export type LockHolder = { readonly id: string; readonly pid: number; readonly created: string }
 
 export type ClaimResult = { readonly id: string; readonly taken: true; readonly by: string } | { readonly id: string; readonly taken: false; readonly why: string }
 
@@ -1473,6 +1678,17 @@ export type Probe = {
   readonly extraKeys: readonly string[]
   /** The asked-about conversations' left records, when the probe was asked to read them; null when it wasn't. */
   readonly left: readonly LeftEntry[] | null
+  /** Every slot runner found running, from a probe in slots mode; null from any other. */
+  readonly slots: readonly SlotRunner[] | null
+  /** heavy-slot's live waiters and busy slots (0 to 2); null with no heavy-slot folder, or none read. */
+  readonly heavyWaiters: number | null
+  readonly heavyBusy: number | null
+  /** The sessions running (a Claude Code command left out), from a probe in slots mode. */
+  readonly room: number | null
+  /** Whole seconds since the machine's last input; null when unread, which no launch takes as idle. */
+  readonly inputIdleSec: number | null
+  /** Each claude.exe holding a claim lock, on any conversation, from a probe in slots mode. */
+  readonly holders: readonly LockHolder[] | null
 }
 
 const isRecord = (value: unknown): value is Record<string, unknown> => typeof value === 'object' && value !== null && !Array.isArray(value)
@@ -1545,6 +1761,17 @@ function registryShape(raw: Record<string, unknown>, dir: number, file: number):
 /** A go's id, as a left record may name the coordinator's go it was written for. */
 const GO_ID = /^wu_[a-z0-9]{1,40}$/
 
+/** A beacon as the probe printed it, checked; null for one not of its shape, which counts as none: no launch picks that slot. */
+function slotBeacon(value: unknown): SlotBeacon | null {
+  if (!isRecord(value)) return null
+  for (const key of Object.keys(value)) if (!['state', 'since', 'window', 'tab', 'configDir'].includes(key)) return null
+  const { state, since, window, tab, configDir } = value
+  if ((state !== 'idle' && state !== 'running') || !isCount(since) || !isSafeFolder(configDir)) return null
+  if (window !== undefined && !isWindowName(window)) return null
+  if (tab !== undefined && (typeof tab !== 'string' || !TAB_LABEL.test(tab))) return null
+  return { state, since, configDir, ...(window === undefined ? {} : { window: window as string }), ...(tab === undefined ? {} : { tab: tab as string }) }
+}
+
 /** One left record as the probe printed it, every field checked. */
 function leftEntry(value: unknown): LeftEntry {
   const l = fields(value, 'a left record', ['asked', 'ok'], ['id', 'how', 'pid', 'created', 'at', 'transcript', 'by', 'go', 'macOk'])
@@ -1594,7 +1821,7 @@ export function parseProbe(stdout: string): Probe | { error: string } {
     return { error: "the probe's answer is not JSON" }
   }
   try {
-    const top = fields(raw, 'the answer', ['v', 'self', 'session', 'slot', 'procs', 'registry', 'transcripts', 'locks', 'claim', 'heavy', 'freeKb', 'errors'], ['slotSeen', 'left'])
+    const top = fields(raw, 'the answer', ['v', 'self', 'session', 'slot', 'procs', 'registry', 'transcripts', 'locks', 'claim', 'heavy', 'freeKb', 'errors'], ['slotSeen', 'left', 'slots', 'heavyWaiters', 'heavyBusy', 'room', 'inputIdleSec', 'holders'])
     if ('slotSeen' in top && (top.slotSeen !== true || top.slot !== null)) bad('the answer says a slot runner was seen, but not as one')
     if (top.v !== 1) bad('the answer is not version 1')
     if (!isPid(top.self)) bad("the probe's own pid is not a pid")
@@ -1622,7 +1849,8 @@ export function parseProbe(stdout: string): Probe | { error: string } {
       }
     }
     const procs = list(top.procs, 'the processes').map((value): ProcessEntry => {
-      const p = fields(value, 'a process', ['pid', 'ppid', 'created', 'name'], ['cls', 'ids', 'cli'])
+      const p = fields(value, 'a process', ['pid', 'ppid', 'created', 'name'], ['cls', 'ids', 'cli', 'privateBytes'])
+      if ('privateBytes' in p && !isCount(p.privateBytes)) bad("a process's private bytes are not a number")
       if ('cli' in p && (p.cli !== true || typeof p.name !== 'string' || p.name.toLowerCase() !== 'claude.exe')) bad('a process is a Claude Code command but not a claude.exe')
       if (!isPid(p.pid) || !isPid(p.ppid) || !isTicks(p.created)) bad('a process has no pid, parent or time as a string')
       if (typeof p.name !== 'string' || (p.name !== '' && !NAME.test(p.name))) bad("a process's name is not a plain name")
@@ -1637,6 +1865,7 @@ export function parseProbe(stdout: string): Probe | { error: string } {
         ...('cls' in p ? { cls: p.cls as ProcessClass } : {}),
         ...(ids !== undefined ? { ids: ids as string[] } : {}),
         ...(p.cli === true ? { cli: true as const } : {}),
+        ...('privateBytes' in p ? { privateBytes: p.privateBytes as number } : {}),
       }
     })
     const registry = list(top.registry, 'the registry').map((value): RegistryEntry => {
@@ -1656,7 +1885,7 @@ export function parseProbe(stdout: string): Probe | { error: string } {
       return { id: t.id as string, dir: t.dir as number, project: t.project as string, mtime: t.mtime as number, ...('size' in t ? { size: t.size as number } : {}) }
     })
     const locks = list(top.locks, 'the locks').map((value): LockEntry => {
-      const l = fields(value, 'a lock', ['id', 'mtime', 'ok'], ['by', 'pid', 'created', 'at', 'transport'])
+      const l = fields(value, 'a lock', ['id', 'mtime', 'ok'], ['by', 'pid', 'created', 'at', 'transport', 'holder'])
       if (typeof l.id !== 'string' || !SESSION_ID.test(l.id) || !isCount(l.mtime) || typeof l.ok !== 'boolean') bad('a lock has no id, time or parse flag')
       const id = l.id as string
       const mtime = l.mtime as number
@@ -1670,7 +1899,13 @@ export function parseProbe(stdout: string): Probe | { error: string } {
         typeof l.transport === 'string' &&
         STATUS.test(l.transport)
       if (!isWhole) return { id, mtime, ok: false }
-      return { id, mtime, ok: true, by: l.by as string, pid: l.pid as number, created: l.created as string, at: l.at as number, transport: l.transport as string }
+      let holder: ProcessRef | undefined
+      if ('holder' in l) {
+        const h = fields(l.holder, "a lock's holder", ['pid', 'created'])
+        if (!isPid(h.pid) || !isTicks(h.created)) bad("a lock's holder is not a pid and a time as a string")
+        holder = { pid: h.pid as number, created: h.created as string }
+      }
+      return { id, mtime, ok: true, by: l.by as string, pid: l.pid as number, created: l.created as string, at: l.at as number, transport: l.transport as string, ...(holder === undefined ? {} : { holder }) }
     })
     let claim: ClaimResult | null = null
     if (top.claim !== null) {
@@ -1701,7 +1936,52 @@ export function parseProbe(stdout: string): Probe | { error: string } {
     })
     const extraKeys = [...new Set(registry.flatMap(entry => (entry.shape === 'ok' ? entry.extra : [])))]
     const left = 'left' in top ? list(top.left, 'the left records').map(leftEntry) : null
-    return { self: top.self as number, session, slot, slotSeen: top.slotSeen === true, procs, registry, transcripts, locks, claim, heavy, freeKb: top.freeKb as number | null, errors, extraKeys, left }
+    const slots =
+      'slots' in top
+        ? list(top.slots, 'the slot runners').map((value): SlotRunner => {
+            const s = fields(value, 'a slot runner', ['pid', 'created', 'id', 'sha256', 'child', 'beacon'])
+            if (!isPid(s.pid) || !isTicks(s.created)) bad('a slot runner is not a pid and a time as a string')
+            if (s.id !== `${s.pid}-${s.created}`) bad("a slot runner's id is not its pid and time")
+            if (s.sha256 !== null && (typeof s.sha256 !== 'string' || !SHA256.test(s.sha256))) bad("a slot runner's hash is not a SHA-256")
+            if (s.child !== null && !isPid(s.child)) bad("a slot runner's child is not a pid")
+            return { pid: s.pid as number, created: s.created as string, id: s.id as string, sha256: s.sha256 as string | null, child: s.child as number | null, beacon: slotBeacon(s.beacon) }
+          })
+        : null
+    const countOrNull = (key: string, what: string, max?: number): number | null => {
+      const value = top[key]
+      if (value === undefined || value === null) return null
+      return isCount(value, max) ? value : bad(`${what} is not a count`)
+    }
+    const holders =
+      'holders' in top
+        ? list(top.holders, "the locks' holders").map((value): LockHolder => {
+            const h = fields(value, "a lock's holder", ['id', 'pid', 'created'])
+            if (typeof h.id !== 'string' || !SESSION_ID.test(h.id) || !isPid(h.pid) || !isTicks(h.created)) bad("a lock's holder is not an id, a pid and a time")
+            return { id: h.id as string, pid: h.pid as number, created: h.created as string }
+          })
+        : null
+    return {
+      self: top.self as number,
+      session,
+      slot,
+      slotSeen: top.slotSeen === true,
+      procs,
+      registry,
+      transcripts,
+      locks,
+      claim,
+      heavy,
+      freeKb: top.freeKb as number | null,
+      errors,
+      extraKeys,
+      left,
+      slots,
+      heavyWaiters: countOrNull('heavyWaiters', 'the heavy-slot waiters'),
+      heavyBusy: countOrNull('heavyBusy', 'the heavy slots busy', 2),
+      room: countOrNull('room', 'the sessions running'),
+      inputIdleSec: countOrNull('inputIdleSec', 'the input idle'),
+      holders,
+    }
   } catch (err) {
     if (err instanceof Bad) return { error: `the probe's answer is not what it must be: ${err.message}` }
     throw err
@@ -1796,9 +2076,22 @@ export type Liveness = { readonly verdict: 'live' | 'not-live' | 'unknown'; read
 /** Whether a claim lock no longer counts: its creator isn't running and it is older than 15 minutes. */
 function isStale(lock: LockEntry, table: Map<number, ProcessEntry>, now: number): boolean {
   if (!lock.ok) return now - lock.mtime > CLAIM_STALE_MS
-  const creator = table.get(lock.pid)
-  const isRunning = creator !== undefined && near(creator.created, lock.created)
-  return !isRunning && now - lock.at > CLAIM_STALE_MS
+  const runs = (ref: ProcessRef): boolean => {
+    const p = table.get(ref.pid)
+    return p !== undefined && near(p.created, ref.created)
+  }
+  // A lock re-owned to a process stands while that process runs, however old it is (review gap 7).
+  if (lock.holder !== undefined && runs(lock.holder)) return false
+  return !runs({ pid: lock.pid, created: lock.created }) && now - lock.at > CLAIM_STALE_MS
+}
+
+/** The claude.exe a claim lock names as its holder, running with that start: each holds that lock's id, and only that. */
+function lockHolders(probe: Probe, table: Map<number, ProcessEntry>): LockHolder[] {
+  const fromLocks = probe.locks.flatMap((lock): LockHolder[] => (lock.ok && lock.holder !== undefined ? [{ id: lock.id, ...lock.holder }] : []))
+  return [...fromLocks, ...(probe.holders ?? [])].filter(h => {
+    const p = table.get(h.pid)
+    return p !== undefined && isClaude(p) && near(p.created, h.created)
+  })
 }
 
 /**
@@ -1941,6 +2234,11 @@ export function liveness(probe: Probe, id: string, now: number, opts: LivenessOp
     if (settled && held !== undefined && held.length > 0 && held.every(other => other !== id)) continue
     live.push(`L2: ${p.name} ${p.pid} names it on its command line`)
   }
+  // A claude.exe a claim lock was re-owned to (a launch stuck at a dialog, review gap 7): live for that
+  // lock's id, and no unknown for any other.
+  const holders = lockHolders(probe, table)
+  const holdersIds = new Set(holders.map(h => h.pid))
+  for (const h of holders) if (h.id === id && !isSelf(h.pid)) live.push(`L6: claude.exe ${h.pid} holds the claim lock on it (a launch that may be stuck at a dialog)`)
   for (const p of probe.procs) {
     if (!isClaude(p)) continue
     // A Claude Code command (claude plugin ..., --version), or a claude.exe it started: no conversation,
@@ -1949,7 +2247,7 @@ export function liveness(probe: Probe, id: string, now: number, opts: LivenessOp
     let at: ProcessEntry | undefined = p
     let isAccounted = false
     for (let i = 0; i < 32 && at !== undefined && !isAccounted; i += 1) {
-      isAccounted = current.has(at.pid)
+      isAccounted = current.has(at.pid) || holdersIds.has(at.pid)
       at = parentOf(table, at)
     }
     if (!isAccounted) unknown.push(`unknown: claude.exe ${p.pid} isn't in any registry this plugin knows (another config folder, or a version without one)`)
@@ -2425,20 +2723,31 @@ export function pickTransport(
 // - `pane`: a ticket for the claude wrapper's tab, which resumes the conversation in the same tab once
 //   the caller's claude has exited (its own checks: the claim, RECHECK); a ticket naming more than one
 //   config folder, or a left record's stat, only for a wrapper of pane file version 3, read here;
-// - `slot`: a record for this pane's slot runner, which resumes it in the same pane once the caller's
-//   claude has exited (its own checks: the claim, the project, RECHECK);
-// - `window`: a new window (Start-Process, Windows PowerShell by its known path), whose script waits for
-//   the caller's process when asked, then RECHECKs (and the left record's stat), checks the claim and
-//   the folder, checks claude-launch.ps1's SHA-256, and runs it, with every config folder and the stat,
-//   so that its own last look is the same: claude-launch.ps1 is the only script that starts claude, the
-//   only place that holds the launch environment. It is put in place first, at its hash's own name;
+// - `slot`: a record for a slot runner: this pane's, which resumes it in the same pane once the caller's
+//   claude has exited, or an idle one elsewhere, its record written with CreateNew (the runner's own
+//   checks: the claim, the project or a new id, RECHECK and the left record, its floor and cap), naming
+//   the launcher it runs by LAUNCH_SCRIPT_SHA256;
+// - `tab`: a tab in a named window of Windows Terminal (Start-Process wt.exe with one quoted string),
+//   running the slot runner with -Resume or -Start and -Launcher, by the one place and hash it is run from;
+// - `window`: a new window. With a name: as the tab, where Windows Terminal is new enough and the slot
+//   runner in place; else, or with `true`, Start-Process of Windows PowerShell by its known path, whose
+//   script waits for the caller's process when asked, then RECHECKs (and the left record's stat), checks
+//   the claim and the folder, checks claude-launch.ps1's SHA-256, and runs it, with every config folder
+//   and the stat, so that its own last look is the same: claude-launch.ps1 is the only script that starts
+//   claude, the only place that holds the launch environment. It is put in place first, at its hash's
+//   own name, which a slot runner runs too, and at the name a person runs;
 // - `auto`: this pane's slot when its runner is verified and takes the folder, else the window, decided
 //   in the script (self-restart's choice).
+// A launch of another process (no waitForExit) must ask for the floor and input idle, and each is read
+// in this same run, right before the claim and the record: never a probe a moment before.
 // It answers `launched <transport> <label> [<pid>]`, or `refused <code> <why>` (a lock it took given
 // back first), and `claim <by>` once the lock is taken. Nothing is written after a failed check.
 //
-// Slots v2 (S2) adds the floor and input checks, an idle slot elsewhere, a tab in a named window and
-// placement's window; asking for any of them now throws, never a launch that skips them.
+// The threat model (N9): a window hashes claude-launch.ps1 and then runs it by its path, a gap of
+// milliseconds. A writer who can use it is the same OS user (T20), who can as well edit the unpinned
+// claude-wrapper.ps1 in the same folder, which the person's profile dot-sources, or run claude itself.
+// The hash stops a stale or edited copy, and names per version stop two versions of the plugins
+// trading one file: not that user.
 
 /** A launch's answer: `launched <transport> <label> [<pid>]`. */
 export const LAUNCH_ANSWER = /^launched (pane|slot|window|tab) ([A-Za-z0-9_.:-]{1,80})(?: (\d{1,10}))?\s*$/m
@@ -2455,21 +2764,38 @@ export const FALLBACK = /^fallback (.{1,1000}?)\s*$/m
 /**
  * Where a launch goes, in the order a caller tries them (the coordinating note, \u00a72):
  * - `{ pane: { token } }`: the caller's own tab, through the claude wrapper's ticket;
- * - `{ slot: id }`: the caller's own pane's slot runner, by its id (`<pid>-<created>`);
+ * - `{ slot: id }`: a slot runner, by its id (`<pid>-<created>`): the caller's own pane's, for a launch
+ *   that replaces its caller; else an idle one elsewhere;
+ * - `{ tab: { window, title, pos?, size? } }`: a tab in that named window, running the slot runner;
+ * - `{ window: { name, pos?, size? } }`: a new named window, as the tab, where Windows Terminal can;
  * - `{ window: true }`: a new window, running claude-launch.ps1;
  * - `'auto'`: this pane's slot when its runner is verified and takes the folder, else the window.
- * The pane, the slot and 'auto' are for a launch that replaces its caller (`waitForExit`).
+ * The pane and 'auto' are for a launch that replaces its caller (`waitForExit`).
  */
-export type LaunchWhere = { readonly pane: { readonly token: string } } | { readonly slot: string } | { readonly window: true } | 'auto'
+export type LaunchWhere =
+  | { readonly pane: { readonly token: string } }
+  | { readonly slot: string }
+  | { readonly tab: WtTab }
+  | { readonly window: true | WtWindow }
+  | 'auto'
+
+/** A window by placement: its name, and where it opens when it isn't there yet. */
+export type WtWindow = { readonly name: string; readonly pos?: readonly [number, number]; readonly size?: readonly [number, number] }
+
+/** A tab by placement: the named window it goes in, its label, and where that window opens when it isn't there yet. */
+export type WtTab = { readonly window: string; readonly title: string; readonly pos?: readonly [number, number]; readonly size?: readonly [number, number] }
 
 /**
  * The checks the launch script makes in the same run as it places the launch:
  * - `live`: NOT LIVE now (RECHECK, and the left record's stat when given), for a launch that doesn't
- *   wait for its caller; one that waits takes its last look after the wait, in the window or the pane;
+ *   wait for its caller, which must ask for it; one that waits takes its last look after the wait;
  * - `fresh`: a start's id is new on this machine: no transcript in any config folder, no registry file
  *   and no command line names it. Required for a start;
- * - `floor`, `input`: the memory floor and cap, and the machine's input idle: slots v2 (S2). Asking for
- *   them now throws.
+ * - `floor`: free memory of at least max(6 GB, 4 GB + the largest session's private bytes), no heavy-slot
+ *   waiter, not both heavy slots busy, and the sessions under the cap, as floorOk reads them. Required of
+ *   a launch of another process;
+ * - `input`: the machine's input idle for at least 60 s; a reading that fails is not idle (PM2). Required
+ *   of a launch of another process. One that replaces its caller may ask (a replacing fresh's window, PM6).
  */
 export type LaunchChecks = { readonly live?: boolean; readonly fresh?: boolean; readonly floor?: boolean; readonly input?: boolean }
 
@@ -2492,8 +2818,12 @@ export type LaunchInput = {
   readonly stateDir: string
   readonly where: LaunchWhere
   readonly checks?: LaunchChecks
-  /** A left record's stat: the last look refuses when the transcript changed since (\u00a73.4). The window's only. */
+  /** A left record's stat: the last look, wherever it is taken, refuses when the transcript changed since (\u00a73.4). */
   readonly left?: LeftStat
+  /** The cap `checks.floor` holds the sessions to: placement.json's limits.maxSessions, else LIMITS_DEFAULT's. */
+  readonly maxSessions?: number
+  /** The folder holding heavy-slot.sh's .gate-lock folders, for `checks.floor`; none: no heavy-slot to wait for. */
+  readonly heavySlotRoot?: string
   /** The caller's own claude.exe, which the pane, the slot or the window waits for before it resumes. */
   readonly waitForExit?: ProcessRef
   /** The pane's ticket's time: the caller's clock, now. */
@@ -2725,6 +3055,91 @@ const WRITE_WHOLE = [
   'catch { [IO.File]::Delete($temp); throw }',
 ]
 
+/**
+ * One element of wt's argument string, by Windows' quoting rules (CommandLineToArgvW): wrapped in double
+ * quotes when it holds a space. Throws on an empty one, one holding a double quote (it would end its
+ * quotes), a semicolon (wt reads it as the next command, wherever it stands) or a percent sign (wt
+ * expands it), and on a quoted one ending in a backslash, which would escape the closing quote.
+ */
+export function wtArgument(element: string): string {
+  if (element === '' || /[";%]/.test(element)) throw new Error(`an argument for Windows Terminal is empty, or holds a double quote, a semicolon or a percent sign: ${JSON.stringify(element)}`)
+  if (!/\s/.test(element)) return element
+  if (element.endsWith('\\')) throw new Error(`an argument with a space ends in a backslash: ${JSON.stringify(element)}`)
+  return `"${element}"`
+}
+
+/** A folder as wt's -d takes it: no trailing backslash, which would escape a closing quote; a drive's root keeps its own. */
+export const wtFolder = (folder: string): string => (folder.length > 3 ? folder.replace(/\\+$/, '') : folder)
+
+/** What a tab's slot runner is opened to do. */
+export type TabRun =
+  | { readonly idle: true }
+  | { readonly start: string; readonly name: string; readonly configDirs?: readonly string[] }
+  | { readonly resume: string; readonly waitFor?: ProcessRef; readonly configDirs?: readonly string[]; readonly left?: LeftStat }
+
+/**
+ * The one string wt.exe is given for a tab (Start-Process's -ArgumentList, which joins an array with
+ * spaces and quotes nothing): the window by name, its place when it isn't there yet, `nt` with the title
+ * and the folder, `--`, then Windows PowerShell by its known path running the slot script from its one
+ * place, and what the tab is opened to do, each value pattern-checked, with the launcher it runs by this
+ * release's pin. Nothing else: no prompt, no assignment, no permission flag.
+ */
+export function wtTabLine(input: { readonly powershell: string; readonly stateDir: string; readonly window: string; readonly title: string; readonly pos?: readonly [number, number]; readonly size?: readonly [number, number]; readonly folder: string; readonly run: TabRun }): string {
+  if (!POWERSHELL_PATH.test(input.powershell)) throw new Error(`not Windows PowerShell by its known path: ${JSON.stringify(input.powershell)}`)
+  if (!isWindowName(input.window)) throw new Error(`not a window Windows Terminal takes by name: ${JSON.stringify(input.window)}`)
+  if (!TAB_LABEL.test(input.title)) throw new Error(`not a tab's label: ${JSON.stringify(input.title)}`)
+  for (const [what, path] of [['the folder', input.folder], ['the state folder', input.stateDir]] as const) {
+    const fault = wtFolderFault(path)
+    if (fault !== undefined) throw new Error(`${what} ${JSON.stringify(path)} ${fault}, so it never reaches Windows Terminal`)
+  }
+  const place = (pair: readonly [number, number] | undefined, flag: string, ok: (a: number, b: number) => boolean): string[] => {
+    if (pair === undefined) return []
+    if (!ok(pair[0], pair[1])) throw new Error(`not a ${flag.slice(2)}: ${JSON.stringify(pair)}`)
+    return [flag, `${pair[0]},${pair[1]}`]
+  }
+  const run = input.run
+  const dirs = 'idle' in run || run.configDirs === undefined ? [] : run.configDirs
+  for (const dir of dirs) {
+    const fault = wtFolderFault(dir)
+    if (fault !== undefined) throw new Error(`a config folder ${JSON.stringify(dir)} ${fault}, so it never reaches Windows Terminal`)
+  }
+  const named = dirs.length === 0 ? [] : ['-ConfigDirs', dirs.map(wtFolder).join('|')]
+  let doing: string[]
+  if ('idle' in run) doing = ['-Idle']
+  else if ('start' in run) {
+    if (!SESSION_ID.test(run.start) || !AREA_NAME.test(run.name)) throw new Error('a tab starts a session id under a session name')
+    doing = ['-Start', run.start, '-Name', run.name, ...named, '-Launcher', LAUNCH_SCRIPT_SHA256]
+  } else {
+    if (!SESSION_ID.test(run.resume)) throw new Error('a tab resumes a session id')
+    const waits = run.waitFor === undefined ? [] : ['-WaitFor', `${run.waitFor.pid}-${run.waitFor.created}`]
+    const left = run.left === undefined ? [] : 'size' in run.left ? ['-LeftSize', String(run.left.size), '-LeftMtime', String(run.left.mtime)] : ['-LeftExitAt', String(run.left.exitAt)]
+    doing = ['-Resume', run.resume, ...waits, ...named, ...left, '-Launcher', LAUNCH_SCRIPT_SHA256]
+  }
+  return [
+    '-w',
+    input.window,
+    ...place(input.pos, '--pos', (x, y) => isPos(x) && isPos(y)),
+    ...place(input.size, '--size', isSize),
+    'nt',
+    '--title',
+    input.title,
+    '--suppressApplicationTitle',
+    '-d',
+    wtFolder(input.folder),
+    '--',
+    input.powershell,
+    '-NoExit',
+    '-NoProfile',
+    '-ExecutionPolicy',
+    'RemoteSigned',
+    '-File',
+    slotScriptPath(input.stateDir),
+    ...doing,
+  ]
+    .map(wtArgument)
+    .join(' ')
+}
+
 /** A launch's input, checked; throws on anything that isn't what it must be, so nothing else is spliced in. */
 function checkLaunch(input: LaunchInput) {
   if (!POWERSHELL_PATH.test(input.powershell)) throw new Error(`not Windows PowerShell by its known path: ${JSON.stringify(input.powershell)}`)
@@ -2739,15 +3154,21 @@ function checkLaunch(input: LaunchInput) {
   const tool = input.tool ?? 'claude-self-tools'
   if (!TOOL_NAME.test(tool)) throw new Error(`not a tool's name: ${JSON.stringify(tool)}`)
   const checks = input.checks ?? {}
-  if (checks.floor === true || checks.input === true) throw new Error('the floor and input checks come with slots v2: not in this version')
   const where = input.where
   const waitFor = input.waitForExit
   if (waitFor !== undefined && (!isPid(waitFor.pid) || !isTicks(waitFor.created))) throw new Error('the process to wait for is not a pid and a time as a string')
   if (checks.live === true && waitFor !== undefined) throw new Error('a launch that waits for its caller takes its last look after the wait, not now')
+  // A launch of another process adds a process, in a pane or a window the person may be typing in.
+  if (waitFor === undefined && (checks.floor !== true || checks.input !== true)) throw new Error('a launch of another process checks the floor and the input idle (checks.floor, checks.input)')
+  if (waitFor === undefined && input.kind === 'resume' && checks.live !== true) throw new Error('a resume that waits for nothing checks NOT LIVE now (checks.live)')
+  const maxSessions = input.maxSessions ?? LIMITS_DEFAULT.maxSessions
+  if (!isCount(maxSessions, 40) || maxSessions < 1) throw new Error(`the cap is not a whole number from 1 to 40: ${JSON.stringify(input.maxSessions)}`)
+  const heavyRoot = input.heavySlotRoot === undefined ? undefined : checkFolder('the heavy-slot folder', input.heavySlotRoot)
   if (input.kind === 'start') {
     if (typeof input.name !== 'string' || !AREA_NAME.test(input.name)) throw new Error(`a start's name is not a session name: ${JSON.stringify(input.name)}`)
     if (checks.fresh !== true) throw new Error('a start checks that its id is new (checks.fresh)')
-    if (where === 'auto' || !('window' in where)) throw new Error('a start goes to a window in this version')
+    if (where === 'auto' || (typeof where === 'object' && 'pane' in where)) throw new Error("a start goes to a slot, a tab or a window: the claude wrapper's ticket and 'auto' resume")
+    if (typeof where === 'object' && waitFor !== undefined && ('tab' in where || ('window' in where && where.window !== true))) throw new Error('a start in a tab waits for nothing: only a resume in one does')
     if (input.left !== undefined) throw new Error('a left record is a resumed conversation\'s')
   } else if (input.kind === 'resume') {
     if (input.name !== undefined) throw new Error('a resume takes no name')
@@ -2755,10 +3176,25 @@ function checkLaunch(input: LaunchInput) {
   } else throw new Error(`not a launch's kind: ${JSON.stringify(input.kind)}`)
   let label: string | undefined
   let ticket: string | undefined
+  /** The string wt.exe is given, for a tab or a named window. */
+  let wtLine: string | undefined
+  /** The tab's stamp, for a tab or a named window. */
+  let stamp: { readonly window: string; readonly tab: string } | undefined
+  const tabRun = (): TabRun =>
+    input.kind === 'start'
+      ? { start: id, name: input.name as string, configDirs }
+      : { resume: id, ...(waitFor === undefined ? {} : { waitFor }), configDirs, ...(input.left === undefined ? {} : { left: input.left }) }
+  const tabOf = (tab: WtTab): string => {
+    if (input.claim !== `launch:${id}`) throw new Error("a tab's or a named window's slot runner takes only the claim naming launch:<its id>")
+    return wtTabLine({ powershell: input.powershell, stateDir: state, window: tab.window, title: tab.title, ...(tab.pos === undefined ? {} : { pos: tab.pos }), ...(tab.size === undefined ? {} : { size: tab.size }), folder, run: tabRun() })
+  }
   if (where === 'auto') {
     if (waitFor === undefined) throw new Error("'auto' is for a launch that replaces its caller (waitForExit)")
-    if (input.left !== undefined) throw new Error("this pane's slot runner doesn't check a left record until slots v2: 'auto' takes none")
     if (!input.claim.startsWith('launch:')) throw new Error("'auto' names a launch's claim; the slot's is its own")
+  } else if ('tab' in where) {
+    wtLine = tabOf(where.tab)
+    stamp = { window: where.tab.window, tab: where.tab.title }
+    label = where.tab.window
   } else if ('pane' in where) {
     if (waitFor === undefined) throw new Error('the pane is for a launch that replaces its caller (waitForExit)')
     if (!input.claim.startsWith('launch:')) throw new Error("the pane's ticket names a launch's claim")
@@ -2768,19 +3204,93 @@ function checkLaunch(input: LaunchInput) {
     ticket = paneTicket({ token: where.pane.token, resume: id, by: input.claim, dir: folder, at: input.now, configDirs, ...(input.left === undefined ? {} : { left: input.left }) })
     label = where.pane.token
   } else if ('slot' in where) {
-    if (waitFor === undefined) throw new Error("this pane's slot is for a launch that replaces its caller (waitForExit)")
-    if (input.left !== undefined) throw new Error("this pane's slot runner doesn't check a left record until slots v2")
     idPath(state, 'slotRecord', where.slot)
     label = where.slot
     if (input.claim !== `slot:${where.slot}`) throw new Error("a slot's launch names that slot's claim")
   } else if ('window' in where) {
-    if (where.window !== true) throw new Error('a window by placement comes with slots v2: not in this version')
     if (!input.claim.startsWith('launch:')) throw new Error("a window names a launch's claim")
+    if (where.window !== true) {
+      const named = where.window
+      wtLine = tabOf({ window: named.name, title: input.name ?? `resume-${id.slice(0, 8)}`, ...(named.pos === undefined ? {} : { pos: named.pos }), ...(named.size === undefined ? {} : { size: named.size }) })
+      stamp = { window: named.name, tab: input.name ?? `resume-${id.slice(0, 8)}` }
+      label = named.name
+    }
   } else throw new Error('not a place to launch to')
   if (input.left !== undefined) leftRecheck(input.left)
   if (input.deadline !== undefined && !isCount(input.deadline)) throw new Error('the deadline is not a time')
-  return { id, folder, state, configDirs, tool, checks, where, waitFor, label, ticket, deadline: input.deadline }
+  return { id, folder, state, configDirs, tool, checks, where, waitFor, label, ticket, wtLine, stamp, maxSessions, heavyRoot, deadline: input.deadline }
 }
+
+/**
+ * The floor, in the launch script's own run (`checks.floor`), by floorOk's rules and in its order: free
+ * memory of at least max(6 GB, 4 GB + the largest session's private bytes; 2 GB when none could be read),
+ * read through Win32; no heavy-slot waiter, not both heavy slots busy, read from heavy-slot's folders; the
+ * sessions under the cap. Anything it can't read refuses. Needs `$table` (with PrivatePageCount),
+ * Get-Parent, Get-Cli, and the `Refuse` function.
+ */
+function floorLines(heavyRoot: string | undefined, maxSessions: number): string[] {
+  return [
+    '$freeKb = $null',
+    'try { $freeKb = [long](Get-CimInstance -ClassName Win32_OperatingSystem -Property FreePhysicalMemory).FreePhysicalMemory } catch { $freeKb = $null }',
+    "if ($null -eq $freeKb) { Refuse 'memory' 'the free memory could not be read' }",
+    '$largest = $null',
+    'foreach ($p in @($table.Values)) { if ($p.Name -eq "claude.exe" -and $null -ne $p.PrivatePageCount -and -not (Get-Cli $p) -and ($null -eq $largest -or [long]$p.PrivatePageCount -gt $largest)) { $largest = [long]$p.PrivatePageCount } }',
+    `if ($null -eq $largest) { $largest = [long]${LARGEST_UNREAD_GB} * 1073741824 }`,
+    `$needBytes = [math]::Max([long]${FLOOR_MIN_GB} * 1073741824, [long]${HEAVY_FLOOR_GB} * 1073741824 + $largest)`,
+    "if (($freeKb * 1024) -lt $needBytes) { Refuse 'memory' ('only ' + [math]::Round($freeKb / 1048576, 1) + ' GB of memory is free, under the ' + [math]::Round($needBytes / 1073741824, 1) + ' GB a launch leaves') }",
+    ...(heavyRoot === undefined
+      ? []
+      : [
+          `$heavyRoot = ${literal(heavyRoot)}`,
+          'try {',
+          ...READ_HEAVY.map(line => `  ${line}`),
+          "} catch { Refuse 'heavy' ('the heavy-slot folders could not be read: ' + $_.Exception.Message) }",
+          "if ($heavyWaiters -gt 0) { Refuse 'heavy' ($heavyWaiters.ToString() + ' heavy jobs are waiting, and they go first') }",
+          "if ($heavyBusy -ge 2) { Refuse 'heavy' 'both heavy slots are busy' }",
+        ]),
+    ...COUNT_SESSIONS,
+    `if ($room -ge ${maxSessions}) { Refuse 'cap' ($room.ToString() + ' sessions are running, at the cap of ${maxSessions}') }`,
+  ]
+}
+
+/** Input idle, in the launch script's own run (`checks.input`): at least 60 s; a reading that fails is not idle. */
+const INPUT_LINES = [
+  ...READ_INPUT_IDLE,
+  `if ($null -eq $inputIdleSec) { Refuse 'input' 'the machine''s input idle could not be read, and that is not idle' }`,
+  `if ($inputIdleSec -lt ${INPUT_IDLE_MS / 1000}) { Refuse 'input' ('the machine had input ' + $inputIdleSec + ' seconds ago, under the ${INPUT_IDLE_MS / 1000} a launch waits for') }`,
+]
+
+/**
+ * An idle slot elsewhere, in the launch script's own run: the runner by its id is running with that start,
+ * runs `-File ...\claude-slot.ps1` of the shipped hash, has no claude.exe under it, and its beacon has said
+ * idle for at least 10 s. Sets `$slot`. Needs `$table`, Get-Created, Get-Sha256, Get-Beacon, Refuse.
+ */
+function slotIdleLines(state: string, slot: string): string[] {
+  const dash = slot.indexOf('-')
+  const pid = slot.slice(0, dash)
+  const created = slot.slice(dash + 1)
+  return [
+    `$runner = $table[[int]${pid}]`,
+    `if ($null -eq $runner -or $runner.Name -ne 'powershell.exe' -or (Get-Created $runner) -cne '${created}') { Refuse 'slot' 'that slot runner is no longer running' }`,
+    String.raw`if ("$($runner.CommandLine)" -notmatch "-File\s+(\x22?)(?<path>[A-Za-z]:\\[^\x22]*?\\claude-slot\.ps1)\1(\s|\z)") { Refuse 'slot' 'that process runs no slot runner' }`,
+    `if ((Get-Sha256 $Matches["path"]) -cne '${SLOT_SCRIPT_SHA256}') { Refuse 'slot' 'that slot runner has another SHA-256 than the one shipped' }`,
+    `foreach ($p in @($table.Values)) { if ($p.Name -eq 'claude.exe' -and [long]$p.ParentProcessId -eq ${pid}) { Refuse 'slot' 'that slot runs a Claude Code already' } }`,
+    '$slotBeacon = $null',
+    `try { $slotBeacon = Get-Beacon ([IO.File]::ReadAllText(${literal(slotBeaconPath(state, slot))}, [Text.Encoding]::UTF8) | ConvertFrom-Json) } catch { $slotBeacon = $null }`,
+    "if ($null -eq $slotBeacon -or $slotBeacon['state'] -cne 'idle') { Refuse 'slot' 'that slot''s beacon does not say idle' }",
+    `if (([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() - [long]$slotBeacon['since']) -lt ${SLOT_IDLE_MIN_MS}) { Refuse 'slot' 'that slot went idle less than ${SLOT_IDLE_MIN_MS / 1000} seconds ago' }`,
+    `$slot = [ordered]@{ id = '${slot}' }`,
+  ]
+}
+
+/**
+ * Windows Terminal's version, read after the PSModulePath reset (the Appx module is 5.1's): `$wtVersion`,
+ * the highest of the Store's and the Preview's, `$null` when neither can be read. Never by running wt.
+ */
+const READ_WT_VERSION = [
+  '$wtVersion = $null',
+  "try { $wtFound = @(Get-AppxPackage -Name 'Microsoft.WindowsTerminal*' | ForEach-Object { [version]$_.Version } | Sort-Object -Descending); if ($wtFound.Count -gt 0) { $wtVersion = $wtFound[0] } } catch { $wtVersion = $null }",
+]
 
 /**
  * The new window's script, run by Windows PowerShell after the launch script has placed it: it waits
@@ -2795,7 +3305,9 @@ function checkLaunch(input: LaunchInput) {
  */
 function windowScript(v: { id: string; kind: 'resume' | 'start'; name?: string; folder: string; state: string; configDirs: readonly string[]; by: string; waitFor?: ProcessRef; left?: LeftStat }): string {
   const resume = v.kind === 'resume'
-  const byHand = resume ? '"claude-launch.ps1 -Resume " + $id + " -Dir " + $folder' : '"claude-launch.ps1 -Start " + $id + " -Name " + $name + " -Dir " + $folder'
+  // A line that runs as it is printed: the script's whole path, and the folder quoted, whatever it holds
+  // (neither can hold a quote). The copy kept for use by hand: the one this window pins may be what changed.
+  const byHand = resume ? `"& '" + $handPath + "' -Resume " + $id + " -Dir '" + $folder + "'"` : `"& '" + $handPath + "' -Start " + $id + " -Name " + $name + " -Dir '" + $folder + "'"`
   // The numbers were checked whole (leftRecheck) before they reach here.
   const leftArgs = v.left === undefined ? '' : 'size' in v.left ? ` -LeftSize '${v.left.size}' -LeftMtime '${v.left.mtime}'` : ` -LeftExitAt '${v.left.exitAt}'`
   const runs = resume ? `& $launchPath -Resume $id -Dir $folder -ConfigDir $configDirs${leftArgs}` : '& $launchPath -Start $id -Name $name -Dir $folder -ConfigDir $configDirs'
@@ -2810,7 +3322,9 @@ function windowScript(v: { id: string; kind: 'resume' | 'start'; name?: string; 
     `$configDirs = @(${v.configDirs.map(literal).join(', ')})`,
     `$claimPath = ${literal(claimPath(v.state, v.id))}`,
     `$launchPath = ${literal(launchScriptPath(v.state))}`,
+    `$handPath = ${literal(launchHandPath(v.state))}`,
     ...GET_SHA256,
+    ...RELEASE_CLAIM,
     ...(v.waitFor === undefined
       ? []
       : [
@@ -2844,9 +3358,12 @@ function windowScript(v: { id: string; kind: 'resume' | 'start'; name?: string; 
     'if ($null -eq $refusal -and -not (Test-Path -LiteralPath $folder -PathType Container)) { $refusal = "The session is not resumed here: its folder " + $folder + " is not there." }',
     // claude-launch.ps1 from its pinned place only, its hash checked just before it runs.
     `if ($null -eq $refusal -and (Get-Sha256 $launchPath) -cne '${LAUNCH_SCRIPT_SHA256}') { $refusal = "The session is not resumed here: claude-launch.ps1 is not at " + $launchPath + " with the SHA-256 this plugin ships (it was changed after the launch put it there)." }`,
+    // A window that refuses gives the claim back, while it still names this window, so the conversation
+    // doesn't read as held for 15 minutes on nothing (N5).
     'if ($null -ne $refusal) {',
     '  Write-Host $refusal',
     `  Write-Host ("Once it is safe, resume it yourself: " + ${byHand})`,
+    '  Release-Claim',
     '  Read-Host "Press Enter to close this window" | Out-Null',
     '  exit 1',
     '}',
@@ -2858,6 +3375,7 @@ function windowScript(v: { id: string; kind: 'resume' | 'start'; name?: string; 
     '} catch {',
     `  Write-Host ("claude-launch.ps1 stopped on an error, so the session may not have ${resume ? 'resumed' : 'started'} here: " + $_.Exception.Message)`,
     `  Write-Host ("Once it is safe, ${resume ? 'resume' : 'start'} it yourself: " + ${byHand})`,
+    '  Release-Claim',
     '  Read-Host "Press Enter to close this window" | Out-Null',
     '  exit 1',
     '}',
@@ -2884,7 +3402,9 @@ export function launch(input: LaunchInput): { readonly argv: readonly string[]; 
 export function launchScriptText(input: LaunchInput): string {
   const v = checkLaunch(input)
   const where = v.where
-  const transport = where === 'auto' ? 'auto' : 'pane' in where ? 'pane' : 'slot' in where ? 'slot' : 'window'
+  const transport = where === 'auto' ? 'auto' : 'pane' in where ? 'pane' : 'slot' in where ? 'slot' : 'tab' in where ? 'tab' : 'window'
+  /** A slot's record for a runner this launch doesn't run under: an idle slot elsewhere. */
+  const elsewhere = where !== 'auto' && 'slot' in where && v.waitFor === undefined
   const usesWindow = transport === 'window' || transport === 'auto'
   const inner = usesWindow
     ? windowScript({ id: v.id, kind: input.kind, ...(input.name === undefined ? {} : { name: input.name }), folder: v.folder, state: v.state, configDirs: v.configDirs, by: input.claim, ...(v.waitFor === undefined ? {} : { waitFor: v.waitFor }), ...(input.left === undefined ? {} : { left: input.left }) })
@@ -2909,13 +3429,37 @@ export function launchScriptText(input: LaunchInput): string {
     `$window = Start-Process -FilePath ${literal(input.powershell)} -ArgumentList '-NoProfile', '-ExecutionPolicy', 'Bypass', '-EncodedCommand', $encoded -PassThru`,
     `$placed = "window - " + $window.Id`,
   ]
-  /** The slot's record, written whole: the conversation, its folder, when, and the config folders the runner's re-check also reads. */
+  /** A tab or a named window: its stamp set first (wt forwards it), the slot script's hash checked right before, then wt.exe with one string. */
+  const openWt =
+    v.wtLine === undefined || v.stamp === undefined
+      ? []
+      : [
+          `$wtLine = ${literal(v.wtLine)}`,
+          `$env:CLAUDE_SELF_TOOLS_WT_WINDOW = ${literal(v.stamp.window)}`,
+          `$env:CLAUDE_SELF_TOOLS_WT_TAB = ${literal(v.stamp.tab)}`,
+          `if ((Get-Sha256 $slotScript) -cne '${SLOT_SCRIPT_SHA256}') { throw ("the slot runner is not at " + $slotScript + " with the SHA-256 this plugin ships") }`,
+          '$window = Start-Process wt.exe -ArgumentList $wtLine -PassThru',
+          `$placed = '${transport} ${v.label ?? ''}'`,
+        ]
+  const leftField = input.left === undefined ? '' : 'size' in input.left ? `; left = [ordered]@{ size = ${input.left.size}; mtime = ${input.left.mtime} }` : `; left = [ordered]@{ exitAt = ${input.left.exitAt} }`
+  /** The slot's record: the conversation, its folder, when, the config folders the runner's re-check also reads, the launcher it runs by this release's pin (put in place below, before the record), and a left record's stat. */
   const writeRecord = [
     // The slot asked for, by the path built from its checked id; or, for 'auto', the slot found here,
     // whose id the script made of two numbers.
     where !== 'auto' && 'slot' in where ? `$final = ${literal(slotRecordPath(v.state, where.slot))}` : '$final = Join-Path $state ("slots\\" + $slot["id"] + ".next.json")',
-    '$text = [ordered]@{ v = 1; resume = $id; folder = $folder; at = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds(); configDirs = [object[]]$configDirs } | ConvertTo-Json -Compress',
-    ...WRITE_WHOLE,
+    input.kind === 'start'
+      ? `$text = [ordered]@{ v = 1; start = $id; name = '${input.name}'; folder = $folder; at = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds(); configDirs = [object[]]$configDirs; launcher = '${LAUNCH_SCRIPT_SHA256}' } | ConvertTo-Json -Compress`
+      : `$text = [ordered]@{ v = 1; resume = $id; folder = $folder; at = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds(); configDirs = [object[]]$configDirs; launcher = '${LAUNCH_SCRIPT_SHA256}'${leftField} } | ConvertTo-Json -Compress -Depth 3`,
+    // A slot elsewhere: CreateNew, so that of a switch and a launch racing for it, one wins, and a record
+    // already there refuses; the runner reads it only once this handle lets go. This pane's own: whole, by
+    // a move or a replace (a withdrawn record of its own may sit there until claude exits).
+    ...(elsewhere
+      ? [
+          '[void][IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($final))',
+          '$recordStream = [IO.File]::Open($final, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)',
+          'try { $recordBytes = [Text.Encoding]::UTF8.GetBytes($text); $recordStream.Write($recordBytes, 0, $recordBytes.Length); $recordStream.Flush($true) } finally { $recordStream.Dispose() }',
+        ]
+      : WRITE_WHOLE),
     '$placed = "slot " + $slot["id"]',
   ]
   /** The claude wrapper's ticket, written whole. */
@@ -2931,13 +3475,37 @@ export function launchScriptText(input: LaunchInput): string {
     '$slotFallback = $null',
     'if ($null -ne $slot -and -not $slotOk) { if ($null -ne $slotHashError) { $slotFallback = "slot hash unreadable: " + $slotHashError } else { $slotFallback = "this pane" + [char]39 + "s claude-slot.ps1 has another SHA-256 than the one shipped" } }',
     'if ($slotSeen) { $slotFallback = "this pane runs claude-slot.ps1 some other way than the slot runner the plugin recognises (Windows PowerShell, powershell.exe -File with the script" + [char]39 + "s absolute path), so it is no slot" }',
-    'if ($slotOk) {',
-    '  $projectName = [regex]::Replace($folder, "[^A-Za-z0-9]", "-")',
-    '  $inProject = $false',
-    '  foreach ($dir in $configDirs) { if ($projectName.Length -le 200 -and (Test-Path -LiteralPath (Join-Path $dir ("projects\\" + $projectName + "\\" + $id + ".jsonl")) -PathType Leaf)) { $inProject = $true } }',
-    '  if (-not $inProject) { $slotOk = $false; $slotFallback = "the folder is not one the slot runner takes: no transcript of the conversation under its project" }',
-    '}',
+    ...(input.kind === 'start'
+      ? []
+      : [
+          'if ($slotOk) {',
+          '  $projectName = [regex]::Replace($folder, "[^A-Za-z0-9]", "-")',
+          '  $inProject = $false',
+          '  foreach ($dir in $configDirs) { if ($projectName.Length -le 200 -and (Test-Path -LiteralPath (Join-Path $dir ("projects\\" + $projectName + "\\" + $id + ".jsonl")) -PathType Leaf)) { $inProject = $true } }',
+          '  if (-not $inProject) { $slotOk = $false; $slotFallback = "the folder is not one the slot runner takes: no transcript of the conversation under its project" }',
+          '}',
+        ]),
   ]
+  /** A tab or a named window: Windows Terminal new enough for a stamp, read after the module path's reset, and the slot script in its one place with the shipped hash. */
+  const wtCheck =
+    v.wtLine === undefined
+      ? []
+      : [
+          ...READ_WT_VERSION,
+          `$slotScript = ${literal(slotScriptPath(v.state))}`,
+          `$wtOld = $null -eq $wtVersion -or $wtVersion -lt [version]'${WT_MIN.stamps}'`,
+          `$slotAway = (Get-Sha256 $slotScript) -cne '${SLOT_SCRIPT_SHA256}'`,
+          ...(transport === 'tab'
+            ? [
+                `if ($wtOld) { Refuse 'wt' ($tool + ': a tab needs Windows Terminal ${WT_MIN.stamps} or later') }`,
+                "if ($slotAway) { Refuse 'slotscript' ($tool + ': the slot runner is not at ' + $slotScript + ' with the SHA-256 this plugin ships: copy it there, unchanged') }",
+              ]
+            : [
+                // A named window without them: the plain window, saying why.
+                '$slotFallback = $null',
+                `if ($wtOld) { $slotFallback = "Windows Terminal ${WT_MIN.stamps} or later is not here, so a plain window, not the one named" } elseif ($slotAway) { $slotFallback = "the slot runner is not at " + $slotScript + " with the SHA-256 this plugin ships, so a plain window, not the one named" }`,
+              ]),
+        ]
   const lines = [
     "$ErrorActionPreference = 'Stop'",
     "$ProgressPreference = 'SilentlyContinue'",
@@ -2954,6 +3522,7 @@ export function launchScriptText(input: LaunchInput): string {
     `$handPath = ${literal(launchHandPath(v.state))}`,
     '$taken = $false',
     '$final = $null',
+    '$window = $null',
     ...RELEASE_CLAIM,
     // A refusal: the lock this run took given back first, then one line, and nothing else.
     'function Refuse($code, $why) {',
@@ -2964,7 +3533,7 @@ export function launchScriptText(input: LaunchInput): string {
     ...GET_SHA256,
     // Every process once, by id: the walk up and the checks read only this table.
     '$table = @{}',
-    'foreach ($p in (Get-CimInstance -ClassName Win32_Process -Property ProcessId, ParentProcessId, Name, CreationDate, CommandLine)) { $table[[int]$p.ProcessId] = $p }',
+    `foreach ($p in (Get-CimInstance -ClassName Win32_Process -Property ProcessId, ParentProcessId, Name, CreationDate, CommandLine${v.checks.floor === true ? ', PrivatePageCount' : ''})) { $table[[int]$p.ProcessId] = $p }`,
     ...GET_PARENT,
     ...GET_CREATED,
     ...FIND_SESSION,
@@ -2975,8 +3544,13 @@ export function launchScriptText(input: LaunchInput): string {
           // The process the launch waits for is the caller's own claude.exe, by its id and its start.
           `if ([long]$session.ProcessId -ne ${v.waitFor.pid} -or [math]::Abs([long](Get-Created $session) - [long]'${v.waitFor.created}') -gt ${PROC_START_TOLERANCE}) { Refuse 'wait' ($tool + ': the process to wait for (${v.waitFor.pid}) is not the Claude Code this launch runs under') }`,
         ]),
-    ...(transport === 'slot' || transport === 'auto' ? slotCheck : []),
-    ...(transport === 'slot'
+    // The floor, the cap and the input idle, read here, in the run that writes the record or opens the
+    // tab (the same-run must-check): never a probe a moment before.
+    ...(v.checks.floor === true ? [...GET_CLI, ...floorLines(v.heavyRoot, v.maxSessions)] : []),
+    ...(v.checks.input === true ? INPUT_LINES : []),
+    ...(elsewhere ? [...GET_BEACON, ...slotIdleLines(v.state, where.slot), "$transport = 'slot'"] : []),
+    ...((transport === 'slot' && !elsewhere) || transport === 'auto' ? slotCheck : []),
+    ...(transport === 'slot' && !elsewhere
       ? [
           `if (-not $slotOk -or $slot["id"] -cne '${v.label}') { if ($null -eq $slotFallback) { $slotFallback = "this pane runs no slot runner, or another than the one asked for" }; Refuse 'slot' ($tool + ': ' + $slotFallback) }`,
           "$transport = 'slot'",
@@ -2988,7 +3562,10 @@ export function launchScriptText(input: LaunchInput): string {
         ? ["$transport = 'pane'"]
         : transport === 'window'
           ? ["$transport = 'window'"]
-          : []),
+          : transport === 'tab'
+            ? ["$transport = 'tab'"]
+            : []),
+    ...wtCheck,
     // A tab whose ticket names more than one config folder, or carries a left record's stat, needs the
     // wrapper of pane file version 3, whose last look reads them: read here, whatever the caller judged
     // (a wrapper of version 2 reads its own config folder alone and checks no left record).
@@ -3002,17 +3579,16 @@ export function launchScriptText(input: LaunchInput): string {
       : []),
     // claude-launch.ps1 in place at its own name, with the shipped hash, before anything is taken or
     // opened: the copy this launch carries is put there when the file is missing or has another hash;
-    // refused only when it can't be. Then the copy kept for use by hand, never refused on.
-    ...(usesWindow
+    // refused only when it can't be. A slot or a tab runs that one too, by the hash its record or line
+    // names: nothing else starts claude. Then the copy a person runs, never refused on.
+    ...(transport !== 'pane'
       ? [
           `$launcherCopy = '${asciiBase64(LAUNCH_SCRIPT_TEXT)}'`,
           ...INSTALL_LAUNCHER,
           ...INSTALL_HAND_COPY,
-          "if ($transport -eq 'window') {",
-          `  $installWhy = Install-Launcher $launchPath $launcherCopy '${LAUNCH_SCRIPT_SHA256}'`,
-          "  if ($null -ne $installWhy) { Refuse 'launcher' ($tool + ': claude-launch.ps1 is not at ' + $launchPath + ' with the SHA-256 this plugin ships, and the copy it carries could not be put there: ' + $installWhy) }",
-          `  Install-HandCopy $handPath $launchPath ${LAUNCH_SCRIPT_VERSION}`,
-          '}',
+          `$installWhy = Install-Launcher $launchPath $launcherCopy '${LAUNCH_SCRIPT_SHA256}'`,
+          "if ($null -ne $installWhy) { Refuse 'launcher' ($tool + ': claude-launch.ps1 is not at ' + $launchPath + ' with the SHA-256 this plugin ships, and the copy it carries could not be put there: ' + $installWhy) }",
+          `Install-HandCopy $handPath $launchPath ${LAUNCH_SCRIPT_VERSION}`,
         ]
       : []),
     ...(v.checks.live === true
@@ -3033,7 +3609,10 @@ export function launchScriptText(input: LaunchInput): string {
     "if (-not $taken) { Refuse 'claim' ($tool + ': another switch, restart or launch holds the claim on this conversation') }",
     say('"claim " + $by'),
     'try {',
-    ...(transport === 'pane' ? writeTicket : transport === 'slot' ? writeRecord : transport === 'window' ? openWindow : []).map(line => `  ${line}`),
+    ...(transport === 'pane' ? writeTicket : transport === 'slot' ? writeRecord : transport === 'tab' ? openWt : transport === 'window' && v.wtLine === undefined ? openWindow : []).map(line => `  ${line}`),
+    ...(transport === 'window' && v.wtLine !== undefined
+      ? ['  if ($null -eq $slotFallback) {', ...openWt.map(line => `    ${line}`), '  } else {', ...openWindow.map(line => `    ${line}`), '  }']
+      : []),
     ...(transport === 'auto'
       ? ['  if ($transport -eq "slot") {', ...writeRecord.map(line => `    ${line}`), '  } else {', ...openWindow.map(line => `    ${line}`), '  }']
       : []),
@@ -3048,45 +3627,401 @@ export function launchScriptText(input: LaunchInput): string {
           'try { $lockNow = [IO.File]::ReadAllText($claimPath) | ConvertFrom-Json } catch { $lockNow = $null }',
           `if ([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() -gt ${v.deadline} -or $null -eq $lockNow -or $lockNow.by -cne $by) {`,
           '  if ($null -ne $final -and $transport -ne "window") { try { [IO.File]::WriteAllText($final, \'{"v":1,"cancelled":true}\') } catch { } }',
+          // A window placed already: it would only sit saying it waits, for up to 10 minutes, for a launch
+          // no one wants. A tab's wt.exe has handed its tab over by now: the released claim turns the tab away.
+          '  if ($transport -eq "window" -and $null -ne $window) { try { $window.Kill() } catch { } }',
           "  Refuse 'late' ($tool + ': the launch was placed past its deadline, or its claim was taken back meanwhile, so it is withdrawn')",
           '}',
         ]),
-    ...(transport === 'auto' ? [`if ($transport -eq 'window' -and $null -ne $slotFallback) { ${say('"fallback " + ($slotFallback -split "\\r?\\n")[0]')} }`] : []),
+    ...(transport === 'auto' || (transport === 'window' && v.wtLine !== undefined) ? [`if ($transport -eq 'window' -and $null -ne $slotFallback) { ${say('"fallback " + ($slotFallback -split "\\r?\\n")[0]')} }`] : []),
     say('"launched " + $placed'),
   ]
   return lines.join('\r\n')
 }
 
+// ---------------------------------------------------------------------------------------------
+// Placement: the file the person edits (\u00a76.1), read by one pure function; the shared fixture
+// (scripts/placement-fixture.json) holds this and the layout script's PowerShell validator equal.
+
+/** A place a launch may go, in a `prefer` list. */
+export type PlacementLeg = 'slot' | 'tab' | 'window'
+
+/** A window of the layout: its name, where it opens, its tabs' labels, and the folder they start in. */
+export type LayoutWindow = { readonly window: string; readonly pos?: readonly [number, number]; readonly size?: readonly [number, number]; readonly tabs: readonly string[]; readonly folder: string }
+
+/** Where launches go: `tab.window` by name, at most `maxTabs` beyond the layout's. */
+export type PlacementLaunch = { readonly prefer: readonly PlacementLeg[]; readonly tab?: { readonly window: string; readonly maxTabs: number }; readonly window?: WtWindow }
+
+/** Where a restart goes: `tab.window` by name, or `same`: the tab's own stamp's window. */
+export type PlacementRestart = { readonly prefer: readonly PlacementLeg[]; readonly tab?: { readonly window: string }; readonly window?: WtWindow }
+
+/** placement.json, read. `limits` as the file gives them: the slot runner's and a launch's defaults fill the rest. */
+export type Placement = {
+  readonly layout: readonly LayoutWindow[]
+  readonly launch?: PlacementLaunch
+  readonly restart?: PlacementRestart
+  readonly workspaces?: Readonly<Record<string, string>>
+  readonly limits?: { readonly minFreeGb?: number; readonly maxSessions?: number }
+  readonly afterBoot?: { readonly fltFix?: string }
+}
+
+const isPos = (value: unknown): value is number => typeof value === 'number' && Number.isInteger(value) && Math.abs(value) <= 32768
+const isSize = (cols: unknown, rows: unknown): boolean => typeof cols === 'number' && Number.isInteger(cols) && cols >= 20 && cols <= 400 && typeof rows === 'number' && Number.isInteger(rows) && rows >= 5 && rows <= 200
+const isWholeIn = (value: unknown, low: number, high: number): value is number => typeof value === 'number' && Number.isInteger(value) && value >= low && value <= high
+
 /**
- * Which launch replaces this session's process (a restart, a switch out of this pane, the
- * coordinator's go), on the probe that judged it, in the coordinating note's order: this tab through
- * the claude wrapper (its pane file's PowerShell is this claude.exe's own parent); else this pane's
- * slot, its script of the shipped hash; else a new window, `fallback` saying why a slot runner found
- * here wasn't used. A launch that doesn't replace its caller has no transport in this version: a slot
- * elsewhere, a tab and placement's window come with slots v2, and it waits. Both are required, never
- * defaulted, so a caller can't leave out what weakens a tab's last look: `configCount`, how many config
- * folders the launch reads (1 to 8: a tab of pane file version 2 reads one alone); `needsLeft`, whether
- * the verdict rests on a left record (it waived L3 and L5: `live.waived` set and the verdict without the
- * record not `not-live`), so only a place whose last look checks it: a tab of pane file version 3, or a
- * window (never this pane's slot, until slots v2, saying so). The launch itself refuses a tab of
- * version 2 for either all the same. A pure function; throws on a count that isn't 1 to 8.
+ * placement.json's text, every field checked by \u00a76.1's rules: `{ placement }`, or `{ errors }` naming
+ * each thing wrong; a bad file means no placement at all. Window names letters, digits, `_` and `-`, never
+ * `0`, `last`, `new`, `-1` or all digits (a name WT reads as special, T-L6); tab labels; folders absolute,
+ * with no quote, control character, `;` or `%` (that one is there, the layout script checks: this is pure);
+ * `pos` within 32768, `size` 20 to 400 columns and 5 to 200 rows; `prefer` from the fixed set, each once;
+ * `workspaces` window names to workspace ids; `limits.minFreeGb` 1 to 64, `limits.maxSessions` 1 to 40;
+ * `afterBoot.fltFix` an absolute .ps1 of the same shape; unknown keys refused, naming them.
  */
-export function pickLaunchTransport(
-  probe: Probe,
-  opts: { readonly replacing: boolean; readonly pane?: { readonly token: string; readonly pane: Pane }; readonly configCount: number; readonly needsLeft: boolean },
-): { readonly where: LaunchWhere; readonly fallback?: string } | { readonly wait: string } {
+export function readPlacement(text: string): { readonly placement: Placement } | { readonly errors: readonly string[] } {
+  let raw: unknown
+  try {
+    raw = JSON.parse(text.replace(/^\ufeff/, ''))
+  } catch {
+    return { errors: ['it is not JSON'] }
+  }
+  if (!isRecord(raw)) return { errors: ['it is not a JSON object'] }
+  const errors: string[] = []
+  const keys = (value: Record<string, unknown>, allowed: readonly string[], where: string): void => {
+    for (const key of Object.keys(value)) if (!allowed.includes(key)) errors.push(`${where} has an unknown key ${key}`)
+  }
+  keys(raw, ['v', 'layout', 'launch', 'restart', 'workspaces', 'limits', 'afterBoot'], 'the file')
+  if (raw.v !== 1) errors.push('it is not version 1')
+  const placeOf = (value: Record<string, unknown>, where: string): { pos?: [number, number]; size?: [number, number] } => {
+    const out: { pos?: [number, number]; size?: [number, number] } = {}
+    if (value.pos !== undefined) {
+      if (Array.isArray(value.pos) && value.pos.length === 2 && isPos(value.pos[0]) && isPos(value.pos[1])) out.pos = [value.pos[0], value.pos[1]]
+      else errors.push(`${where} has a pos that is not two whole numbers within 32768`)
+    }
+    if (value.size !== undefined) {
+      if (Array.isArray(value.size) && value.size.length === 2 && isSize(value.size[0], value.size[1])) out.size = [value.size[0] as number, value.size[1] as number]
+      else errors.push(`${where} has a size that is not 20-400 columns and 5-200 rows`)
+    }
+    return out
+  }
+  const preferOf = (value: unknown, where: string): PlacementLeg[] => {
+    if (!Array.isArray(value) || value.length < 1 || value.length > 3) {
+      errors.push(`${where}.prefer is not a list of slot, tab and window`)
+      return []
+    }
+    const seen: PlacementLeg[] = []
+    for (const leg of value) {
+      if (leg !== 'slot' && leg !== 'tab' && leg !== 'window') errors.push(`${where}.prefer holds something other than slot, tab and window`)
+      else if (seen.includes(leg)) errors.push(`${where}.prefer holds ${leg} twice`)
+      else seen.push(leg)
+    }
+    return seen
+  }
+  const namedWindow = (value: unknown, where: string): WtWindow | undefined => {
+    if (!isRecord(value)) {
+      errors.push(`${where}.window is not an object`)
+      return undefined
+    }
+    keys(value, ['name', 'pos', 'size'], `${where}.window`)
+    if (!isWindowName(value.name)) errors.push(`${where}.window.name is not a name Windows Terminal takes as one`)
+    return { name: value.name as string, ...placeOf(value, `${where}.window`) }
+  }
+  const layout: LayoutWindow[] = []
+  if (!Array.isArray(raw.layout)) errors.push('layout is not a list')
+  else {
+    const names = new Set<string>()
+    raw.layout.forEach((value: unknown, at: number) => {
+      const here = `layout[${at}]`
+      if (!isRecord(value)) {
+        errors.push(`${here} is not an object`)
+        return
+      }
+      keys(value, ['window', 'pos', 'size', 'tabs', 'folder'], here)
+      if (!isWindowName(value.window)) errors.push(`${here}.window is not a name Windows Terminal takes as one`)
+      else if (names.has(value.window)) errors.push(`${here}.window names a window twice`)
+      else names.add(value.window)
+      const place = placeOf(value, here)
+      const tabs: string[] = []
+      if (!Array.isArray(value.tabs) || value.tabs.length < 1) errors.push(`${here}.tabs is not a list of tab labels`)
+      else {
+        for (const tab of value.tabs) {
+          if (typeof tab !== 'string' || !TAB_LABEL.test(tab)) errors.push(`${here}.tabs holds something that is not a tab label`)
+          else if (tabs.includes(tab)) errors.push(`${here}.tabs holds a label twice`)
+          else tabs.push(tab)
+        }
+      }
+      if (wtFolderFault(value.folder) !== undefined) errors.push(`${here}.folder is not an absolute folder with no quote, semicolon or %`)
+      layout.push({ window: value.window as string, ...place, tabs, folder: value.folder as string })
+    })
+  }
+  let launch: PlacementLaunch | undefined
+  if (raw.launch !== undefined) {
+    if (!isRecord(raw.launch)) errors.push('launch is not an object')
+    else {
+      keys(raw.launch, ['prefer', 'tab', 'window'], 'launch')
+      const prefer = preferOf(raw.launch.prefer, 'launch')
+      let tab: PlacementLaunch['tab']
+      if (raw.launch.tab !== undefined) {
+        if (!isRecord(raw.launch.tab)) errors.push('launch.tab is not an object')
+        else {
+          keys(raw.launch.tab, ['window', 'maxTabs'], 'launch.tab')
+          if (!isWindowName(raw.launch.tab.window)) errors.push('launch.tab.window is not a name Windows Terminal takes as one')
+          else if (raw.launch.tab.window === 'same') errors.push('launch.tab.window is same, which only restart.tab takes')
+          if (!isWholeIn(raw.launch.tab.maxTabs, 1, 16)) errors.push('launch.tab.maxTabs is not a whole number from 1 to 16')
+          tab = { window: raw.launch.tab.window as string, maxTabs: raw.launch.tab.maxTabs as number }
+        }
+      }
+      const window = raw.launch.window === undefined ? undefined : namedWindow(raw.launch.window, 'launch')
+      launch = { prefer, ...(tab === undefined ? {} : { tab }), ...(window === undefined ? {} : { window }) }
+    }
+  }
+  let restart: PlacementRestart | undefined
+  if (raw.restart !== undefined) {
+    if (!isRecord(raw.restart)) errors.push('restart is not an object')
+    else {
+      keys(raw.restart, ['prefer', 'tab', 'window'], 'restart')
+      const prefer = preferOf(raw.restart.prefer, 'restart')
+      let tab: PlacementRestart['tab']
+      if (raw.restart.tab !== undefined) {
+        if (!isRecord(raw.restart.tab)) errors.push('restart.tab is not an object')
+        else {
+          keys(raw.restart.tab, ['window'], 'restart.tab')
+          if (raw.restart.tab.window !== 'same' && !isWindowName(raw.restart.tab.window)) errors.push('restart.tab.window is neither same nor a name Windows Terminal takes as one')
+          tab = { window: raw.restart.tab.window as string }
+        }
+      }
+      const window = raw.restart.window === undefined ? undefined : namedWindow(raw.restart.window, 'restart')
+      restart = { prefer, ...(tab === undefined ? {} : { tab }), ...(window === undefined ? {} : { window }) }
+    }
+  }
+  let workspaces: Record<string, string> | undefined
+  if (raw.workspaces !== undefined) {
+    if (!isRecord(raw.workspaces)) errors.push('workspaces is not an object')
+    else {
+      workspaces = {}
+      for (const [name, value] of Object.entries(raw.workspaces)) {
+        if (!isWindowName(name)) errors.push(`workspaces has a key that is not a window name: ${name}`)
+        if (typeof value !== 'string' || !WORKSPACE_ID.test(value)) errors.push(`workspaces.${name} is not a workspace id`)
+        else workspaces[name] = value
+      }
+    }
+  }
+  let limits: Placement['limits']
+  if (raw.limits !== undefined) {
+    if (!isRecord(raw.limits)) errors.push('limits is not an object')
+    else {
+      keys(raw.limits, ['minFreeGb', 'maxSessions'], 'limits')
+      if (raw.limits.minFreeGb !== undefined && !isWholeIn(raw.limits.minFreeGb, 1, 64)) errors.push('limits.minFreeGb is not a whole number from 1 to 64')
+      if (raw.limits.maxSessions !== undefined && !isWholeIn(raw.limits.maxSessions, 1, 40)) errors.push('limits.maxSessions is not a whole number from 1 to 40')
+      limits = { ...(raw.limits.minFreeGb === undefined ? {} : { minFreeGb: raw.limits.minFreeGb as number }), ...(raw.limits.maxSessions === undefined ? {} : { maxSessions: raw.limits.maxSessions as number }) }
+    }
+  }
+  let afterBoot: Placement['afterBoot']
+  if (raw.afterBoot !== undefined) {
+    if (!isRecord(raw.afterBoot)) errors.push('afterBoot is not an object')
+    else {
+      keys(raw.afterBoot, ['fltFix'], 'afterBoot')
+      const flt = raw.afterBoot.fltFix
+      if (flt !== undefined && (wtFolderFault(flt) !== undefined || !/\.ps1$/i.test(flt as string))) errors.push('afterBoot.fltFix is not an absolute .ps1 file that is there, with no quote, semicolon or %')
+      afterBoot = flt === undefined ? {} : { fltFix: flt as string }
+    }
+  }
+  if (errors.length > 0) return { errors }
+  return { placement: { layout, ...(launch === undefined ? {} : { launch }), ...(restart === undefined ? {} : { restart }), ...(workspaces === undefined ? {} : { workspaces }), ...(limits === undefined ? {} : { limits }), ...(afterBoot === undefined ? {} : { afterBoot }) } }
+}
+
+/**
+ * placement.json under `state`, read with the engine: `placement`, or null when there is none; a bad
+ * file means no placement, and `errors` says what is wrong with it. Never throws.
+ */
+export async function loadPlacement($: EngineInterface, state: string): Promise<{ readonly placement: Placement | null; readonly errors?: readonly string[] }> {
+  try {
+    const path = placementPath(state)
+    if (!(await $.fs.exists(path))) return { placement: null }
+    const text = await $.fs.read(path)
+    if (typeof text !== 'string') return { placement: null, errors: ["it can't be read as text"] }
+    const read = readPlacement(text)
+    return 'errors' in read ? { placement: null, errors: read.errors } : { placement: read.placement }
+  } catch (err) {
+    return { placement: null, errors: [errorLine(err)] }
+  }
+}
+
+/** A launch's memory floor, in KB, from a probe in slots mode: max(6 GB, 4 GB + the largest session's private bytes; 2 GB when none could be read). */
+export function floorNeedKb(probe: Probe): number {
+  const sizes = probe.procs.filter(p => isClaude(p) && p.cli !== true && p.privateBytes !== undefined).map(p => p.privateBytes as number)
+  const largestKb = sizes.length === 0 ? LARGEST_UNREAD_GB * 1024 * 1024 : Math.max(...sizes) / 1024
+  return Math.max(FLOOR_MIN_GB * 1024 * 1024, HEAVY_FLOOR_GB * 1024 * 1024 + largestKb)
+}
+
+/**
+ * Whether a launch of another process may proceed, from a probe in slots mode: `ok`, or the first reason
+ * it waits (PM5, \u00a75.6): `memory` (free under floorNeedKb, or unread), `heavy` (a heavy-slot waiter, both
+ * slots busy, or heavy-slot's folders unread), `cap` (the sessions at `maxSessions`, or unread). A pure
+ * function: only advisory, as the launch reads each again in its own run (checks.floor).
+ */
+export function floorOk(probe: Probe, maxSessions: number = LIMITS_DEFAULT.maxSessions): 'ok' | 'memory' | 'heavy' | 'cap' {
+  if (probe.freeKb === null || probe.freeKb < floorNeedKb(probe)) return 'memory'
+  if (probe.errors.some(e => e.source === 'heavy')) return 'heavy'
+  if ((probe.heavyWaiters ?? 0) > 0 || (probe.heavyBusy ?? 0) >= 2) return 'heavy'
+  if (probe.room === null || probe.room >= maxSessions) return 'cap'
+  return 'ok'
+}
+
+/** Whether the machine's input has been idle long enough for a launch: a null reading is not idle (PM2). */
+export const inputIdle = (probe: Probe): boolean => probe.inputIdleSec !== null && probe.inputIdleSec * 1000 >= INPUT_IDLE_MS
+
+/**
+ * The slot runners a launch of another process may use, first to last (\u00a75.5): the shipped hash; no
+ * claude.exe under it; its beacon idle for at least 10 s; its window untagged, or tagged with this
+ * workspace; its config folder the one asked for.
+ */
+export function idleSlots(probe: Probe, placement: Placement | null, opts: { readonly workspace?: string; readonly configDir: string; readonly now: number }): SlotRunner[] {
+  return (probe.slots ?? [])
+    .filter(slot => {
+      const beacon = slot.beacon
+      if (slot.sha256 !== SLOT_SCRIPT_SHA256 || slot.child !== null || beacon === null || beacon.state !== 'idle') return false
+      if (opts.now - beacon.since < SLOT_IDLE_MIN_MS) return false
+      if (!sameFolder(beacon.configDir, opts.configDir)) return false
+      const tag = beacon.window === undefined ? undefined : placement?.workspaces?.[beacon.window]
+      return tag === undefined || tag === opts.workspace
+    })
+    .sort((a, b) => a.pid - b.pid)
+}
+
+/** The overflow tabs in `window`: slots stamped with it whose tab isn't one of the layout's for it. */
+function overflowTabs(probe: Probe, placement: Placement, window: string): number {
+  const own = placement.layout.find(w => w.window === window)?.tabs ?? []
+  return (probe.slots ?? []).filter(slot => slot.beacon?.window === window && !(slot.beacon.tab !== undefined && own.includes(slot.beacon.tab))).length
+}
+
+/** Where a launch goes, and the places to try if that one is refused for want of Windows Terminal or the slot script. */
+export type LaunchPick = { readonly where: LaunchWhere; readonly fallback?: string; readonly then?: readonly LaunchWhere[] } | { readonly wait: 'input' | 'slot'; readonly why: string }
+
+/** What pickLaunchTransport is told besides the probe and the placement. */
+export type PickOptions = {
+  /** A launch that replaces its caller: a restart, a switch out of this pane, the coordinator's go. */
+  readonly replacing: boolean
+  /** This tab's claude wrapper, when the session carries its token. */
+  readonly pane?: { readonly token: string; readonly pane: Pane }
+  /** How many config folders the launch reads (1 to 8: a tab of pane file version 2 reads one alone). */
+  readonly configCount: number
+  /** Whether the verdict rests on a left record (it waived L3 and L5). */
+  readonly needsLeft: boolean
+  /** The placement's section: `restart` for self-restart, else `launch`. */
+  readonly using?: 'launch' | 'restart'
+  /** This tab's stamp, as its environment says (`same`, and a tab's label). */
+  readonly stamp?: { readonly window?: string; readonly tab?: string }
+  /** A tab's label: the session's name for a start. */
+  readonly title?: string
+  /** The conversation's folder: one Windows Terminal would expand goes to no tab or named window. */
+  readonly folder?: string
+  /** The workspace a launch belongs to: a window tagged with another is passed over. */
+  readonly workspace?: string
+  /** The config folder the conversation needs (a resume), or the machine's default (a start). */
+  readonly configDir?: string
+  /** Now, for how long a beacon has said idle. */
+  readonly now?: number
+  /** A launch that replaces its caller, whose tab or window waits for the input idle too (a replacing fresh, PM6). */
+  readonly needsInput?: boolean
+}
+
+/** A tab or a window by the placement's section, in its `prefer` order: where a launch goes past a slot. */
+function placedLegs(probe: Probe, placement: Placement | null, opts: PickOptions): { readonly legs: LaunchWhere[]; readonly why?: string } {
+  if (placement === null) return { legs: [] }
+  const using = opts.using ?? 'launch'
+  const section = using === 'restart' ? placement.restart : placement.launch
+  if (section === undefined) return { legs: [] }
+  // A folder Windows Terminal would expand reaches no wt string: past the slot, a plain window.
+  const fault = opts.folder === undefined ? undefined : wtFolderFault(opts.folder)
+  if (fault !== undefined) return { legs: [], why: `its folder ${fault}, so no tab or named window` }
+  const legs: LaunchWhere[] = []
+  const said: string[] = []
+  for (const leg of section.prefer) {
+    if (leg === 'tab' && section.tab !== undefined) {
+      const window = section.tab.window === 'same' ? opts.stamp?.window : section.tab.window
+      if (window === undefined || !isWindowName(window)) {
+        said.push('this tab carries no window stamp')
+        continue
+      }
+      const maxTabs = 'maxTabs' in section.tab ? (section.tab as { maxTabs: number }).maxTabs : undefined
+      if (maxTabs !== undefined && (probe.slots === null || overflowTabs(probe, placement, window) >= maxTabs)) {
+        said.push(`window ${window} has no room for another overflow tab`)
+        continue
+      }
+      const home = placement.layout.find(w => w.window === window)
+      const title = section.tab.window === 'same' && opts.stamp?.tab !== undefined && TAB_LABEL.test(opts.stamp.tab) ? opts.stamp.tab : (opts.title ?? 'overflow')
+      legs.push({ tab: { window, title, ...(home?.pos === undefined ? {} : { pos: home.pos }), ...(home?.size === undefined ? {} : { size: home.size }) } })
+    }
+    if (leg === 'window') {
+      const named = section.window ?? placement.launch?.window
+      if (named !== undefined) legs.push({ window: named })
+      else said.push('the placement names no window')
+    }
+  }
+  return { legs, ...(said.length === 0 ? {} : { why: said.join('; ') }) }
+}
+
+/**
+ * Where a launch goes, on the probe that judged it, in the coordinating note's order; a pure function.
+ *
+ * A launch that replaces its caller (`replacing`): this tab through the claude wrapper (its pane file's
+ * PowerShell is this claude.exe's own parent, and its last look reads what the launch needs); else this
+ * pane's slot, its script of the shipped hash; else the placement's tab or window in the section's
+ * `prefer` order; else a new window, `fallback` saying why a slot runner found here wasn't used.
+ *
+ * A launch of another process: the machine's input idle for at least 60 s, whichever the place (PM2: a null
+ * reading is not idle, `wait: 'input'`); then, in `launch.prefer`'s order: the first idle slot (idleSlots);
+ * a tab, with room in `maxTabs`; a window, when the placement allows it. With no placement: the first idle
+ * slot, else today's window. Else `wait: 'slot'`.
+ *
+ * Two are required, never defaulted, so a caller can't leave out what weakens a tab's last look:
+ * `configCount` (1 to 8), and `needsLeft`, whether the verdict rests on a left record. The launch itself
+ * refuses a tab of pane file version 2 for either all the same. Throws on a count that isn't 1 to 8.
+ */
+export function pickLaunchTransport(probe: Probe, placement: Placement | null, opts: PickOptions): LaunchPick {
   if (!Number.isInteger(opts.configCount) || opts.configCount < 1 || opts.configCount > 8) throw new Error(`a launch reads 1 to 8 config folders, not ${JSON.stringify(opts.configCount)}`)
   if (typeof opts.needsLeft !== 'boolean') throw new Error('needsLeft says whether the verdict rests on a left record: true or false')
-  if (!opts.replacing) return { wait: 'a launch of another process needs an idle slot, a tab or a window, which come with slots v2 (S2)' }
-  const tab = opts.pane
-  const needsLeft = opts.needsLeft
-  if (tab !== undefined && PANE_TOKEN.test(tab.token) && paneFallback(probe, tab.pane) === undefined && paneReads(tab.pane, opts.configCount) === undefined && (!needsLeft || paneNoLeft(tab.pane) === undefined)) return { where: { pane: { token: tab.token } } }
-  const slot = probe.slot
-  if (slot !== null && slot.sha256 === SLOT_SCRIPT_SHA256) return needsLeft ? { where: { window: true }, fallback: SLOT_NO_LEFT } : { where: { slot: slot.id } }
-  if (slot !== null) return { where: { window: true }, fallback: slotFallback(slot) }
-  if (probe.slotSeen) return { where: { window: true }, fallback: SLOT_NOT_RECOGNISED }
-  return { where: { window: true } }
+  const notIdle: LaunchPick = { wait: 'input', why: probe.inputIdleSec === null ? "the machine's input idle could not be read, and that is not idle" : `the machine had input ${probe.inputIdleSec} seconds ago, under ${INPUT_IDLE_MS / 1000}` }
+  if (opts.replacing) {
+    const tab = opts.pane
+    if (tab !== undefined && PANE_TOKEN.test(tab.token) && paneFallback(probe, tab.pane) === undefined && paneReads(tab.pane, opts.configCount) === undefined && (!opts.needsLeft || paneNoLeft(tab.pane) === undefined)) return { where: { pane: { token: tab.token } } }
+    const slot = probe.slot
+    if (slot !== null && slot.sha256 === SLOT_SCRIPT_SHA256) return { where: { slot: slot.id } }
+    const fallback = slot !== null ? slotFallback(slot) : probe.slotSeen ? SLOT_NOT_RECOGNISED : undefined
+    if (opts.needsInput === true && !inputIdle(probe)) return notIdle
+    const { legs } = placedLegs(probe, placement, opts)
+    const [first, ...then] = [...legs, { window: true } as const]
+    return { where: first as LaunchWhere, ...(fallback === undefined ? {} : { fallback }), ...(then.length === 0 ? {} : { then }) }
+  }
+  if (!inputIdle(probe)) return notIdle
+  if (opts.configDir === undefined || opts.now === undefined) throw new Error('a launch of another process names the config folder it needs, and now')
+  const slots = idleSlots(probe, placement, { configDir: opts.configDir, now: opts.now, ...(opts.workspace === undefined ? {} : { workspace: opts.workspace }) })
+  const first = slots[0]
+  if (placement === null || placement.launch === undefined) return first !== undefined ? { where: { slot: first.id } } : { where: { window: true } }
+  const { legs, why } = placedLegs(probe, placement, { ...opts, using: 'launch' })
+  // Each place in the file's order: a slot where `prefer` names it, or the placed legs as they fall.
+  const ordered: LaunchWhere[] = []
+  for (const leg of placement.launch.prefer) {
+    if (leg === 'slot' && first !== undefined) ordered.push({ slot: first.id })
+    if (leg === 'tab') ordered.push(...legs.filter(place => typeof place === 'object' && 'tab' in place))
+    if (leg === 'window') ordered.push(...legs.filter(place => typeof place === 'object' && 'window' in place))
+  }
+  const [next, ...then] = ordered
+  if (next === undefined) return { wait: 'slot', why: `no slot is idle, and no tab or window is open to it${why === undefined ? '' : ` (${why})`}` }
+  return { where: next, ...(then.length === 0 ? {} : { then }) }
 }
+
+/** The claim a place takes, when the place decides it: its slot's, or for a tab's or a named window's slot runner, `launch:<id>`. Undefined: a launch's own, any. */
+export function claimOf(where: LaunchWhere, id: string): string | undefined {
+  if (where === 'auto' || 'pane' in where) return undefined
+  if ('slot' in where) return `slot:${where.slot}`
+  if ('tab' in where || where.window !== true) return `launch:${id}`
+  return undefined
+}
+
+/** The label a tab or a named window gets for a resume, when the placement gives none: of letters, digits and a hyphen. */
+export const resumeTitle = (id: string): string => `resume-${id.slice(0, 8)}`
 
 
 // ---------------------------------------------------------------------------------------------
@@ -3135,6 +4070,53 @@ export function releaseScript(input: { readonly stateDir: string; readonly id: s
     // Deleted while this handle, which shares delete, still keeps every writer out.
     // A reader that has it open without sharing delete makes the delete fail: try again, then leave it.
     `    if ($null -eq $lock -or $lock.by -cne '${by}') { $answer = 'not-ours' } else { try { [IO.File]::Delete($path); $answer = 'released' } catch { if ${IS_IO} { $answer = 'busy' } else { throw } } }`,
+    '  } finally { $stream.Dispose() }',
+    '}',
+    '$answer',
+  ].join('\r\n')
+}
+
+/** The relock script's answer: the lock re-owned, none there, one naming another, or one held by a taker throughout. */
+export const RELOCKED = /^(relocked|absent|not-ours|busy)\s*$/m
+
+/**
+ * Re-owns the claim lock on `id` to `holder` (review gap 7): a launch whose process is stuck at a dialog
+ * keeps the conversation claimed, and the lock isn't stale while that process runs, whoever made it. Only
+ * a lock naming this launch's `by`: read and rewritten through one handle that lets no one else write it,
+ * every other field as it was. Throws on any input that isn't what it must be.
+ */
+export function relockScript(input: { readonly stateDir: string; readonly id: string; readonly by: string; readonly holder: ProcessRef }): string {
+  const { state, id, by } = checkClaim(input)
+  if (!isPid(input.holder.pid) || !isTicks(input.holder.created)) throw new Error('the holder is not a pid and a time as a string')
+  return [
+    "$ErrorActionPreference = 'Stop'",
+    "$ProgressPreference = 'SilentlyContinue'",
+    PSMODULEPATH_RESET,
+    `$path = ${literal(claimPath(state, id))}`,
+    "$answer = 'busy'",
+    "for ($try = 0; $try -lt 3 -and $answer -eq 'busy'; $try++) {",
+    '  if ($try -gt 0) { Start-Sleep -Milliseconds 250 }',
+    '  try { $stream = [IO.File]::Open($path, [IO.FileMode]::Open, [IO.FileAccess]::ReadWrite, [IO.FileShare]::Read) }',
+    '  catch {',
+    "    if ($_.Exception -is [IO.FileNotFoundException] -or $_.Exception.InnerException -is [IO.FileNotFoundException] -or $_.Exception -is [IO.DirectoryNotFoundException] -or $_.Exception.InnerException -is [IO.DirectoryNotFoundException]) { $answer = 'absent'; continue }",
+    `    if ${IS_IO} { continue }`,
+    '    throw',
+    '  }',
+    '  try {',
+    '    $reader = New-Object IO.StreamReader($stream, [Text.Encoding]::UTF8, $true, 4096, $true)',
+    '    $text = $reader.ReadToEnd()',
+    '    $reader.Dispose()',
+    '    $lock = $null',
+    '    try { $lock = $text | ConvertFrom-Json } catch { $lock = $null }',
+    `    if ($null -eq $lock -or $lock.by -cne '${by}') { $answer = 'not-ours' }`,
+    '    else {',
+    `      $bytes = [Text.Encoding]::UTF8.GetBytes(([ordered]@{ v = $lock.v; by = $lock.by; pid = $lock.pid; created = $lock.created; at = $lock.at; transport = $lock.transport; holder = [ordered]@{ pid = ${input.holder.pid}; created = '${input.holder.created}' } } | ConvertTo-Json -Compress -Depth 3))`,
+    '      [void]$stream.Seek(0, [IO.SeekOrigin]::Begin)',
+    '      $stream.SetLength(0)',
+    '      $stream.Write($bytes, 0, $bytes.Length)',
+    '      $stream.Flush()',
+    "      $answer = 'relocked'",
+    '    }',
     '  } finally { $stream.Dispose() }',
     '}',
     '$answer',
@@ -3250,13 +4232,6 @@ export function paneNoLeft(pane: Pane): string | undefined {
   if (pane.v >= 3) return undefined
   return "this tab's claude wrapper is an older one (its pane file is version 2), whose last look doesn't check a left record, and this move rests on one (a return trip soon after a switch): copy the current claude-wrapper.ps1 into place"
 }
-
-/**
- * Why this pane's slot runner doesn't take a move that rests on a left record: its last look doesn't
- * check one until slots v2. A new window, whose last look does, takes the move instead.
- */
-export const SLOT_NO_LEFT =
-  "this pane's slot runner doesn't check a left record until slots v2, and this move rests on one (a return trip soon after a switch), so a new window takes it: its last look does"
 
 /**
  * The pane file of the tab with `token` (the session's CLAUDE_PANE_TOKEN, which the caller reads by
@@ -3550,7 +4525,8 @@ export type BackgroundTask = { readonly id: string; readonly type?: string; read
  *   there is no probe to run (off Windows: the probe is a Windows PowerShell script), which looks at
  *   nothing and says nothing; a caller on Windows always passes it.
  * - `tasks`: the Stop hook's `background_tasks` (stopTasks), which tells a Monitor from a shell. Absent
- *   where the caller has none to read.
+ *   where the caller has none to read: no plugin's pre-check has one (a classic Stop hook in each would be
+ *   a new gating hook, for work the process tree and the agent list mostly show already).
  * - `agents`: `$.agent.list()`.
  * - `wake`: self-wake's pending wake-up, null for none. Absent while nothing reads it.
  */
@@ -3843,12 +4819,24 @@ export async function runProbe($: EngineInterface, target: { readonly powershell
 /**
  * What the exit pre-check reads, all at once: the crons, the agents, and the probe when `probe` says
  * where it runs from (a string there: why it can't run, which is passed on as the probe's failure;
- * absent: no probe, off Windows).
+ * absent: no probe, off Windows), and the wake-up of the conversation `more.wake` names.
  */
-export async function readExit($: EngineInterface, probe?: { readonly powershell: string; readonly id: string } | string): Promise<ExitInputs> {
-  const [crons, agents, busy] = await Promise.all([readCrons($), readAgents($), probe === undefined || typeof probe === 'string' ? Promise.resolve(probe) : runProbe($, probe)])
-  return busy === undefined ? { crons, agents } : { crons, agents, busy }
+export async function readExit(
+  $: EngineInterface,
+  probe?: { readonly powershell: string; readonly id: string } | string,
+  more: { readonly wake?: { readonly state: string; readonly id: string } } = {},
+): Promise<ExitInputs> {
+  const [crons, agents, busy, wake] = await Promise.all([
+    readCrons($),
+    readAgents($),
+    probe === undefined || typeof probe === 'string' ? Promise.resolve(probe) : runProbe($, probe),
+    more.wake === undefined ? Promise.resolve(undefined) : readWake($, more.wake.state, more.wake.id).then(exitWake),
+  ])
+  return { crons, agents, ...(busy === undefined ? {} : { busy }), ...(wake === undefined ? {} : { wake }) }
 }
+
+/** S10w's read as exitBlockers takes it: a pending wake-up by when it is due, null for none, why when unknown, which holds as pending does. */
+export const exitWake = (read: WakeRead): WakeLike | null | string => (read.wake === 'pending' ? { due: read.due } : read.wake === 'none' ? null : read.why)
 
 // ---------------------------------------------------------------------------------------------
 // The files the coordinator reads: the pending marker, and the last self-check.
@@ -4106,7 +5094,7 @@ export type WakeRead = { readonly wake: 'pending'; readonly due: number } | { re
  * or a tool list that can't be read, is unknown, and unknown holds. Without self-wake, there is nothing
  * to wait for.
  */
-export async function readWake($: EngineInterface, state: string, id: string): Promise<WakeRead> {
+export async function readWake($: EngineInterface, state: string, id: string, other?: { readonly now: number }): Promise<WakeRead> {
   const path = idPathOrNone(state, 'wake', id)
   if (path === undefined) return { wake: 'unknown', why: `${JSON.stringify(id)} is not a session id` }
   let present: boolean
@@ -4125,8 +5113,21 @@ export async function readWake($: EngineInterface, state: string, id: string): P
   }
   const marker = typeof text === 'string' ? readWakeMarker(text) : undefined
   if (marker === undefined) return { wake: 'unknown', why: `self-wake's marker for this conversation is not of its shape: update self-wake to ${SELF_WAKE_MARKER_VERSION} or later; ${WAKE_WAY_OUT}` }
+  if (other !== undefined && marker.armed && marker.due !== undefined && wakeStale(marker, other.now)) {
+    return { wake: 'unknown', why: `its marker says a wake-up was due at ${new Date(marker.due).toISOString().slice(0, 16).replace('T', ' ')} UTC, which has passed: the process that armed it is likely gone` }
+  }
   return marker.armed && marker.due !== undefined ? { wake: 'pending', due: marker.due } : { wake: 'none', why: 'no wake-up is armed' }
 }
+
+/**
+ * A wake-up should have fired this long ago before another session's read stops taking its marker's word:
+ * the timer fires at `due` and rewrites the marker at once, so one still armed past this is a process
+ * that exited with it armed. The session itself reads its own marker as it stands.
+ */
+export const WAKE_STALE_GRACE_MS = 5 * 60 * 1000
+
+/** Whether an armed marker's wake-up is past due by more than the grace: for a reader other than the session itself (`readWake`'s `other`: the coordinator's pool). */
+export const wakeStale = (marker: WakeMarker, now: number): boolean => marker.armed && marker.due !== undefined && marker.due < now - WAKE_STALE_GRACE_MS
 
 /** The wake marker removal's answer: `removed` (no marker there now), or `kept <why>`. */
 export const WAKE_REMOVED = /^(removed|kept)(?: (.{1,600}?))?\s*$/m
@@ -4173,6 +5174,172 @@ export function wakeHold(read: WakeRead): string | undefined {
   if (read.wake === 'pending') return `S10w: a wake-up is pending (due ${new Date(read.due).toISOString().slice(0, 16).replace('T', ' ')} UTC): cancel it with cancel_wake, or wait for it`
   if (read.wake === 'unknown') return `S10w: whether a wake-up is pending is unknown, and unknown holds: ${read.why}`
   return undefined
+}
+
+// ---------------------------------------------------------------------------------------------
+// The trampoline (\u00a77.3): a final command that checks again when it is dequeued.
+//
+// `$.command.run` queues; a turn that enters right after the same-tick check runs first, and the command
+// after it with no fresh safe point. So the plugin registers a command of its own at session.start,
+// answers it with a command.run hook on that literal name (which never reads `next`, so validate lists it
+// as answering its own command, not as a gate), and queues that, with a nonce, instead of the final
+// command. Its handler runs when the engine dequeues it, after any racing turn: it checks again, and only
+// then queues the real command, unawaited (awaiting would wait on the queue the handler itself holds);
+// otherwise it withdraws what the switch or the restart placed. GO_VIA ships as 'direct': the plain
+// command, as before. Flipping it is one commit, once the live checks M17a-d have passed.
+
+/** How a final command runs. One constant: the flip to 'trampoline' is one commit, after M17a-d pass live. */
+export const GO_VIA: 'trampoline' | 'direct' = 'direct'
+
+/** One final command and what hangs on it. */
+export type GoStep = {
+  /** The command that ends the switch or the restart: `exit`, `resume`, `clear`. */
+  readonly command: string
+  readonly args?: string
+  /** The conversation this step belongs to, by the event's id. */
+  readonly conversation: string
+  /** The conversation this process holds now. */
+  readonly holds: () => Promise<string | undefined>
+  /** The session's subagents, or why they can't be read. */
+  readonly agents: () => Promise<readonly AgentLike[] | string>
+  /** For an exit: the process tree alone, or why it can't be read. S2 to S6 hold on it. */
+  readonly probe?: () => Promise<Probe | string>
+  /** Right before the command, once every check has passed (self-switch's exit record). */
+  readonly before?: () => Promise<void>
+  /** After the command has run. */
+  readonly after?: () => Promise<void>
+  /** The command, or its queueing, failed. */
+  readonly failed: (err: unknown) => Promise<void>
+  /** It stood down: everything placed is taken back, saying why. Only ever on the trampoline. */
+  readonly withdraw: (said: string) => Promise<void>
+  /** What the handler answers when the command goes ahead. */
+  readonly runs: string
+}
+
+/** The handler's answer when nothing is armed under that nonce: a person typed the command, or a stale queue entry. */
+export const GO_NOTHING = 'Nothing to do.'
+
+/** One plugin's trampoline: its command and its state, and the two marks of a main-loop turn. goRun and goAnswer act on it. */
+export type Go = {
+  /** The plugin's own command. */
+  readonly name: string
+  /** How this plugin's final commands run: GO_VIA, in what ships. */
+  via: 'trampoline' | 'direct'
+  /** How many main-loop turns have started: a turn since arming stands the step down. */
+  epoch: number
+  /** Whether a main-loop turn is running now. */
+  running: boolean
+  /** The step waiting for its command to be dequeued, under its nonce. */
+  armed: { readonly nonce: string; readonly step: GoStep; readonly epoch: number } | undefined
+  /** Each main-loop turn's start and end. */
+  turnStarted: () => void
+  turnEnded: () => void
+}
+
+/** 16 random hex digits: what the handler is told, so a person's typing or a stale entry acts on nothing. */
+function goNonce(): string {
+  const bytes = new Uint8Array(8)
+  crypto.getRandomValues(bytes)
+  return [...bytes].map(b => b.toString(16).padStart(2, '0')).join('')
+}
+
+/** A plugin's trampoline, for its command `name`: one per plugin. */
+export function goStep(name: string): Go {
+  const go: Go = {
+    name,
+    via: GO_VIA,
+    epoch: 0,
+    running: false,
+    armed: undefined,
+    turnStarted: () => {
+      go.epoch += 1
+      go.running = true
+    },
+    turnEnded: () => {
+      go.running = false
+    },
+  }
+  return go
+}
+
+/** Queues the step's command. */
+function queueIt($: EngineInterface, step: GoStep): Promise<void> {
+  return $.command.run({ command: step.command, ...(step.args === undefined ? {} : { args: step.args }) }).then(() => undefined)
+}
+
+/** Why a step stands down now, or undefined when it goes ahead: every check at dequeue. */
+async function goRecheck(go: Go, at: { readonly step: GoStep; readonly epoch: number }): Promise<string | undefined> {
+  const fresh = (): string | undefined => (go.epoch !== at.epoch || go.running ? 'a turn came first' : undefined)
+  if (fresh() !== undefined) return fresh()
+  if ((await at.step.holds()) !== at.step.conversation) return 'this session became another conversation'
+  const agents = await at.step.agents()
+  const busy = typeof agents === 'string' ? `its subagents can't be read (${agents})` : agents.some(a => isBusyAgent(a.status)) ? agentsHeld(agents.filter(a => isBusyAgent(a.status))) : undefined
+  if (busy !== undefined) return busy
+  if (at.step.probe !== undefined) {
+    const safe = safePoint(await at.step.probe(), { isReadable: true, markers: [], trees: [] }, [])
+    if (safe.verdict !== 'clear') return safe.reasons.join('; ')
+  }
+  return fresh()
+}
+
+/**
+ * Runs `step`: the plain command, or through the trampoline. Never rejects: failures go to `step.failed`.
+ * A plain function, as goAnswer is: the engine loads a hooks module only when `$` goes to a plain function's
+ * argument, never to a method.
+ */
+export async function goRun($: EngineInterface, go: Go, step: GoStep): Promise<void> {
+  if (go.via === 'direct') {
+    try {
+      await step.before?.()
+      await queueIt($, step)
+    } catch (err) {
+      await step.failed(err)
+      return
+    }
+    await step.after?.()
+    return
+  }
+  const nonce = goNonce()
+  go.armed = { nonce, step, epoch: go.epoch }
+  try {
+    await $.command.run({ command: go.name, args: nonce })
+  } catch (err) {
+    if (go.armed?.nonce === nonce) go.armed = undefined
+    await step.failed(err)
+  }
+}
+
+/** The command.run hook's answer: it never reads `next`. */
+export async function goAnswer($: EngineInterface, go: Go, args: string): Promise<{ readonly text: string }> {
+  const at = go.armed
+  if (at === undefined || args.trim() !== at.nonce) return { text: GO_NOTHING }
+  go.armed = undefined
+  let said: string | undefined
+  try {
+    said = await goRecheck(go, at)
+  } catch (err) {
+    said = `the checks at dequeue failed (${errorLine(err)})`
+  }
+  if (said !== undefined) {
+    await at.step.withdraw(said)
+    return { text: `It stood down: ${oneLine(said, 300)}.` }
+  }
+  try {
+    await at.step.before?.()
+  } catch (err) {
+    await at.step.failed(err)
+    return { text: `It didn't run: ${errorLine(err)}.` }
+  }
+  // Never awaited: the command waits on the queue this handler holds. The test kit refuses even this ("called
+  // from a command.run hook", a host check): if M17b shows the same live, a flip needs the design's Trampoline
+  // C here, a timer that queues it, with a same-tick check first. Why GO_VIA stays 'direct' until then.
+  void queueIt($, at.step)
+    .then(
+      () => at.step.after?.(),
+      err => at.step.failed(err),
+    )
+    .catch(() => undefined)
+  return { text: at.step.runs }
 }
 
 // ---------------------------------------------------------------------------------------------

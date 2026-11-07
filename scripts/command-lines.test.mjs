@@ -44,7 +44,7 @@ const launchFor = change => machine.launchScriptText({
 })
 const window = launchFor({})
 const restart = launchFor({ where: 'auto', left: undefined })
-const start = launchFor({ kind: 'start', name: 'a'.repeat(40), checks: { fresh: true }, waitForExit: undefined, left: undefined })
+const start = launchFor({ kind: 'start', name: 'a'.repeat(40), checks: { fresh: true, floor: true, input: true }, waitForExit: undefined, left: undefined })
 const TOKEN = '00000000-0000-4000-a000-000000000001'
 const scripts = [
   ["self-switch's probe: two ids, the claim, 8 config folders, a heavy-slot root", machine.probeScript({ ids: [W, T], take: T, configDirs, stateDir: state, heavySlotRoot: folder('F', 'heavy') })],
@@ -65,6 +65,9 @@ const scripts = [
   ['the left record, written', machine.leftScript({ stateDir: state, id: T, how: 'exit', configDirs, by: 'coordinator', go: `wu_${'a'.repeat(40)}`, process: { pid: 4294967295, created: '99999999999999999999' } })],
   ['the left records, read: 8 ids', machine.leftReadScript({ stateDir: state, ids: Array.from({ length: 8 }, () => T), configDirs })],
   ["the probe, reading 8 ids' left records", machine.probeScript({ ids: Array.from({ length: 8 }, () => T), take: T, configDirs, stateDir: state, heavySlotRoot: folder('F', 'heavy'), left: true })],
+  ['the probe in slots mode', machine.probeScript({ ids: [T], configDirs, stateDir: state, heavySlotRoot: folder('F', 'heavy'), slots: true })],
+  ['the relock', machine.relockScript({ stateDir: state, id: T, by: BY, holder: { pid: 4294967295, created: '99999999999999999999' } })],
+  ['the launch to an idle slot elsewhere: its floor, its input, a start', launchFor({ kind: 'start', name: 'a'.repeat(40), checks: { fresh: true, floor: true, input: true }, waitForExit: undefined, left: undefined, where: { slot: '4294967295-99999999999999999999' }, claim: 'slot:4294967295-99999999999999999999', heavySlotRoot: folder('F', 'heavy') })],
   ['lanes.json, one entry of the longest folder', machine.lanesUpdateScript({ configDir: configDirs[0], name: 'a'.repeat(40), entry: { session: T, folder: resumeIn, window: 'w'.repeat(40), tab: 't'.repeat(40), ws: 'w_abcdefghijkl', at: 9007199254740991 } })],
 ]
 

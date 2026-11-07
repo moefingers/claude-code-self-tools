@@ -1,15 +1,16 @@
 # claude-launch.ps1: starts Claude Code as a top-level session. The one script in
 # claude-code-self-tools that runs claude: every launch (a restart's or a switch's window, the
-# coordinator's go, a steward's launch, and you by hand) comes through it.
-# claude-launch version 1
+# coordinator's go, a steward's launch, a slot runner's every start, and you by hand) comes through it.
+# claude-launch version 2
 #
 # Part of self-switch (claude-code-self-tools, plugins/self-switch/slot/claude-launch.ps1). Nobody
 # copies it: a launch that opens a window puts the copy it carries in %LOCALAPPDATA%\claude-self-tools,
 # as claude-launch-<the first 8 hex digits of its SHA-256>.ps1, one file per version of the plugins,
 # and the window runs it from there only when its SHA-256 is the one the plugins ship
-# (LAUNCH_SCRIPT_SHA256), checked right before it runs. The same launch keeps claude-launch.ps1 there
-# for you to run by hand: the highest version any launch has carried (the version line above). A
-# window never runs that one.
+# (LAUNCH_SCRIPT_SHA256), checked right before it runs: that is the verified copy. The same launch keeps
+# claude-launch.ps1 there, once a first launch has run: the highest version any launch has carried (the
+# version line above), for you to run by hand. A slot runner runs the verified copy too, by the SHA-256 its
+# record or argument names. A window or a slot runner never runs the copy for use by hand.
 #
 # By hand, in a terminal:
 #   claude-launch.ps1 -Resume <session id> [-Dir <folder>]               resume a conversation
@@ -57,7 +58,7 @@ $ProgressPreference = 'SilentlyContinue'
 
 $SessionId = '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\z'
 $AreaName = '^[a-z0-9][a-z0-9-]{0,39}\z'
-$Whole = '^\d{1,15}\z'
+$Whole = '^\d{1,16}\z'
 # The launch environment: LAUNCH_ENV_CLEAR, LAUNCH_ENV_DROP and LAUNCH_ENV_SET in the plugins' machine code.
 $Clear = 'CLAUDE_CODE_CHILD_SESSION', 'CLAUDECODE', 'CLAUDE_CODE_SESSION_ID', 'CLAUDE_PID', 'CLAUDE_EFFORT', 'CLAUDE_CODE_BRIDGE_SESSION_ID', 'CLAUDE_CODE_MESSAGING_SOCKET', 'CLAUDE_CODE_MESSAGING_TOKEN', 'CLAUDE_CODE_REMOTE', 'CLAUDE_CODE_REMOTE_SESSION_ID', 'CLAUDE_JOB_DIR', 'AI_AGENT', 'CLAUDE_CODE_ENTRYPOINT', 'CLAUDE_CODE_EXECPATH', 'CLAUDE_CODE_SESSION_ATTENDED', 'CLAUDE_CODE_SSE_PORT', 'NO_COLOR'
 $Drop = 'PSExecutionPolicyPreference', 'CLAUDE_PANE_TOKEN'
@@ -74,7 +75,7 @@ function Stop-Launch($why) {
 # with spaces at either end.
 function Test-Shape($path) {
   if ($path -isnot [string] -or $path.Length -lt 3 -or $path.Length -gt 240) { return $false }
-  if ($path -cnotmatch '^[A-Za-z]:\\' -or $path -match '[\x00-\x1f\x7f\x22\x27\u2018-\u201e<>|?*/]' -or $path.IndexOf(':', 2) -ge 0) { return $false }
+  if ($path -cnotmatch '^[A-Za-z]:\\' -or $path -match '[\x00-\x1f\x7f-\x9f\x22\x27\u2018-\u201e<>|?*/]' -or $path.IndexOf(':', 2) -ge 0) { return $false }
   $parts = $path.Substring(3).Split('\')
   for ($i = 0; $i -lt $parts.Count; $i++) {
     if ($parts[$i] -eq '') { if ($i -ne $parts.Count - 1) { return $false } }

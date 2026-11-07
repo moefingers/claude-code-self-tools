@@ -1,18 +1,26 @@
 // Embeds plugins/self-switch/slot/claude-launch.ps1 in shared/hooks/machine.ts as LAUNCH_SCRIPT_TEXT
 // (one JSON string per line, right after launchHandPath), replacing the copy there, and writes the
 // script's SHA-256 into LAUNCH_SCRIPT_SHA256 and its version line (`# claude-launch version <n>`) into
-// LAUNCH_SCRIPT_VERSION. Run after any edit to the script, with its version line one higher, then
-// `node scripts/sync-shared.mjs`; scripts/claude-launch.test.mjs holds the four equal.
+// LAUNCH_SCRIPT_VERSION. It pins the slot runner too: its SHA-256 into claude-layout.ps1's `$SlotSha`, and
+// into SLOT_SCRIPT_SHA256; then the layout script's own into LAYOUT_SCRIPT_SHA256. Run after any edit to
+// one of the three, with claude-launch's version line one higher if it changed, then
+// `node scripts/sync-shared.mjs`; scripts/claude-launch.test.mjs and scripts/slot-runner.test.mjs hold them equal.
 import { createHash } from 'node:crypto'
 import { readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { ROOT } from './sync-shared.mjs'
 
-const ps1 = readFileSync(join(ROOT, 'plugins', 'self-switch', 'slot', 'claude-launch.ps1'), 'utf8')
-if (/[^\x00-\x7f]/.test(ps1) || ps1.includes('\r')) throw new Error('claude-launch.ps1 must be ASCII with LF line ends')
+const SLOT_FOLDER = join(ROOT, 'plugins', 'self-switch', 'slot')
+const sha256 = text => createHash('sha256').update(text).digest('hex')
+const plain = (name, text) => {
+  if (/[^\x00-\x7f]/.test(text) || text.includes('\r')) throw new Error(`${name} must be ASCII with LF line ends`)
+  return text
+}
+
+const ps1 = plain('claude-launch.ps1', readFileSync(join(SLOT_FOLDER, 'claude-launch.ps1'), 'utf8'))
 const version = /^# claude-launch version (\d{1,6})$/m.exec(ps1)?.[1]
 if (version === undefined) throw new Error('claude-launch.ps1 has no `# claude-launch version <n>` line')
-const sha = createHash('sha256').update(ps1).digest('hex')
+const sha = sha256(ps1)
 const file = join(ROOT, 'shared', 'hooks', 'machine.ts')
 let text = readFileSync(file, 'utf8')
 const anchor = "export const launchHandPath = (state: string): string => `${state}\\\\claude-launch.ps1`\n"
@@ -32,9 +40,33 @@ const block = [
 // Functions, never strings, as the replacements: the script's text holds `$'` and the like, which a
 // replacement string would read as patterns.
 text = text.replace(anchor, () => anchor + block)
-const shaLine = /^export const LAUNCH_SCRIPT_SHA256 = '[0-9a-f]{64}'$/m
-const versionLine = /^export const LAUNCH_SCRIPT_VERSION = \d{1,6}$/m
-if (!shaLine.test(text) || !versionLine.test(text)) throw new Error('LAUNCH_SCRIPT_SHA256 or LAUNCH_SCRIPT_VERSION is not where this script expects it')
-text = text.replace(shaLine, () => `export const LAUNCH_SCRIPT_SHA256 = '${sha}'`).replace(versionLine, () => `export const LAUNCH_SCRIPT_VERSION = ${version}`)
+const lines = {
+  LAUNCH_SCRIPT_SHA256: /^export const LAUNCH_SCRIPT_SHA256 = '[0-9a-f]{64}'$/m,
+  LAUNCH_SCRIPT_VERSION: /^export const LAUNCH_SCRIPT_VERSION = \d{1,6}$/m,
+  SLOT_SCRIPT_SHA256: /^export const SLOT_SCRIPT_SHA256 = '[0-9a-f]{64}'$/m,
+  LAYOUT_SCRIPT_SHA256: /^export const LAYOUT_SCRIPT_SHA256 = '[0-9a-f]{64}'$/m,
+}
+for (const [name, line] of Object.entries(lines)) if (!line.test(text)) throw new Error(`${name} is not where this script expects it`)
+
+const slotSha = sha256(plain('claude-slot.ps1', readFileSync(join(SLOT_FOLDER, 'claude-slot.ps1'), 'utf8')))
+const layoutFile = join(SLOT_FOLDER, 'claude-layout.ps1')
+const layoutLine = /^\$SlotSha = '[^']*'$/m
+const oldLayout = plain('claude-layout.ps1', readFileSync(layoutFile, 'utf8'))
+if (!layoutLine.test(oldLayout)) throw new Error('claude-layout.ps1 has no $SlotSha line')
+const layout = oldLayout.replace(layoutLine, () => `$SlotSha = '${slotSha}'`)
+writeFileSync(layoutFile, layout)
+const layoutSha = sha256(layout)
+
+text = text
+  .replace(lines.LAUNCH_SCRIPT_SHA256, () => `export const LAUNCH_SCRIPT_SHA256 = '${sha}'`)
+  .replace(lines.LAUNCH_SCRIPT_VERSION, () => `export const LAUNCH_SCRIPT_VERSION = ${version}`)
+  .replace(lines.SLOT_SCRIPT_SHA256, () => `export const SLOT_SCRIPT_SHA256 = '${slotSha}'`)
+  .replace(lines.LAYOUT_SCRIPT_SHA256, () => `export const LAYOUT_SCRIPT_SHA256 = '${layoutSha}'`)
 writeFileSync(file, text)
-console.log(`LAUNCH_SCRIPT_TEXT embedded; LAUNCH_SCRIPT_SHA256 = '${sha}'; LAUNCH_SCRIPT_VERSION = ${version}`)
+// The README prints the layout script's hash, for the person to compare.
+const readmeFile = join(ROOT, 'README.md')
+const readmeLine = /LAYOUT_SCRIPT_SHA256: `[0-9a-f]{64}`/
+const readme = readFileSync(readmeFile, 'utf8')
+if (!readmeLine.test(readme)) throw new Error('the README prints no LAYOUT_SCRIPT_SHA256')
+writeFileSync(readmeFile, readme.replace(readmeLine, () => `LAYOUT_SCRIPT_SHA256: \`${layoutSha}\``))
+console.log(`LAUNCH_SCRIPT_TEXT embedded; LAUNCH_SCRIPT_SHA256 = '${sha}'; LAUNCH_SCRIPT_VERSION = ${version}; SLOT_SCRIPT_SHA256 = '${slotSha}'; LAYOUT_SCRIPT_SHA256 = '${layoutSha}'`)

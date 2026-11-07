@@ -114,6 +114,9 @@ function engine(on: On, { env = WINDOWS, id = ID, launcher = 'opens', exit = 'ex
   on('fs.write', () => ({ value: undefined }))
   on('session.start', (_, e) => ({ cwd: e.cwd }))
   on('session.id', () => ({ value: world.id }))
+  on('tool.list', () => ({ value: [] }))
+  on('fs.exists', () => ({ value: false }))
+  on('command.register', (_, e) => ({ value: { command: e.name } }))
   on('session.cwd', () => ({ value: 'C:\\work\\repo' }))
   on('tool.register', () => ({ value: { tool: TOOL } }))
   on('ui.status', () => ({ value: undefined }))
@@ -326,7 +329,8 @@ test('the launch script: quiet progress, parents older than their children, valu
   // An error, or an end within 10 seconds: the window says how to resume by hand, and waits.
   expect(script).toContain('$code = $LASTEXITCODE')
   expect(script).toContain('if ($code -ne 0 -or ((Get-Date) - $started).TotalSeconds -lt 10) {')
-  expect(script).toContain('"Once it is safe, resume it yourself: " + "claude-launch.ps1 -Resume " + $id + " -Dir " + $folder')
+  // Inside the window's own literal, each quote doubled.
+  expect(script).toContain(`"Once it is safe, resume it yourself: " + "& ''" + $handPath + "'' -Resume " + $id + " -Dir ''" + $folder + "''"`)
   // Three pauses: a refusal, a run of claude-launch.ps1 that stops on an error (caught), and an end within seconds.
   expect(script.split('Read-Host "Press Enter to close this window"').length - 1).toBe(3)
   expect(script).not.toContain('-NoExit')

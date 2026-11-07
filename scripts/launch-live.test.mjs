@@ -70,10 +70,14 @@ const runsOf = dirs => {
   return existsSync(log) ? readFileSync(log, 'utf8').split('\n').filter(Boolean).map(line => JSON.parse(line)) : []
 }
 
-/** A launch script with Start-Process replaced by a throw: a fault in a test can never open a window. */
+/** A launch script with Start-Process replaced by a throw: a fault in a test can never open a window. It throws itself when one is left that isn't so guarded (D3): a renamed anchor can't silently take the guard away. */
 const noWindow = script => {
   const at = '$window = Start-Process'
-  return script.includes(at) ? script.split(at).join(`throw 'a test never opens a window'; ${at}`) : script
+  const guarded = script.includes(at) ? script.split(at).join(`throw 'a test never opens a window'; ${at}`) : script
+  const starts = (guarded.match(/Start-Process/g) ?? []).length
+  const held = (guarded.match(/throw 'a test never opens a window'; \$window = Start-Process/g) ?? []).length
+  assert.equal(starts, held, 'every Start-Process in a script a test runs is guarded')
+  return guarded
 }
 
 /** A resume's launch into the lab, under a fresh launch's claim. */
@@ -272,7 +276,7 @@ function runWindow(inner, dirs, extra = {}) {
 /** A window's launch in the lab, not waiting (no old process here), its claim in place, the launcher installed. */
 function windowLab(change = {}) {
   const dirs = lab()
-  const input = launchInput(dirs, { checks: { live: true }, ...change })
+  const input = launchInput(dirs, { checks: { live: true, floor: true, input: true }, ...change })
   const inner = innerOf(machine.launchScriptText(input))
   mkdirSync(join(dirs.state, 'claims'), { recursive: true })
   writeFileSync(machine.claimPath(dirs.state, input.id), claimText(input.claim, 4))
@@ -297,12 +301,13 @@ describe("the window's own script, run as the window runs it (hidden, here)", { 
   })
 
   test('a launcher whose hash changed after the launch put it there: not run, and the window says so', async () => {
-    const { dirs, inner } = windowLab()
+    const { dirs, input, inner } = windowLab()
     writeFileSync(machine.launchScriptPath(dirs.state), `${machine.LAUNCH_SCRIPT_TEXT}# one line more\n`)
     const ran = await runWindow(inner, dirs)
     assert.equal(ran.runs.length, 0, ran.out)
     assert.match(ran.out, /claude-launch\.ps1 is not at .+ with the SHA-256 this plugin ships/)
-    assert.match(ran.out, /Once it is safe, resume it yourself: claude-launch\.ps1 -Resume /)
+    assert.ok(!existsSync(machine.claimPath(dirs.state, input.id)), 'a window that refuses gives the claim back (N5)')
+    assert.match(ran.out, /Once it is safe, resume it yourself: & '.+claude-launch\.ps1' -Resume [0-9a-f-]{36} -Dir '.+'/)
     assert.equal(ran.code, 1)
   })
 
@@ -312,14 +317,16 @@ describe("the window's own script, run as the window runs it (hidden, here)", { 
     const ran = await runWindow(inner, dirs)
     assert.equal(ran.runs.length, 0, ran.out)
     assert.match(ran.out, /the claim on it no longer names this window/)
+    assert.ok(existsSync(machine.claimPath(dirs.state, input.id)), "another's claim is left alone")
   })
 
   test('a folder that is gone: not run', async () => {
-    const { dirs, inner } = windowLab()
+    const { dirs, input, inner } = windowLab()
     rmSync(dirs.folder, { recursive: true, force: true })
     const ran = await runWindow(inner, dirs)
     assert.equal(ran.runs.length, 0, ran.out)
     assert.match(ran.out, /its folder .+ is not there/)
+    assert.ok(!existsSync(machine.claimPath(dirs.state, input.id)), 'a window that refuses gives the claim back (N5)')
   })
 
   test('claude-launch.ps1 that stops on an error is caught: the window says so and how to resume, and waits (F3)', async () => {
@@ -329,7 +336,7 @@ describe("the window's own script, run as the window runs it (hidden, here)", { 
     const ran = await runWindow(inner, dirs)
     assert.equal(ran.runs.length, 0, ran.out)
     assert.match(ran.out, /claude-launch\.ps1 stopped on an error, so the session may not have resumed here: claude\.exe is locked by an update/)
-    assert.match(ran.out, /Once it is safe, resume it yourself: claude-launch\.ps1 -Resume /)
+    assert.match(ran.out, /Once it is safe, resume it yourself: & '.+claude-launch\.ps1' -Resume [0-9a-f-]{36} -Dir '.+'/)
     assert.equal(ran.code, 1)
   })
 })

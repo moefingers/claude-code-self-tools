@@ -14,7 +14,8 @@ Lets a session end itself once the current turn ends, as `/exit` does, with a st
 - **Only at a finished break.** A session calls it once a piece of work is finished, never mid-merge, mid-push or mid-task: the same rule as compacting with [self-compact](../self-compact). The tool's description says so.
 - **The exit waits for the turn to end.** A command can't run while a turn is running, so the call queues it, and it runs once the turn ends with Claude's answer.
 - **The reason is logged.** Before `/exit` runs, the reason and the note go into the conversation as a row Claude reads when the session is resumed (`claude --resume`), and into a transcript line you see, which the debug log keeps too.
-- **Remote Control and wake-ups end with it.** Your phone and browser lose the session. The tool description says so.
+- **Remote Control ends with it.** Your phone and browser lose the session. The tool description says so.
+- **A wake-up pending holds it**, by self-wake's marker for this conversation (cancel it with `cancel_wake`); self-wake on with no marker it can read holds too.
 - **Nothing that would make `/exit` ask.** A queued `/exit` that meets a confirmation dialog waits there for you, so the plugin checks first, and refuses while anything stands, naming each with how to stop it. Claude stops them and calls again:
   - **a session cron** (from CronCreate, ScheduleWakeup or `/loop`), read with the built-in `CronList` tool through the same call the engine makes for Claude's own, and only after the permission check says `allow`, so it never opens a dialog; a durable one is named as such, since it survives the exit;
   - **a background job under the session**: a background Bash, PowerShell or Monitor job, a build, or a heavy-slot run, found by the probe of this session's processes (Windows only; the probe can't tell a Monitor's job from a Bash one, so both are a *background shell*);

@@ -31,8 +31,16 @@ const queued = { plugin: 'self-clear', key: 'queued' } as const
 /** A beat after the turn's end, so the turn is no longer running when the clear starts. */
 const SETTLE_MS = 500
 
-/** An agent in one of these is still to report. */
-const BUSY: readonly string[] = ['pending', 'running', 'waiting']
+/**
+ * An agent in one of these has ended. Every other status is still to report: `pending`, `running`,
+ * `waiting`, `idle` (a teammate between turns, whose work a clear cuts from its context without a word),
+ * and any status a later Claude Code adds, so an unknown one holds rather than passes. As isBusyAgent in
+ * the machine code the other plugins share (this plugin carries none of it).
+ */
+const AGENT_DONE: readonly string[] = ['completed', 'failed', 'killed']
+
+/** An agent in one of these reports on its own. Any other that holds says how to clear it: TaskStop. */
+const AT_WORK: readonly string[] = ['pending', 'running', 'waiting']
 
 /** The two reasons a clear is for, and how the leaving row and the toast say each. */
 const WHY: Readonly<Record<Why, string>> = {
@@ -89,7 +97,12 @@ async function tellModel($: EngineInterface, note: string): Promise<void> {
 /** The agents still to report, by their task's description; undefined when the list can't be read. */
 async function busyAgents($: EngineInterface): Promise<string[] | undefined> {
   try {
-    return (await $.agent.list()).filter(a => BUSY.includes(a.status)).map(a => (a.description.trim() === '' ? a.type : a.description))
+    return (await $.agent.list())
+      .filter(a => !AGENT_DONE.includes(a.status))
+      .map(a => {
+        const name = a.description.trim() === '' ? a.type : a.description
+        return AT_WORK.includes(a.status) ? name : `${name}: ${a.status}, so it won't report on its own: stop it with TaskStop`
+      })
   } catch {
     return undefined
   }

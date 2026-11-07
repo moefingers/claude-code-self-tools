@@ -12,9 +12,10 @@
 // The pre-check (exitBlockers, in the shared machine code): it refuses while anything would make /exit
 // stop at its confirmation, or end work still running: a session cron (the built-in CronList, read
 // through $.tool.call once $.tool.check allows it, so never a dialog), a background job under the
-// session (the probe's S6, on Windows), a subagent. Each is named with how to stop it. Anything it
-// can't read refuses too, saying so. It runs at the call, so nothing is queued while a blocker
-// stands, and again when the exit is armed, right before the command.
+// session (the probe's S6, on Windows), a subagent, a wake-up pending with self-wake (its marker;
+// self-wake on with one that can't be read holds too). Each is named with how to stop it.
+// Anything it can't read refuses too, saying so. It runs at the call, so nothing is queued while a
+// blocker stands, and again when the exit is armed, right before the command.
 //
 // The pending marker: while the exit is queued or armed, %LOCALAPPDATA%\claude-self-tools\pending\
 // <conversation>.json says so ({ v: 1, kind: 'exit', at }), and the coordinator holds its deliveries
@@ -26,7 +27,7 @@
 // command has started cancels the exit, as an interrupted turn does.
 import type { EngineInterface, Register } from 'claude-code'
 import type { Queued } from '../types'
-import { blockersText, exitBlockers, markPending, powershellPath, readExit, SESSION_ID, SYSTEM_ROOT } from './machine'
+import { blockersText, exitBlockers, isSafeFolder, markPending, powershellPath, readExit, SESSION_ID, stateFolder, SYSTEM_ROOT } from './machine'
 import type { PendingKind } from './machine'
 import { configureUpdateCheck, loadUpdateCheck, withUpdateNotice } from './update-check'
 
@@ -41,8 +42,8 @@ const DESCRIPTION = [
   'Ends this session once the current turn ends, as /exit does: Claude Code closes, and nothing more happens here until someone resumes the session (claude --resume).',
   'Call it only when the person asked you to end the session, or your instructions say to close it once its work is done or handed off. Only at a finished break: never mid-merge, mid-push or mid-task. Never to get out of a task, and not to restart (restart_after_turn, if it is available, does that).',
   '`reason` (required) says why; it is recorded in the transcript. `note` is for whoever resumes this session: what was left, and where its notes are. Write your notes down first.',
-  "It refuses while anything would make /exit stop at its confirmation or cut work off, naming each with how to stop it: a session cron (delete it with CronDelete), a background Bash, PowerShell or Monitor job (stop it with TaskStop), a subagent still running; and while any of that can't be read. Stop them, then call again.",
-  'What still ends with the session: Remote Control (the phone and browser lose the session) and wake-ups.',
+  "It refuses while anything would make /exit stop at its confirmation or cut work off, naming each with how to stop it: a session cron (delete it with CronDelete), a background Bash, PowerShell or Monitor job (stop it with TaskStop), a subagent still running, a wake-up from wake_after still pending (cancel it with cancel_wake); and while any of that can't be read. Stop them, then call again.",
+  'What still ends with the session: Remote Control (the phone and browser lose the session).',
   'End the turn after calling it; the exit runs once your answer is shown.',
 ].join(' ')
 
@@ -115,7 +116,11 @@ async function probeTarget($: EngineInterface): Promise<{ powershell: string; id
 
 /** What stands in the exit's way now, each with how to stop it, as one line; undefined when nothing does. */
 async function blockers($: EngineInterface): Promise<string | undefined> {
-  const found = exitBlockers(await readExit($, await probeTarget($)))
+  const target = await probeTarget($)
+  // This conversation's wake-up, by self-wake's marker: only where there are markers at all.
+  const local = await env(() => $.env.get('LOCALAPPDATA'))
+  const wake = typeof target === 'object' && isSafeFolder(local) ? { wake: { state: stateFolder(local), id: target.id } } : {}
+  const found = exitBlockers(await readExit($, target, wake))
   return found.length === 0 ? undefined : blockersText(found)
 }
 
@@ -212,7 +217,7 @@ export const register: Register = (on, options) => {
     $.ui.status('exit queued for when this turn ends')
     const kept = note === undefined ? '' : ' The note goes in with it, for whoever resumes the session.'
     return {
-      result: `Queued. This session exits once this turn ends; the reason is recorded in the transcript: ${reason}.${kept} Remote Control and wake-ups end with it. Right before the exit it checks again for session crons, background jobs and subagents.`,
+      result: `Queued. This session exits once this turn ends; the reason is recorded in the transcript: ${reason}.${kept} Remote Control ends with it. Right before the exit it checks again for session crons, background jobs, subagents and a pending wake-up.`,
     }
   }).catch(($, e, next) => (next.called ? next(e) : { deny: 'self-exit: queuing the exit failed; nothing is queued.' }))
 

@@ -1005,7 +1005,8 @@ describe('the scripts, as text', () => {
       expect(RECHECK).toContain('    for ($try = 1; $try -le 3 -and $null -eq $e; $try++) {')
       expect(RECHECK).toContain('      if ($null -eq $e -and $try -lt 3) { Start-Sleep -Milliseconds 250 }')
       expect(script).toContain('$refusal = "The session is not resumed here, so that two copies never write it: " + $live + "."')
-      expect(script).toContain('Write-Host ("Once it is safe, resume it yourself: " + "claude-launch.ps1 -Resume " + $id + " -Dir " + $folder)')
+      // Inside the window's own literal, each quote doubled.
+      expect(script).toContain(`Write-Host ("Once it is safe, resume it yourself: " + "& ''" + $handPath + "'' -Resume " + $id + " -Dir ''" + $folder + "''")`)
       // The window stops on a failed read, so the re-check's catch refuses: a new PowerShell would go on.
       const stops = script.indexOf('$ErrorActionPreference = "Stop"')
       expect(stops).toBeGreaterThan(0)

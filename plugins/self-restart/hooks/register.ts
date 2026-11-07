@@ -34,6 +34,16 @@
 // claude.exe's parent, the slot or the window, as before; a token's tab passed over is said in the
 // log and in the row the restarted session reads.
 //
+// The placement: where no tab and no slot takes the restart, it follows placement.json's `restart.prefer`
+// when the file reads: a tab in this tab's own window (`same`, from the stamp CLAUDE_SELF_TOOLS_WT_WINDOW
+// in this process's environment; a hand-started tab has none, and falls through), or the placement's
+// window, each running the slot runner, which waits for this process to exit; else today's window. Each
+// is tried in turn while it is refused for want of Windows Terminal or the slot runner.
+//
+// The final command goes through the trampoline when GO_VIA says so (it ships as 'direct'): a command of
+// this plugin's own, self-restart-go, whose hook never reads `next` and checks again when the engine
+// dequeues it; a turn that came first stands the restart down.
+//
 // The first prompt never goes on a command line. It waits in the plugin's own store, under the
 // session's id, and the copy of this plugin in the process that resumes the session sends it, once,
 // at the classic SessionStart with `source: "resume"` for that id. One older than 15 minutes is
@@ -42,8 +52,9 @@
 // The pre-check (exitBlockers, in the shared machine code), as self-exit's: it refuses while anything
 // would make the exit stop at its confirmation, or end work still running: a session cron (the
 // built-in CronList, read through $.tool.call once $.tool.check allows it, so never a dialog), a
-// background job under the session (the probe's S6), a subagent; each named with how to stop it, and
-// anything unreadable refuses too. It runs at the call, so nothing is queued while a blocker stands,
+// background job under the session (the probe's S6), a subagent, a wake-up pending with self-wake (its
+// marker; one that can't be read holds); each named with how to stop it, and anything unreadable refuses
+// too. It runs at the call, so nothing is queued while a blocker stands,
 // and again when the restart is armed, with the rest of the safe point. A subagent is checked again
 // right before the exit. And no restart loop: a session whose restart opened its window less than 2
 // minutes ago is refused another, at the call and right before the launch (the plugin's store keeps
@@ -61,9 +72,10 @@
 // left waiting, and the person and the model are told so.
 import type { EngineInterface, Register } from 'claude-code'
 import type { Queued, Restart } from '../types'
+import { go } from './go'
 import { launch as buildLaunch, parseLaunch, powershellPath, RELEASED, releaseScript, SESSION_ID, stateFolder, SYSTEM_ROOT, WAIT_SECONDS } from './launcher'
-import type { AgentLike, LaunchInput, PendingKind, Probe } from './machine'
-import { agentsHeld, agentsWayOut, blockersText, exitBlockers, isBusyAgent, isSafeFolder, LAUNCH_DEADLINE_MS, LAUNCH_RETRY_MS, LAUNCH_RUN_MS, launchFolderFault, launchFolderSaid, markPending, oneLine, paneFallback, paneTicketPath, powershellCall, quoted, readExit, readGit, readPane, safePoint, SLOT_SCRIPT_SHA256, idPathOrNone } from './machine'
+import type { AgentLike, LaunchInput, LaunchWhere, PendingKind, Placement, Probe } from './machine'
+import { goAnswer, goRun, agentsHeld, agentsWayOut, blockersText, claimOf, exitBlockers, isBusyAgent, isSafeFolder, isWindowName, LAUNCH_DEADLINE_MS, LAUNCH_RETRY_MS, LAUNCH_RUN_MS, launchFolderFault, launchFolderSaid, loadPlacement, markPending, oneLine, paneFallback, paneTicketPath, pickLaunchTransport, powershellCall, quoted, readExit, readGit, readPane, resumeTitle, runProbe, safePoint, SLOT_SCRIPT_SHA256, idPathOrNone, TAB_LABEL } from './machine'
 import { configureUpdateCheck, loadUpdateCheck, withUpdateNotice } from './update-check'
 
 const queued = { plugin: 'self-restart', key: 'queued' } as const
@@ -98,7 +110,7 @@ const DESCRIPTION = [
   'Call it when a restart is the fix: the person switched accounts, changed a setting that takes effect at startup, or a plugin won\'t reload (try reload_plugins_after_turn first, if it is available). Only at a finished break: never mid-merge, mid-push or mid-task. Never on your own to clear a problem a restart doesn\'t fix.',
   'Windows only, in a session run in a terminal.',
   '`reason` (required) says why; it is recorded in the transcript. `resume` is the message that starts your first turn in the restarted session: what to check or do next. Give it whenever you have a next step of your own; leave it out only when the next step waits on someone else.',
-  'It refuses unless the session is at a safe point: while a session cron is set (delete it with CronDelete), while subagents you started are still running, while anything runs under this session (a background Bash, PowerShell or Monitor job, git, a build, test or lint, a dev server or Playwright, a heavy-slot job), while a git operation is in flight in the repo, and while any of that can\'t be read; each is named with how to stop it. It refuses a second restart within 2 minutes of the last. What still ends with this process: wake-ups, background tasks it can\'t see, Remote Control (with Remote Control on for all sessions, the resumed session connects again).',
+  'It refuses unless the session is at a safe point: while a session cron is set (delete it with CronDelete), while subagents you started are still running, while a wake-up from wake_after is pending (cancel it with cancel_wake), while anything runs under this session (a background Bash, PowerShell or Monitor job, git, a build, test or lint, a dev server or Playwright, a heavy-slot job), while a git operation is in flight in the repo, and while any of that can\'t be read; each is named with how to stop it. It refuses a second restart within 2 minutes of the last. What still ends with this process: Remote Control (with Remote Control on for all sessions, the resumed session connects again).',
   'End the turn after calling it; the restart starts once your answer is shown.',
 ].join(' ')
 
@@ -120,6 +132,11 @@ let armed: Queued | undefined
  * when `$.session.id()` is read alone.
  */
 let current: string | undefined
+
+/** Whether the log has said this tab's claude wrapper is an older one: once per process. */
+let toldOldWrapper = false
+/** Whether the log has said what is wrong with placement.json: once per process. */
+let toldPlacement = false
 
 /** Trimmed text, or undefined when it is not a string or is blank. */
 function text(raw: unknown): string | undefined {
@@ -212,13 +229,19 @@ async function env($: EngineInterface, read: () => Promise<string | undefined>):
 
 /**
  * What stands in the exit's way now (the pre-check: crons, the probe's S6 when the launch can be
- * planned, subagents), each with how to stop it, as one line; undefined when nothing does. Off
- * Windows, or where the launch can't be planned, the probe isn't run: the restart is refused when
- * armed, saying why, and nothing exits.
+ * planned, subagents, a wake-up pending), each with how to stop it, as one
+ * line; undefined when nothing does. Off Windows, or where the launch can't be planned, the probe isn't
+ * run: the restart is refused when armed, saying why, and nothing exits.
  */
 async function blockers($: EngineInterface, launch: { powershell: string; id: string } | undefined): Promise<string | undefined> {
-  const found = exitBlockers(await readExit($, launch))
+  const found = exitBlockers(await readExit($, launch, await exitMore($, launch?.id)))
   return found.length === 0 ? undefined : blockersText(found)
+}
+
+/** What the pre-check reads besides the machine: this conversation's wake-up. */
+async function exitMore($: EngineInterface, id: string | undefined): Promise<{ readonly wake?: { readonly state: string; readonly id: string } }> {
+  const local = await env($, () => $.env.get('LOCALAPPDATA'))
+  return id !== undefined && isSafeFolder(local) ? { wake: { state: stateFolder(local), id } } : {}
 }
 
 /**
@@ -231,7 +254,7 @@ async function blockers($: EngineInterface, launch: { powershell: string; id: st
  * runs right under the claude wrapper's tab.
  */
 async function notSafe($: EngineInterface, launch: { powershell: string; id: string; cwd: string }): Promise<{ readonly unsafe: string } | { readonly probe: Probe }> {
-  const read = await readExit($, launch)
+  const read = await readExit($, launch, await exitMore($, launch.id))
   const found = exitBlockers(read)
   if (found.length > 0) return { unsafe: blockersText(found) }
   let cwd: string
@@ -263,8 +286,29 @@ async function paneOf($: EngineInterface, launch: { id: string; cwd: string }, p
   const state = stateFolder(local)
   const pane = await readPane($, state, token)
   if ('why' in pane) return { fallback: pane.why }
+  if (pane.v < 3 && !toldOldWrapper) {
+    toldOldWrapper = true
+    $.ui.log("this tab's claude wrapper is an older one (its pane file is version 2): a session it resumes gets no CLAUDE_CODE_DISABLE_BG_SHELL_PRESSURE_REAP, and its last look reads less. Copy the current claude-wrapper.ps1 into place.")
+  }
   const passed = paneFallback(probe, pane)
   return passed === undefined ? { token, state } : { fallback: passed }
+}
+
+/** placement.json, or null: a bad file means no placement, said in the log once. */
+async function placementOf($: EngineInterface, state: string): Promise<Placement | null> {
+  const read = await loadPlacement($, state)
+  if (read.errors !== undefined && !toldPlacement) {
+    toldPlacement = true
+    $.ui.log(`placement.json is not of its shape, so it isn't used: ${oneLine(read.errors.join('; '), 400)}`)
+  }
+  return read.placement
+}
+
+/** This tab's stamp, as its environment says, each checked: what `tab: same` goes by. A hand-started tab has none. */
+async function stampOf($: EngineInterface): Promise<{ readonly window?: string; readonly tab?: string }> {
+  const window = await env($, () => $.env.get('CLAUDE_SELF_TOOLS_WT_WINDOW'))
+  const tab = await env($, () => $.env.get('CLAUDE_SELF_TOOLS_WT_TAB'))
+  return { ...(isWindowName(window) ? { window } : {}), ...(typeof tab === 'string' && TAB_LABEL.test(tab) ? { tab } : {}) }
 }
 
 /**
@@ -448,6 +492,8 @@ async function restartNow($: EngineInterface, value: Queued): Promise<void> {
   let slot: string | undefined
   let fallback: string | undefined
   let tab = false
+  /** Where the placement put it: a new tab, or a named window. */
+  let placedAt: string | undefined
   /** The claim the ticket, the slot's record or the window holds, once it is in place. */
   let claimed: string | undefined
   // One run of the shared launcher (launch, machine.ts): it checks this is the claude.exe the probe
@@ -464,52 +510,68 @@ async function restartNow($: EngineInterface, value: Queued): Promise<void> {
   else {
     /** The claim the script printed it took, once it took one. */
     let claim: string | undefined
-    /** This launch's own claim: a fresh launch's, which the script names and takes. */
-    const ours = `launch:${crypto.randomUUID()}`
+    /** This launch's own claim: a fresh launch's, which the script names and takes; a tab's or a named window's runner takes only `launch:<id>`. */
+    let ours = ''
     /** The run ended without a clean answer (an exit code, no answer, a timeout): it may have placed something. */
     let unclean = false
-    try {
-      const now = await $.clock.now()
-      const input: LaunchInput = {
-        powershell: launch.powershell,
-        kind: 'resume',
-        id: launch.id,
-        folder: launch.cwd,
-        claim: ours,
-        configDirs: site.configDirs,
-        stateDir: site.state,
-        where: pane !== undefined && 'token' in pane ? { pane: { token: pane.token } } : 'auto',
-        waitForExit: { pid: own.pid, created: own.created },
-        now,
-        tool: 'self-restart',
-        deadline: now + LAUNCH_DEADLINE_MS,
+    // The places, in turn: this tab's wrapper; or this pane's slot ('auto' decides it in the script); or
+    // placement.json's tab and window, then 'auto'. The next only when one is refused for want of Windows
+    // Terminal or the slot runner.
+    const legs = await restartLegs($, site.state, judged.probe, launch, pane)
+    for (const [n, where] of legs.entries()) {
+      ours = claimOf(where, launch.id) ?? `launch:${crypto.randomUUID()}`
+      claim = undefined
+      unclean = false
+      opened = undefined
+      let refusedFor: string | undefined
+      try {
+        const now = await $.clock.now()
+        const input: LaunchInput = {
+          powershell: launch.powershell,
+          kind: 'resume',
+          id: launch.id,
+          folder: launch.cwd,
+          claim: ours,
+          configDirs: site.configDirs,
+          stateDir: site.state,
+          where,
+          waitForExit: { pid: own.pid, created: own.created },
+          now,
+          tool: 'self-restart',
+          deadline: now + LAUNCH_DEADLINE_MS,
+        }
+        const call = buildLaunch(input)
+        const run = await $.process.run(call.argv, {
+          stdin: call.stdin,
+          cwd: launch.cwd,
+          timeoutMs: LAUNCH_RUN_MS,
+        })
+        const answer = parseLaunch(run.stdout)
+        claim = answer.claim
+        if (run.exitCode !== 0 || !('launched' in answer)) {
+          unclean = run.exitCode !== 0 || !('refused' in answer)
+          refusedFor = 'refused' in answer ? answer.refused.code : undefined
+          const said = 'refused' in answer ? answer.refused.why : brief(`${run.stdout} ${run.stderr}`)
+          const nothing = pane !== undefined && 'token' in pane ? "the ticket for this tab wasn't written" : "the launcher didn't place the restart"
+          opened = `${nothing} (${run.exitCode !== 0 ? `exit ${run.exitCode}` : 'refused'}${said === '' ? '' : `: ${said}`})`
+        } else {
+          const placed = answer.launched
+          if (placed.transport === 'slot') slot = placed.label
+          if (placed.transport === 'pane') tab = true
+          if (placed.transport === 'tab') placedAt = `a new tab in window ${placed.label}`
+          if (placed.transport === 'window' && placed.label !== '-') placedAt = `a new window, ${placed.label}`
+          // The claim the launch took: the resumed session's copy of this plugin releases it.
+          claimed = claim
+          if (claim !== undefined) await keep($, launch.id, { ...kept, claim })
+          // A slot runner found but not used: the launcher says why, and so does the restart.
+          if (placed.transport === 'window' && answer.fallback !== undefined) fallback = oneLine(answer.fallback, 300)
+        }
+      } catch (err) {
+        unclean = true
+        opened = `the launcher didn't run: ${why(err)}`
       }
-      const call = buildLaunch(input)
-      const run = await $.process.run(call.argv, {
-        stdin: call.stdin,
-        cwd: launch.cwd,
-        timeoutMs: LAUNCH_RUN_MS,
-      })
-      const answer = parseLaunch(run.stdout)
-      claim = answer.claim
-      if (run.exitCode !== 0 || !('launched' in answer)) {
-        unclean = run.exitCode !== 0 || !('refused' in answer)
-        const said = 'refused' in answer ? answer.refused.why : brief(`${run.stdout} ${run.stderr}`)
-        const nothing = pane !== undefined && 'token' in pane ? "the ticket for this tab wasn't written" : "the launcher didn't place the restart"
-        opened = `${nothing} (${run.exitCode !== 0 ? `exit ${run.exitCode}` : 'refused'}${said === '' ? '' : `: ${said}`})`
-      } else {
-        const placed = answer.launched
-        if (placed.transport === 'slot') slot = placed.label
-        if (placed.transport === 'pane') tab = true
-        // The claim the launch took: the resumed session's copy of this plugin releases it.
-        claimed = claim
-        if (claim !== undefined) await keep($, launch.id, { ...kept, claim })
-        // A slot runner found but not used: the launcher says why, and so does the restart.
-        if (placed.transport === 'window' && answer.fallback !== undefined) fallback = oneLine(answer.fallback, 300)
-      }
-    } catch (err) {
-      unclean = true
-      opened = `the launcher didn't run: ${why(err)}`
+      if (opened === undefined || n === legs.length - 1 || (refusedFor !== 'wt' && refusedFor !== 'slotscript')) break
+      $.ui.log(`the placed restart wasn't used: ${oneLine(opened, 300)}. The next place is tried.`)
     }
     // A claim taken for a launch that isn't in place is given back at once (a clean refusal gave back
     // its own already). After a run that ended without a clean answer, a ticket that may be there is
@@ -525,16 +587,19 @@ async function restartNow($: EngineInterface, value: Queued): Promise<void> {
       // slot's claim the script took on this conversation, taken back too.
       const autoSlot = ticket === undefined && judged.probe.slot !== null && judged.probe.slot.sha256 === SLOT_SCRIPT_SHA256 ? judged.probe.slot.id : undefined
       const autoRecord = autoSlot === undefined ? undefined : idPathOrNone(site.state, 'slotRecord', autoSlot)
-      const takeBack = async (): Promise<void> => {
+      const given = ours
+      const takeBack = async (first: boolean): Promise<void> => {
         // Each only while it is still this launch's: a ticket naming its claim, a record resuming this
-        // conversation. A run that wrote nothing leaves nothing to withdraw.
-        await withdrawIfOurs($, ticket, raw => raw.by === ours)
-        await withdrawIfOurs($, autoRecord, raw => raw.resume === launch.id)
-        await release($, launch.id, ours)
-        if (autoSlot !== undefined) await release($, launch.id, `slot:${autoSlot}`)
+        // conversation. A run that wrote nothing leaves nothing to withdraw. The slot's claim and record
+        // aren't one launch's, so only the first time: a newer launch of the same conversation through
+        // this slot, within the seconds of the retry, keeps its own.
+        await withdrawIfOurs($, ticket, raw => raw.by === given)
+        if (first) await withdrawIfOurs($, autoRecord, raw => raw.resume === launch.id)
+        await release($, launch.id, given)
+        if (first && autoSlot !== undefined) await release($, launch.id, `slot:${autoSlot}`)
       }
-      await takeBack()
-      $.clock.after(LAUNCH_RETRY_MS, () => void takeBack())
+      await takeBack(true)
+      $.clock.after(LAUNCH_RETRY_MS, () => void takeBack(false))
     }
   }
   if (opened === undefined) await noteRestart($, launch.id)
@@ -583,36 +648,79 @@ async function restartNow($: EngineInterface, value: Queued): Promise<void> {
   $.ui.log(`Restarting at the session's own request: ${value.reason}`)
   if (fallback !== undefined) $.ui.log(`this pane's slot runner isn't used: ${fallback}. A new window resumes the session.`)
   if (passedTab !== undefined) $.ui.log(`this tab's claude wrapper isn't used: ${passedTab}. A new window resumes the session.`)
-  const where = slot !== undefined ? "this pane's slot" : tab ? 'this tab' : 'a new window'
+  const where = slot !== undefined ? "this pane's slot" : tab ? 'this tab' : (placedAt ?? 'a new window')
   $.ui.toast(`Restarting: ${where} resumes this session once it has exited${fallback === undefined ? '' : `, not this pane's slot (${fallback})`}. ${value.reason}`)
   // Done as the exit runs: the coordinator delivers again, to the resumed session.
   await mark($, null)
-  try {
-    await $.command.run({ command: 'exit' })
-  } catch (err) {
-    const minutes = WAIT_SECONDS / 60
-    if (spot !== undefined) {
-      $.ui.toast(`Exit didn't run: ${why(err)}. ${spot.Name} resumes the session if it exits (/exit) within ${SLOT_SECONDS / 60} minutes.`)
-      await tellModel($, `The restart ${spot.left}, but the exit didn't run: ${why(err)}. If this process exits within ${SLOT_SECONDS / 60} minutes, ${spot.session}; after that this session goes on as it is.`)
-      return
-    }
-    $.ui.toast(`Exit didn't run: ${why(err)}. The new window waits ${minutes} minutes for this session to exit (/exit), then gives up.`)
-    await tellModel(
-      $,
-      `The restart's new window opened, but the exit didn't run: ${why(err)}. The window waits up to ${minutes} minutes for this process to exit and then resumes the session there; the person can exit (/exit) for that. After that it gives up and says so, and this session goes on.`,
-    )
-    return
-  }
-  // An exit that took ends this module with the session, and this never fires.
-  $.clock.after(CHECK_MS, () => {
-    if (tab) {
-      $.ui.toast(`The exit ran, but the session is still open. This tab resumes it if it exits within ${SLOT_SECONDS / 60} minutes.`)
-      void tellModel($, `The restart's exit ran, but the session is still open (a dialog may have been answered no). If it exits within ${SLOT_SECONDS / 60} minutes, the wrapper resumes it in this tab; after that the ticket is ignored.`)
-      return
-    }
-    $.ui.toast(`The exit ran, but the session is still open. The new window waits up to ${WAIT_SECONDS / 60} minutes for it to exit.`)
-    void tellModel($, 'The restart\'s exit ran, but the session is still open (a dialog may have been answered no). The new window waits for it to exit, then resumes it there.')
+  const siteState = 'refusal' in site ? undefined : site.state
+  await goRun($, go, {
+    command: 'exit',
+    conversation: launch.id,
+    holds: async () => current ?? (await $.session.id()),
+    agents: async () => {
+      try {
+        return await $.agent.list()
+      } catch (err) {
+        return why(err)
+      }
+    },
+    probe: () => runProbe($, launch),
+    runs: `self-restart: /exit runs now; ${where} resumes this session once it has exited.`,
+    // Stood down at dequeue (only through the trampoline): what was placed is taken back, and the
+    // released claim turns away a waiting tab or window.
+    withdraw: async said => {
+      if (tab && siteState !== undefined) {
+        const token = await env($, () => $.env.get('CLAUDE_PANE_TOKEN'))
+        await withdrawIfOurs($, token === undefined ? undefined : paneTicketPath(siteState, token), raw => raw.by === claimed)
+      }
+      if (slot !== undefined && siteState !== undefined) await withdrawIfOurs($, idPathOrNone(siteState, 'slotRecord', slot), raw => raw.resume === launch.id)
+      if (claimed !== undefined) await release($, launch.id, claimed)
+      await keep($, launch.id, null)
+      await refuse($, `Restart stood down: ${said}.`, `The restart stood down when its exit came up: ${said}. What it had placed was taken back. The session goes on.`)
+    },
+    failed: async err => {
+      const minutes = WAIT_SECONDS / 60
+      if (spot !== undefined) {
+        $.ui.toast(`Exit didn't run: ${why(err)}. ${spot.Name} resumes the session if it exits (/exit) within ${SLOT_SECONDS / 60} minutes.`)
+        await tellModel($, `The restart ${spot.left}, but the exit didn't run: ${why(err)}. If this process exits within ${SLOT_SECONDS / 60} minutes, ${spot.session}; after that this session goes on as it is.`)
+        return
+      }
+      $.ui.toast(`Exit didn't run: ${why(err)}. The new window waits ${minutes} minutes for this session to exit (/exit), then gives up.`)
+      await tellModel(
+        $,
+        `The restart's new window opened, but the exit didn't run: ${why(err)}. The window waits up to ${minutes} minutes for this process to exit and then resumes the session there; the person can exit (/exit) for that. After that it gives up and says so, and this session goes on.`,
+      )
+    },
+    after: async () => {
+      // An exit that took ends this module with the session, and this never fires.
+      $.clock.after(CHECK_MS, () => {
+        if (tab) {
+          $.ui.toast(`The exit ran, but the session is still open. This tab resumes it if it exits within ${SLOT_SECONDS / 60} minutes.`)
+          void tellModel($, `The restart's exit ran, but the session is still open (a dialog may have been answered no). If it exits within ${SLOT_SECONDS / 60} minutes, the wrapper resumes it in this tab; after that the ticket is ignored.`)
+          return
+        }
+        $.ui.toast(`The exit ran, but the session is still open. The new window waits up to ${WAIT_SECONDS / 60} minutes for it to exit.`)
+        void tellModel($, 'The restart\'s exit ran, but the session is still open (a dialog may have been answered no). The new window waits for it to exit, then resumes it there.')
+      })
+    },
   })
+}
+
+/**
+ * The places a restart tries, in turn: this tab's claude wrapper, when it runs this claude.exe; else this
+ * pane's slot, verified on the probe that judged ('auto' decides it in the script); else placement.json's
+ * `restart.prefer` (a tab in this tab's own window, by its stamp, or the placement's window), then 'auto',
+ * today's window. A hand-started tab has no stamp, and falls through.
+ */
+async function restartLegs($: EngineInterface, state: string, probe: Probe, launch: { readonly id: string; readonly cwd: string }, pane: { readonly token: string } | { readonly fallback: string } | undefined): Promise<readonly LaunchWhere[]> {
+  if (pane !== undefined && 'token' in pane) return [{ pane: { token: pane.token } }]
+  if (probe.slot !== null && probe.slot.sha256 === SLOT_SCRIPT_SHA256) return ['auto']
+  const placement = await placementOf($, state)
+  if (placement === null) return ['auto']
+  const stamp = await stampOf($)
+  const placed = pickLaunchTransport(probe, placement, { replacing: true, using: 'restart', configCount: 1, needsLeft: false, stamp, title: stamp.tab ?? resumeTitle(launch.id), folder: launch.cwd })
+  if ('wait' in placed) return ['auto']
+  return [...[placed.where, ...(placed.then ?? [])].filter(where => where === 'auto' || !('window' in where) || where.window !== true), 'auto']
 }
 
 /** Removes the claim lock the restart's launcher took, once the resumed session holds the conversation. */
@@ -668,6 +776,13 @@ export const register: Register = (on, options) => {
     // The first start's folder only: a reload starts the plugin again from wherever the session is now.
     const { value: first } = await $.state.get(folder)
     if (typeof first !== 'string' || first === '') await $.state.set(folder, e.cwd)
+    // The trampoline's command: registered whichever way GO_VIA says, so its hook answers a person's
+    // typing or a stale entry, and validate sees it as a hook that answers its own command.
+    try {
+      await $.command.register({ name: 'self-restart-go', description: "self-restart's own step when it runs a restart. Typing it does nothing." })
+    } catch (err) {
+      $.ui.log(`self-restart's step command wasn't registered (${why(err)}); a restart through the trampoline then says so and doesn't run.`)
+    }
     await $.tool.register({
       name: 'restart_after_turn',
       description: DESCRIPTION,
@@ -689,6 +804,9 @@ export const register: Register = (on, options) => {
     loadUpdateCheck($)
     return started
   })
+
+  // The trampoline's handler. It never reads `next`: it answers its own command, and is no gate.
+  on('command.run', { command: 'self-restart-go' }, ($, e) => goAnswer($, go, e.args)).catch(() => ({ text: "self-restart: the restart's step failed, so it did not run." }))
 
   // The process that resumed a session this plugin restarted: send that restart's first prompt.
   on('classic.SessionStart', async ($, e, next) => {
@@ -738,6 +856,7 @@ export const register: Register = (on, options) => {
   on('turn.complete', async ($, e, next) => {
     const done = await next(e)
     if (e.agentId !== undefined) return done
+    go.turnEnded()
     const { value } = await $.state.get(queued)
     if (!value) return done
     await $.state.set(queued, null)
@@ -756,6 +875,7 @@ export const register: Register = (on, options) => {
   // A message that starts a turn before the restart's exit has started takes the restart back.
   on('turn.start', async ($, e, next) => {
     const started = await next(e)
+    if (e.agentId === undefined) go.turnStarted()
     if (e.agentId !== undefined || armed === undefined) return started
     armed = undefined
     $.ui.status(undefined)
