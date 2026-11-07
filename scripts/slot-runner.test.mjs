@@ -77,6 +77,20 @@ function runnerProblems(text) {
   need((code.match(/Refuse-Record \$text/g) ?? []).length === 2 && has("if ($named) { Give-Back $id ('slot:' + $slotId) }") && has('if ($named) { Say-ByHand $id'), 'a refused record gives the claim back and says the line')
   need(has('{ Give-Back $run.Resume $held }') && has('{ Give-Back $run.Start $held }') && has('{ Say-ByHand $run.Resume $null $run.Dir }'), 'a changed launcher gives the claim back and says the line')
   need(has("if (Test-Shape $folder) { \" -Dir '\" + $folder + \"'\" }"), 'the line names its folder')
+  // The launcher refusing or throwing: a tab's claim back on either, a record's on a throw alone, before anything is said (D2).
+  const judgedRun = text.indexOf('$gaveBack = $null -ne $heldId -and ($null -ne $threw -or ($held -cmatch $LaunchClaim -and $code -ne 0))')
+  const gaveBack = text.indexOf('if ($gaveBack) { Give-Back $heldId $held }')
+  const errorSaid = text.indexOf("if ($null -ne $threw) { Write-Host ('claude-launch.ps1 stopped on an error")
+  const lineSaid = text.indexOf('if ($gaveBack) { Say-ByHand $heldId $(if ($run.ContainsKey(\'Start\')) { $run.Name } else { $null }) $run.Dir }')
+  need(judgedRun > text.indexOf('$code = $LASTEXITCODE') && text.indexOf('$code = $LASTEXITCODE') > text.indexOf('try { & $launcherPath @run }') && has('catch { $threw = $_.Exception.Message }'), "a launcher that refused or threw: a tab's claim back on either, a record's on a throw alone")
+  need(judgedRun > 0 && judgedRun < gaveBack && gaveBack < errorSaid, 'its claim back before the error is said')
+  need(errorSaid > 0 && errorSaid < lineSaid, 'whenever the claim goes back, the line to run it by hand')
+  const cleared = text.indexOf('$global:LASTEXITCODE = 0')
+  need(cleared > 0 && cleared < text.indexOf('try { & $launcherPath @run }'), 'the exit code this run left, not an earlier one')
+  // Never ending the runner before the refusal is said, and the delete tried again as releaseScript does (D4).
+  need(has('function Give-Back($id, $by) {\n  try {\n') && has('    Release-Claim\n  } catch { }\n}'), 'a give-back that fails never ends the runner')
+  need(has('  } catch { } finally { $stream.Dispose() }\n'), 'Release-Claim never throws')
+  need(has('      for ($try = 0; $try -lt 3; $try++) {\n') && has('        if ($try -gt 0) { Start-Sleep -Milliseconds 250 }\n') && has('        try { [IO.File]::Delete($claimPath); break } catch { }\n'), 'the delete tried three times, 250 ms apart')
   // The beacon says what this process runs (F4), read once as it starts.
   // After the wait: asked of the process, as one that has exited stays in the table while a handle is open on it.
   need(has("if (-not (Test-Gone $parts[0])) { $why = 'the old process is still running' }") && !code.includes('Get-Process -Id'), 'the old process asked whether it has exited')
@@ -161,6 +175,16 @@ for (const [name, from, to, expect] of [
   ['F7: a refusing tab keeping its claim', 'if ($id -cmatch $SessionId -and $Claim -cmatch $LaunchClaim) { Give-Back $id $Claim }', '', /gives its claim back/],
   ['F7: a refused record keeping its claim', "if ($named) { Give-Back $id ('slot:' + $slotId) }", '', /refused record gives the claim back/],
   ['F7: the line without its folder', "if (Test-Shape $folder) { \" -Dir '\" + $folder + \"'\" } else { '' }", "''", /the line names its folder/],
+  ["D2: a tab keeping its claim when the launcher refuses", '($held -cmatch $LaunchClaim -and $code -ne 0)', '$false', /a record's on a throw alone/],
+  ['D2: a throw keeping the claim', '$null -ne $threw -or ', '', /a record's on a throw alone/],
+  ["D2: a record's claim given back on a normal return", '$held -cmatch $LaunchClaim -and ', '', /a record's on a throw alone/],
+  ['D2: the error said before the claim is back', "  $code = $LASTEXITCODE\n", "  if ($null -ne $threw) { Write-Host ('claude-launch.ps1 stopped on an error, so Claude Code may not have started here: ' + $threw) }\n  $code = $LASTEXITCODE\n", /before the error is said/],
+  ['D2: no line to run it by hand when the launcher refuses', "  if ($gaveBack) { Say-ByHand $heldId $(if ($run.ContainsKey('Start')) { $run.Name } else { $null }) $run.Dir }\n", '', /the line to run it by hand/],
+  ['D2: an exit code an earlier run left', '$global:LASTEXITCODE = 0', '$null = 0', /not an earlier one/],
+  ['D4: a give-back that can end the runner', '    Release-Claim\n  } catch { }\n}', '    Release-Claim\n  } finally { }\n}', /never ends the runner/],
+  ['D4: Release-Claim that can throw', '  } catch { } finally { $stream.Dispose() }\n', '  } finally { $stream.Dispose() }\n', /never throws/],
+  ['D4: the delete tried once', '$try -lt 3', '$try -lt 1', /tried three times/],
+  ['D4: the delete tried at once, with no wait', '        if ($try -gt 0) { Start-Sleep -Milliseconds 250 }\n', '', /250 ms apart/],
   ['N5: the launcher told every folder', '$run.ConfigDir = @($dirs[1..($dirs.Count - 1)])', '$run.ConfigDir = $dirs', /does not read already/],
   ['a start record without its claim check', "if ($null -eq $why -and -not (Test-Claim $id ('slot:' + $slotId))) {", 'if ($false) {', /names this slot/],
   ['the record deleted after it is judged', '    [IO.File]::Delete($recordPath)\n', '', /deleted before anything/],

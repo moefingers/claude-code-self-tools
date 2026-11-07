@@ -56,7 +56,10 @@
 #   limits.maxSessions (default 12), from placement.json beside this script; before a `resume` record
 #   (a switch, which replaces a process), the cap only.
 # - A refusal is printed here, with the line to run by hand, and the claim it holds is given back, so the
-#   conversation doesn't read as held for 15 minutes on nothing.
+#   conversation doesn't read as held for 15 minutes on nothing. The launcher refusing (its exit 2), ending
+#   non-zero or throwing gives a tab's claim back too, and says that line. A record's only on a throw, saying
+#   it too: a session that ran in this pane and restarted holds that same claim, and its record, waiting
+#   here, needs it.
 # - With no record it waits: Enter starts a new Claude Code here, and a record that arrives meanwhile is
 #   honoured (it looks every 200 ms). Ctrl+C leaves the slot, at a PowerShell prompt.
 #
@@ -329,12 +332,20 @@ function Release-Claim {
     $reader.Dispose()
     $lock = $null
     try { $lock = $text | ConvertFrom-Json } catch { $lock = $null }
-    if ($null -ne $lock -and $lock.by -ceq $by) { try { [IO.File]::Delete($claimPath) } catch { } }
-  } finally { $stream.Dispose() }
+    if ($null -ne $lock -and $lock.by -ceq $by) {
+      for ($try = 0; $try -lt 3; $try++) {
+        if ($try -gt 0) { Start-Sleep -Milliseconds 250 }
+        try { [IO.File]::Delete($claimPath); break } catch { }
+      }
+    }
+  } catch { } finally { $stream.Dispose() }
 }
+# Never throws: what a caller says next is said whatever happens here, and a lock left behind goes stale.
 function Give-Back($id, $by) {
-  $claimPath = Join-Path $state ('claims\' + $id + '.lock')
-  Release-Claim
+  try {
+    $claimPath = Join-Path $state ('claims\' + $id + '.lock')
+    Release-Claim
+  } catch { }
 }
 
 # The line that runs a refused conversation by hand: in its own folder, or --resume looks in another project.
@@ -543,9 +554,19 @@ function Start-Claude($run) {
   }
   Write-Beacon 'running'
   $policy = [Environment]::GetEnvironmentVariable('PSExecutionPolicyPreference', [EnvironmentVariableTarget]::Process)
+  $global:LASTEXITCODE = 0 # this run's exit code below, not one an earlier run here left
+  $threw = $null
   try { & $launcherPath @run }
-  catch { Write-Host ('claude-launch.ps1 stopped on an error, so Claude Code may not have started here: ' + $_.Exception.Message) }
+  catch { $threw = $_.Exception.Message }
   finally { [Environment]::SetEnvironmentVariable('PSExecutionPolicyPreference', $policy, [EnvironmentVariableTarget]::Process) }
+  $code = $LASTEXITCODE
+  # Its claim back first: once this is said, the lock is free. A tab's is this launch's own, so it can be no one
+  # else's. A record's, slot:<id>, only on a throw: see the top of this file. Then the line to run it by hand.
+  $heldId = if ($run.ContainsKey('Resume')) { $run.Resume } elseif ($run.ContainsKey('Start')) { $run.Start } else { $null }
+  $gaveBack = $null -ne $heldId -and ($null -ne $threw -or ($held -cmatch $LaunchClaim -and $code -ne 0))
+  if ($gaveBack) { Give-Back $heldId $held }
+  if ($null -ne $threw) { Write-Host ('claude-launch.ps1 stopped on an error, so Claude Code may not have started here: ' + $threw) }
+  if ($gaveBack) { Say-ByHand $heldId $(if ($run.ContainsKey('Start')) { $run.Name } else { $null }) $run.Dir }
   Write-Beacon 'idle'
 }
 

@@ -486,13 +486,13 @@ export const REGISTRY_VERSION_MARKERS = ['v', 'schema', 'schemaVersion', 'format
 export const LAUNCH_LINE_TRUSTED_AFTER_MS = 60_000
 
 /** The SHA-256 of plugins/self-switch/slot/claude-slot.ps1, as it is committed. */
-export const SLOT_SCRIPT_SHA256 = '529c4a1aad907c2c00e9077afe77a1ebc90f0d3e8e8ab1e80f9f6dbf4c1be076'
+export const SLOT_SCRIPT_SHA256 = '21cd4444cc3c24844df43b02a3497bd48821543a756502a61cb698261c44a999'
 
 /**
  * The SHA-256 of plugins/self-switch/slot/claude-layout.ps1, as it is committed: a release pin, tested and
  * printed in the README for the person to compare. Nothing runs that script but the person, by hand.
  */
-export const LAYOUT_SCRIPT_SHA256 = '40e311729d3aeea177c77bb0aee07eb9ae3c6bd88ea3e3d2bca08a29d686bf6e'
+export const LAYOUT_SCRIPT_SHA256 = '8e02f0c59e8a5817eb581b8b6ff85c7551d3b1c4fa021849a17afa2e80ac2b39'
 
 /** Input idle for this long before any launch of another process (PM2): a null reading is not idle. */
 export const INPUT_IDLE_MS = 60_000
@@ -1160,9 +1160,11 @@ const HEAVY_STALE_SECS = 3600
  * names its waiter by an MSYS pid, which Windows can't look up: it counts while a heavy-slot shell runs at
  * all (the process table) and it is under an hour old, so a ticket a dead waiter left holds a launch only
  * while another job runs, which clears it. A slot counts as held while the Windows pid it names runs, or,
- * with none named, while it is under an hour old. Needs `$table`; throws when the folders can't be read.
+ * with none named, while it is under an hour old. Needs `$table`; throws when the folders can't be read, and
+ * when `$heavyRoot` is no folder (a typo, a drive not mounted yet): nothing found there is not nothing waiting.
  */
 const READ_HEAVY = [
+  'if (-not (Test-Path -LiteralPath $heavyRoot -PathType Container)) { throw ("no folder at " + $heavyRoot) }',
   '$heavyWaiters = 0',
   '$heavyBusy = 0',
   String.raw`$heavyShells = @($table.Values | Where-Object { "$($_.CommandLine)" -match "heavy-slot\.sh" }).Count`,
@@ -1948,6 +1950,7 @@ export function parseProbe(stdout: string): Probe | { error: string } {
         return { slot: h.slot as HeavySlot['slot'], winpid: h.winpid as number | null }
       })
     }
+    if (typeof top.heavyChecked === 'boolean' && top.heavyChecked !== (heavy !== null)) bad('the answer says whether heavy-slot was read, and its heavy slots say otherwise')
     if (top.freeKb !== null && !isCount(top.freeKb)) bad('free memory is not a number')
     const errors = list(top.errors, 'the errors').map(value => {
       const m = typeof value === 'string' ? /^(registry|transcripts|locks|heavy|memory|left):(\d?)$/.exec(value) : null
@@ -3057,7 +3060,9 @@ const FRESH_CHECK = [
 
 /**
  * Gives back the claim lock this run took: read through a handle that keeps every writer out, and
- * deleted while it is held, only when it still names `$by`. Needs `$claimPath` and `$by`.
+ * deleted while it is held, only when it still names `$by`. A reader that has it open without sharing
+ * delete makes the delete fail: tried twice more, 250 ms apart, as releaseScript does; then it is left, to
+ * go stale. It never throws, so what its caller says next is said. Needs `$claimPath` and `$by`.
  */
 export const RELEASE_CLAIM = [
   'function Release-Claim {',
@@ -3068,8 +3073,13 @@ export const RELEASE_CLAIM = [
   '    $reader.Dispose()',
   '    $lock = $null',
   '    try { $lock = $text | ConvertFrom-Json } catch { $lock = $null }',
-  '    if ($null -ne $lock -and $lock.by -ceq $by) { try { [IO.File]::Delete($claimPath) } catch { } }',
-  '  } finally { $stream.Dispose() }',
+  '    if ($null -ne $lock -and $lock.by -ceq $by) {',
+  '      for ($try = 0; $try -lt 3; $try++) {',
+  '        if ($try -gt 0) { Start-Sleep -Milliseconds 250 }',
+  '        try { [IO.File]::Delete($claimPath); break } catch { }',
+  '      }',
+  '    }',
+  '  } catch { } finally { $stream.Dispose() }',
   '}',
 ]
 
@@ -3435,6 +3445,8 @@ function windowScript(v: { id: string; kind: 'resume' | 'start'; name?: string; 
     `if ($code -ne 0 -or ((Get-Date) - $started).TotalSeconds -lt ${SHORT_RUN_SECONDS}) {`,
     '  Write-Host "Claude Code ended (exit code $code)."',
     `  Write-Host ("If the session did not ${resume ? 'resume' : 'start'} here, do it yourself: " + ${byHand})`,
+    // The launcher refused (its exit 2: nothing ran), or what ran has ended: this launch's own claim, so no one else's.
+    '  if ($code -ne 0) { Release-Claim }',
     '  Read-Host "Press Enter to close this window" | Out-Null',
     '}',
     'exit $code',
@@ -3912,8 +3924,8 @@ export function floorNeedKb(probe: Probe): number {
 /**
  * Whether a launch of another process may proceed, from a probe in slots mode: `ok`, or the first reason
  * it waits (PM5, \u00a75.6): `memory` (free under floorNeedKb, or unread), `heavy` (a heavy-slot waiter, both
- * slots busy, or heavy-slot's folders unread), `cap` (the sessions at `maxSessions`, or unread). A pure
- * function: only advisory, as the launch reads each again in its own run (checks.floor).
+ * slots busy, heavy-slot's folders unread, or read with no count), `cap` (the sessions at `maxSessions`, or
+ * unread). A pure function: only advisory, as the launch reads each again in its own run (checks.floor).
  */
 export function floorOk(probe: Probe, maxSessions: number): 'ok' | 'memory' | 'heavy' | 'cap' {
   if (!isCount(maxSessions, 40) || maxSessions < 1) throw new Error(`the cap is not a whole number from 1 to 40: ${JSON.stringify(maxSessions)}`)
@@ -3921,6 +3933,8 @@ export function floorOk(probe: Probe, maxSessions: number): 'ok' | 'memory' | 'h
   if (probe.errors.some(e => e.source === 'heavy')) return 'heavy'
   // A reading that doesn't say whether heavy-slot was looked at isn't a floor's: only a named none skips it.
   if (probe.heavyChecked === undefined) return 'heavy'
+  // Read, yet with no count: not a reading that says it's free. Only a named none has none.
+  if (probe.heavyChecked && (probe.heavyWaiters === null || probe.heavyBusy === null)) return 'heavy'
   if ((probe.heavyWaiters ?? 0) > 0 || (probe.heavyBusy ?? 0) >= 2) return 'heavy'
   if (probe.room === null || probe.room >= maxSessions) return 'cap'
   return 'ok'
@@ -3974,7 +3988,7 @@ export type PickOptions = {
   readonly title?: string
   /** The conversation's folder: one Windows Terminal would expand goes to no tab or named window. */
   readonly folder?: string
-  /** The workspace a launch belongs to: a window tagged with another is passed over. */
+  /** The workspace a launch belongs to: a window tagged with another is passed over. Required of a launch of another process; one that replaces its caller names none. */
   readonly workspace?: string
   /** The config folder the conversation needs (a resume), or the machine's default (a start). */
   readonly configDir?: string
@@ -3995,7 +4009,7 @@ function placedLegs(probe: Probe, placement: Placement | null, opts: PickOptions
   if (fault !== undefined) return { legs: [], why: `its folder ${fault}, so no tab or named window` }
   const legs: LaunchWhere[] = []
   const said: string[] = []
-  // Only for a caller that names a workspace: a move of this session's own, which names none, goes where it goes.
+  // A launch of another process always names one (pickLaunchTransport throws); a move of this session's own names none, and goes where it goes.
   const taggedElsewhere = (window: string): boolean => {
     const tag = placement.workspaces?.[window]
     return opts.workspace !== undefined && tag !== undefined && tag !== opts.workspace
@@ -4045,7 +4059,9 @@ function placedLegs(probe: Probe, placement: Placement | null, opts: PickOptions
  *
  * Two are required, never defaulted, so a caller can't leave out what weakens a tab's last look:
  * `configCount` (1 to 8), and `needsLeft`, whether the verdict rests on a left record. The launch itself
- * refuses a tab of pane file version 2 for either all the same. Throws on a count that isn't 1 to 8.
+ * refuses a tab of pane file version 2 for either all the same. Throws on a count that isn't 1 to 8. A launch
+ * of another process names `configDir`, `now` and `workspace` too, or it throws: with no workspace, idleSlots
+ * would pass over a tagged slot and the placed legs take a tagged tab or window instead.
  */
 export function pickLaunchTransport(probe: Probe, placement: Placement | null, opts: PickOptions): LaunchPick {
   if (!Number.isInteger(opts.configCount) || opts.configCount < 1 || opts.configCount > 8) throw new Error(`a launch reads 1 to 8 config folders, not ${JSON.stringify(opts.configCount)}`)
@@ -4064,6 +4080,7 @@ export function pickLaunchTransport(probe: Probe, placement: Placement | null, o
   }
   if (!inputIdle(probe)) return notIdle
   if (opts.configDir === undefined || opts.now === undefined) throw new Error('a launch of another process names the config folder it needs, and now')
+  if (opts.workspace === undefined) throw new Error('a launch of another process names its workspace: with none, the tags on tabs and windows would not hold it')
   const slots = idleSlots(probe, placement, { configDir: opts.configDir, now: opts.now, ...(opts.workspace === undefined ? {} : { workspace: opts.workspace }) })
   const first = slots[0]
   if (placement === null || placement.launch === undefined) return first !== undefined ? { where: { slot: first.id } } : { where: { window: true } }

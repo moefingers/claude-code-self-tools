@@ -46,6 +46,13 @@ function otherLauncher(dirs, version, mark) {
   writeFileSync(path, text)
   return { path, sha, ran: () => existsSync(join(dirs.state, mark)) }
 }
+/** A launcher at the name its own hash gives that does only `body`, an exit or a throw. Its hash. */
+function launcherDoing(dirs, version, body) {
+  const text = `# claude-launch version ${version}\nparam()\n${body}\n`
+  const sha = sha256Of(text)
+  writeFileSync(machine.launchScriptPath(dirs.state, sha), text)
+  return sha
+}
 /** The argument a launch's tab carries: this release's pin. */
 const PIN = ['-Launcher', machine.LAUNCH_SCRIPT_SHA256]
 /** And its own claim, as a launch names it on the line. */
@@ -400,13 +407,14 @@ describe('the slot runner, run for real against the stub', { skip: !isWindows &&
     const waits = ({ pid, created }) => ['-WaitFor', `${pid}-${created}`]
     const tabA = startRunner(dirs, ['-Resume', id, ...waits(old), ...tab(first)])
     const tabB = startRunner(dirs, ['-Resume', id, ...waits(old), ...tab(second)])
+    const both = what => `${what}\nA:\n${tabA.out()}\nB:\n${tabB.out()}`
     try {
-      await until(() => /Waiting for the old Claude Code/.test(tabA.out()) && /Waiting for the old Claude Code/.test(tabB.out()), `both wait\n${tabA.out()}\n${tabB.out()}`)
+      await until(() => /Waiting for the old Claude Code/.test(tabA.out()) && /Waiting for the old Claude Code/.test(tabB.out()), () => both('both wait'))
       old.stop()
-      await until(() => runsOf(dirs).length >= 1, () => `the resume\nA:\n${tabA.out()}\nB:\n${tabB.out()}`)
-      await until(() => /does not name this tab's launch/.test(tabA.out()), `the first turned away\n${tabA.out()}`)
-      assert.deepEqual(runsOf(dirs).map(run => run.args), [['--resume', id]], 'one copy writes it')
-      assert.equal(JSON.parse(readFileSync(machine.claimPath(dirs.state, id), 'utf8')).by, second, 'the one turned away leaves the lock that names the other')
+      await until(() => runsOf(dirs).length >= 1, () => both('the resume'))
+      await until(() => /does not name this tab's launch/.test(tabA.out()), () => both('the first turned away'))
+      assert.deepEqual(runsOf(dirs).map(run => run.args), [['--resume', id]], both('one copy writes it'))
+      assert.equal(JSON.parse(readFileSync(machine.claimPath(dirs.state, id), 'utf8')).by, second, both('the one turned away leaves the lock that names the other'))
     } finally {
       old.stop()
       tabA.stop()
@@ -481,6 +489,121 @@ describe('the slot runner, run for real against the stub', { skip: !isWindows &&
     } finally {
       runner.stop()
     }
+  })
+
+  test("D2: the launcher refusing, ending non-zero or throwing gives a tab's claim back, and a normal end doesn't; a record's goes back only on a throw, as a session that restarted in this pane holds that same claim", async () => {
+    const dirs = lab()
+    const throwing = launcherDoing(dirs, 1001, "throw 'claude.exe is locked by an update'")
+    const ending = launcherDoing(dirs, 1002, 'exit 0')
+    const refusing = launcherDoing(dirs, 1003, 'exit 2')
+    const prompts = runner => (runner.out().match(/Enter starts a new session here/g) ?? []).length
+    const held = id => existsSync(machine.claimPath(dirs.state, id))
+    const tabRun = async (pin, env = {}) => {
+      const id = randomUUID()
+      const by = `launch:${randomUUID()}`
+      claim(dirs, id, by)
+      const opened = startRunner(dirs, ['-Start', id, '-Name', 'dealerwrap', '-Claim', by, '-Launcher', pin], { env })
+      try {
+        await until(() => prompts(opened) >= 1, () => `it goes on as an idle slot\n${opened.out()}`)
+        return { held: held(id), said: opened.out() }
+      } finally {
+        opened.stop()
+      }
+    }
+    const line = /Once it is safe, start it yourself: & '.+claude-launch\.ps1' -Start [0-9a-f-]{36} -Name dealerwrap -Dir '.+work folder'/
+    const nonZero = await tabRun(machine.LAUNCH_SCRIPT_SHA256, { STUB_EXIT: '7' })
+    assert.equal(runsOf(dirs).length, 1, nonZero.said)
+    assert.equal(nonZero.held, false, `claude ending non-zero\n${nonZero.said}`)
+    assert.match(nonZero.said, line)
+    const normal = await tabRun(ending)
+    assert.equal(normal.held, true, `a normal end\n${normal.said}`)
+    assert.doesNotMatch(normal.said, line)
+    const thrown = await tabRun(throwing)
+    assert.equal(thrown.held, false, `a throw\n${thrown.said}`)
+    assert.match(thrown.said, /stopped on an error, so Claude Code may not have started here: claude\.exe is locked by an update/)
+    assert.match(thrown.said, line)
+    // The launcher's own refusal, its exit 2: claude.exe missing, as mid-update. The line is what's left to recover by.
+    rmSync(join(dirs.home, '.local', 'bin', 'claude.exe'), { maxRetries: 20, retryDelay: 250 })
+    const refused = await tabRun(machine.LAUNCH_SCRIPT_SHA256)
+    assert.match(refused.said, /no claude\.exe was found/)
+    assert.equal(refused.held, false, `its exit 2\n${refused.said}`)
+    assert.match(refused.said, line)
+    // A record: slot:<id> is what a restart's record in this pane holds, so only a throw gives it back.
+    const runner = startRunner(dirs, ['-Idle'])
+    try {
+      await until(() => runner.id() !== undefined && prompts(runner) >= 1, () => `the beacon\n${runner.out()}`)
+      const slot = runner.id()
+      const recordRun = async launcher => {
+        const id = randomUUID()
+        const before = prompts(runner)
+        claim(dirs, id, `slot:${slot}`)
+        record(dirs, slot, { v: 1, start: id, name: 'dealerwrap', folder: dirs.folder, at: Date.now(), launcher })
+        await until(() => prompts(runner) > before, () => `it goes on\n${runner.out()}`)
+        return held(id)
+      }
+      assert.equal(await recordRun(refusing), true, `its exit 2 leaves it\n${runner.out()}`)
+      assert.equal(await recordRun(ending), true, `a normal end leaves it\n${runner.out()}`)
+      assert.doesNotMatch(runner.out(), line, 'a claim it keeps says no line')
+      assert.equal(await recordRun(throwing), false, `a throw gives it back\n${runner.out()}`)
+      assert.match(runner.out(), /stopped on an error, so Claude Code may not have started here/)
+      assert.match(runner.out(), line)
+    } finally {
+      runner.stop()
+    }
+  })
+
+  test('D4: a give-back that fails never takes the refusal with it: the words and the line still come, and the runner goes on', async () => {
+    const dirs = lab()
+    const source = readFileSync(RUNNER, 'utf8')
+    const faulty = source.replace('function Release-Claim {\n', "function Release-Claim {\n  throw 'an I/O error, as a read can meet'\n")
+    assert.notEqual(faulty, source)
+    const edited = { ...dirs, script: join(dirs.root, 'edited', 'claude-slot.ps1') }
+    mkdirSync(join(dirs.root, 'edited'))
+    writeFileSync(edited.script, faulty)
+    const id = randomUUID()
+    const path = transcript(dirs, id)
+    const by = `launch:${randomUUID()}`
+    claim(dirs, id, by)
+    const refused = startRunner(edited, ['-Resume', id, '-LeftSize', '999', '-LeftMtime', String(Math.round(statSync(path).mtimeMs)), ...tab(by)])
+    try {
+      await until(() => /Enter starts a new session here/.test(refused.out()), () => `it goes on\n${refused.out()}`)
+      assert.match(refused.out(), /This tab did not run what it was opened for/)
+      assert.match(refused.out(), /Once it is safe, resume it yourself: & /)
+      assert.ok(existsSync(machine.claimPath(dirs.state, id)), 'the lock stays, to go stale')
+    } finally {
+      refused.stop()
+    }
+  })
+
+  test('D4: Release-Claim tries a delete again when a reader holds it up; held throughout, the lock stays, it never throws, and what follows runs. No timing: the reader lets go when a delete has failed', () => {
+    const dirs = lab()
+    const path = machine.claimPath(dirs.state, randomUUID())
+    const by = `launch:${randomUUID()}`
+    const run = (lines, { letsGo = false, named = by } = {}) => {
+      writeFileSync(path, lockText(named))
+      const script = [
+        "$ErrorActionPreference = 'Stop'",
+        `$claimPath = '${path}'`,
+        `$by = '${by}'`,
+        '$global:deletes = 0',
+        '$global:reader = [IO.File]::Open($claimPath, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)',
+        `function Delete-Lock { $global:deletes++; try { [IO.File]::Delete($claimPath) } catch { ${letsGo ? '$global:reader.Dispose(); ' : ''}throw } }`,
+        ...lines.map(line => line.replace('[IO.File]::Delete($claimPath)', 'Delete-Lock')),
+        'Release-Claim',
+        '[Console]::Out.WriteLine("went on " + $global:deletes)',
+      ].join('\r\n')
+      const ran = spawnSync(WINDOWS_POWERSHELL, ['-NoProfile', '-NonInteractive', '-EncodedCommand', machine.encodeCommand(script)], { env: envOf(dirs), encoding: 'utf8', windowsHide: true })
+      return { said: ran.stdout + ran.stderr, deletes: Number(/went on (\d+)/.exec(ran.stdout)?.[1]), there: existsSync(path) }
+    }
+    const again = run(machine.RELEASE_CLAIM, { letsGo: true })
+    assert.deepEqual([again.deletes, again.there], [2, false], again.said)
+    const held = run(machine.RELEASE_CLAIM)
+    assert.deepEqual([held.deletes, held.there], [3, true], held.said)
+    const other = run(machine.RELEASE_CLAIM, { named: `launch:${randomUUID()}` })
+    assert.deepEqual([other.deletes, other.there], [0, true], other.said)
+    // Planted: the delete tried once. The check above would see it.
+    const once = run(machine.RELEASE_CLAIM.map(line => line.replace('$try -lt 3', '$try -lt 1')), { letsGo: true })
+    assert.deepEqual([once.deletes, once.there], [1, true], once.said)
   })
 
   test('N5: eight other config folders named: the launcher is told those, adds its own, and runs', async () => {
@@ -864,6 +987,24 @@ describe("the probe's slots mode, and the launch's own run, against a running ru
     assert.equal(machine.parseLaunch(cap.stdout).refused?.code, 'cap', cap.stdout + cap.stderr)
     const typing = await underStub({ stub, work, env: envOf(dirs), script: () => noWindow(machine.launchScriptText(input({ maxSessions: 40 }))).replace('$needBytes = [math]::Max(', '$freeKb = [long]999999999; $needBytes = [math]::Max(').replace('$idleMs = [ClaudeSelfToolsInput]::IdleMs()', '$idleMs = 1000') })
     assert.equal(machine.parseLaunch(typing.stdout).refused?.code, 'input', typing.stdout + typing.stderr)
+    assert.ok(!existsSync(machine.claimPath(dirs.state, id)), 'nothing taken')
+  })
+
+  test('D3: a heavy-slot root that is no folder is not free: the probe says it could not read it, floorOk waits, and the launch refuses in its own run', async () => {
+    const dirs = lab()
+    const id = randomUUID()
+    const wrong = join(dirs.root, 'no such folder')
+    const ran = await underStub({ stub, work, env: envOf(dirs), script: () => machine.probeScript({ ids: [id], configDirs: [dirs.config], stateDir: dirs.state, heavySlotRoot: wrong, slots: true }) })
+    const probe = machine.parseProbe(ran.stdout)
+    assert.ok(!('error' in probe), `${probe.error}\n${ran.stdout}${ran.stderr}`)
+    assert.ok(probe.errors.some(e => e.source === 'heavy'), ran.stdout)
+    assert.equal(probe.heavyChecked, true)
+    assert.deepEqual([probe.heavyWaiters, probe.heavyBusy], [null, null])
+    assert.equal(machine.floorOk({ ...probe, freeKb: 999_999_999 }, 40), 'heavy')
+    const input = { powershell: WINDOWS_POWERSHELL, kind: 'start', id, name: 'dealerwrap', folder: dirs.folder, claim: `launch:${randomUUID()}`, configDirs: [dirs.config], stateDir: dirs.state, where: { window: true }, checks: { floor: true, input: true, fresh: true }, maxSessions: 40, heavySlotRoot: wrong, tool: 'coordinator' }
+    const refused = await underStub({ stub, work, env: envOf(dirs), script: () => noWindow(machine.launchScriptText(input)).replace('$needBytes = [math]::Max(', '$freeKb = [long]999999999; $needBytes = [math]::Max(') })
+    assert.equal(machine.parseLaunch(refused.stdout).refused?.code, 'heavy', refused.stdout + refused.stderr)
+    assert.match(refused.stdout, /the heavy-slot folders could not be read: no folder at /)
     assert.ok(!existsSync(machine.claimPath(dirs.state, id)), 'nothing taken')
   })
 

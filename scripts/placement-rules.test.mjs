@@ -42,7 +42,7 @@ const raw = (change = {}) => ({
   transcripts: [],
   locks: [],
   claim: null,
-  heavy: null,
+  heavy: [],
   freeKb: 32 * GIB_KB,
   errors: [],
   slots: [],
@@ -60,7 +60,7 @@ const probeOf = (m, change) => {
   return parsed
 }
 const idleRunner = (m, change = {}, beacon = {}) => ({ pid: 21, created: '134062345678901240', id: `21-134062345678901240`, sha256: m.SLOT_SCRIPT_SHA256, child: null, beacon: { state: 'idle', since: NOW - 60_000, configDir: CONFIG, sha256: m.SLOT_SCRIPT_SHA256, ...beacon }, ...change })
-const PICK = { replacing: false, configCount: 1, needsLeft: false, configDir: CONFIG, now: NOW }
+const PICK = { replacing: false, configCount: 1, needsLeft: false, configDir: CONFIG, now: NOW, workspace: 'default' }
 
 const placementOf = (m, change = {}) => {
   const read = m.readPlacement(JSON.stringify({ v: 1, layout: [{ window: 'claude-4', pos: [960, 540], size: [160, 42], tabs: ['s10'], folder: 'C:\\work' }], launch: { prefer: ['slot', 'tab', 'window'], tab: { window: 'claude-4', maxTabs: 1 }, window: { name: 'claude-overflow', pos: [1920, 0], size: [140, 60] } }, restart: { prefer: ['slot', 'tab', 'window'], tab: { window: 'same' } }, workspaces: { 'claude-4': 'default' }, ...change }))
@@ -184,13 +184,14 @@ const CHECKS = {
     assert.equal(m.floorOk(probeOf(m, { heavyBusy: 2 }), 12), 'heavy', 'both slots busy')
     assert.equal(m.floorOk(probeOf(m, { heavyBusy: 1 }), 12), 'ok', 'one slot busy')
     assert.equal(m.floorOk(probeOf(m, { errors: ['heavy:'] }), 12), 'heavy', "heavy-slot's folders unread")
-    assert.equal(m.floorOk(probeOf(m, { heavyWaiters: null, heavyBusy: null }), 12), 'ok', 'no heavy-slot on this machine')
+    // D3: read, yet no count, is no reading that it's free; only a named none has none.
+    for (const counts of [{ heavyWaiters: null, heavyBusy: null }, { heavyWaiters: null }, { heavyBusy: null }]) assert.equal(m.floorOk(probeOf(m, counts), 12), 'heavy', `read, with no count: ${JSON.stringify(counts)}`)
     assert.equal(m.floorOk(probeOf(m, { room: 12 }), 12), 'cap')
     assert.equal(m.floorOk(probeOf(m, { room: 11 }), 12), 'ok')
     assert.equal(m.floorOk(probeOf(m, { room: 6 }), 6), 'cap', 'the cap as placement names it')
     assert.throws(() => m.floorOk(probeOf(m)), /the cap/, 'never a default')
     assert.equal(m.floorOk(probeOf(m, { heavyChecked: undefined }), 12), 'heavy', 'a reading that does not say whether heavy-slot was looked at')
-    assert.equal(m.floorOk(probeOf(m, { heavyChecked: false, heavyWaiters: null, heavyBusy: null }), 12), 'ok', 'named none')
+    assert.equal(m.floorOk(probeOf(m, { heavyChecked: false, heavy: null, heavyWaiters: null, heavyBusy: null }), 12), 'ok', 'named none: no heavy-slot on this machine')
     // Required: left out, a floor would skip heavy-slot and fall to the default cap without a word (F8).
     assert.throws(() => m.launchScriptText(launchInput({ claim: `slot:${SLOT}`, where: { slot: SLOT }, waitForExit: undefined, checks: { ...FLOOR_CHECKS, live: true }, heavySlotRoot: undefined })), /heavySlotRoot, maxSessions/)
     assert.throws(() => m.launchScriptText(launchInput({ claim: `slot:${SLOT}`, where: { slot: SLOT }, waitForExit: undefined, checks: { ...FLOOR_CHECKS, live: true }, maxSessions: undefined })), /heavySlotRoot, maxSessions/)
@@ -208,6 +209,12 @@ const CHECKS = {
     assert.ok(s.includes('PrivatePageCount'))
     assert.ok(s.includes("if ($heavyWaiters -gt 0) { Refuse 'heavy'"), 'a heavy waiter refuses')
     assert.ok(s.includes("if ($heavyBusy -ge 2) { Refuse 'heavy'"), 'both slots busy refuse')
+    // D3: a root that is no folder throws before anything is read, in the launch's own run and the probe's; each turns it into a refusal or an error.
+    const noFolder = 'if (-not (Test-Path -LiteralPath $heavyRoot -PathType Container)) { throw ("no folder at " + $heavyRoot) }'
+    const probe = m.probeScript({ ids: [T], configDirs: [CONFIG], stateDir: STATE, slots: true, heavySlotRoot: 'O:\\heavy' })
+    for (const script of [s, probe]) assert.ok(script.includes(noFolder) && script.indexOf(noFolder) < script.indexOf('$heavyQueue = Join-Path $heavyRoot'), 'a wrong root is not read as free')
+    assert.ok(s.indexOf('} catch { Refuse \'heavy\' (') > s.indexOf(noFolder), "in the launch's try: a refusal")
+    assert.ok(probe.indexOf('[void]$errors.Add("heavy:") } } }') > probe.indexOf(noFolder), "in the probe's try: an error")
     assert.ok(s.includes("if ($room -ge 12) { Refuse 'cap'"), 'the cap')
     // The same run: floor, cap, input, slot, freshness, claim, record, each in this one script, in order.
     const order = ["Refuse 'memory'", "Refuse 'heavy'", "Refuse 'cap'", "Refuse 'input'", "$slotBeacon['state'] -cne 'idle'", "Refuse 'fresh'", '$taken = New-Claim', '[IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)\r\n']
@@ -331,9 +338,12 @@ const CHECKS = {
       assert.equal(probeOf(m, { slots: [idleRunner(m, { beacon })] }).slots[0].beacon, null, JSON.stringify(beacon))
     }
     // The rest is checked as ever: an answer that isn't of its shape is no answer.
-    for (const change of [{ slots: 'x' }, { slots: [{ pid: 'x' }] }, { slots: [idleRunner(m, { id: 'wrong' })] }, { slots: [idleRunner(m, { sha256: 'zz' })] }, { heavyWaiters: -1 }, { heavyBusy: 3 }, { room: 1.5 }, { inputIdleSec: 'x' }, { holders: [{ id: 'x', pid: 1, created: '1' }] }]) {
+    for (const change of [{ slots: 'x' }, { slots: [{ pid: 'x' }] }, { slots: [idleRunner(m, { id: 'wrong' })] }, { slots: [idleRunner(m, { sha256: 'zz' })] }, { heavyWaiters: -1 }, { heavyBusy: 3 }, { room: 1.5 }, { inputIdleSec: 'x' }, { holders: [{ id: 'x', pid: 1, created: '1' }] }, { heavyChecked: true, heavy: null }, { heavyChecked: false, heavy: [] }]) {
       assert.ok('error' in m.parseProbe(JSON.stringify(raw(change))), JSON.stringify(change))
     }
+    // D3: heavyChecked says what the heavy slots say.
+    assert.equal(probeOf(m, { heavyChecked: true, heavy: [] }).heavyChecked, true)
+    assert.equal(probeOf(m, { heavyChecked: false, heavy: null, heavyWaiters: null, heavyBusy: null }).heavyChecked, false)
     // An old probe: no slots mode, all of it null.
     const { slots, heavyWaiters, heavyBusy, room, inputIdleSec, holders, ...old } = raw()
     const parsed = m.parseProbe(JSON.stringify(old))
@@ -397,6 +407,11 @@ const CHECKS = {
     assert.ok(inner.includes(`"& '" + $handPath + "' -Resume " + $id + " -Dir '" + $folder + "'"`), 'N2')
     assert.ok(/Write-Host \$refusal\r\n.*\r\n {2}Release-Claim\r\n {2}Read-Host/.test(inner), 'N5: the refusal gives the claim back before it waits')
     assert.ok(inner.includes('function Release-Claim {'))
+    // D2: the launcher refusing or ending non-zero gives this launch's claim back, before the window waits; a normal end, even a short one, doesn't.
+    assert.ok(/Claude Code ended \(exit code \$code\)\."\r\n.*\r\n {2}if \(\$code -ne 0\) \{ Release-Claim \}\r\n {2}Read-Host/.test(inner), 'D2')
+    // D4: the delete tried again, and it never throws, so a window's words and its Enter are never lost to it.
+    assert.ok(inner.includes('      for ($try = 0; $try -lt 3; $try++) {\r\n        if ($try -gt 0) { Start-Sleep -Milliseconds 250 }\r\n        try { [IO.File]::Delete($claimPath); break } catch { }\r\n'), 'D4: tried three times')
+    assert.ok(inner.includes('  } catch { } finally { $stream.Dispose() }\r\n'), 'D4: never throws')
     const late = m.launchScriptText(launchInput({ deadline: NOW }))
     assert.ok(late.includes('if ($transport -eq "window" -and $null -ne $window) { try { $window.Kill() } catch { } }'), 'N6')
   },
@@ -574,11 +589,16 @@ const CHECKS = {
     // F3: a tab or a named window tagged for another workspace is passed over, saying so.
     const read = m.readPlacement(JSON.stringify({ v: 1, layout: [], launch: { prefer: ['tab', 'window'], tab: { window: 'claude-4', maxTabs: 2 }, window: { name: 'claude-overflow' } }, workspaces: { 'claude-4': 'default', 'claude-overflow': 'default' } }))
     if ('errors' in read) throw new Error(read.errors.join('; '))
-    const pick = workspace => m.pickLaunchTransport(probeOf(m, { slots: [] }), read.placement, { ...PICK, ...(workspace === undefined ? {} : { workspace }), title: 't', folder: 'C:\\work' })
+    const pick = workspace => m.pickLaunchTransport(probeOf(m, { slots: [] }), read.placement, { ...PICK, workspace, title: 't', folder: 'C:\\work' })
     assert.deepEqual(pick('default').where, { tab: { window: 'claude-4', title: 't' } }, 'its own')
     assert.equal(pick('w_abcdefghijkl').wait, 'slot', 'another workspace: neither')
     assert.match(pick('w_abcdefghijkl').why, /window claude-4 is tagged for another workspace; window claude-overflow is tagged for another workspace/)
-    assert.ok(pick(undefined).where !== undefined, 'a caller that names no workspace is not held to one')
+    // D1: a launch of another process names one, with or without a placement: with none, it would land in tagged tabs and windows.
+    assert.throws(() => pick(undefined), /names its workspace/)
+    assert.throws(() => m.pickLaunchTransport(probeOf(m, { slots: [] }), null, { ...PICK, workspace: undefined }), /names its workspace/)
+    // A launch that replaces its caller names none, and goes where it goes, tags or no.
+    const moved = m.pickLaunchTransport(probeOf(m, { slots: [] }), read.placement, { replacing: true, configCount: 1, needsLeft: false, title: 't', folder: 'C:\\work' })
+    assert.deepEqual(moved.where, { tab: { window: 'claude-4', title: 't' } }, 'a caller that names no workspace is not held to one')
   },
   wtByItsPath(m) {
     // N2: never a bare name, which would search the conversation's own folder too.
@@ -682,6 +702,15 @@ const FAULTS = [
   ['F8: a floor with its heavy-slot folder and cap left out', 'floorRules', 'if (checks.floor === true && (input.heavySlotRoot === undefined || input.maxSessions === undefined)) throw', 'if (false) throw'],
   ['F8: the slots mode with no word on heavy-slot', 'floorRules', 'if (input.slots === true && input.heavySlotRoot === undefined) throw', 'if (false) throw'],
   ['F8: floorOk reading no word as none', 'floorRules', "if (probe.heavyChecked === undefined) return 'heavy'", ''],
+  ['D1: a launch of another process naming no workspace', 'workspaceTabs', 'if (opts.workspace === undefined) throw new Error(', 'if (false) throw new Error('],
+  ['D2: a window whose launcher refused keeping the claim', 'windowRefusal', "    '  if ($code -ne 0) { Release-Claim }',\n", ''],
+  ['D2: a window giving the claim back on a normal end too', 'windowRefusal', "'  if ($code -ne 0) { Release-Claim }',", "'  Release-Claim',"],
+  ['D3: a heavy-slot root that is no folder read as free', 'floorScript', "  'if (-not (Test-Path -LiteralPath $heavyRoot -PathType Container)) { throw (\"no folder at \" + $heavyRoot) }',\n", ''],
+  ['D3: floorOk passing a reading with no counts', 'floorRules', "if (probe.heavyChecked && (probe.heavyWaiters === null || probe.heavyBusy === null)) return 'heavy'", ''],
+  ['D3: floorOk passing a reading with one count missing', 'floorRules', 'probe.heavyWaiters === null || probe.heavyBusy === null', 'probe.heavyWaiters === null && probe.heavyBusy === null'],
+  ['D3: heavyChecked taken against its heavy slots', 'parsing', "if (typeof top.heavyChecked === 'boolean' && top.heavyChecked !== (heavy !== null)) bad(", 'if (false) bad('],
+  ['D4: the delete tried once', 'windowRefusal', "'      for ($try = 0; $try -lt 3; $try++) {',", "'      for ($try = 0; $try -lt 1; $try++) {',"],
+  ['D4: Release-Claim that can throw', 'windowRefusal', "'  } catch { } finally { $stream.Dispose() }',", "'  } finally { $stream.Dispose() }',"],
   ['N2: wt by its bare name', 'wtByItsPath', '$window = Start-Process $wtExe -ArgumentList', '$window = Start-Process wt.exe -ArgumentList'],
   ["N12: a live holder's lock taken", 'relockHolder', "if ($held) { $answer = 'held' } else {", "if ($false) { $answer = 'held' } else {"],
   ['the left stat left off a tab', 'leftAtLastLook', "...(input.left === undefined ? {} : { left: input.left }) }\n  const tabOf", "}\n  const tabOf"],

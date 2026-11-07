@@ -258,8 +258,9 @@ describe('the checks, the claim and the place, in one run, in that order', () =>
     const wait = inner.indexOf('Wait-Process -Id 100 -Timeout 600 -ErrorAction SilentlyContinue')
     expect(wait).toBeGreaterThan(0)
     expect(inner.indexOf('if (-not (Test-Gone 100)) { $refusal = "The old process is still running')).toBeGreaterThan(wait)
-    for (const line of RECHECK) expect(inner.indexOf(`    ${line}`)).toBeGreaterThan(wait)
-    expect(inner.indexOf('$lock.by -cne $by')).toBeGreaterThan(inner.indexOf(`    ${RECHECK[RECHECK.length - 1]}`))
+    // Read from the wait on: RECHECK has lines as plain as a closing brace, which the functions above it hold too.
+    for (const line of RECHECK) expect(inner.indexOf(`    ${line}`, wait)).toBeGreaterThan(wait)
+    expect(inner.indexOf('$lock.by -cne $by')).toBeGreaterThan(inner.indexOf(`    ${RECHECK[RECHECK.length - 1]}`, wait))
     expect(inner.indexOf('& $launchPath')).toBeGreaterThan(inner.indexOf('$lock.by -cne $by'))
     // waitForExit skipped: no wait, no last look after it. A test that plants it must fail here.
     expect(innerOf(launchScriptText(noWait({ checks: ANOTHER })))).not.toContain('Wait-Process')
@@ -305,7 +306,7 @@ describe('the checks, the claim and the place, in one run, in that order', () =>
         if (at >= 0) expect(at).toBeGreaterThan(claim)
       }
       expect(script).toContain('function Refuse($code, $why) {\r\n  if ($taken) { Release-Claim }')
-      expect(script).toContain('if ($null -ne $lock -and $lock.by -ceq $by) { try { [IO.File]::Delete($claimPath) } catch { } }')
+      expect(script).toContain('if ($null -ne $lock -and $lock.by -ceq $by) {\r\n      for ($try = 0; $try -lt 3; $try++) {\r\n        if ($try -gt 0) { Start-Sleep -Milliseconds 250 }\r\n        try { [IO.File]::Delete($claimPath); break } catch { }\r\n')
       expect(script).toContain("} catch { Refuse 'place' ($tool + ': the launch could not be placed: ' + $_.Exception.Message) }")
     }
   })
