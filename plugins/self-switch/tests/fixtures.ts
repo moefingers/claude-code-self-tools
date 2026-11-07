@@ -39,12 +39,37 @@ export type RawProbe = {
   slotSeen?: true
   procs: RawProcess[]
   registry: RawRegistry[]
-  transcripts: { id: string; dir: number; project: string; mtime: number }[]
+  transcripts: { id: string; dir: number; project: string; mtime: number; size?: number }[]
   locks: Record<string, unknown>[]
   claim: Record<string, unknown> | null
   heavy: { slot: string; winpid: number | null }[] | null
   freeKb: number | null
   errors: string[]
+  /** The asked-about conversations' left records, when the probe was asked to read them. */
+  left?: Record<string, unknown>[]
+}
+
+/**
+ * T left cleanly by an exit a minute ago (\u00a73.4): a left record whose MAC matched, written by process 777
+ * (gone), its transcript last written 5 s after it, which alone would read live by L3. `change` alters
+ * the record, for one condition of the waiver failing.
+ */
+export function leftExit(probe: RawProbe, change: (record: Record<string, unknown>) => void = () => undefined): void {
+  probe.transcripts = probe.transcripts.map(t => (t.id === T ? { ...t, mtime: NOW - 55_000, size: 4096 } : t))
+  const record: Record<string, unknown> = {
+    asked: T,
+    ok: true,
+    id: T,
+    how: 'exit',
+    pid: 777,
+    created: ft(50),
+    at: NOW - 60_000,
+    transcript: { dir: 0, project: PROJECT, size: 4096, mtime: NOW - 55_000 },
+    by: 'self-switch',
+    macOk: true,
+  }
+  change(record)
+  probe.left = [record]
 }
 
 /**

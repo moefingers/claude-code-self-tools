@@ -17,6 +17,8 @@ import {
   readSelfcheck,
   selfcheckPath,
   selfcheckRecord,
+  stopCrons,
+  stopTasks,
 } from '../hooks/machine'
 
 const ID = '0f8fad5b-d9cb-469f-a165-70867728950e'
@@ -65,6 +67,37 @@ const MONITOR = { pid: 506, ppid: 100, created: ft(501), name: 'powershell.exe',
 describe('exitBlockers', () => {
   test('nothing stands: no cron, nothing under the session but the probe and an MCP server, no subagent running', () => {
     expect(exitBlockers({ crons: [], busy: probeOf(), agents: [{ id: 'a1', status: 'completed', description: 'Lint' }] })).toEqual([])
+  })
+
+  test('a subagent stands until it has ended: idle (a teammate the exit would end without a word), and a status this code does not know; completed, failed and killed do not (S1-8)', () => {
+    const found = exitBlockers({
+      crons: [],
+      busy: probeOf(),
+      agents: [
+        { id: 'a1', status: 'idle', description: 'A teammate' },
+        { id: 'a2', status: 'paused', description: 'A status from a later Claude Code' },
+        { id: 'a3', status: 'completed', description: 'Lint' },
+        { id: 'a4', status: 'failed', description: 'Build' },
+        { id: 'a5', status: 'killed', description: 'Watch' },
+      ],
+    })
+    expect(found.map(b => b.id)).toEqual(['a1', 'a2'])
+    // Neither reports on its own: each still holds, and says how to clear it (D-5).
+    expect(found[0]).toEqual({ kind: 'subagent', id: 'a1', what: "a subagent hasn't ended (A teammate; idle)", howToStop: 'stop it with TaskStop (a1), or exit by hand' })
+    expect(found[1]).toEqual({ kind: 'subagent', id: 'a2', what: "a subagent hasn't ended (A status from a later Claude Code; paused)", howToStop: 'stop it with TaskStop (a2), or exit by hand' })
+  })
+
+  test('one at its task, pending or waiting, is waited for: it reports on its own (D-5)', () => {
+    const found = exitBlockers({ crons: [], agents: [{ id: 'a1', status: 'pending', description: 'Lint' }, { id: 'a2', status: 'waiting', description: 'Build' }] })
+    expect(found.map(b => b.howToStop)).toEqual(['wait for it to report, or stop it with TaskStop (a1)', 'wait for it to report, or stop it with TaskStop (a2)'])
+  })
+
+  test('a durable cron is named apart: it survives the exit, and the hold says to delete it (D-4)', () => {
+    const found = exitBlockers({ crons: [{ ...CRON, durable: true }, { id: 'b2c4d6e8', cron: '0 9 * * 1-5', durable: false }], agents: [] })
+    expect(found).toEqual([
+      { kind: 'cron', id: '7f3a9c21', what: 'durable cron 7f3a9c21 (Every 5 minutes: «check the deploy») is set, and survives the exit', howToStop: 'delete it with CronDelete (id 7f3a9c21)' },
+      { kind: 'cron', id: 'b2c4d6e8', what: 'cron b2c4d6e8 (0 9 * * 1-5) is set to wake this session', howToStop: 'delete it with CronDelete (id b2c4d6e8)' },
+    ])
   })
 
   test('a cron, a background shell, a Monitor, a subagent and a wake-up are each listed with how to stop it', () => {
@@ -167,9 +200,43 @@ describe('exitBlockers', () => {
     expect(found.howToStop).toBe('delete it with CronDelete (id \u00abx y\\\u00bb\u00bb)')
   })
 
+  test("the Stop hook's background tasks (a lane restart's read): a Monitor told from a shell, each with how to stop it; a cron left out is a fault", () => {
+    const found = exitBlockers({
+      crons: stopCrons([{ id: 'c1', schedule: '*/5 * * * *', recurring: true, prompt: 'check the deploy' }]) ?? 'unread',
+      tasks: stopTasks([
+        { id: 't1', type: 'shell', status: 'running', description: 'npm run dev', command: 'npm run dev' },
+        { id: 't2', type: 'monitor', status: 'running', description: 'watch the build', server: 'ci', tool: 'watch' },
+        { id: 't3', type: 'shell', status: 'completed', description: 'done already' },
+        { id: 't4', type: 'subagent', status: 'running', description: 'the agents list says this one' },
+      ]) ?? 'unread',
+      agents: [{ id: 'a1', status: 'running', description: 'Run the e2e suite' }],
+      wake: { due: Date.UTC(2026, 10, 4, 12, 30, 0) },
+    })
+    expect(found.map(b => b.kind)).toEqual(['cron', 'shell', 'monitor', 'subagent', 'wake'])
+    expect(found[0]).toEqual({ kind: 'cron', id: 'c1', what: 'cron c1 (*/5 * * * *: \u00abcheck the deploy\u00bb) is set to wake this session', howToStop: 'delete it with CronDelete (id c1)' })
+    expect(found[1]).toEqual({ kind: 'shell', id: 't1', what: 'a background shell task t1 (\u00abnpm run dev\u00bb) is running', howToStop: 'stop task t1 with TaskStop, or let it finish' })
+    expect(found[2]).toEqual({ kind: 'monitor', id: 't2', what: 'a Monitor task t2 (\u00abwatch the build\u00bb) is running', howToStop: 'stop task t2 with TaskStop, or let it finish' })
+    expect(found[4]).toEqual({ kind: 'wake', what: 'a wake-up is pending (due 2026-11-04 12:30 UTC)', howToStop: "cancel it with cancel_wake: it doesn't outlive this process" })
+    // Unreadable tasks are a blocker of their own.
+    expect(exitBlockers({ crons: [], tasks: 'the Stop hook carried no background_tasks', agents: [] }).map(b => b.what)).toEqual(["can't tell what background tasks are in flight (the Stop hook carried no background_tasks)"])
+  })
+
+  test("the Stop hook's arrays read strictly: each entry an object with an id, or none of them", () => {
+    expect(stopTasks([])).toEqual([])
+    expect(stopCrons([])).toEqual([])
+    for (const bad of [undefined, null, 'x', {}, [{}], [{ id: '' }], [{ id: 3 }], [null]]) {
+      expect(stopTasks(bad)).toBeUndefined()
+      expect(stopCrons(bad)).toBeUndefined()
+    }
+    expect(stopCrons([{ id: 'c', schedule: '0 9 * * 1-5', recurring: false }])).toEqual([{ id: 'c', cron: '0 9 * * 1-5', recurring: false }])
+    expect(stopCrons([{ id: 'c', durable: true }])).toEqual([{ id: 'c', durable: true }])
+  })
+
   test("CronList's answer: its jobs, each with an id; any other shape is none of them", () => {
     expect(cronJobs({ jobs: [] })).toEqual([])
-    expect(cronJobs({ jobs: [{ ...CRON, nextFireAt: 1, durable: false }] })).toEqual([CRON])
+    // `durable` is kept (D-4): a durable cron survives the exit, and is named apart.
+    expect(cronJobs({ jobs: [{ ...CRON, nextFireAt: 1, durable: false }] })).toEqual([{ ...CRON, durable: false }])
+    expect(cronJobs({ jobs: [{ id: 'd1', durable: true }, { id: 'd2', durable: 'yes' }] })).toEqual([{ id: 'd1', durable: true }, { id: 'd2' }])
     for (const bad of [undefined, null, 'jobs', [], {}, { jobs: 'none' }, { jobs: [{}] }, { jobs: [{ id: '' }] }, { jobs: [{ id: 7 }] }, { jobs: [CRON, null] }]) {
       expect(cronJobs(bad)).toBeUndefined()
     }

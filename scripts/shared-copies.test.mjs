@@ -27,9 +27,9 @@ test('no plugin keeps a copy of a file that is not in shared/, or not meant for 
   assert.deepEqual(left, [], 'run `node scripts/sync-shared.mjs` to remove them, then commit')
 })
 
-test('the machine code goes to self-check, self-exit, self-restart and self-switch only', () => {
+test('the machine code goes to self-check, self-exit, self-restart, self-switch and self-wake only', () => {
   const machine = copies().filter(c => c.file === 'hooks/machine.ts')
-  assert.deepEqual(machine.map(c => c.plugin).sort(), ['self-check', 'self-exit', 'self-restart', 'self-switch'])
+  assert.deepEqual(machine.map(c => c.plugin).sort(), ['self-check', 'self-exit', 'self-restart', 'self-switch', 'self-wake'])
   // The update check, which names no plugins, still goes to every one.
   assert.deepEqual(copies().filter(c => c.file === 'hooks/update-check.ts').map(c => c.plugin), plugins())
 })
