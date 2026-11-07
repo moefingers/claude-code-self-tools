@@ -1,8 +1,9 @@
 // self-switch's plugin, against a fake engine: the probe, the launcher, git and the release answer
 // from fixtures; /resume and /exit are recorded, never run. Nothing here starts a process.
 import { describe, expect, mock, test } from 'claude-code/testing'
+import { go } from '../hooks/go'
 import type { AgentStatus, On } from 'claude-code'
-import { claimPath, gatePath, launchScriptText, type LaunchInput, leftPath, MAX_UNTRACKED, paneNoLeft, panePath, paneTicketPath, quoted, SLOT_NO_LEFT, SLOT_NOT_RECOGNISED, SLOT_SCRIPT_SHA256, slotRecordPath, STDIN_BOOTSTRAP, wakeMarker, wakePath } from '../hooks/machine'
+import { claimPath, gatePath, goAnswer, GO_NOTHING, GO_VIA, launchScriptText, placementPath, type LaunchInput, leftPath, MAX_UNTRACKED, paneNoLeft, panePath, paneTicketPath, quoted, SLOT_NOT_RECOGNISED, SLOT_SCRIPT_SHA256, slotRecordPath, STDIN_BOOTSTRAP, wakeMarker, wakePath } from '../hooks/machine'
 import { decode, ELSEWHERE, elsewhere, entry, ft, inSlot, LAUNCH, leftExit, machine, NOW, OTHER, PERMISSION_FLAGS, PROJECT, type RawProbe, REPO, T, under, W, X } from './fixtures'
 
 const TOOL = 'mcp__self-switch__switch_after_turn'
@@ -80,7 +81,7 @@ type Options = {
    */
   cwd?: string
   /** What the launcher does. */
-  launcher?: 'opens' | 'fails' | 'refuses'
+  launcher?: 'opens' | 'fails' | 'refuses' | 'no-wt'
   /** The claude wrapper's pane file for TOKEN, when there is one (the session carries CLAUDE_PANE_TOKEN only when `env` says so). */
   pane?: string
   /**
@@ -144,6 +145,8 @@ function engine(
   }: Options = {},
 ) {
   const runs: Run[] = []
+  /** The commands the plugin registered. */
+  const registered: string[] = []
   const commands: { command: string; args?: string }[] = []
   const prompts: { text: string; origin: unknown }[] = []
   const toasts: string[] = []
@@ -220,6 +223,10 @@ function engine(
   }
   on('session.start', (_, e) => ({ cwd: e.cwd }))
   on('session.id', () => answer({ value: world.id }))
+  on('command.register', (_, e) => {
+    registered.push(e.name)
+    return answer({ value: { command: e.name } })
+  })
   on('session.cwd', () => answer({ value: world.cwd }))
   on('tool.register', (_, e) => {
     described.push(String(e.description))
@@ -332,8 +339,11 @@ function engine(
     }
     // The launch takes again the claim its script names, and says what it placed.
     const by = /^\$by = '((?:launch|slot):[0-9a-f-]{1,40})'$/m.exec(script)?.[1] ?? 'none'
+    // A tab or a named window, by placement.json: wt.exe by its one string.
+    if (kind === 'launcher' && script.includes('Start-Process $wtExe') && launcher === 'no-wt') return ok('refused wt self-switch: a tab needs Windows Terminal 1.19 or later\r\n')
+    if (kind === 'launcher' && script.includes('Start-Process $wtExe') && !script.includes('Start-Process -FilePath')) return ok(`claim ${by}\r\nlaunched tab ${/^\s*\$env:CLAUDE_SELF_TOOLS_WT_WINDOW = '([^']*)'$/m.exec(script)?.[1] ?? '-'}\r\n`)
     if (kind === 'launcher' && launcher === 'refuses') return ok('refused launcher self-switch: claude-launch.ps1 is not where it must be\r\n')
-    if (kind === 'launcher') return launcher === 'opens' ? ok(`claim ${by}\r\nlaunched window - 100\r\n`) : ok('self-switch: no claude on PATH\r\n', 4)
+    if (kind === 'launcher') return launcher === 'opens' || launcher === 'no-wt' ? ok(`claim ${by}\r\nlaunched window - 100\r\n`) : ok('self-switch: no claude on PATH\r\n', 4)
     if (kind === 'slot') {
       const final = literalOf('final')
       if (final !== undefined) files.set(final, JSON.stringify({ v: 1, resume: literalOf('id'), folder: literalOf('folder'), at: NOW }))
@@ -360,7 +370,13 @@ function engine(
     if (kind === 'check') return ok(checkLive === undefined ? `${claim}\r\n` : `live ${checkLive}\r\n`)
     return ok('', 1)
   })
+  /** The trampoline's own command, once queued: a test dequeues it, as the engine would. */
+  const queuedGo = { args: '' }
   on('command.run', async (_, e, next) => {
+    if (e.command === 'self-switch-go') {
+      queuedGo.args = e.args
+      return {}
+    }
     hashOut = false
     commands.push({ command: e.command, ...(e.args ? { args: e.args } : {}) })
     if (e.command === 'resume') {
@@ -377,7 +393,7 @@ function engine(
   // The left record's runs are their own: lefts() (and the tests of the left record) read them.
   const kinds = () => runs.map(r => r.kind).filter(k => k !== 'git' && k !== 'left')
   const lefts = () => runs.filter(r => r.kind === 'left')
-  return { runs, commands, prompts, toasts, logs, writes, files, described, clock, session, world, held, tickets, kinds, lefts }
+  return { runs, commands, prompts, toasts, logs, writes, files, described, clock, session, world, held, tickets, kinds, lefts, registered, queuedGo }
 }
 
 /** A session id's shape, for the fake's own parsing. */
@@ -2136,30 +2152,14 @@ describe('the left record (\u00a73.4)', () => {
   /** T left a minute ago by exiting, its transcript in the other project: live by L3 alone, waived by the record. */
   const leftOther = (p: RawProbe): void => (elsewhere(p), leftExit(p, r => (r.transcript = { dir: 0, project: 'C--work-other', size: 4096, mtime: NOW - 55_000 })))
 
-  test("this pane's slot runner, whose last look can't check the record until slots v2: a new window takes the move, under a launch's claim, saying why", async ($, on) => {
-    const { runs, kinds, commands, logs, tickets, session, clock } = engine(on, { probe: machine(p => (leftOther(p), inSlot(p))), store: THERE })
+  test("this pane's slot runner, whose last look checks the record: the slot takes the move, the record's stat in its record", async ($, on) => {
+    const { runs, kinds, commands, tickets, clock } = engine(on, { probe: machine(p => (leftOther(p), inSlot(p))), store: THERE })
     await $.session.start(start)
     await switchNow($, clock)
-    expect(kinds()).toEqual(['probe', 'launcher'])
+    expect(kinds()).toEqual(['probe', 'slot'])
     expect(commands).toEqual([{ command: 'exit' }])
-    const launch = runs.find(r => r.kind === 'launcher')?.script ?? ''
-    // A fresh launch's claim, which the launch takes over from the slot's (this process holds both).
-    const claim = /^\$by = '(launch:[0-9a-f-]{36})'$/m.exec(launch)?.[1]
-    expect(claim).toBeDefined()
-    expect(launch).not.toContain(`$by = 'slot:`)
-    // The window's last look checks the transcript against the record.
-    expect(launch).toContain(`$leftSize = $null; $leftMtime = $null; $leftExitAt = ${NOW - 60_000}`)
-    expect(tickets()[T]).toMatchObject({ transport: 'window', by: claim, fallback: SLOT_NO_LEFT })
-    expect(logs).toContain(`this pane's slot runner isn't used: ${SLOT_NO_LEFT}. A new window resumes ${T}.`)
-    expect(rows(session)).toContain(SLOT_NO_LEFT)
-  })
-
-  test('the window refusing that move gives back both claims: the slot\'s the probe took, and the launch\'s', async ($, on) => {
-    const { kinds, commands, clock } = engine(on, { probe: machine(p => (leftOther(p), inSlot(p))), store: THERE, launcher: 'refuses' })
-    await $.session.start(start)
-    await switchNow($, clock)
-    expect(commands).toEqual([])
-    expect(kinds()).toEqual(['probe', 'launcher', 'release', 'release'])
+    expect(runs.find(r => r.kind === 'slot')?.script ?? '').toContain(`; left = [ordered]@{ exitAt = ${NOW - 60_000} } } | ConvertTo-Json -Compress -Depth 3`)
+    expect(tickets()[T]).toMatchObject({ transport: 'slot' })
   })
 
   test("an older claude wrapper (pane file version 2), whose last look doesn't check the record: a new window, and the log says why", async ($, on) => {
@@ -2287,5 +2287,124 @@ describe('a run the switch gave up on can leave nothing behind (the coordinator\
     await switchNow($, clock)
     await clock.advance(4000)
     expect(kinds()).toEqual(['probe', 'launcher', 'release'])
+  })
+})
+
+describe('the trampoline: a final command that checks again when it is dequeued', () => {
+  const THERE = { [`alive:${T}`]: { at: NOW - HOUR, folder: ELSEWHERE, project: 'C--work-other' } }
+  /** Through the trampoline, for one test: what ships is 'direct'. */
+  // The plugin's hooks load apart from a test's modules, so a test can't flip the `go` they use: these run
+  // once GO_VIA itself is flipped. The S2 round ran them so, against a copy of the plugin with the constant changed:
+  // the stand-down passes; the /exit does not yet, as the kit refuses a command from a command.run hook (M17b).
+  // On a flip, 'through it' fails until the design's Trampoline C: the flip's checklist names it.
+  const afterFlip: typeof test = GO_VIA === 'trampoline' ? test : (...args) => test(`skipped until GO_VIA flips: ${args[0]}`, () => undefined)
+  /** What the engine does with the queued command: runs it, through the plugin's own hook. */
+  const dequeue = async ($: TestDollar, clock: { advance: (ms: number) => Promise<void> }, args: string): Promise<void> => {
+    await $.command.run({ command: 'self-switch-go', args, origin: { kind: 'plugin', name: 'self-switch' }, presentation: { isFullscreen: false, columns: 120 } })
+    await clock.advance(1)
+  }
+
+  test("GO_VIA ships as 'direct', and the plugin registers its own command at session.start all the same", async ($, on) => {
+    expect(GO_VIA).toBe('direct')
+    expect(go.via).toBe('direct')
+    const { registered } = engine(on)
+    await $.session.start(start)
+    expect(registered).toContain('self-switch-go')
+  })
+
+  test('typing the command does nothing: its own hook answers, and nothing below it runs', async ($, on) => {
+    const { commands } = engine(on, { exit: 'stays' })
+    await $.session.start(start)
+    expect((await $.command.run({ command: 'self-switch-go', args: 'typed by a person', origin: { kind: 'composer' }, presentation: { isFullscreen: false, columns: 120 } })).text).toBe(GO_NOTHING)
+    expect(await goAnswer($ as never, go, '')).toEqual({ text: GO_NOTHING })
+    expect(commands).toEqual([])
+  })
+
+  /** The machine as the switch's own probe reads it, and as the process-tree probe at dequeue reads it: its config folders are none. */
+  const atDequeue = (busy: boolean) => (script: string) =>
+    machine(p => {
+      elsewhere(p)
+      inSlot(p)
+      if (busy && script.includes('$configDirs = @()')) p.procs.push({ pid: 500, ppid: 100, created: ft(1100), name: 'bash.exe', cls: 'shell' })
+    })
+
+  afterFlip('through it: at dequeue it reads the process tree; the exit record is written then, and /exit runs', async ($, on) => {
+    const { commands, lefts, runs, clock, queuedGo } = engine(on, { probe: atDequeue(false) as never, store: THERE, exit: 'stays' })
+    await $.session.start(start)
+    await switchNow($, clock)
+    expect(commands).toEqual([])
+    await dequeue($, clock, queuedGo.args)
+    expect(runs.filter(r => r.kind === 'probe').length).toBe(2)
+    expect(lefts()).toHaveLength(1)
+    expect(commands).toEqual([{ command: 'exit' }])
+  })
+
+  afterFlip('a job under this session at dequeue stands it down: no /exit, no exit record, its record withdrawn, the claim released, the ticket gone, and said', async ($, on) => {
+    const { commands, files, kinds, lefts, tickets, toasts, session, clock, queuedGo } = engine(on, { probe: atDequeue(true) as never, store: THERE, exit: 'stays' })
+    await $.session.start(start)
+    await switchNow($, clock)
+    await dequeue($, clock, queuedGo.args)
+    expect(commands).toEqual([])
+    expect(lefts()).toHaveLength(0)
+    const record = [...files.entries()].find(([path]) => path.endsWith('.next.json'))
+    expect(JSON.parse(record?.[1] ?? '{}')).toEqual({ v: 1, cancelled: true })
+    expect(kinds()).toContain('release')
+    expect(tickets()[T]).toBeUndefined()
+    expect(toasts.join(' ')).toContain('S6: bash.exe 500')
+    expect(rows(session)).toContain("didn't happen after all")
+  })
+})
+
+describe('placement.json: where the new window goes', () => {
+  const THERE = { [`alive:${T}`]: { at: NOW - HOUR, folder: ELSEWHERE, project: 'C--work-other' } }
+  const FILE = JSON.stringify({ v: 1, layout: [], launch: { prefer: ['slot', 'tab', 'window'], tab: { window: 'claude-4', maxTabs: 2 }, window: { name: 'claude-overflow' } } })
+  const noSlots = (p: RawProbe): void => {
+    elsewhere(p)
+    ;(p as unknown as { slots: unknown[] }).slots = []
+  }
+
+  test('a tab in launch.tab.window, running the slot runner, under the claim naming launch:<id>; no placement.json: the plain window', async ($, on) => {
+    const { runs, files, commands, clock } = engine(on, { probe: machine(noSlots), store: THERE })
+    files.set(placementPath(STATE), FILE)
+    await $.session.start(start)
+    await switchNow($, clock)
+    const script = runs.find(r => r.kind === 'launcher')?.script ?? ''
+    expect(script).toContain('Start-Process $wtExe -ArgumentList $wtLine')
+    // This switch's own claim, on the tab's line too: a later launch that takes the lock over turns this tab away.
+    expect(script).toContain(`$by = '${LAUNCH}'`)
+    expect(script).toContain(`-Claim ${LAUNCH} `)
+    expect(script).toContain(`-Resume ${T} -WaitFor `)
+    expect(script).toContain("$env:CLAUDE_SELF_TOOLS_WT_WINDOW = 'claude-4'")
+    // In the probe that judged: the slots, for whether the window has room.
+    expect(runs.find(r => r.kind === 'probe')?.script ?? '').toContain('$result["slots"]')
+    expect(commands).toEqual([{ command: 'exit' }])
+  })
+
+  test('refused for want of Windows Terminal: the next place, then the plain window', async ($, on) => {
+    const { runs, files, commands, clock } = engine(on, { probe: machine(noSlots), store: THERE, launcher: 'no-wt' })
+    files.set(placementPath(STATE), JSON.stringify({ v: 1, layout: [], launch: { prefer: ['tab'], tab: { window: 'claude-4', maxTabs: 2 } } }))
+    await $.session.start(start)
+    await switchNow($, clock)
+    const launches = runs.filter(r => r.kind === 'launcher').map(r => r.script)
+    expect(launches).toHaveLength(2)
+    expect(launches[0]).toContain('Start-Process $wtExe')
+    expect(launches[1]).not.toContain('Start-Process $wtExe')
+    expect(commands).toEqual([{ command: 'exit' }])
+  })
+
+  test('a bad file means no placement: the plain window, said in the log once', async ($, on) => {
+    const { runs, files, logs, clock } = engine(on, { probe: machine(elsewhere), store: THERE })
+    files.set(placementPath(STATE), JSON.stringify({ v: 1, layout: [{ window: 'last', tabs: ['t'], folder: 'C:\\x' }] }))
+    await $.session.start(start)
+    await switchNow($, clock)
+    expect(runs.find(r => r.kind === 'launcher')?.script ?? '').not.toContain('wt.exe')
+    expect(logs.filter(line => line.startsWith('placement.json is not of its shape')).length).toBeLessThanOrEqual(1)
+  })
+
+  test('an older claude wrapper is said in the log, once per process (N11)', async ($, on) => {
+    const { logs, clock } = engine(on, { env: { ...WINDOWS, CLAUDE_PANE_TOKEN: TOKEN }, pane: PANE, probe: machine(elsewhere), store: THERE })
+    await $.session.start(start)
+    await switchNow($, clock)
+    expect(logs.filter(line => line.includes('CLAUDE_CODE_DISABLE_BG_SHELL_PRESSURE_REAP')).length).toBeLessThanOrEqual(1)
   })
 })

@@ -51,7 +51,7 @@ What the plugin adds, in each session:
    - **A turn still running at the change**: the plugin waits for it. If that turn then ends on such an error, it gets resumed.
    - **A session at a finished break gets nothing.** A rewind past the cut-off turn isn't seen: the plugin API gives no cheap mark of the newest message, and listing the conversation copies up to 4096 messages in every session at once. The 6-hour limit bounds it.
    - **The loop-breaker.** If the turn the resume started ends on an error at once (no usage, or in under 30 seconds), that conversation isn't resumed again until you type a prompt, at the terminal or from the app. A prompt you type while that turn runs counts too. A resumed turn that did real work before it hit the limit stays resumable.
-4. **It shows one toast per change**, saying what happened. For example: *Login changed; Remote Control reconnected as "auth-refactor"; resumed the interrupted turn.*
+4. **It shows one toast per change**, saying what happened. For example: *Login changed; Remote Control reconnected as "auth-refactor"; resumed: the turn ended on rate_limit 12 s ago.* The resume names the error kind its turn ended on and how long ago, in the toast and in a debug line, so a resume can be checked after the fact.
 
 Nothing runs while a turn is running. To turn either part off, use the plugin's settings in `/config`, both on by default:
 

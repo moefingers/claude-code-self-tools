@@ -41,6 +41,16 @@ async function until(path, ms) {
   }
 }
 
+/** A launch script with Start-Process replaced by a throw: a fault in a test can never open a window. It throws itself when one is left that isn't so guarded (D3): a renamed anchor can't silently take the guard away. */
+export function noWindow(script) {
+  const at = '$window = Start-Process'
+  const guarded = script.includes(at) ? script.split(at).join(`throw 'a test never opens a window'; ${at}`) : script
+  const starts = (guarded.match(/Start-Process/g) ?? []).length
+  const held = (guarded.match(/throw 'a test never opens a window'; \$window = Start-Process/g) ?? []).length
+  if (starts !== held) throw new Error('every Start-Process in a script a test runs is guarded')
+  return guarded
+}
+
 /**
  * Starts the stub (as a session's claude.exe) with `args`, and keeps it running `ms`: a holder of a
  * conversation, for a last look to find. Its pid and creation time (a FILETIME string), and `stop`.

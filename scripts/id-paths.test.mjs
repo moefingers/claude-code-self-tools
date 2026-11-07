@@ -91,7 +91,7 @@ test('no call site joins an id folder with a value of its own: every such path g
 
 test('each path helper of the machine code delegates to idPath', () => {
   const text = readFileSync(join(ROOT, 'shared', 'hooks', 'machine.ts'), 'utf8')
-  const helpers = { claimPath: 'claim', slotRecordPath: 'slotRecord', gatePath: 'gate', panePath: 'pane', paneTicketPath: 'paneTicket', leftPath: 'left', pokePath: 'poke', wakePath: 'wake', pendingPath: 'pending', selfcheckPath: 'selfcheck' }
+  const helpers = { claimPath: 'claim', slotRecordPath: 'slotRecord', slotBeaconPath: 'slotBeacon', gatePath: 'gate', panePath: 'pane', paneTicketPath: 'paneTicket', leftPath: 'left', pokePath: 'poke', wakePath: 'wake', pendingPath: 'pending', selfcheckPath: 'selfcheck' }
   for (const [name, file] of Object.entries(helpers)) {
     const line = text.split(/\r?\n/).find(l => l.startsWith(`export const ${name} = `))
     assert.ok(line !== undefined, `${name} is defined`)

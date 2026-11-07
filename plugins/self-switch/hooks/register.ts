@@ -37,6 +37,13 @@
 //   why.
 // The slot's record, the tab's ticket and the window are each placed by one run of the shared launcher
 // (launch, machine.ts), which checks this is the claude.exe the probe judged and takes the claim again.
+// The window follows placement.json's `launch.prefer` when the file reads (readPlacement): a tab in its
+// named window, or its named window, each running the slot runner, which waits for this process to exit;
+// else, or where Windows Terminal or the slot runner isn't up to it, the plain window. A bad file means
+// no placement, said in the log.
+// The final command (/resume or /exit) goes through the trampoline when GO_VIA says so (it ships as
+// 'direct'): a command of this plugin's own, self-switch-go, whose hook never reads `next` and checks
+// again when the engine dequeues it; a turn that came first stands the switch down.
 // S10w: a wake-up armed with self-wake for this conversation holds the switch, read from self-wake's
 // marker (readWake) at the call, at the run, and once more right before the final command (a wake-up
 // set in the same turn is marked as that turn ends, which nothing orders before the first read);
@@ -56,8 +63,8 @@
 // doesn't run, or runs and leaves the session open (at the next turn's end, while the record is still
 // that exit's); never for a typed `/exit`, a crash or a kill. Its probe reads the
 // target's record, which may waive L3 and L5 (a return trip soon after a switch), and the last look
-// in place, in the window or in a tab of pane file version 3 checks the transcript against it; this
-// pane's slot runner doesn't until slots v2, nor does an older wrapper, so a move that rests on a record
+// in place, in a slot (a verified runner is version 2), in a tab, in the window or in a tab of pane file
+// version 3 checks the transcript against it; an older wrapper doesn't, so a move that rests on a record
 // goes to a new window instead, saying why.
 // No transport passes a permission flag: the resumed conversation starts in the mode a new session would.
 //
@@ -84,7 +91,8 @@
 // names, never by `$.session.id()`.
 import type { EngineInterface, Register, Timer } from 'claude-code'
 import type { Heartbeat, Queued, Ticket } from '../types'
-import type { AgentLike, LaunchInput, LeftStat, Pane, Probe, ProcessRef, Transport } from './machine'
+import { go } from './go'
+import type { AgentLike, LaunchInput, LaunchWhere, LeftStat, Pane, Placement, Probe, ProcessRef, Transport } from './machine'
 import {
   agentsHeld,
   agentsWayOut,
@@ -93,6 +101,10 @@ import {
   isBusyAgent,
   LAUNCH_RUN_MS,
   leftPath,
+  loadPlacement,
+  pickLaunchTransport,
+  resumeTitle,
+  runProbe,
   readCrons,
   paneFallback,
   paneNoLeft,
@@ -109,6 +121,8 @@ import {
   movesConversation,
   claimCheckScript,
   gatePath,
+  goAnswer,
+  goRun,
   isSafeFolder,
   launch as buildLaunch,
   LAUNCH_DEADLINE_MS,
@@ -135,7 +149,6 @@ import {
   releaseScript,
   SESSION_ID,
   safePoint,
-  SLOT_NO_LEFT,
   slotRecordPath,
   stateFolder,
   SYSTEM_ROOT,
@@ -245,6 +258,10 @@ let currentAt: number | undefined
  * open (a dialog answered no): taken back at the next main-loop turn's end, if still that exit's.
  */
 let exitLeft: { readonly state: string; readonly id: string; readonly leaving: ProcessRef } | undefined
+/** Whether the log has said this tab's claude wrapper is an older one: once per process. */
+let toldOldWrapper = false
+/** Whether the log has said what is wrong with placement.json: once per process. */
+let toldPlacement = false
 /** The registry keys not in REGISTRY_KEYS already logged by this process: each is logged once. */
 const seenKeys = new Set<string>()
 /** When old heartbeats were last looked for. */
@@ -310,7 +327,21 @@ async function tabOf($: EngineInterface, state: string): Promise<{ readonly toke
   const token = await env(() => $.env.get('CLAUDE_PANE_TOKEN'))
   if (token === undefined || token === '') return undefined
   const pane = await readPane($, state, token)
+  if (!('why' in pane) && pane.v < 3 && !toldOldWrapper) {
+    toldOldWrapper = true
+    $.ui.log("this tab's claude wrapper is an older one (its pane file is version 2): a session it resumes gets no CLAUDE_CODE_DISABLE_BG_SHELL_PRESSURE_REAP, and its last look reads less. Copy the current claude-wrapper.ps1 into place.")
+  }
   return 'why' in pane ? pane : { token, pane }
+}
+
+/** placement.json, or null: a bad file means no placement, said in the log once. */
+async function placementOf($: EngineInterface, state: string): Promise<Placement | null> {
+  const read = await loadPlacement($, state)
+  if (read.errors !== undefined && !toldPlacement) {
+    toldPlacement = true
+    $.ui.log(`placement.json is not of its shape, so it isn't used: ${oneLine(read.errors.join('; '), 400)}`)
+  }
+  return read.placement
 }
 
 /** The session's id, or undefined when it can't be read. */
@@ -425,6 +456,8 @@ type Context = {
   readonly folder: string
   readonly configDirs: readonly string[]
   readonly heavySlotRoot?: string
+  /** placement.json, when there is one that reads: where the new window goes. */
+  readonly placement: Placement | null
 }
 
 /** Windows PowerShell and the plugins' state folder, or why they can't be found. */
@@ -456,7 +489,7 @@ async function context($: EngineInterface): Promise<Context | { refusal: string 
   if ('refusal' in dirs) return dirs
   const heavy = settings.heavySlotRoot
   if (heavy !== '' && heavy !== undefined && !isSafeFolder(heavy)) return { refusal: `the heavySlotRoot setting reads ${JSON.stringify(heavy)}, not an absolute folder without quotes` }
-  return { ...found, own, cwd, folder, configDirs: dirs.configDirs, ...(isSafeFolder(heavy) ? { heavySlotRoot: heavy.replace(/\\+$/, '') } : {}) }
+  return { ...found, own, cwd, folder, configDirs: dirs.configDirs, placement: await placementOf($, found.state), ...(isSafeFolder(heavy) ? { heavySlotRoot: heavy.replace(/\\+$/, '') } : {}) }
 }
 
 /** The config folders the checks read: this session's own (CLAUDE_CONFIG_DIR, or %USERPROFILE%\.claude) first, then the configDirs setting's. */
@@ -769,7 +802,8 @@ function logNewKeys($: EngineInterface, found: Probe): void {
 /** The probe, with the claim on `to` taken in the same run; or why it gave no answer. */
 async function probe($: EngineInterface, ctx: Context, to: string): Promise<Probe | { failure: string }> {
   try {
-    const script = probeScript({ ids: [ctx.own, to], take: to, configDirs: ctx.configDirs, stateDir: ctx.state, left: true, ...(ctx.heavySlotRoot === undefined ? {} : { heavySlotRoot: ctx.heavySlotRoot }) })
+    // With a placement, the slots too: whether an overflow window has room for a tab.
+    const script = probeScript({ ids: [ctx.own, to], take: to, configDirs: ctx.configDirs, stateDir: ctx.state, left: true, ...(ctx.heavySlotRoot === undefined ? {} : { heavySlotRoot: ctx.heavySlotRoot }), ...(ctx.placement === null ? {} : { slots: true, heavySlotRoot: ctx.heavySlotRoot ?? null }) })
     const call = powershellCall(ctx.powershell, script)
     const run = await $.process.run(call.argv, { stdin: call.stdin, cwd: ctx.folder, timeoutMs: PROBE_MS })
     if (run.exitCode !== 0) return { failure: `it exited ${run.exitCode}${brief(run.stderr) === '' ? '' : `: ${brief(run.stderr)}`}` }
@@ -783,23 +817,28 @@ async function probe($: EngineInterface, ctx: Context, to: string): Promise<Prob
 /**
  * One run of the shared launcher (launch, machine.ts): it checks this is the claude.exe the probe
  * judged, takes the claim the probe took again for this launch, and places it (this pane's slot's
- * record, this tab's ticket, or a new window). Why it wasn't placed, and whether the run ended without a
- * clean answer (an exit code, no answer, a timeout: it may have placed something); undefined when it was.
+ * record, this tab's ticket, a tab or a named window, or a new window). Why it wasn't placed, the refusal's
+ * code, and whether the run ended without a clean answer (an exit code, no answer, a timeout: it may have
+ * placed something); or, when it was, `placed` and a fallback when it opened a plain window for a named one.
  */
-async function placeLaunch($: EngineInterface, input: LaunchInput, cwd: string): Promise<{ readonly said: string; readonly unclean: boolean } | undefined> {
+async function placeLaunch(
+  $: EngineInterface,
+  input: LaunchInput,
+  cwd: string,
+): Promise<{ readonly said: string; readonly unclean: boolean; readonly code?: string } | { readonly placed: 'pane' | 'slot' | 'window' | 'tab'; readonly label: string; readonly fallback?: string }> {
   // An input the launcher refuses to build (a folder with a semicolon, say) runs nothing: a clean refusal.
   let call: { readonly argv: readonly string[]; readonly stdin: string }
   try {
     call = buildLaunch(input)
   } catch (err) {
-    return { said: `the launch can't be made: ${why(err)}`, unclean: false }
+    return { said: `the launch can't be made: ${why(err)}`, unclean: false, code: 'build' }
   }
   try {
     const run = await $.process.run(call.argv, { stdin: call.stdin, cwd, timeoutMs: LAUNCH_RUN_MS })
     const answer = parseLaunch(run.stdout)
-    if (run.exitCode === 0 && 'launched' in answer) return undefined
+    if (run.exitCode === 0 && 'launched' in answer) return { placed: answer.launched.transport, label: answer.launched.label, ...(answer.fallback === undefined ? {} : { fallback: answer.fallback }) }
     const said = 'refused' in answer ? answer.refused.why : brief(`${run.stdout} ${run.stderr}`)
-    return { said: `${run.exitCode !== 0 ? `the launcher exited ${run.exitCode}` : 'the launcher refused'}${said === '' ? '' : `: ${said}`}`, unclean: run.exitCode !== 0 || !('refused' in answer) }
+    return { said: `${run.exitCode !== 0 ? `the launcher exited ${run.exitCode}` : 'the launcher refused'}${said === '' ? '' : `: ${said}`}`, unclean: run.exitCode !== 0 || !('refused' in answer), ...('refused' in answer ? { code: answer.refused.code } : {}) }
   } catch (err) {
     return { said: `the launcher didn't run: ${why(err)}`, unclean: true }
   }
@@ -1017,13 +1056,11 @@ async function switchNow($: EngineInterface, value: Queued): Promise<void> {
   }
   const { found, by, beat, live, plain } = looked
   /**
-   * The claim the launch names: the probe's, or a fresh launch's when a slot's claim must become a
-   * window's (the launch takes it over: the same process holds both). Both are given back on a release.
+   * The claim the launch names: the probe's own, fresh for each switch, which a tab or a named window is
+   * told too. So a later launch that takes the lock over turns an earlier one away.
    */
-  let claim = by
   const free = async (): Promise<void> => {
     if (by !== undefined) await release($, ctx.powershell, ctx.state, to, by)
-    if (claim !== undefined && claim !== by) await release($, ctx.powershell, ctx.state, to, claim)
   }
   const held = async (said: string): Promise<void> => {
     await free()
@@ -1038,23 +1075,24 @@ async function switchNow($: EngineInterface, value: Queued): Promise<void> {
   const picked = pickTransport(found, ctx.own, to, beat?.folder, tab !== undefined && 'pane' in tab ? tab : undefined, ctx.configDirs.length)
   if ('refusal' in picked) return held(picked.refusal)
   // A left record waives L3 and L5 only where the last look checks the transcript against it: in place,
-  // in the window, and in a tab whose claude wrapper is of pane file version 3. When the verdict rests on
-  // it, this pane's slot runner (until slots v2) and an older wrapper pass the move to a new window,
-  // saying why; the slot's claim becomes a launch's, which the launch takes over from it.
+  // in a slot (a verified runner is version 2), in a tab or the window, and in a tab whose claude wrapper
+  // is of pane file version 3. When the verdict rests on it, an older wrapper passes the move to a new
+  // window, saying why.
   const restsOnLeft = live.waived !== undefined && plain.verdict !== 'not-live'
   const tabNoLeft = restsOnLeft && picked.transport === 'pane' && tab !== undefined && 'pane' in tab ? paneNoLeft(tab.pane) : undefined
-  const pick: Transport =
-    restsOnLeft && picked.transport === 'slot'
-      ? { transport: 'window', folder: picked.folder, fallback: SLOT_NO_LEFT }
-      : tabNoLeft !== undefined && picked.transport === 'pane'
-        ? { transport: 'window', folder: picked.folder }
-        : picked
+  const pick: Transport = tabNoLeft !== undefined && picked.transport === 'pane' ? { transport: 'window', folder: picked.folder } : picked
   if (picked.transport === 'slot' && by !== `slot:${picked.slot}`) return held("the claim lock doesn't name this pane's slot")
-  if (picked.transport === 'slot' && pick.transport === 'window') claim = `launch:${crypto.randomUUID()}`
+  // The window: where placement.json puts it (launch.prefer), each place tried in turn while it is refused
+  // for want of Windows Terminal or the slot runner, the plain window last.
+  const legs: readonly LaunchWhere[] = (() => {
+    if (pick.transport !== 'window' || ctx.placement === null) return [{ window: true } as const]
+    const placed = pickLaunchTransport(found, ctx.placement, { replacing: true, using: 'launch', configCount: ctx.configDirs.length, needsLeft: false, title: resumeTitle(to), folder: pick.folder })
+    return 'where' in placed ? [placed.where, ...(placed.then ?? [])] : [{ window: true } as const]
+  })()
   /** The claim the ticket, the record or the window names. */
-  const named = claim ?? by
+  const named = by
   if ((pick.transport === 'window' || pick.transport === 'pane') && !named.startsWith('launch:')) return held("the claim lock doesn't name a launch")
-  const left = pick.transport === 'slot' || (pick.transport === 'pane' && tab !== undefined && 'pane' in tab && paneNoLeft(tab.pane) !== undefined) ? undefined : live.waived
+  const left = pick.transport === 'pane' && tab !== undefined && 'pane' in tab && paneNoLeft(tab.pane) !== undefined ? undefined : live.waived
   const own: ProcessRef | undefined = found.session === null ? undefined : { pid: found.session.pid, created: found.session.created }
   // A tab with a token that a new window is used instead of: why, for the log.
   const tabPassed = pick.transport !== 'window' || tab === undefined ? undefined : 'why' in tab ? tab.why : (tabNoLeft ?? paneFallback(found, tab.pane) ?? paneReads(tab.pane, ctx.configDirs.length))
@@ -1067,7 +1105,10 @@ async function switchNow($: EngineInterface, value: Queued): Promise<void> {
     const jobs = await readCrons($)
     const ending = exitBlockers({ crons: typeof jobs === 'string' ? jobs : jobs.filter(job => job.durable !== true), agents: [] })
     const lasting = typeof jobs === 'string' ? [] : exitBlockers({ crons: jobs.filter(job => job.durable === true), agents: [] })
-    const said = [...(ending.length > 0 ? [`this switch ends this process, and with it the session's crons: ${blockersText(ending)}`] : []), ...(lasting.length > 0 ? [blockersText(lasting)] : [])]
+    const said = [
+      ...(ending.length > 0 ? [`this switch ends this process, and with it the session's crons: ${blockersText(ending)}`] : []),
+      ...(lasting.length > 0 ? [blockersText(lasting)] : []),
+    ]
     if (said.length > 0) return held(said.join('; '))
   }
   // S11: the start folder (in place: the next conversation works in it) against its baseline; the named
@@ -1139,23 +1180,30 @@ async function switchNow($: EngineInterface, value: Queued): Promise<void> {
     // Taken back right before the command, after the last wait: a turn that starts up to here stops it.
     if (armed !== value) return undo('a new turn started')
     armed = undefined
-    try {
-      await $.command.run({ command: 'resume', args: to })
-    } catch (err) {
-      return undo(`/resume didn't run: ${why(err)}`)
-    }
-    const after = await sessionId($)
-    if (after !== to) {
-      $.ui.toast(`Switch didn't take: this session is still ${after === undefined ? 'its own conversation' : after.slice(0, 8)}. Its ticket waits 15 minutes in case the resume completes.`)
-      await tellModel(
-        $,
-        `The switch ran /resume ${to}, but this session is still conversation ${after ?? ctx.own} (a dialog may be open, or it was answered no), so it did not switch. The ticket is kept: if the resume completes within 15 minutes, the resumed conversation gets its arrival note. Otherwise nothing changed, and the claim lock is released when the ticket runs out.`,
-      )
-      return
-    }
-    $.ui.toast(`Switched in place to ${to}.`)
-    // The classic SessionStart delivers the arrival; if it hasn't by then, this does.
-    $.clock.after(ARRIVAL_FALLBACK_MS, () => void arrive($, to))
+    await goRun($, go, {
+      command: 'resume',
+      args: to,
+      conversation: ctx.own,
+      holds: async () => current ?? (await sessionId($)),
+      agents: () => agentList($),
+      failed: err => undo(`/resume didn't run: ${why(err)}`),
+      withdraw: said => undo(said),
+      runs: `self-switch: /resume ${to} runs now.`,
+      after: async () => {
+        const after = await sessionId($)
+        if (after !== to) {
+          $.ui.toast(`Switch didn't take: this session is still ${after === undefined ? 'its own conversation' : after.slice(0, 8)}. Its ticket waits 15 minutes in case the resume completes.`)
+          await tellModel(
+            $,
+            `The switch ran /resume ${to}, but this session is still conversation ${after ?? ctx.own} (a dialog may be open, or it was answered no), so it did not switch. The ticket is kept: if the resume completes within 15 minutes, the resumed conversation gets its arrival note. Otherwise nothing changed, and the claim lock is released when the ticket runs out.`,
+          )
+          return
+        }
+        $.ui.toast(`Switched in place to ${to}.`)
+        // The classic SessionStart delivers the arrival; if it hasn't by then, this does.
+        $.clock.after(ARRIVAL_FALLBACK_MS, () => void arrive($, to))
+      },
+    })
     return
   }
 
@@ -1175,20 +1223,38 @@ async function switchNow($: EngineInterface, value: Queued): Promise<void> {
     deadline: (await $.clock.now()) + LAUNCH_DEADLINE_MS,
   } as const
   let record: string | undefined
+  /** Where the new window went, when placement.json put it somewhere: a tab or a named window. */
+  let placedAt: string | undefined
+  /** Why a named window fell back to the plain one. */
+  let placedFallback: string | undefined
   if (pick.transport === 'slot') {
     record = slotRecordPath(ctx.state, pick.slot)
-    const failed = await placeLaunch($, { ...base, where: { slot: pick.slot } }, pick.folder)
-    if (failed !== undefined) return undo(`the slot's record wasn't written (${failed.said})`, record, failed.unclean)
+    const failed = await placeLaunch($, { ...base, where: { slot: pick.slot }, ...(left === undefined ? {} : { left }) }, pick.folder)
+    if ('said' in failed) return undo(`the slot's record wasn't written (${failed.said})`, record, failed.unclean)
   } else if (pick.transport === 'pane') {
     // The ticket for this tab's claude wrapper, written whole and moved into place; taken back, it is
     // overwritten as withdrawn (undo), which the wrapper says and resumes nothing. It names the claim
     // the probe took: the wrapper resumes only while the lock still names it.
     record = paneTicketPath(ctx.state, pick.token)
     const failed = await placeLaunch($, { ...base, where: { pane: { token: pick.token } }, now: await $.clock.now(), ...(left === undefined ? {} : { left }) }, pick.folder)
-    if (failed !== undefined) return undo(`this tab's ticket wasn't written (${failed.said})`, record, failed.unclean)
+    if ('said' in failed) return undo(`this tab's ticket wasn't written (${failed.said})`, record, failed.unclean)
   } else {
-    const failed = await placeLaunch($, { ...base, where: { window: true }, ...(left === undefined ? {} : { left }) }, pick.folder)
-    if (failed !== undefined) return undo(`no window opened (${failed.said})`, undefined, failed.unclean)
+    // Each place in turn; only for want of Windows Terminal, the slot runner or a build does the next go.
+    let placed = false
+    for (const leg of legs) {
+      const tried = await placeLaunch($, { ...base, where: leg, ...(left === undefined ? {} : { left }) }, pick.folder)
+      if ('placed' in tried) {
+        placed = true
+        if (tried.placed === 'tab') placedAt = `a new tab in window ${tried.label}`
+        else if (tried.label !== '-') placedAt = `a new window, ${tried.label}`
+        placedFallback = tried.fallback
+        break
+      }
+      const next = leg !== legs[legs.length - 1] && (tried.code === 'wt' || tried.code === 'slotscript' || tried.code === 'build')
+      if (!next) return undo(`no window opened (${tried.said})`, undefined, tried.unclean)
+      $.ui.log(`the placed launch wasn't used: ${oneLine(tried.said, 300)}. The next place is tried.`)
+    }
+    if (!placed) return undo('no window opened', undefined, false)
   }
   // Right before the exit: a turn that started meanwhile, a subagent, or a wake-up marked since the
   // first read (S10w again: one set in the same turn as the switch is marked as that turn ends, which
@@ -1198,44 +1264,60 @@ async function switchNow($: EngineInterface, value: Queued): Promise<void> {
   if (late !== undefined) return undo(late, record)
   // The left record of this conversation, how: exit, written by the leaving side right before its
   // /exit: the conversation switched back to soon after reads not live once this process has gone.
-  // Taken back (undo) if the exit then doesn't run.
-  await writeLeft($, ctx.own, 'exit', own)
-  wroteLeft = true
-  await noteRecent($, ctx.own)
+  // Taken back (undo) if the exit then doesn't run. Through the trampoline it is written in its handler,
+  // once the checks at dequeue have passed.
+  const writeExitRecord = async (): Promise<void> => {
+    await writeLeft($, ctx.own, 'exit', own)
+    wroteLeft = true
+    await noteRecent($, ctx.own)
+  }
+  const stands = go.via === 'direct'
+  if (stands) await writeExitRecord()
   const where =
     pick.transport === 'slot'
       ? "this pane's slot resumes it here"
       : pick.transport === 'pane'
         ? 'this tab resumes it here'
-        : fallback === undefined
-          ? 'a new window resumes it'
-          : `a new window resumes it, not this pane's slot (${fallback})`
+        : placedAt !== undefined
+          ? `${placedAt} resumes it`
+          : fallback === undefined
+            ? 'a new window resumes it'
+            : `a new window resumes it, not this pane's slot (${fallback})`
   // Taken back right before the command, after the last wait: a turn that starts up to here stops it.
   if (armed !== value) return undo('a new turn started', record)
   armed = undefined
   $.ui.log(`Switching to ${to}: ${value.reason}`)
   if (fallback !== undefined) $.ui.log(`this pane's slot runner isn't used: ${fallback}. A new window resumes ${to}.`)
+  if (placedFallback !== undefined) $.ui.log(`the placed window isn't used: ${oneLine(placedFallback, 300)}.`)
   if (tabPassed !== undefined) $.ui.log(`this tab's claude wrapper isn't used: ${oneLine(tabPassed, 300)}. A new window resumes ${to}.`)
   $.ui.toast(`Switching to ${to}: this session exits, and ${where} once this process has gone.`)
-  try {
-    await $.command.run({ command: 'exit' })
-  } catch (err) {
-    return undo(`the exit didn't run: ${why(err)}`, record)
-  }
-  // The exit ran and this module is still here: the session may stay open (a dialog answered no). Its
-  // exit record is taken back at the next turn's end, if it is still this exit's: a turn that ends means
-  // the session went on, and a typed /exit later must not pass for this one.
-  exitLeft = { state: ctx.state, id: ctx.own, leaving: own }
-  // An exit that took ends this module with the session, and this never fires.
-  $.clock.after(CHECK_MS, () => {
-    const waits =
-      pick.transport === 'slot'
-        ? 'The slot honours its record for 2 minutes'
-        : pick.transport === 'pane'
-          ? "This tab's claude wrapper honours its ticket for 2 minutes"
-          : `The new window waits up to ${WAIT_SECONDS / 60} minutes for this session to exit`
-    $.ui.toast(`The exit ran, but the session is still open. ${waits}.`)
-    void tellModel($, `The switch's exit ran, but this session is still open (a dialog may have been answered no). ${waits}, then gives up; the claim on ${to} is released when its ticket runs out, 15 minutes after the switch.`)
+  await goRun($, go, {
+    command: 'exit',
+    conversation: ctx.own,
+    holds: async () => current ?? (await sessionId($)),
+    agents: () => agentList($),
+    probe: () => runProbe($, { powershell: ctx.powershell, id: ctx.own }),
+    ...(stands ? {} : { before: writeExitRecord }),
+    failed: err => undo(`the exit didn't run: ${why(err)}`, record),
+    withdraw: said => undo(said, record),
+    runs: `self-switch: /exit runs now; ${where} once this process has gone.`,
+    after: async () => {
+      // The exit ran and this module is still here: the session may stay open (a dialog answered no). Its
+      // exit record is taken back at the next turn's end, if it is still this exit's: a turn that ends means
+      // the session went on, and a typed /exit later must not pass for this one.
+      exitLeft = { state: ctx.state, id: ctx.own, leaving: own }
+      // An exit that took ends this module with the session, and this never fires.
+      $.clock.after(CHECK_MS, () => {
+        const waits =
+          pick.transport === 'slot'
+            ? 'The slot honours its record for 2 minutes'
+            : pick.transport === 'pane'
+              ? "This tab's claude wrapper honours its ticket for 2 minutes"
+              : `The new window waits up to ${WAIT_SECONDS / 60} minutes for this session to exit`
+        $.ui.toast(`The exit ran, but the session is still open. ${waits}.`)
+        void tellModel($, `The switch's exit ran, but this session is still open (a dialog may have been answered no). ${waits}, then gives up; the claim on ${to} is released when its ticket runs out, 15 minutes after the switch.`)
+      })
+    },
   })
 }
 
@@ -1306,10 +1388,20 @@ export const register: Register = (on, options) => {
       },
       isDeferred: false,
     })
+    // The trampoline's command: registered whichever way GO_VIA says, so its hook answers a person's
+    // typing or a stale entry, and validate sees it as a hook that answers its own command.
+    try {
+      await $.command.register({ name: 'self-switch-go', description: "self-switch's own step when it runs a switch. Typing it does nothing." })
+    } catch (err) {
+      $.ui.log(`self-switch's step command wasn't registered (${why(err)}); a switch through the trampoline then says so and doesn't run.`)
+    }
     loadUpdateCheck($)
     startBeat($)
     return started
   })
+
+  // The trampoline's handler. It never reads `next`: it answers its own command, and is no gate.
+  on('command.run', { command: 'self-switch-go' }, ($, e) => goAnswer($, go, e.args)).catch(() => ({ text: "self-switch: the switch's step failed, so it did not run." }))
 
   // The process that holds a conversation a switch moved here: the arrival, once. On a resume, first
   // the heartbeat, of the conversation the event names: `$.session.id()` may still read the one that
@@ -1417,6 +1509,7 @@ export const register: Register = (on, options) => {
   on('turn.complete', async ($, e, next) => {
     const done = await next(e)
     if (e.agentId !== undefined) return done
+    go.turnEnded()
     // A switch's /exit ran, and a turn has ended since: the session stayed open. Its exit record is
     // taken back, if it is still that exit's, before anything this turn queued runs.
     const left = exitLeft
@@ -1440,6 +1533,7 @@ export const register: Register = (on, options) => {
   on('turn.start', async ($, e, next) => {
     const started = await next(e)
     if (e.agentId !== undefined) return started
+    go.turnStarted()
     void heartbeat($)
     if (armed === undefined) return started
     const value = armed

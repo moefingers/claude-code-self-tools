@@ -15,7 +15,7 @@ import { join } from 'node:path'
 import { after, before, describe, test } from 'node:test'
 import { pathToFileURL } from 'node:url'
 import { gzipSync } from 'node:zlib'
-import { compileStub, fence, underStub, WINDOWS_POWERSHELL } from './stub.mjs'
+import { compileStub, fence, noWindow, underStub, WINDOWS_POWERSHELL } from './stub.mjs'
 import { ROOT } from './sync-shared.mjs'
 
 const machine = await import(pathToFileURL(join(ROOT, 'shared', 'hooks', 'machine.ts')).href)
@@ -68,12 +68,6 @@ function envOf(dirs, extra = {}) {
 const runsOf = dirs => {
   const log = join(dirs.root, 'claude-runs.jsonl')
   return existsSync(log) ? readFileSync(log, 'utf8').split('\n').filter(Boolean).map(line => JSON.parse(line)) : []
-}
-
-/** A launch script with Start-Process replaced by a throw: a fault in a test can never open a window. */
-const noWindow = script => {
-  const at = '$window = Start-Process'
-  return script.includes(at) ? script.split(at).join(`throw 'a test never opens a window'; ${at}`) : script
 }
 
 /** A resume's launch into the lab, under a fresh launch's claim. */
@@ -272,7 +266,7 @@ function runWindow(inner, dirs, extra = {}) {
 /** A window's launch in the lab, not waiting (no old process here), its claim in place, the launcher installed. */
 function windowLab(change = {}) {
   const dirs = lab()
-  const input = launchInput(dirs, { checks: { live: true }, ...change })
+  const input = launchInput(dirs, { checks: { live: true, floor: true, input: true }, heavySlotRoot: null, maxSessions: 12, ...change })
   const inner = innerOf(machine.launchScriptText(input))
   mkdirSync(join(dirs.state, 'claims'), { recursive: true })
   writeFileSync(machine.claimPath(dirs.state, input.id), claimText(input.claim, 4))
@@ -297,12 +291,13 @@ describe("the window's own script, run as the window runs it (hidden, here)", { 
   })
 
   test('a launcher whose hash changed after the launch put it there: not run, and the window says so', async () => {
-    const { dirs, inner } = windowLab()
+    const { dirs, input, inner } = windowLab()
     writeFileSync(machine.launchScriptPath(dirs.state), `${machine.LAUNCH_SCRIPT_TEXT}# one line more\n`)
     const ran = await runWindow(inner, dirs)
     assert.equal(ran.runs.length, 0, ran.out)
     assert.match(ran.out, /claude-launch\.ps1 is not at .+ with the SHA-256 this plugin ships/)
-    assert.match(ran.out, /Once it is safe, resume it yourself: claude-launch\.ps1 -Resume /)
+    assert.ok(!existsSync(machine.claimPath(dirs.state, input.id)), 'a window that refuses gives the claim back (N5)')
+    assert.match(ran.out, /Once it is safe, resume it yourself: & '.+claude-launch\.ps1' -Resume [0-9a-f-]{36} -Dir '.+'/)
     assert.equal(ran.code, 1)
   })
 
@@ -312,14 +307,16 @@ describe("the window's own script, run as the window runs it (hidden, here)", { 
     const ran = await runWindow(inner, dirs)
     assert.equal(ran.runs.length, 0, ran.out)
     assert.match(ran.out, /the claim on it no longer names this window/)
+    assert.ok(existsSync(machine.claimPath(dirs.state, input.id)), "another's claim is left alone")
   })
 
   test('a folder that is gone: not run', async () => {
-    const { dirs, inner } = windowLab()
+    const { dirs, input, inner } = windowLab()
     rmSync(dirs.folder, { recursive: true, force: true })
     const ran = await runWindow(inner, dirs)
     assert.equal(ran.runs.length, 0, ran.out)
     assert.match(ran.out, /its folder .+ is not there/)
+    assert.ok(!existsSync(machine.claimPath(dirs.state, input.id)), 'a window that refuses gives the claim back (N5)')
   })
 
   test('claude-launch.ps1 that stops on an error is caught: the window says so and how to resume, and waits (F3)', async () => {
@@ -329,7 +326,27 @@ describe("the window's own script, run as the window runs it (hidden, here)", { 
     const ran = await runWindow(inner, dirs)
     assert.equal(ran.runs.length, 0, ran.out)
     assert.match(ran.out, /claude-launch\.ps1 stopped on an error, so the session may not have resumed here: claude\.exe is locked by an update/)
-    assert.match(ran.out, /Once it is safe, resume it yourself: claude-launch\.ps1 -Resume /)
+    assert.match(ran.out, /Once it is safe, resume it yourself: & '.+claude-launch\.ps1' -Resume [0-9a-f-]{36} -Dir '.+'/)
     assert.equal(ran.code, 1)
+  })
+
+  test("D2: the launcher refusing (no claude.exe, its exit 2) or claude ending non-zero gives this launch's claim back; a normal end, even a short one, leaves it", async () => {
+    const refused = windowLab()
+    rmSync(join(refused.dirs.home, '.local', 'bin', 'claude.exe'))
+    const nothing = await runWindow(refused.inner, refused.dirs)
+    assert.equal(nothing.runs.length, 0, nothing.out)
+    assert.match(nothing.out, /no claude\.exe was found/)
+    assert.match(nothing.out, /Claude Code ended \(exit code 2\)\./)
+    assert.ok(!existsSync(machine.claimPath(refused.dirs.state, refused.input.id)), `given back\n${nothing.out}`)
+    assert.equal(nothing.code, 2, nothing.out)
+    const ended = windowLab()
+    const seven = await runWindow(ended.inner, ended.dirs, { STUB_EXIT: '7' })
+    assert.equal(seven.runs.length, 1, seven.out)
+    assert.ok(!existsSync(machine.claimPath(ended.dirs.state, ended.input.id)), `given back\n${seven.out}`)
+    assert.equal(seven.code, 7, seven.out)
+    const normal = windowLab()
+    const zero = await runWindow(normal.inner, normal.dirs)
+    assert.equal(zero.code, 0, zero.out)
+    assert.ok(existsSync(machine.claimPath(normal.dirs.state, normal.input.id)), `left\n${zero.out}`)
   })
 })

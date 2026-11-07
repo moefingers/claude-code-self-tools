@@ -121,6 +121,9 @@ function engine(
   })
   on('session.start', (_, e) => ({ cwd: e.cwd }))
   on('session.id', () => ({ value: ID }))
+  on('tool.list', () => ({ value: [] }))
+  on('fs.exists', () => ({ value: false }))
+  on('command.register', (_, e) => ({ value: { command: e.name } }))
   on('session.cwd', () => (world.cwd === 'reads' ? { value: 'C:\\work\\repo' } : { deny: 'no folder' }))
   on('tool.register', (_, e) => {
     described.push(String(e.description))
@@ -437,7 +440,7 @@ test("the tool's description says it holds on the full safe point, and what stil
   expect(text).toContain('It refuses unless the session is at a safe point')
   expect(text).toContain('while anything runs under this session (a background Bash, PowerShell or Monitor job, git, a build, test or lint, a dev server or Playwright, a heavy-slot job)')
   expect(text).toContain("while any of that can't be read")
-  expect(text).toContain("What still ends with this process: wake-ups, background tasks it can't see")
+  expect(text).toContain('What still ends with this process: Remote Control')
 })
 
 test('a release that finds the lock held open throughout is logged, never taken as released', async ($, on) => {

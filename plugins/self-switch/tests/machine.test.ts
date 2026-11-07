@@ -1005,7 +1005,8 @@ describe('the scripts, as text', () => {
       expect(RECHECK).toContain('    for ($try = 1; $try -le 3 -and $null -eq $e; $try++) {')
       expect(RECHECK).toContain('      if ($null -eq $e -and $try -lt 3) { Start-Sleep -Milliseconds 250 }')
       expect(script).toContain('$refusal = "The session is not resumed here, so that two copies never write it: " + $live + "."')
-      expect(script).toContain('Write-Host ("Once it is safe, resume it yourself: " + "claude-launch.ps1 -Resume " + $id + " -Dir " + $folder)')
+      // Inside the window's own literal, each quote doubled.
+      expect(script).toContain(`Write-Host ("Once it is safe, resume it yourself: " + "& ''" + $handPath + "'' -Resume " + $id + " -Dir ''" + $folder + "''")`)
       // The window stops on a failed read, so the re-check's catch refuses: a new PowerShell would go on.
       const stops = script.indexOf('$ErrorActionPreference = "Stop"')
       expect(stops).toBeGreaterThan(0)
@@ -1089,7 +1090,7 @@ describe('the scripts, as text', () => {
 
   test('the restart launch says why it passed over a slot runner, on a line of its own after the claim', () => {
     expect(restart).toContain(
-      'if ($null -ne $slot -and -not $slotOk) { if ($null -ne $slotHashError) { $slotFallback = "slot hash unreadable: " + $slotHashError } else { $slotFallback = "this pane" + [char]39 + "s claude-slot.ps1 has another SHA-256 than the one shipped" } }',
+      'if ($null -ne $slot -and -not $slotOk) { if ($null -ne $slotHashError) { $slotFallback = "slot hash unreadable: " + $slotHashError } elseif ($slotStale) { $slotFallback = "this pane" + [char]39 + "s slot runner does not say it reads records at the shipped hash: it was left with Ctrl+C, or it runs an older copy (restart the pane)" } else { $slotFallback = "this pane" + [char]39 + "s claude-slot.ps1 has another SHA-256 than the one shipped" } }',
     )
     const said = restart.indexOf('[Console]::Out.WriteLine("fallback " + ($slotFallback -split "\\r?\\n")[0])')
     expect(said).toBeGreaterThan(restart.indexOf('[Console]::Out.WriteLine("claim " + $by)'))

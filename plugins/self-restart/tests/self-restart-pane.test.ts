@@ -105,6 +105,9 @@ function engine(on: On, { token = TOKEN, pane = PANE, probe = probeOf(), paneScr
   })
   on('session.start', (_, e) => ({ cwd: e.cwd }))
   on('session.id', () => ({ value: ID }))
+  on('tool.list', () => ({ value: [] }))
+  on('fs.exists', (_, e) => ({ value: files.has(e.path) }))
+  on('command.register', (_, e) => ({ value: { command: e.name } }))
   on('session.cwd', () => ({ value: REPO }))
   on('tool.register', (_, e) => {
     described.push(String(e.description))
@@ -334,9 +337,11 @@ test("an 'auto' run that timed out after this pane's slot was verified: the slot
   expect(scripts[1]).toContain(`$lock.by -cne '${claimOf(scripts[0])}'`)
   expect(scripts[2]).toContain(`$lock.by -cne 'slot:${SLOT}'`)
   expect(writes.filter(w => w.path === slotRecordPath(STATE, SLOT))).toEqual([{ path: slotRecordPath(STATE, SLOT), text: '{"v":1,"cancelled":true}' }])
-  // Once more 3 s later: both claims again; the record, withdrawn already, is not written again.
+  // Once more 3 s later: this launch's claim alone. The slot's claim and record aren't one launch's: a newer
+  // launch through this slot, within those seconds, keeps its own. The record is not written again.
   await clock.advance(4000)
-  expect(kinds).toEqual(['launcher', 'release', 'release', 'release', 'release'])
+  expect(kinds).toEqual(['launcher', 'release', 'release', 'release'])
+  expect(scripts[3]).toContain(`$lock.by -cne '${claimOf(scripts[0])}'`)
   expect(writes.filter(w => w.path === slotRecordPath(STATE, SLOT))).toHaveLength(1)
 })
 

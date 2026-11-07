@@ -4,8 +4,7 @@
 // never named; its argument checks before anything changes; -Lane through lanes.json, saying which
 // conversation; its own last look (RECHECK and LEFT_RECHECK, line for line), by hand too, against a
 // holder the stub plays. And a scan: nothing else in the repository starts
-// claude but the two known places (the slot runner, until slots v2; the claude wrapper, the person's
-// own `claude`). Then, on Windows, it runs for real in Windows PowerShell 5.1 and PowerShell 7 against
+// claude but the claude wrapper, the person's own `claude`; the slot runner goes through this script. Then, on Windows, it runs for real in Windows PowerShell 5.1 and PowerShell 7 against
 // the stub claude.exe (scripts/claude-wrapper-stub.cs, compiled into a temporary folder), whose
 // USERPROFILE, LOCALAPPDATA and CLAUDE_CONFIG_DIR are temporary folders, and faults are planted in a
 // copy of the script, each caught. Run with `node --test "scripts/*.test.mjs"`.
@@ -147,7 +146,7 @@ function sources(dir = ROOT) {
   })
 }
 
-test('nothing but claude-launch.ps1 starts claude, but the two known places; and they clear the same list', () => {
+test('nothing but claude-launch.ps1 starts claude, but the claude wrapper; the slot runner runs it; each list of what to clear is the one list', () => {
   const starters = []
   for (const path of sources()) {
     // The machine code carries claude-launch.ps1 itself (LAUNCH_SCRIPT_TEXT), byte for byte (the next
@@ -163,11 +162,13 @@ test('nothing but claude-launch.ps1 starts claude, but the two known places; and
     // a claude session (--resume, --session-id). `claude plugin ...` (scripts/test-all.mjs) starts none.
     if (/&\s*(\$exe\b|\$claude\.Source\b|'[^'\n]*claude(\.exe)?')|\[\s*['"]claude(\.exe)?['"]\s*,\s*\[?\s*['"]--(resume|session-id)|--resume ['"]?\$id/.test(code)) starters.push(relative(ROOT, path).split('\\').join('/'))
   }
-  assert.deepEqual(starters.sort(), ['plugins/self-switch/slot/claude-launch.ps1', 'plugins/self-switch/slot/claude-slot.ps1', 'tools/claude-wrapper/claude-wrapper.ps1'])
-  // The two known places clear exactly the launch environment's list, never a WT name.
+  assert.deepEqual(starters.sort(), ['plugins/self-switch/slot/claude-launch.ps1', 'tools/claude-wrapper/claude-wrapper.ps1'])
+  // The slot runner holds no such list; the wrapper and the layout script clear exactly the launch environment's, never a WT name.
   const slot = readFileSync(join(ROOT, 'plugins', 'self-switch', 'slot', 'claude-slot.ps1'), 'utf8')
+  const layout = readFileSync(join(ROOT, 'plugins', 'self-switch', 'slot', 'claude-layout.ps1'), 'utf8')
   const wrapper = readFileSync(join(ROOT, 'tools', 'claude-wrapper', 'claude-wrapper.ps1'), 'utf8')
-  assert.ok(slot.includes(`$Markers = ${machine.LAUNCH_ENV_CLEAR.map(name => `'${name}'`).join(', ')}\n`))
+  assert.ok(!slot.includes('$Markers') && !slot.includes('NO_COLOR'))
+  assert.ok(layout.includes(`$Clear = ${machine.LAUNCH_ENV_CLEAR.map(name => `'${name}'`).join(', ')}\n`))
   assert.ok(wrapper.includes(`$markers = ${machine.LAUNCH_ENV_CLEAR.map(name => `'${name}'`).join(', ')}\n`))
   // The plugins start no process but Windows PowerShell and git: never claude.
   for (const plugin of ['self-switch', 'self-restart', 'self-wake', 'self-exit', 'self-check']) {

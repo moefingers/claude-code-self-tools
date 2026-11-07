@@ -6,7 +6,7 @@ import { expect, mock, test } from 'claude-code/testing'
 import type { Engine } from 'claude-code/testing'
 import type { On } from 'claude-code'
 import { RELEASE_SCRIPT, TAKE_SCRIPT } from '../hooks/rc-lock'
-import { fingerprintOf, isCutOff, jitterOf, RC_WAIT_MS, RESUME } from '../hooks/relogin'
+import { fingerprintOf, isCutOff, jitterOf, RC_WAIT_MS, resumedSaid, RESUME } from '../hooks/relogin'
 
 const CONNECTED = 'Disconnect Remote Control'
 const NOT_CONNECTED = 'Control this session from your phone or claude.ai/code'
@@ -229,6 +229,9 @@ async function cutOff($: Engine, w: World, turnId = 't1', error: 'rate_limit' | 
   await w.clock.advance(5000)
 }
 
+/** The toasts, a resume's error kind and how long ago put aside: a test's clock makes that up. The words themselves have a test of their own. */
+const noAgo = (toasts: readonly string[]): string[] => toasts.map(said => said.replace(/ended on \w+ \d+ (?:s|min|h) ago/, 'ended on KIND AGO ago'))
+
 /** What was read of the machine's files: the update check's read of the plugin's own manifest, and the lock, left out. */
 const machineReads = (w: World) => w.reads.filter(path => path !== LOCK && !/[\\/]\.claude-plugin[\\/]plugin\.json$/.test(path))
 
@@ -247,7 +250,7 @@ test('a switch after the limit: Remote Control reconnects under the title, then,
   expect(w.prompts).toEqual([])
   await w.clock.advance(DELAY + 15_000)
   expect(w.prompts).toEqual([RESUME])
-  expect(w.toasts).toEqual([`Login changed; Remote Control reconnected as "${TITLE}"; resumed the interrupted turn.`])
+  expect(noAgo(w.toasts)).toEqual([`Login changed; Remote Control reconnected as "${TITLE}"; resumed: the turn ended on KIND AGO ago.`])
 
   await w.clock.advance(10 * 60_000)
   expect(w.commands).toHaveLength(1)
@@ -325,7 +328,7 @@ test('Remote Control that was off stays off when the setting for all sessions is
   await w.clock.advance(FLOW)
   expect(w.commands).toEqual([])
   expect(w.prompts).toEqual([RESUME])
-  expect(w.toasts).toEqual(['Login changed; Remote Control was off, and is left off; resumed the interrupted turn.'])
+  expect(noAgo(w.toasts)).toEqual([`Login changed; Remote Control was off, and is left off; resumed: the turn ended on KIND AGO ago.`])
 })
 
 test('Remote Control that was off connects when the setting for all sessions is on', async ($, on) => {
@@ -365,7 +368,7 @@ test('a turn running at the change is waited for, and resumed when the change cu
   await w.clock.advance(FLOW)
   expect(w.commands).toEqual([`remote-control ${TITLE}`])
   expect(w.prompts).toEqual([RESUME])
-  expect(w.toasts).toEqual([`Login changed; Remote Control reconnected as "${TITLE}"; resumed the interrupted turn.`])
+  expect(noAgo(w.toasts)).toEqual([`Login changed; Remote Control reconnected as "${TITLE}"; resumed: the turn ended on KIND AGO ago.`])
 })
 
 test('a turn running at the change that finishes with an answer is not resumed', async ($, on) => {
@@ -560,7 +563,7 @@ test('Remote Control that reads connected all along is never run over; the resum
   await w.clock.advance(RC_WAIT_MS + DELAY)
   expect(w.commands).toEqual([])
   expect(w.prompts).toEqual([RESUME])
-  expect(w.toasts).toEqual(['Login changed; Remote Control still reads connected, so nothing ran; resumed the interrupted turn.'])
+  expect(noAgo(w.toasts)).toEqual([`Login changed; Remote Control still reads connected, so nothing ran; resumed: the turn ended on KIND AGO ago.`])
 })
 
 test('a reading it does not recognise runs nothing', async ($, on) => {
@@ -818,7 +821,7 @@ test('reconnectOnLoginChange off: Remote Control is left as it was', { options: 
   await w.clock.advance(FLOW)
   expect(w.commands).toEqual([])
   expect(w.prompts).toEqual([RESUME])
-  expect(w.toasts).toEqual(['Login changed; Remote Control left as it was (reconnectOnLoginChange is off); resumed the interrupted turn.'])
+  expect(noAgo(w.toasts)).toEqual([`Login changed; Remote Control left as it was (reconnectOnLoginChange is off); resumed: the turn ended on KIND AGO ago.`])
 })
 
 test('resumeAfterLoginChange off: no resume', { options: { resumeAfterLoginChange: false } }, async ($, on) => {
@@ -875,4 +878,23 @@ test("each session's delay is its own, within a minute", async () => {
   const delays = ['00000000-0000-4000-8000-000000000001', '00000000-0000-4000-8000-000000000003', SESSION].map(jitterOf)
   expect(new Set(delays).size).toBe(3)
   expect(delays.every(d => d >= 0 && d <= 60_000)).toBe(true)
+})
+
+test('a resume says which error its turn ended on, and how long ago, in the toast and the debug line', async ($, on) => {
+  expect(resumedSaid('rate_limit', 12_000)).toBe('resumed: the turn ended on rate_limit 12 s ago')
+  expect(resumedSaid('authentication_failed', 5 * 60_000)).toBe('resumed: the turn ended on authentication_failed 5 min ago')
+  expect(resumedSaid('overloaded', 3 * 3_600_000)).toBe('resumed: the turn ended on overloaded 3 h ago')
+  const w = machine(on)
+  const debug: string[] = []
+  on('ui.log', (_, e) => {
+    debug.push(String(e.text))
+    return { value: undefined }
+  })
+  await begin($, w)
+  await cutOff($, w)
+  w.switchTo('account-b')
+  await w.clock.advance(SETTLE + DELAY + 15_000)
+  expect(w.prompts).toEqual([RESUME])
+  expect(w.toasts[0]).toMatch(/resumed: the turn ended on rate_limit \d+ (?:s|min) ago\.$/)
+  expect(debug.some(line => /self-remote-control: resumed: the turn ended on rate_limit \d+ (?:s|min) ago/.test(line))).toBe(true)
 })
