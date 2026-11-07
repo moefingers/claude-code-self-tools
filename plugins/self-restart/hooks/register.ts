@@ -62,8 +62,8 @@
 import type { EngineInterface, Register } from 'claude-code'
 import type { Queued, Restart } from '../types'
 import { launch as buildLaunch, parseLaunch, powershellPath, RELEASED, releaseScript, SESSION_ID, stateFolder, SYSTEM_ROOT, WAIT_SECONDS } from './launcher'
-import type { LaunchInput, PendingKind, Probe } from './machine'
-import { blockersText, exitBlockers, isBusyAgent, isSafeFolder, LAUNCH_DEADLINE_MS, LAUNCH_RETRY_MS, LAUNCH_RUN_MS, launchFolderFault, launchFolderSaid, markPending, oneLine, paneFallback, paneTicketPath, powershellCall, quoted, readExit, readGit, readPane, safePoint, SLOT_SCRIPT_SHA256, idPathOrNone } from './machine'
+import type { AgentLike, LaunchInput, PendingKind, Probe } from './machine'
+import { agentsHeld, agentsWayOut, blockersText, exitBlockers, isBusyAgent, isSafeFolder, LAUNCH_DEADLINE_MS, LAUNCH_RETRY_MS, LAUNCH_RUN_MS, launchFolderFault, launchFolderSaid, markPending, oneLine, paneFallback, paneTicketPath, powershellCall, quoted, readExit, readGit, readPane, safePoint, SLOT_SCRIPT_SHA256, idPathOrNone } from './machine'
 import { configureUpdateCheck, loadUpdateCheck, withUpdateNotice } from './update-check'
 
 const queued = { plugin: 'self-restart', key: 'queued' } as const
@@ -181,20 +181,24 @@ async function sendResume($: EngineInterface, said: string, resume: string): Pro
   }
 }
 
-/** The agents still to report, by their task's description; undefined when the list can't be read. */
-async function busyAgents($: EngineInterface): Promise<string[] | undefined> {
+/** The agents still to report (any that hasn't ended); undefined when the list can't be read. */
+async function busyAgents($: EngineInterface): Promise<readonly AgentLike[] | undefined> {
   try {
-    return (await $.agent.list()).filter(a => isBusyAgent(a.status)).map(a => (a.description.trim() === '' ? a.type : a.description))
+    return (await $.agent.list()).filter(a => isBusyAgent(a.status))
   } catch {
     return undefined
   }
 }
 
-/** Why a restart can't go ahead with these agents, or undefined when none is still to report. */
-function blocked(busy: string[] | undefined): string | undefined {
+/**
+ * Why a restart can't go ahead with these agents, or undefined when none is still to report. One that
+ * won't report on its own (an idle teammate, a status not known here) holds too, saying how to clear it.
+ */
+function blocked(busy: readonly AgentLike[] | undefined): string | undefined {
   if (busy === undefined) return "the session's subagents can't be read, so whether any is still running is unknown"
   if (busy.length === 0) return undefined
-  return `${busy.length === 1 ? 'a subagent is' : `${busy.length} subagents are`} still running (${busy.join('; ')}), and ${busy.length === 1 ? 'its work' : 'their work'} would end with this process`
+  const way = agentsWayOut(busy)
+  return `${agentsHeld(busy)}, and ${busy.length === 1 ? 'its work' : 'their work'} would end with this process${way === undefined ? '' : `; ${way}`}`
 }
 
 /** A variable of this process's environment, or undefined when unset or unreadable. */
@@ -403,10 +407,12 @@ async function restartNow($: EngineInterface, value: Queued): Promise<void> {
     // The next cancel counts on from it; nothing else depends on it.
   }
   $.ui.status(undefined)
-  const stop = blocked(await busyAgents($))
+  const busy = await busyAgents($)
+  const stop = blocked(busy)
   if (stop !== undefined) {
     armed = undefined
-    await refuse($, `Restart cancelled: ${stop}.`, `The restart you queued didn't run: ${stop}. The session goes on; call restart_after_turn again once they have reported.`)
+    const once = busy !== undefined && agentsWayOut(busy) !== undefined ? 'they have ended' : 'they have reported'
+    await refuse($, `Restart cancelled: ${stop}.`, `The restart you queued didn't run: ${stop}. The session goes on; call restart_after_turn again once ${once}.`)
     return
   }
   const launch = await plan($)

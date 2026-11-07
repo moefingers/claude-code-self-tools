@@ -82,7 +82,22 @@ describe('exitBlockers', () => {
       ],
     })
     expect(found.map(b => b.id)).toEqual(['a1', 'a2'])
-    expect(found[0]).toEqual({ kind: 'subagent', id: 'a1', what: "a subagent hasn't ended (A teammate; idle)", howToStop: 'wait for it to report, or stop it with TaskStop (a1)' })
+    // Neither reports on its own: each still holds, and says how to clear it (D-5).
+    expect(found[0]).toEqual({ kind: 'subagent', id: 'a1', what: "a subagent hasn't ended (A teammate; idle)", howToStop: 'stop it with TaskStop (a1), or, if it is already gone, run /reload-plugins' })
+    expect(found[1]).toEqual({ kind: 'subagent', id: 'a2', what: "a subagent hasn't ended (A status from a later Claude Code; paused)", howToStop: 'stop it with TaskStop (a2), or, if it is already gone, run /reload-plugins' })
+  })
+
+  test('one at its task, pending or waiting, is waited for: it reports on its own (D-5)', () => {
+    const found = exitBlockers({ crons: [], agents: [{ id: 'a1', status: 'pending', description: 'Lint' }, { id: 'a2', status: 'waiting', description: 'Build' }] })
+    expect(found.map(b => b.howToStop)).toEqual(['wait for it to report, or stop it with TaskStop (a1)', 'wait for it to report, or stop it with TaskStop (a2)'])
+  })
+
+  test('a durable cron is named apart: it survives the exit, and the hold says to delete it (D-4)', () => {
+    const found = exitBlockers({ crons: [{ ...CRON, durable: true }, { id: 'b2c4d6e8', cron: '0 9 * * 1-5', durable: false }], agents: [] })
+    expect(found).toEqual([
+      { kind: 'cron', id: '7f3a9c21', what: 'durable cron 7f3a9c21 (Every 5 minutes: «check the deploy») is set, and survives the exit', howToStop: 'delete it with CronDelete (id 7f3a9c21)' },
+      { kind: 'cron', id: 'b2c4d6e8', what: 'cron b2c4d6e8 (0 9 * * 1-5) is set to wake this session', howToStop: 'delete it with CronDelete (id b2c4d6e8)' },
+    ])
   })
 
   test('a cron, a background shell, a Monitor, a subagent and a wake-up are each listed with how to stop it', () => {
@@ -214,11 +229,14 @@ describe('exitBlockers', () => {
       expect(stopCrons(bad)).toBeUndefined()
     }
     expect(stopCrons([{ id: 'c', schedule: '0 9 * * 1-5', recurring: false }])).toEqual([{ id: 'c', cron: '0 9 * * 1-5', recurring: false }])
+    expect(stopCrons([{ id: 'c', durable: true }])).toEqual([{ id: 'c', durable: true }])
   })
 
   test("CronList's answer: its jobs, each with an id; any other shape is none of them", () => {
     expect(cronJobs({ jobs: [] })).toEqual([])
-    expect(cronJobs({ jobs: [{ ...CRON, nextFireAt: 1, durable: false }] })).toEqual([CRON])
+    // `durable` is kept (D-4): a durable cron survives the exit, and is named apart.
+    expect(cronJobs({ jobs: [{ ...CRON, nextFireAt: 1, durable: false }] })).toEqual([{ ...CRON, durable: false }])
+    expect(cronJobs({ jobs: [{ id: 'd1', durable: true }, { id: 'd2', durable: 'yes' }] })).toEqual([{ id: 'd1', durable: true }, { id: 'd2' }])
     for (const bad of [undefined, null, 'jobs', [], {}, { jobs: 'none' }, { jobs: [{}] }, { jobs: [{ id: '' }] }, { jobs: [{ id: 7 }] }, { jobs: [CRON, null] }]) {
       expect(cronJobs(bad)).toBeUndefined()
     }

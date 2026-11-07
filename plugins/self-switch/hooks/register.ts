@@ -41,15 +41,20 @@
 // marker (readWake) at the call, at the run, and once more right before the final command (a wake-up
 // set in the same turn is marked as that turn ends, which nothing orders before the first read);
 // self-wake on with no marker, or one that can't be read, holds too. The conversation it is read for
-// is the one the last SessionStart named, as self-wake keys its markers: while `$.session.id()` reads
-// another, the switch waits. A session cron (CronCreate, /loop, ScheduleWakeup, read with CronList)
-// holds a switch that ends this process (a slot, a tab, a window); one that can't be read holds too.
+// is the one the last SessionStart of a startup, a resume or a clear named, as self-wake keys its
+// markers: while `$.session.id()` reads another, within ID_LAG_MS of that event (the id lags it), the
+// switch waits. Past that, or where no such event reached this plugin (a managed or Team/Enterprise
+// guard keeps classic hooks from mods), it is `$.session.id()`'s, said in the log. A fork's
+// SessionStart moves nothing. A session cron (CronCreate, /loop, ScheduleWakeup, read with CronList)
+// holds a switch that ends this process (a slot, a tab, a window); one that can't be read holds too. A
+// durable cron is named apart: it survives the exit, so the hold says to delete it.
 // Other pending wake-ups are dropped by every transport (an in-place `/resume` swaps `$.state`; an
 // exit ends them): the tool's result, the leaving row and the arrival say so, so they can be set again.
 // The left record (\u00a73.4): this plugin writes one for the conversation it leaves, in place from the
 // classic SessionStart of the one it arrives at (LEFT_SETTLE_MS after, keyed by the event's id), and on
 // exit right before its own `/exit`, taken back (written over as withdrawn) when that `/exit` then
-// doesn't run; never for a typed `/exit`, a crash or a kill. Its probe reads the
+// doesn't run, or runs and leaves the session open (at the next turn's end, while the record is still
+// that exit's); never for a typed `/exit`, a crash or a kill. Its probe reads the
 // target's record, which may waive L3 and L5 (a return trip soon after a switch), and the last look
 // in place, in the window or in a tab of pane file version 3 checks the transcript against it; this
 // pane's slot runner doesn't until slots v2, nor does an older wrapper, so a move that rests on a record
@@ -81,6 +86,8 @@ import type { EngineInterface, Register, Timer } from 'claude-code'
 import type { Heartbeat, Queued, Ticket } from '../types'
 import type { AgentLike, LaunchInput, LeftStat, Pane, Probe, ProcessRef, Transport } from './machine'
 import {
+  agentsHeld,
+  agentsWayOut,
   blockersText,
   exitBlockers,
   isBusyAgent,
@@ -178,6 +185,12 @@ const KEEP_BEATS_MS = 30 * 24 * 60 * 60 * 1000
 const PRUNE_EVERY_MS = 6 * 60 * 60 * 1000
 /** After an in-place resume took, the switch delivers the arrival itself if the SessionStart hasn't by then. */
 const ARRIVAL_FALLBACK_MS = 5000
+/**
+ * How long after a main-loop SessionStart `$.session.id()` may still read the conversation before it
+ * (it lags the event, seen live on 2.1.318): within it, a disagreement holds a switch (idsDisagree);
+ * past it, `$.session.id()` is trusted, so a disagreement that never resolves can't hold every switch.
+ */
+const ID_LAG_MS = 15_000
 /** The most switches under way the store keeps. */
 const MAX_KEPT = 50
 
@@ -219,12 +232,21 @@ let beat: Timer | undefined
 let startFolder: string | undefined
 /**
  * The conversation this process holds now: from each main-loop classic SessionStart's own id (the
- * event's: `$.session.id()` may still read the one before), and at session.start when none is known
- * yet. A `/clear` carries the S11 baseline of this conversation to the one it starts.
+ * event's: `$.session.id()` may still read the one before) of a startup, a resume or a clear, never a
+ * fork's (the /fork background copy, a conversation moved to the background: the foreground stays) or
+ * a source this plugin doesn't know; and at session.start when none is known yet. A `/clear` carries
+ * the S11 baseline of this conversation to the one it starts.
  */
 let current: string | undefined
 /** Whether `current` was named by a classic SessionStart (else by a session.start, from `$.session.id()`). */
 let currentFromEvent = false
+/** When `current` was named (by a classic SessionStart, or a session.start), by the engine's clock. */
+let currentAt: number | undefined
+/**
+ * The exit record a switch wrote right before an `/exit` that ran and came back with the session still
+ * open (a dialog answered no): taken back at the next main-loop turn's end, if still that exit's.
+ */
+let exitLeft: { readonly state: string; readonly id: string; readonly leaving: ProcessRef } | undefined
 /** The registry keys not in REGISTRY_KEYS already logged by this process: each is logged once. */
 const seenKeys = new Set<string>()
 /** When old heartbeats were last looked for. */
@@ -304,13 +326,23 @@ async function sessionId($: EngineInterface): Promise<string | undefined> {
 
 /**
  * Why the conversation this process holds is unclear now, or undefined when it isn't: `$.session.id()`
- * reads `own`, but the last main-loop SessionStart named another (`current`, the event's own id, which
- * self-wake keys its markers by). Right after an in-place move the id lags its event; a switch then
- * would read another conversation's wake marker and write another's exit record, so it waits.
+ * reads `own`, but the last main-loop SessionStart of a startup, a resume or a clear named another
+ * (`current`, the event's own id, which self-wake keys its markers by), at most ID_LAG_MS ago. Right
+ * after an in-place move the id lags its event; a switch then would read another conversation's wake
+ * marker and write another's exit record, so it waits. Only an event's id holds: where none reached
+ * this plugin (a managed or Team/Enterprise guard keeps classic hooks from mods, and session.start
+ * doesn't run again after a /clear or a /resume), `current` is a session.start's own reading, and a
+ * later `$.session.id()` is the better one. Past ID_LAG_MS, `$.session.id()` is trusted, said in the log.
  */
-function idsDisagree(own: string): string | undefined {
-  if (current === undefined || current === own) return undefined
-  return `this session's id reads ${own}, but its last SessionStart named ${current}: it is moving between conversations, so which one it would leave is unclear`
+async function idsDisagree($: EngineInterface, own: string): Promise<string | undefined> {
+  if (!currentFromEvent || current === undefined || current === own) return undefined
+  const since = currentAt === undefined ? Number.NaN : (await $.clock.now()) - currentAt
+  if (since >= 0 && since <= ID_LAG_MS) {
+    return `this session's id reads ${own}, but its last SessionStart named ${current}: it is moving between conversations, so which one it would leave is unclear`
+  }
+  const when = Number.isFinite(since) && since > 0 ? `${Math.round(since / 1000)} seconds ago` : 'at a time the clock no longer agrees with'
+  $.ui.log(`this session's id reads ${own}, but its last SessionStart named ${current} ${when}; past ${ID_LAG_MS / 1000} seconds the id is trusted, so the switch leaves ${own}.`)
+  return undefined
 }
 
 /**
@@ -342,10 +374,10 @@ async function withdrawLeft($: EngineInterface, state: string, id: string, leavi
   await withdrawIfOurs($, leftPath(state, id), raw => raw.how === 'exit' && raw.id === id && raw.pid === String(leaving.pid) && raw.created === leaving.created)
 }
 
-/** The agents still to report, by their task's description; undefined when the list can't be read. */
-async function busyAgents($: EngineInterface): Promise<string[] | undefined> {
+/** The agents still to report (any that hasn't ended); undefined when the list can't be read. */
+async function busyAgents($: EngineInterface): Promise<readonly AgentLike[] | undefined> {
   try {
-    return (await $.agent.list()).filter(a => isBusyAgent(a.status)).map(a => (a.description.trim() === '' ? a.type : a.description))
+    return (await $.agent.list()).filter(a => isBusyAgent(a.status))
   } catch {
     return undefined
   }
@@ -360,11 +392,15 @@ async function agentList($: EngineInterface): Promise<readonly AgentLike[] | str
   }
 }
 
-/** Why a switch can't go ahead with these agents, or undefined when none is still to report. */
-function blocked(busy: string[] | undefined): string | undefined {
+/**
+ * Why a switch can't go ahead with these agents, or undefined when none is still to report. One that
+ * won't report on its own (an idle teammate, a status not known here) holds too, saying how to clear it.
+ */
+function blocked(busy: readonly AgentLike[] | undefined): string | undefined {
   if (busy === undefined) return "the session's subagents can't be read, so whether any is still running is unknown"
   if (busy.length === 0) return undefined
-  return `${busy.length === 1 ? 'a subagent is' : `${busy.length} subagents are`} still running (${busy.join('; ')}), and ${busy.length === 1 ? 'its work' : 'their work'} would be left behind`
+  const way = agentsWayOut(busy)
+  return `${agentsHeld(busy)}, and ${busy.length === 1 ? 'its work' : 'their work'} would be left behind${way === undefined ? '' : `; ${way}`}`
 }
 
 /** What the switch needs to read and run, each from the engine and the settings, never from the tool's input. */
@@ -908,7 +944,7 @@ async function switchNow($: EngineInterface, value: Queued): Promise<void> {
   if (moved !== undefined) return movedAway($, value, moved)
   // The conversation this switch leaves is the one the last SessionStart named, as self-wake keys its
   // marker (S10w) and as the exit record names it: with `$.session.id()` reading another, it waits.
-  const torn = idsDisagree(ctx.own)
+  const torn = await idsDisagree($, ctx.own)
   if (torn !== undefined) return notRun(torn)
   const gateSaid = (gated: string): string => (gated === COORDINATED ? 'the coordinator runs switches in this session; ask the merger or the owner for a wrap-up' : gated)
   const gated = await gateRefusal($, ctx.state, ctx.own, await $.clock.now())
@@ -1011,10 +1047,15 @@ async function switchNow($: EngineInterface, value: Queued): Promise<void> {
   const tabPassed = pick.transport !== 'window' || tab === undefined ? undefined : 'why' in tab ? tab.why : (tabNoLeft ?? paneFallback(found, tab.pane) ?? paneReads(tab.pane, ctx.configDirs.length))
   // A move that ends this process (a slot, a tab, a window) ends its session crons with it (CronCreate,
   // /loop, ScheduleWakeup), and its /exit would stop to ask about one: it holds on one, or on crons
-  // that can't be read (the shared reader, CronList, as self-exit's and self-restart's pre-check).
+  // that can't be read (the shared reader, CronList, as self-exit's and self-restart's pre-check). A
+  // durable cron doesn't end with it: it survives the exit, so it holds too, named apart, saying to
+  // delete it.
   if (pick.transport !== 'in-place') {
-    const crons = exitBlockers({ crons: await readCrons($), agents: [] })
-    if (crons.length > 0) return held(`this switch ends this process, and with it the session's crons: ${blockersText(crons)}`)
+    const jobs = await readCrons($)
+    const ending = exitBlockers({ crons: typeof jobs === 'string' ? jobs : jobs.filter(job => job.durable !== true), agents: [] })
+    const lasting = typeof jobs === 'string' ? [] : exitBlockers({ crons: jobs.filter(job => job.durable === true), agents: [] })
+    const said = [...(ending.length > 0 ? [`this switch ends this process, and with it the session's crons: ${blockersText(ending)}`] : []), ...(lasting.length > 0 ? [blockersText(lasting)] : [])]
+    if (said.length > 0) return held(said.join('; '))
   }
   // S11: the start folder (in place: the next conversation works in it) against its baseline; the named
   // worktrees, and the session's own folder when it is another tree, always.
@@ -1168,6 +1209,10 @@ async function switchNow($: EngineInterface, value: Queued): Promise<void> {
   } catch (err) {
     return undo(`the exit didn't run: ${why(err)}`, record)
   }
+  // The exit ran and this module is still here: the session may stay open (a dialog answered no). Its
+  // exit record is taken back at the next turn's end, if it is still this exit's: a turn that ends means
+  // the session went on, and a typed /exit later must not pass for this one.
+  exitLeft = { state: ctx.state, id: ctx.own, leaving: own }
   // An exit that took ends this module with the session, and this never fires.
   $.clock.after(CHECK_MS, () => {
     const waits =
@@ -1218,7 +1263,10 @@ export const register: Register = (on, options) => {
     // resume) starts with its own id. One a SessionStart named stands: `$.session.id()` may lag it.
     if (current === undefined || !currentFromEvent) {
       const own = await sessionId($)
-      if (own !== undefined && SESSION_ID.test(own)) current = own
+      if (own !== undefined && SESSION_ID.test(own)) {
+        current = own
+        currentAt = await $.clock.now()
+      }
     }
     await $.tool.register({
       name: 'switch_after_turn',
@@ -1263,14 +1311,16 @@ export const register: Register = (on, options) => {
       $.ui.toast('Switch cancelled: this session became another conversation before it ran.')
     }
     const id = e.session_id
-    // The conversation this process held until now, and the one it holds from here, by the event's id.
-    const previous = current
-    if (e.agent_id === undefined && typeof id === 'string' && SESSION_ID.test(id)) {
-      current = id
-      currentFromEvent = true
-    }
+    // Only the main loop's startup, resume and clear move this process to a conversation: a fork's
+    // SessionStart (the /fork background copy, a conversation moved to the background) leaves the
+    // foreground where it was, and a source this plugin doesn't know moves nothing.
     if (e.agent_id !== undefined || (e.source !== 'resume' && e.source !== 'startup' && e.source !== 'clear')) return done
     if (typeof id !== 'string' || !SESSION_ID.test(id)) return done
+    // The conversation this process held until now, and the one it holds from here, by the event's id.
+    const previous = current
+    current = id
+    currentFromEvent = true
+    currentAt = await $.clock.now()
     // In place (a /resume or /clear, this plugin's switch or one the person typed): this process left
     // the conversation it held. The arriving side writes its left record, keyed by this event's id,
     // LEFT_SETTLE_MS after it, so the engine's last write to the conversation left is inside the stat.
@@ -1311,10 +1361,14 @@ export const register: Register = (on, options) => {
       return { deny: "Not queued: this session's id can't be read, so the switch can't be tied to this conversation. Try again; if it persists, switch by hand." }
     }
     if (own === to) return { deny: `This session is already conversation ${to}.` }
-    const torn = idsDisagree(own)
+    const torn = await idsDisagree($, own)
     if (torn !== undefined) return { deny: `Not queued: ${torn}. Try again in a moment.` }
-    const stop = blocked(await busyAgents($))
-    if (stop !== undefined) return { deny: `Not queued: ${stop}. Wait for them to report, or stop them, then call again.` }
+    const busy = await busyAgents($)
+    const stop = blocked(busy)
+    if (stop !== undefined) {
+      const then = busy !== undefined && agentsWayOut(busy) !== undefined ? 'Once they have ended, call again.' : 'Wait for them to report, or stop them, then call again.'
+      return { deny: `Not queued: ${stop}. ${then}` }
+    }
     // S10w at the call: a pending wake-up, or one whose state can't be read, holds the switch.
     const where = await machine($)
     if (!('refusal' in where)) {
@@ -1345,6 +1399,11 @@ export const register: Register = (on, options) => {
   on('turn.complete', async ($, e, next) => {
     const done = await next(e)
     if (e.agentId !== undefined) return done
+    // A switch's /exit ran, and a turn has ended since: the session stayed open. Its exit record is
+    // taken back, if it is still that exit's, before anything this turn queued runs.
+    const left = exitLeft
+    exitLeft = undefined
+    if (left !== undefined) await withdrawLeft($, left.state, left.id, left.leaving)
     void heartbeat($)
     const { value } = await $.state.get(queued)
     if (!value) return done

@@ -372,6 +372,14 @@ export const AGENT_DONE: readonly string[] = ['completed', 'failed', 'killed']
 export const isBusyAgent = (status: string): boolean => !AGENT_DONE.includes(status)
 
 /**
+ * An agent in one of these is at its task, and reports on its own once done: `pending`, `running`,
+ * `waiting`. Any other that holds (isBusyAgent) may never: an idle teammate, between turns until it is
+ * stopped, or a status this code doesn't know (a terminal one a later Claude Code adds among them). It
+ * holds all the same, and the hold says how to clear it: TaskStop, or, once it is gone, /reload-plugins.
+ */
+export const AGENT_AT_WORK: readonly string[] = ['pending', 'running', 'waiting']
+
+/**
  * Every key a session registry file (`<config>\sessions\<pid>.json`) was seen to hold on Claude Code
  * 2.1.318. Any other key is logged once per process by name, and ignored: what liveness reads is
  * REGISTRY_FIELDS, checked strictly, and a new format is caught by REGISTRY_VERSION_MARKERS.
@@ -2010,6 +2018,35 @@ export type Baseline = { readonly folder: string; readonly fingerprint: string; 
 
 export type AgentLike = { readonly status: string; readonly description?: string; readonly type?: string; readonly id?: string }
 
+/** An agent's name as a hold says it: its task's description, else its type, else `an agent`; one line. */
+export const agentName = (agent: AgentLike): string => oneLine(agent.description?.trim() ? agent.description.trim() : (agent.type ?? 'an agent'), 120)
+
+/**
+ * The subagents that hold (each isBusyAgent), as one clause naming them: `a subagent is still running
+ * (Lint)` while each is at its task (AGENT_AT_WORK), else `2 subagents haven't ended (Lint; A teammate)`.
+ */
+export function agentsHeld(agents: readonly AgentLike[]): string {
+  const n = agents.length
+  const names = agents.map(agentName).join('; ')
+  return agents.every(a => AGENT_AT_WORK.includes(a.status))
+    ? `${n === 1 ? 'a subagent is' : `${n} subagents are`} still running (${names})`
+    : `${n === 1 ? "a subagent hasn't" : `${n} subagents haven't`} ended (${names})`
+}
+
+/**
+ * How to clear the subagents among `agents` that hold and won't report on their own (an idle teammate,
+ * a status this code doesn't know), each named with its status; undefined when there are none. The hold
+ * stands: TaskStop ends one, and /reload-plugins clears one that is already gone.
+ */
+export function agentsWayOut(agents: readonly AgentLike[]): string | undefined {
+  const stuck = agents.filter(a => isBusyAgent(a.status) && !AGENT_AT_WORK.includes(a.status))
+  if (stuck.length === 0) return undefined
+  const named = stuck.map(a => `${agentName(a)} (${oneLine(a.status, 40)})`)
+  return stuck.length === 1
+    ? `${named[0]} won't report on its own: stop it with TaskStop, or, if it is already gone, run /reload-plugins`
+    : `${named.join(', ')} won't report on their own: stop each with TaskStop, or, for one already gone, run /reload-plugins`
+}
+
 export type SafePoint = { readonly verdict: 'clear' | 'hold'; readonly reasons: readonly string[] }
 
 const CHECK: Record<ProcessClass, (p: ProcessEntry) => string> = {
@@ -2023,7 +2060,8 @@ const CHECK: Record<ProcessClass, (p: ProcessEntry) => string> = {
 /**
  * Whether the session is at a safe point to end or switch (\u00a74 of the design): `hold` with a reason
  * line per check that stops it, `clear` only when every check could be read and none stops it.
- * - S1: a subagent pending, running or waiting (`agents`; a string says why they couldn't be read);
+ * - S1: a subagent that hasn't ended (isBusyAgent; one that won't report on its own is named with its
+ *   status and how to clear it, agentsWayOut) (`agents`; a string says why they couldn't be read);
  * - S2: a git process under the session, or a git operation in flight in a worktree of its repos;
  * - S3: a heavy slot whose job's Windows pid runs under the session, or a heavy-slot job under it;
  * - S4: a dev server, Playwright or a debugged browser under it;
@@ -2038,8 +2076,9 @@ export function safePoint(probe: Probe | string, git: GitState, agents: readonly
   const reasons: string[] = []
   if (typeof agents === 'string') reasons.push(`S1: the session's subagents can't be read (${agents})`)
   else {
-    const busy = agents.filter(a => isBusyAgent(a.status)).map(a => (a.description?.trim() ? a.description.trim() : (a.type ?? 'an agent')))
-    if (busy.length > 0) reasons.push(`S1: ${busy.length === 1 ? 'a subagent is' : `${busy.length} subagents are`} still running (${busy.join('; ')})`)
+    const busy = agents.filter(a => isBusyAgent(a.status))
+    const way = agentsWayOut(busy)
+    if (busy.length > 0) reasons.push(`S1: ${agentsHeld(busy)}${way === undefined ? '' : `; ${way}`}`)
   }
   if (typeof probe === 'string') reasons.push(`the machine probe failed (${probe}), so what runs under this session is unknown`)
   else {
@@ -3453,13 +3492,17 @@ export function readGate(text: string, now: number): 'coordinated' | 'open' | 's
 // refuse while anything stands, so that nothing is queued that /exit would meet a dialog over; the
 // coordinator's ready_for_reboot reads the same.
 
-/** One job as the built-in CronList tool lists it: a session cron (CronCreate, ScheduleWakeup, /loop). */
+/**
+ * One job as the built-in CronList tool lists it: a session cron (CronCreate, ScheduleWakeup, /loop).
+ * `durable`: CronCreate's durable job, which survives the exit (the session's others end with it).
+ */
 export type CronJob = {
   readonly id: string
   readonly humanSchedule?: string
   readonly cron?: string
   readonly prompt?: string
   readonly recurring?: boolean
+  readonly durable?: boolean
 }
 
 /** A wake-up self-wake holds for this session: by its note when the caller has it, or by when it is due (its marker's `due`). */
@@ -3520,6 +3563,7 @@ export function stopCrons(value: unknown): CronJob[] | undefined {
       ...(typeof job.schedule === 'string' ? { cron: job.schedule } : {}),
       ...(typeof job.prompt === 'string' ? { prompt: job.prompt } : {}),
       ...(typeof job.recurring === 'boolean' ? { recurring: job.recurring } : {}),
+      ...(typeof job.durable === 'boolean' ? { durable: job.durable } : {}),
     })
   }
   return jobs
@@ -3592,7 +3636,9 @@ export function exitBlockers(input: ExitInputs): ExitBlocker[] {
       const id = idText(job.id)
       const when = oneLine(job.humanSchedule ?? job.cron ?? 'its schedule', 80)
       const words = job.prompt === undefined ? '' : `: ${quoted(oneLine(job.prompt, 80))}`
-      found.push({ kind: 'cron', id: job.id, what: `cron ${id} (${when}${words}) is set to wake this session`, howToStop: `delete it with CronDelete (id ${id})` })
+      // A durable cron is named apart: it doesn't end with the session, so it would go on after the exit.
+      const what = job.durable === true ? `durable cron ${id} (${when}${words}) is set, and survives the exit` : `cron ${id} (${when}${words}) is set to wake this session`
+      found.push({ kind: 'cron', id: job.id, what, howToStop: `delete it with CronDelete (id ${id})` })
     }
   }
   if (input.busy !== undefined) {
@@ -3631,14 +3677,16 @@ export function exitBlockers(input: ExitInputs): ExitBlocker[] {
   else {
     for (const agent of input.agents) {
       if (!isBusyAgent(agent.status)) continue
-      const described = agent.description?.trim() ?? ''
-      const name = oneLine(described !== '' ? described : (agent.type ?? 'an agent'), 120)
+      const name = agentName(agent)
       const id = typeof agent.id === 'string' && agent.id !== '' ? agent.id : undefined
+      const stop = `stop it with TaskStop${id === undefined ? '' : ` (${idText(id)})`}`
       found.push({
         kind: 'subagent',
         ...(id === undefined ? {} : { id }),
         what: agent.status === 'running' ? `a subagent is still running (${name})` : `a subagent hasn't ended (${name}; ${oneLine(agent.status, 40)})`,
-        howToStop: `wait for it to report, or stop it with TaskStop${id === undefined ? '' : ` (${idText(id)})`}`,
+        // One at its task reports on its own; an idle teammate, or a status this code doesn't know, may
+        // never: it still holds, and says how to clear it.
+        howToStop: AGENT_AT_WORK.includes(agent.status) ? `wait for it to report, or ${stop}` : `${stop}, or, if it is already gone, run /reload-plugins`,
       })
     }
   }
@@ -3699,6 +3747,7 @@ export function cronJobs(result: unknown): CronJob[] | undefined {
       ...(typeof job.cron === 'string' ? { cron: job.cron } : {}),
       ...(typeof job.prompt === 'string' ? { prompt: job.prompt } : {}),
       ...(typeof job.recurring === 'boolean' ? { recurring: job.recurring } : {}),
+      ...(typeof job.durable === 'boolean' ? { durable: job.durable } : {}),
     })
   }
   return jobs

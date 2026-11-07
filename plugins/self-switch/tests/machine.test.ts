@@ -568,11 +568,15 @@ describe('the safe point', () => {
     })
   })
 
-  test('a subagent holds it until it has ended: idle (a teammate between turns), and a status this code does not know, hold too (S1-8)', () => {
+  test('a subagent holds it until it has ended: idle (a teammate between turns), and a status this code does not know, hold too, saying how to clear them (S1-8, D-5)', () => {
     expect(point(undefined, CLEAN, [{ status: 'idle', description: 'A teammate' }, { status: 'paused', description: 'A later status' }, { status: 'failed', description: 'Lint' }, { status: 'killed', description: 'Build' }])).toEqual({
       verdict: 'hold',
-      reasons: ['S1: 2 subagents are still running (A teammate; A later status)'],
+      reasons: ["S1: 2 subagents haven't ended (A teammate; A later status); A teammate (idle), A later status (paused) won't report on their own: stop each with TaskStop, or, for one already gone, run /reload-plugins"],
     })
+    // One at its task beside one that won't report: both named, the way out for the one alone.
+    expect(point(undefined, CLEAN, [{ status: 'running', description: 'Lint' }, { status: 'idle', type: 'teammate' }]).reasons).toEqual([
+      "S1: 2 subagents haven't ended (Lint; teammate); teammate (idle) won't report on its own: stop it with TaskStop, or, if it is already gone, run /reload-plugins",
+    ])
   })
 
   test("anything that can't be read holds it, and says why", () => {

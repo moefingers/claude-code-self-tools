@@ -90,7 +90,7 @@ type Options = {
    */
   paneScript?: 'writes' | 'fails' | 'wrote-fails' | 'agent' | 'other'
   /** The session's crons, as CronList lists them; `asks`: CronList's permission would ask, so they can't be read. */
-  crons?: { id: string; humanSchedule?: string; prompt?: string }[] | 'asks'
+  crons?: { id: string; humanSchedule?: string; prompt?: string; durable?: boolean }[] | 'asks'
   /** A wake-up marked armed while the switch runs: when a script of this kind runs, the marker becomes this. */
   markOn?: { kind: Run['kind']; marker: string }
   /** What the in-place claim check reads: the lock still this switch's, another's, or none. */
@@ -821,6 +821,23 @@ describe('refusals, before and at the run', () => {
     await clock.advance(1000)
     expect(kinds()).toEqual([])
     expect(commands).toEqual([])
+  })
+
+  test('an idle teammate, or a status not known here, still holds, and says how to clear it: TaskStop, or /reload-plugins once it is gone (D-5)', async ($, on) => {
+    const { kinds, commands, world, session, clock } = engine(on, { agents: [{ description: 'A teammate', status: 'idle' }] })
+    await $.session.start(start)
+    expect((await $.tool.call(call)).deny).toBe(
+      "Not queued: a subagent hasn't ended (A teammate), and its work would be left behind; A teammate (idle) won't report on its own: stop it with TaskStop, or, if it is already gone, run /reload-plugins. Once they have ended, call again.",
+    )
+    // Held at the run too, whatever the status: never loosened.
+    world.agents = []
+    expect((await $.tool.call(call)).deny).toBeUndefined()
+    world.agents = [{ description: 'A teammate', status: 'stopped' as never }]
+    await $.turn.complete(answered)
+    await clock.advance(1000)
+    expect(kinds()).toEqual([])
+    expect(commands).toEqual([])
+    expect(rows(session)).toContain("A teammate (stopped) won't report on its own: stop it with TaskStop, or, if it is already gone, run /reload-plugins")
   })
 
   test('a call without to, reason or notes is refused', async ($, on) => {
@@ -1864,6 +1881,47 @@ describe("S10w: a wake-up armed with self-wake holds the switch (self-wake's mar
     await clock.advance(1000)
     expect(kinds()).toEqual([])
   })
+
+  test('a lag inside 15 seconds of that SessionStart still holds: refused at the call (D-1)', async ($, on) => {
+    const { kinds, clock } = engine(on)
+    await $.session.start(start)
+    await $.classic.SessionStart({ source: 'resume', session_id: X })
+    await clock.advance(14_000)
+    expect((await $.tool.call(call)).deny).toBe(`Not queued: this session's id reads ${W}, but its last SessionStart named ${X}: it is moving between conversations, so which one it would leave is unclear. Try again in a moment.`)
+    await $.turn.complete(answered)
+    await clock.advance(1000)
+    expect(kinds()).toEqual([])
+  })
+
+  test('a lag past 15 seconds no longer holds: $.session.id() is trusted, the log says so, and the switch goes (D-1)', async ($, on) => {
+    const { commands, logs, clock } = engine(on)
+    await $.session.start(start)
+    await $.classic.SessionStart({ source: 'resume', session_id: X })
+    await clock.advance(16_000)
+    await switchNow($, clock)
+    expect(commands).toEqual([{ command: 'resume', args: T }])
+    expect(logs).toContain(`this session's id reads ${W}, but its last SessionStart named ${X} 16 seconds ago; past 15 seconds the id is trusted, so the switch leaves ${W}.`)
+  })
+
+  test("no classic SessionStart reaches the plugin (a managed or Team/Enterprise guard keeps classic hooks from mods): after an in-place /clear, $.session.id() is read, and the switch goes (D-1)", async ($, on) => {
+    const { commands, clock, world } = engine(on, { probe: machine(p => void p.transcripts.push({ id: X, dir: 0, project: PROJECT, mtime: NOW - 30_000 })) })
+    await $.session.start(start)
+    // A /clear typed in place: the session is X now, and no SessionStart came to say so (session.start
+    // doesn't run again). Before D-1, every switch from here was refused.
+    world.id = X
+    await switchNow($, clock)
+    expect(commands).toEqual([{ command: 'resume', args: T }])
+  })
+
+  test("a fork's SessionStart (the /fork background copy) moves nothing: the switch leaves the conversation $.session.id() reads (D-1)", async ($, on) => {
+    const { commands, session, clock } = engine(on)
+    await $.session.start(start)
+    await $.classic.SessionStart({ source: 'startup', session_id: W })
+    await $.classic.SessionStart({ source: 'fork', session_id: X })
+    await switchNow($, clock)
+    expect(commands).toEqual([{ command: 'resume', args: T }])
+    expect(texts(session).some(t => t.includes(`claude --resume ${W}) to pick up here`))).toBe(true)
+  })
 })
 
 describe('session crons: a switch that ends this process holds on one (S1-7)', () => {
@@ -1893,6 +1951,25 @@ describe('session crons: a switch that ends this process holds on one (S1-7)', (
     await $.session.start(start)
     await switchNow($, clock)
     expect(commands).toEqual([{ command: 'resume', args: T }])
+  })
+
+  test('a durable cron is named apart: it survives the exit, so the hold says to delete it, never that it ends with the process (D-4)', async ($, on) => {
+    const { commands, kinds, session, clock } = engine(on, { probe: machine(elsewhere), store: THERE, crons: [{ ...CRON, durable: true }] })
+    await $.session.start(start)
+    await switchNow($, clock)
+    expect(commands).toEqual([])
+    expect(kinds()).toEqual(['probe', 'release'])
+    expect(rows(session)).toContain("didn't run: durable cron 7f3a9c21 (Every 5 minutes: «check the deploy») is set, and survives the exit: delete it with CronDelete (id 7f3a9c21). This conversation goes on.")
+  })
+
+  test('both kinds: the crons that end with the process, then the durable one apart (D-4)', async ($, on) => {
+    const { commands, session, clock } = engine(on, { probe: machine(elsewhere), store: THERE, crons: [{ ...CRON, durable: true }, { id: 'b2c4d6e8', humanSchedule: 'Every hour' }] })
+    await $.session.start(start)
+    await switchNow($, clock)
+    expect(commands).toEqual([])
+    expect(rows(session)).toContain(
+      "didn't run: this switch ends this process, and with it the session's crons: cron b2c4d6e8 (Every hour) is set to wake this session: delete it with CronDelete (id b2c4d6e8); durable cron 7f3a9c21 (Every 5 minutes: «check the deploy») is set, and survives the exit: delete it with CronDelete (id 7f3a9c21).",
+    )
   })
 })
 
@@ -1973,6 +2050,37 @@ describe('the left record (\u00a73.4)', () => {
     expect(lefts()).toHaveLength(1)
     expect(writes).toContainEqual({ path: leftPath(STATE, W), text: '{"v":1,"cancelled":true}' })
     expect(rows(session)).toMatch(/didn't happen after all: the exit didn't run/)
+  })
+
+  test('an /exit that runs but leaves the session open: the exit record stands until the next turn ends, then is taken back (D-2)', async ($, on) => {
+    const { commands, files, lefts, clock } = engine(on, { probe: machine(elsewhere), store: THERE, exit: 'stays' })
+    await $.session.start(start)
+    await switchNow($, clock)
+    expect(commands).toEqual([{ command: 'exit' }])
+    expect(lefts()).toHaveLength(1)
+    const record = files.get(leftPath(STATE, W))
+    expect(JSON.parse(record ?? '{}')).toMatchObject({ v: 1, id: W, how: 'exit', pid: '100', created: ft(2) })
+    // While no turn has ended, the exit may still go through (its dialog still open): the record stands.
+    await clock.advance(10_000)
+    expect(files.get(leftPath(STATE, W))).toBe(record)
+    // A turn ends: the session went on, and a typed /exit later must not pass for the switch's.
+    await $.turn.start({ text: 'a message', turnId: 't2' })
+    await $.turn.complete({ ...answered, turnId: 't2' })
+    expect(files.get(leftPath(STATE, W))).toBe('{"v":1,"cancelled":true}')
+  })
+
+  test("a record that is no longer that exit's is left as it is at the next turn's end (D-2)", async ($, on) => {
+    const { files, writes, clock } = engine(on, { probe: machine(elsewhere), store: THERE, exit: 'stays' })
+    await $.session.start(start)
+    await switchNow($, clock)
+    // Another process's exit record for W, written since.
+    const other = JSON.stringify({ v: 1, id: W, how: 'exit', pid: '777', created: ft(50), at: String(NOW), by: 'self-switch', mac: '0'.repeat(64) })
+    files.set(leftPath(STATE, W), other)
+    const before = writes.length
+    await $.turn.start({ text: 'a message', turnId: 't2' })
+    await $.turn.complete({ ...answered, turnId: 't2' })
+    expect(files.get(leftPath(STATE, W))).toBe(other)
+    expect(writes.slice(before).filter(w => w.path === leftPath(STATE, W))).toEqual([])
   })
 
   test('a return trip: a left record waives L3 in place, and the last look checks the transcript against it (LR12)', async ($, on) => {

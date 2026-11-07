@@ -163,9 +163,10 @@ describe("the wake marker (S10w's read): wake\\<conversation>.json, { v: 1, arme
   /**
    * The engine with %LOCALAPPDATA%, the session's id and the file writes: each marker as written, by
    * conversation. `failArmed`: that many writes of an armed marker fail (a scanner holding the file);
-   * `removal`: what the removal script answers, `removed` or `kept`; `scripts`, each script it was run with.
+   * `removal`: what the removal script answers, `removed` or `kept`; `removalMs`, how long on the
+   * engine's clock it takes to answer; `scripts`, each script it was run with.
    */
-  function marked(on: On, { failArmed = 0, removal = 'removed' }: { failArmed?: number; removal?: 'removed' | 'kept' } = {}) {
+  function marked(on: On, { failArmed = 0, removal = 'removed', removalMs = 0 }: { failArmed?: number; removal?: 'removed' | 'kept'; removalMs?: number } = {}) {
     const base = engine(on)
     const writes: { path: string; text: string }[] = []
     const failed: string[] = []
@@ -188,8 +189,9 @@ describe("the wake marker (S10w's read): wake\\<conversation>.json, { v: 1, arme
       writes.push({ path: e.path, text: e.text })
       return { value: undefined }
     })
-    on('process.run', (_, e) => {
+    on('process.run', async (_, e) => {
       scripts.push(String(e.init?.stdin ?? ''))
+      if (removalMs > 0) await base.clock.sleep(removalMs)
       return { value: { exitCode: 0, stdout: removal === 'removed' ? 'removed\r\n' : 'kept The process cannot access the file\r\n', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
     })
     /** The markers written for `id`, parsed, oldest first. */
@@ -305,6 +307,24 @@ describe("the wake marker (S10w's read): wake\\<conversation>.json, { v: 1, arme
     expect(WAKE_REMOVED.exec('removed\r\n')?.[1]).toBe('removed')
     expect(toasts).toContain("Wake-up set, but its marker couldn't be written, so it was removed: a switch or a go here reads this wake-up as unknown, and holds, until it fires or is cancelled.")
     expect(logs.some(l => l.startsWith("self-wake: the wake marker for ") && l.includes("the marker there before, if any, still stands"))).toBe(true)
+  })
+
+  test('the removal is awaited: the turn\'s end returns only once it has run, so a switch read right after never finds the stale marker (D-3)', async ($, on) => {
+    const { scripts, toasts, clock } = marked(on, { failArmed: 2, removalMs: 2000 })
+    await $.session.start(start)
+    await $.tool.call({ tool: WAKE, minutes: 5, note: 'check the deploy' })
+    let ended = false
+    const ending = $.turn.complete({ ...answered, turnId: 't1' }).then(done => {
+      ended = true
+      return done
+    })
+    await clock.settle()
+    // The removal runs, and the turn's end waits on it.
+    expect(scripts).toEqual([wakeRemoveScript({ stateDir: STATE, id: W })])
+    expect(ended).toBe(false)
+    await clock.advance(2000)
+    await ending
+    expect(toasts).toContain("Wake-up set, but its marker couldn't be written, so it was removed: a switch or a go here reads this wake-up as unknown, and holds, until it fires or is cancelled.")
   })
 
   test('one that can\'t be removed either: the toast says a switch may not see it, and how to stop that (S1-2)', async ($, on) => {

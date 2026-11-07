@@ -177,7 +177,8 @@ async function fire($: EngineInterface, id: string): Promise<void> {
  * Starts this module's timer for `wake`, in place of any it had; one already due fires at once. The
  * wake-up belongs to `conversation`, whose marker then says armed (and the one a replaced wake-up
  * belonged to, if another, not). The armed marker is awaited, so a switch or a go queued in the same
- * turn reads it, and written once more if that fails; failing again, it is removed (unmark).
+ * turn reads it, and written once more if that fails; failing again, it is removed (unmark), awaited
+ * too: a switch's read right after must not find the stale marker saying none.
  */
 async function arm($: EngineInterface, wake: Wake, now: number, conversationOf: string | undefined): Promise<void> {
   timer?.cancel()
@@ -185,7 +186,7 @@ async function arm($: EngineInterface, wake: Wake, now: number, conversationOf: 
   held = { conversation: conversationOf, id: wake.id, dueAt: wake.dueAt }
   timer = $.clock.after(Math.max(0, wake.dueAt - now), () => void fire($, wake.id))
   $.ui.status(pinned(wake.note))
-  if (!(await mark($, conversationOf)) && !(await mark($, conversationOf)) && conversationOf !== undefined) void unmark($, conversationOf)
+  if (!(await mark($, conversationOf)) && !(await mark($, conversationOf)) && conversationOf !== undefined) await unmark($, conversationOf)
   if (replaced !== undefined && replaced !== conversationOf) void mark($, replaced)
 }
 
