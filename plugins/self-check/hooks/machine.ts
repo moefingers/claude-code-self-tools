@@ -375,9 +375,37 @@ export const isBusyAgent = (status: string): boolean => !AGENT_DONE.includes(sta
  * An agent in one of these is at its task, and reports on its own once done: `pending`, `running`,
  * `waiting`. Any other that holds (isBusyAgent) may never: an idle teammate, between turns until it is
  * stopped, or a status this code doesn't know (a terminal one a later Claude Code adds among them). It
- * holds all the same, and the hold says how to clear it: TaskStop, or, once it is gone, /reload-plugins.
+ * holds all the same, and the hold says how to clear it: TaskStop, or exit by hand.
  */
 export const AGENT_AT_WORK: readonly string[] = ['pending', 'running', 'waiting']
+
+/**
+ * How long after the SessionStart that named a conversation `$.session.id()` may still read the one
+ * before (it lags the event, seen live on 2.1.318): within it, the event's id stands; past it,
+ * `$.session.id()` is the conversation, so a disagreement that never resolves holds nothing for good.
+ */
+export const ID_LAG_MS = 15_000
+
+/**
+ * Whether a classic SessionStart of this source moves the process to the conversation it names: a
+ * startup, a resume or a clear does. A fork's doesn't (the /fork background copy, a conversation moved
+ * to the background: the foreground stays), nor does a compact's or a source not known here. Where a
+ * fork's does move the foreground (/branch), idLag sees it: `$.session.id()` reads the fork's id.
+ */
+export const movesConversation = (source: unknown): boolean => source === 'startup' || source === 'resume' || source === 'clear'
+
+/**
+ * How `$.session.id()`, reading `own` at `now`, stands against `named`, the conversation the last
+ * moving SessionStart named at `at`:
+ * - `agrees`: they are one, or no event has named one;
+ * - `lags`: it reads another, at most ID_LAG_MS after the event: the event's id stands;
+ * - `stale`: it reads another past that, or the clock reads before the event: `own` is the conversation.
+ */
+export function idLag(named: string | undefined, at: number | undefined, own: string, now: number): 'agrees' | 'lags' | 'stale' {
+  if (named === undefined || named === own) return 'agrees'
+  const since = at === undefined ? Number.NaN : now - at
+  return since >= 0 && since <= ID_LAG_MS ? 'lags' : 'stale'
+}
 
 /**
  * Every key a session registry file (`<config>\sessions\<pid>.json`) was seen to hold on Claude Code
@@ -2036,15 +2064,16 @@ export function agentsHeld(agents: readonly AgentLike[]): string {
 /**
  * How to clear the subagents among `agents` that hold and won't report on their own (an idle teammate,
  * a status this code doesn't know), each named with its status; undefined when there are none. The hold
- * stands: TaskStop ends one, and /reload-plugins clears one that is already gone.
+ * stands: TaskStop ends one, or the person exits by hand. Whether a reload clears one already gone from
+ * `$.agent.list()` is unknown until G2, so it isn't offered.
  */
 export function agentsWayOut(agents: readonly AgentLike[]): string | undefined {
   const stuck = agents.filter(a => isBusyAgent(a.status) && !AGENT_AT_WORK.includes(a.status))
   if (stuck.length === 0) return undefined
   const named = stuck.map(a => `${agentName(a)} (${oneLine(a.status, 40)})`)
   return stuck.length === 1
-    ? `${named[0]} won't report on its own: stop it with TaskStop, or, if it is already gone, run /reload-plugins`
-    : `${named.join(', ')} won't report on their own: stop each with TaskStop, or, for one already gone, run /reload-plugins`
+    ? `${named[0]} won't report on its own: stop it with TaskStop, or exit by hand`
+    : `${named.join(', ')} won't report on their own: stop each with TaskStop, or exit by hand`
 }
 
 export type SafePoint = { readonly verdict: 'clear' | 'hold'; readonly reasons: readonly string[] }
@@ -3686,7 +3715,7 @@ export function exitBlockers(input: ExitInputs): ExitBlocker[] {
         what: agent.status === 'running' ? `a subagent is still running (${name})` : `a subagent hasn't ended (${name}; ${oneLine(agent.status, 40)})`,
         // One at its task reports on its own; an idle teammate, or a status this code doesn't know, may
         // never: it still holds, and says how to clear it.
-        howToStop: AGENT_AT_WORK.includes(agent.status) ? `wait for it to report, or ${stop}` : `${stop}, or, if it is already gone, run /reload-plugins`,
+        howToStop: AGENT_AT_WORK.includes(agent.status) ? `wait for it to report, or ${stop}` : `${stop}, or exit by hand`,
       })
     }
   }

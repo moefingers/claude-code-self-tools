@@ -83,8 +83,8 @@ describe('exitBlockers', () => {
     })
     expect(found.map(b => b.id)).toEqual(['a1', 'a2'])
     // Neither reports on its own: each still holds, and says how to clear it (D-5).
-    expect(found[0]).toEqual({ kind: 'subagent', id: 'a1', what: "a subagent hasn't ended (A teammate; idle)", howToStop: 'stop it with TaskStop (a1), or, if it is already gone, run /reload-plugins' })
-    expect(found[1]).toEqual({ kind: 'subagent', id: 'a2', what: "a subagent hasn't ended (A status from a later Claude Code; paused)", howToStop: 'stop it with TaskStop (a2), or, if it is already gone, run /reload-plugins' })
+    expect(found[0]).toEqual({ kind: 'subagent', id: 'a1', what: "a subagent hasn't ended (A teammate; idle)", howToStop: 'stop it with TaskStop (a1), or exit by hand' })
+    expect(found[1]).toEqual({ kind: 'subagent', id: 'a2', what: "a subagent hasn't ended (A status from a later Claude Code; paused)", howToStop: 'stop it with TaskStop (a2), or exit by hand' })
   })
 
   test('one at its task, pending or waiting, is waited for: it reports on its own (D-5)', () => {

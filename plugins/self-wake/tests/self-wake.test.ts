@@ -258,6 +258,52 @@ describe("the wake marker (S10w's read): wake\\<conversation>.json, { v: 1, arme
     expect(markers(W).at(-1)?.armed).toBe(false)
   })
 
+  test("a fork's SessionStart moves nothing: its own marker says none, a wake-up stays armed under W, and one set after it is W's too, so a switch from W holds (D-6)", async ($, on) => {
+    const { markers, clock } = marked(on)
+    await $.session.start(start)
+    await $.classic.SessionStart({ source: 'startup', session_id: W })
+    await $.tool.call({ tool: WAKE, minutes: 10, note: 'check W' })
+    await $.turn.complete({ ...answered, turnId: 't1' })
+    await clock.settle()
+    expect(markers(W).at(-1)?.armed).toBe(true)
+    await $.classic.SessionStart({ source: 'fork', session_id: T })
+    await clock.settle()
+    expect(markers(T).at(-1)?.armed).toBe(false)
+    expect(markers(W).at(-1)?.armed).toBe(true)
+    // Set after the fork's event, in the foreground, still W: never stored under the fork.
+    await $.tool.call({ tool: WAKE, minutes: 5, note: 'check W again' })
+    await $.turn.complete({ ...answered, turnId: 't2' })
+    await clock.settle()
+    expect(markers(W).at(-1)?.armed).toBe(true)
+    expect(markers(T).at(-1)?.armed).toBe(false)
+  })
+
+  test("an id that lags its SessionStart, inside 15 seconds: the event's id stands, and the wake-up is armed under it (D-6)", async ($, on) => {
+    const { markers, clock } = marked(on)
+    await $.session.start(start)
+    await $.classic.SessionStart({ source: 'resume', session_id: T })
+    await clock.advance(14_000)
+    await $.tool.call({ tool: WAKE, minutes: 5, note: 'check T' })
+    await $.turn.complete({ ...answered, turnId: 't1' })
+    await clock.settle()
+    expect(markers(T).at(-1)?.armed).toBe(true)
+    expect(markers(W).at(-1)?.armed).toBe(false)
+  })
+
+  test('after /branch, past 15 seconds, $.session.id() is the conversation: the wake-up is armed under the one it reads (D-6)', async ($, on) => {
+    const { markers, world, clock } = marked(on)
+    await $.session.start(start)
+    await $.classic.SessionStart({ source: 'startup', session_id: W })
+    await $.classic.SessionStart({ source: 'fork', session_id: T })
+    world.id = T
+    await clock.advance(16_000)
+    await $.tool.call({ tool: WAKE, minutes: 5, note: 'check T' })
+    await $.turn.complete({ ...answered, turnId: 't1' })
+    await clock.settle()
+    expect(markers(T).at(-1)?.armed).toBe(true)
+    expect(markers(W).at(-1)?.armed).toBe(false)
+  })
+
   test('a wake-up keeps the conversation it was armed in: after a reload, a move to another and back finds its marker armed, never handed to the other (S1-1)', async ($, on) => {
     const { markers, clock } = marked(on)
     await $.session.start(start)

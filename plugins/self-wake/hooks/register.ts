@@ -12,7 +12,8 @@
 // The wake marker (S10w's read, for self-switch and the coordinator): %LOCALAPPDATA%\claude-self-tools\
 // wake\<conversation>.json = { v: 1, armed, due?, at }, `armed` true only while this process holds a
 // timer for that conversation's wake-up. Written at the start of each conversation this process holds
-// (session.start, and each classic SessionStart by its event's id), when a wake-up is armed or
+// (session.start, and each classic SessionStart by its event's id: a fork's writes its own marker and
+// moves nothing, by the rule self-switch reads the same id by, movesConversation), when a wake-up is armed or
 // replaced, when it fires, and when it is cancelled; and for the conversation an in-place /resume or
 // /clear left, which no timer of this process holds any more (unless it holds its wake-up still). Each
 // write replaces the file whole. The path is built from the conversation's id by the shared machine
@@ -24,7 +25,7 @@
 // switch may not see the wake-up.
 import type { EngineInterface, Register, Timer } from 'claude-code'
 import type { Wake } from '../types'
-import { isSafeFolder, powershellPath, removeWakeMarker, SESSION_ID, stateFolder, SYSTEM_ROOT, wakeMarker, wakePath } from './machine'
+import { idLag, isSafeFolder, movesConversation, powershellPath, removeWakeMarker, SESSION_ID, stateFolder, SYSTEM_ROOT, wakeMarker, wakePath } from './machine'
 import { configureUpdateCheck, loadUpdateCheck, withUpdateNotice } from './update-check'
 
 const queued = { plugin: 'self-wake', key: 'queued' } as const
@@ -53,10 +54,14 @@ const SUBAGENT =
 let timer: Timer | undefined
 
 /**
- * The conversation this process holds: each main-loop classic SessionStart's own id (`$.session.id()`
- * may still read the one before at an in-place resume), and at session.start until one comes.
+ * The conversation this process holds: each main-loop classic SessionStart's own id, of a startup, a
+ * resume or a clear (`$.session.id()` may still read the one before at an in-place resume), and at
+ * session.start until one comes. A fork's names nothing here: the foreground stays.
  */
 let current: string | undefined
+
+/** When the SessionStart that named `current` came, by the engine's clock; undefined once it was read from `$.session.id()`. */
+let currentAt: number | undefined
 
 /** The wake-up this module's timer holds: the conversation it was armed in, its id, and when it is due. */
 let held: { conversation: string | undefined; readonly id: string; readonly dueAt: number } | undefined
@@ -64,15 +69,26 @@ let held: { conversation: string | undefined; readonly id: string; readonly dueA
 /** Whether a failed marker write was logged already: once per process. */
 let warned = false
 
-/** The conversation this process holds now, or undefined when it can't be read. */
+/**
+ * The conversation this process holds now, or undefined when it can't be read: by the rule self-switch
+ * holds a switch by (idLag). The SessionStart's id stands while `$.session.id()` lags it; past that the
+ * id is the conversation, from here (a /branch, whose fork's SessionStart names nothing here).
+ */
 async function conversation($: EngineInterface): Promise<string | undefined> {
-  if (current !== undefined) return current
+  let own: string | undefined
   try {
     const id = await $.session.id()
-    return SESSION_ID.test(id) ? id : undefined
+    own = SESSION_ID.test(id) ? id : undefined
   } catch {
-    return undefined
+    own = undefined
   }
+  if (current === undefined) return own
+  if (own === undefined) return current
+  if (idLag(current, currentAt, own, await $.clock.now()) === 'stale') {
+    current = own
+    currentAt = undefined
+  }
+  return current
 }
 
 /**
@@ -242,13 +258,21 @@ export const register: Register = (on, options) => {
   // none could be read then, to the first one named here. An
   // in-place move leaves a conversation whose wake-up no timer of this process holds any more: its
   // marker says so (unless the timer still holds it: a move back before it is due fires it there).
+  // A fork's event (the /fork background copy, a conversation moved to the background) writes the
+  // fork's marker and moves nothing: the foreground stays where it was, and a wake-up set there is
+  // that conversation's, or a switch from it would read none and drop the wake-up.
   // It answers what the chain beneath answered, always, and quickly (the markers are written after,
   // unawaited); a failure here passes the start through unchanged (the .catch).
   on('classic.SessionStart', async ($, e, next) => {
     const done = await next(e)
     if (e.agent_id !== undefined || typeof e.session_id !== 'string' || !SESSION_ID.test(e.session_id)) return done
+    if (!movesConversation(e.source)) {
+      void mark($, e.session_id)
+      return done
+    }
     const previous = current
     current = e.session_id
+    currentAt = await $.clock.now()
     if (previous === undefined && held !== undefined && held.conversation === undefined) held.conversation = current
     void mark($, current)
     if (previous !== undefined && previous !== current) void mark($, previous)

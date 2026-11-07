@@ -41,11 +41,11 @@
 // marker (readWake) at the call, at the run, and once more right before the final command (a wake-up
 // set in the same turn is marked as that turn ends, which nothing orders before the first read);
 // self-wake on with no marker, or one that can't be read, holds too. The conversation it is read for
-// is the one the last SessionStart of a startup, a resume or a clear named, as self-wake keys its
-// markers: while `$.session.id()` reads another, within ID_LAG_MS of that event (the id lags it), the
-// switch waits. Past that, or where no such event reached this plugin (a managed or Team/Enterprise
-// guard keeps classic hooks from mods), it is `$.session.id()`'s, said in the log. A fork's
-// SessionStart moves nothing. A session cron (CronCreate, /loop, ScheduleWakeup, read with CronList)
+// is the one the last SessionStart of a startup, a resume or a clear named (movesConversation, the
+// rule self-wake keys its markers by): while `$.session.id()` reads another, within ID_LAG_MS of that
+// event (the id lags it), the switch waits. Past that, or where no such event reached this plugin (a
+// managed or Team/Enterprise guard keeps classic hooks from mods), it is `$.session.id()`'s, said in
+// the log, and this process holds that one from there. A fork's SessionStart moves nothing. A session cron (CronCreate, /loop, ScheduleWakeup, read with CronList)
 // holds a switch that ends this process (a slot, a tab, a window); one that can't be read holds too. A
 // durable cron is named apart: it survives the exit, so the hold says to delete it.
 // Other pending wake-ups are dropped by every transport (an in-place `/resume` swaps `$.state`; an
@@ -104,6 +104,9 @@ import {
   CLAIM_CHECK_LIVE,
   fingerprintOf,
   CLAIM_CHECKED,
+  ID_LAG_MS,
+  idLag,
+  movesConversation,
   claimCheckScript,
   gatePath,
   isSafeFolder,
@@ -185,12 +188,6 @@ const KEEP_BEATS_MS = 30 * 24 * 60 * 60 * 1000
 const PRUNE_EVERY_MS = 6 * 60 * 60 * 1000
 /** After an in-place resume took, the switch delivers the arrival itself if the SessionStart hasn't by then. */
 const ARRIVAL_FALLBACK_MS = 5000
-/**
- * How long after a main-loop SessionStart `$.session.id()` may still read the conversation before it
- * (it lags the event, seen live on 2.1.318): within it, a disagreement holds a switch (idsDisagree);
- * past it, `$.session.id()` is trusted, so a disagreement that never resolves can't hold every switch.
- */
-const ID_LAG_MS = 15_000
 /** The most switches under way the store keeps. */
 const MAX_KEPT = 50
 
@@ -234,13 +231,14 @@ let startFolder: string | undefined
  * The conversation this process holds now: from each main-loop classic SessionStart's own id (the
  * event's: `$.session.id()` may still read the one before) of a startup, a resume or a clear, never a
  * fork's (the /fork background copy, a conversation moved to the background: the foreground stays) or
- * a source this plugin doesn't know; and at session.start when none is known yet. A `/clear` carries
- * the S11 baseline of this conversation to the one it starts.
+ * a source this plugin doesn't know (movesConversation); at session.start when none is known yet; and
+ * from `$.session.id()` once that is trusted (settleId). A `/clear` carries the S11 baseline of this
+ * conversation to the one it starts.
  */
 let current: string | undefined
-/** Whether `current` was named by a classic SessionStart (else by a session.start, from `$.session.id()`). */
+/** Whether `current` was named by a classic SessionStart (else it was read from `$.session.id()`). */
 let currentFromEvent = false
-/** When `current` was named (by a classic SessionStart, or a session.start), by the engine's clock. */
+/** When `current` was named or read, by the engine's clock. */
 let currentAt: number | undefined
 /**
  * The exit record a switch wrote right before an `/exit` that ran and came back with the session still
@@ -332,17 +330,32 @@ async function sessionId($: EngineInterface): Promise<string | undefined> {
  * marker and write another's exit record, so it waits. Only an event's id holds: where none reached
  * this plugin (a managed or Team/Enterprise guard keeps classic hooks from mods, and session.start
  * doesn't run again after a /clear or a /resume), `current` is a session.start's own reading, and a
- * later `$.session.id()` is the better one. Past ID_LAG_MS, `$.session.id()` is trusted, said in the log.
+ * later `$.session.id()` is the better one. Past ID_LAG_MS, `$.session.id()` is trusted (settleId).
  */
 async function idsDisagree($: EngineInterface, own: string): Promise<string | undefined> {
-  if (!currentFromEvent || current === undefined || current === own) return undefined
-  const since = currentAt === undefined ? Number.NaN : (await $.clock.now()) - currentAt
-  if (since >= 0 && since <= ID_LAG_MS) {
-    return `this session's id reads ${own}, but its last SessionStart named ${current}: it is moving between conversations, so which one it would leave is unclear`
+  if (!settleId($, own, await $.clock.now())) return undefined
+  return `this session's id reads ${own}, but its last SessionStart named ${current}: it is moving between conversations, so which one it would leave is unclear`
+}
+
+/**
+ * `current` against `$.session.id()` reading `own` at `now` (idLag): true while the id lags the
+ * SessionStart that named `current`, which stands. Otherwise `current` is `own` from here, so the next
+ * left record names the conversation this process really holds, after a /branch too: its fork's
+ * SessionStart names nothing here, and the id does move. Adopting an id past the lag is said in the
+ * log, once; one no event disagrees with is a session.start's own reading, and goes without a word.
+ */
+function settleId($: EngineInterface, own: string, now: number): boolean {
+  if (current === own) return false
+  if (currentFromEvent && idLag(current, currentAt, own, now) === 'lags') return true
+  if (currentFromEvent) {
+    const since = currentAt === undefined ? Number.NaN : now - currentAt
+    const when = Number.isFinite(since) && since > 0 ? `${Math.round(since / 1000)} seconds ago` : 'at a time the clock no longer agrees with'
+    $.ui.log(`this session's id reads ${own}, but its last SessionStart named ${current} ${when}; past ${ID_LAG_MS / 1000} seconds the id is trusted, so this session holds ${own} from here.`)
   }
-  const when = Number.isFinite(since) && since > 0 ? `${Math.round(since / 1000)} seconds ago` : 'at a time the clock no longer agrees with'
-  $.ui.log(`this session's id reads ${own}, but its last SessionStart named ${current} ${when}; past ${ID_LAG_MS / 1000} seconds the id is trusted, so the switch leaves ${own}.`)
-  return undefined
+  current = own
+  currentFromEvent = false
+  currentAt = now
+  return false
 }
 
 /**
@@ -1314,13 +1327,18 @@ export const register: Register = (on, options) => {
     // Only the main loop's startup, resume and clear move this process to a conversation: a fork's
     // SessionStart (the /fork background copy, a conversation moved to the background) leaves the
     // foreground where it was, and a source this plugin doesn't know moves nothing.
-    if (e.agent_id !== undefined || (e.source !== 'resume' && e.source !== 'startup' && e.source !== 'clear')) return done
+    if (e.agent_id !== undefined || !movesConversation(e.source)) return done
     if (typeof id !== 'string' || !SESSION_ID.test(id)) return done
     // The conversation this process held until now, and the one it holds from here, by the event's id.
+    // `$.session.id()` here still reads the one left, or this one already: the one left, past the lag,
+    // is what `current` should have read (a /branch since), so its left record names it.
+    const now = await $.clock.now()
+    const reads = await sessionId($)
+    if (reads !== undefined && reads !== id && SESSION_ID.test(reads)) settleId($, reads, now)
     const previous = current
     current = id
     currentFromEvent = true
-    currentAt = await $.clock.now()
+    currentAt = now
     // In place (a /resume or /clear, this plugin's switch or one the person typed): this process left
     // the conversation it held. The arriving side writes its left record, keyed by this event's id,
     // LEFT_SETTLE_MS after it, so the engine's last write to the conversation left is inside the stat.

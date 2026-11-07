@@ -823,11 +823,11 @@ describe('refusals, before and at the run', () => {
     expect(commands).toEqual([])
   })
 
-  test('an idle teammate, or a status not known here, still holds, and says how to clear it: TaskStop, or /reload-plugins once it is gone (D-5)', async ($, on) => {
+  test('an idle teammate, or a status not known here, still holds, and says how to clear it: TaskStop, or exit by hand (D-5, D-8)', async ($, on) => {
     const { kinds, commands, world, session, clock } = engine(on, { agents: [{ description: 'A teammate', status: 'idle' }] })
     await $.session.start(start)
     expect((await $.tool.call(call)).deny).toBe(
-      "Not queued: a subagent hasn't ended (A teammate), and its work would be left behind; A teammate (idle) won't report on its own: stop it with TaskStop, or, if it is already gone, run /reload-plugins. Once they have ended, call again.",
+      "Not queued: a subagent hasn't ended (A teammate), and its work would be left behind; A teammate (idle) won't report on its own: stop it with TaskStop, or exit by hand. Once they have ended, call again.",
     )
     // Held at the run too, whatever the status: never loosened.
     world.agents = []
@@ -837,7 +837,7 @@ describe('refusals, before and at the run', () => {
     await clock.advance(1000)
     expect(kinds()).toEqual([])
     expect(commands).toEqual([])
-    expect(rows(session)).toContain("A teammate (stopped) won't report on its own: stop it with TaskStop, or, if it is already gone, run /reload-plugins")
+    expect(rows(session)).toContain("A teammate (stopped) won't report on its own: stop it with TaskStop, or exit by hand")
   })
 
   test('a call without to, reason or notes is refused', async ($, on) => {
@@ -1900,7 +1900,7 @@ describe("S10w: a wake-up armed with self-wake holds the switch (self-wake's mar
     await clock.advance(16_000)
     await switchNow($, clock)
     expect(commands).toEqual([{ command: 'resume', args: T }])
-    expect(logs).toContain(`this session's id reads ${W}, but its last SessionStart named ${X} 16 seconds ago; past 15 seconds the id is trusted, so the switch leaves ${W}.`)
+    expect(logs).toContain(`this session's id reads ${W}, but its last SessionStart named ${X} 16 seconds ago; past 15 seconds the id is trusted, so this session holds ${W} from here.`)
   })
 
   test("no classic SessionStart reaches the plugin (a managed or Team/Enterprise guard keeps classic hooks from mods): after an in-place /clear, $.session.id() is read, and the switch goes (D-1)", async ($, on) => {
@@ -1921,6 +1921,36 @@ describe("S10w: a wake-up armed with self-wake holds the switch (self-wake's mar
     await switchNow($, clock)
     expect(commands).toEqual([{ command: 'resume', args: T }])
     expect(texts(session).some(t => t.includes(`claude --resume ${W}) to pick up here`))).toBe(true)
+  })
+
+  test('after /branch, past 15 seconds, the id read is adopted: said once, and the next left record names the conversation really left (D-7)', async ($, on) => {
+    const { commands, logs, lefts, world, clock } = engine(on, { probe: machine(p => void p.transcripts.push({ id: X, dir: 0, project: PROJECT, mtime: NOW - 30_000 })) })
+    await $.session.start(start)
+    await $.classic.SessionStart({ source: 'startup', session_id: W })
+    // /branch: a fork's SessionStart, which names nothing here, and the foreground does move.
+    await $.classic.SessionStart({ source: 'fork', session_id: X })
+    world.id = X
+    await clock.advance(16_000)
+    await switchNow($, clock)
+    expect(commands).toEqual([{ command: 'resume', args: T }])
+    expect(logs.filter(l => l.includes('the id is trusted'))).toHaveLength(1)
+    await $.classic.SessionStart({ source: 'resume', session_id: T })
+    await clock.advance(3100)
+    expect(lefts().map(r => /^\$id = '(.+)'$/m.exec(r.script ?? '')?.[1])).toEqual([X])
+  })
+
+  test('a /resume typed after /branch, with no switch in between: its left record names the conversation really left (D-7)', async ($, on) => {
+    const { lefts, world, clock } = engine(on)
+    await $.session.start(start)
+    await $.classic.SessionStart({ source: 'startup', session_id: W })
+    await $.classic.SessionStart({ source: 'fork', session_id: X })
+    world.id = X
+    await clock.advance(16_000)
+    // $.session.id() still reads the one left, as at an in-place resume.
+    await $.classic.SessionStart({ source: 'resume', session_id: T })
+    world.id = T
+    await clock.advance(3100)
+    expect(lefts().map(r => /^\$id = '(.+)'$/m.exec(r.script ?? '')?.[1])).toEqual([X])
   })
 })
 
