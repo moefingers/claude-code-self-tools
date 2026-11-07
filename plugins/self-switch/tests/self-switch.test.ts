@@ -340,8 +340,8 @@ function engine(
     // The launch takes again the claim its script names, and says what it placed.
     const by = /^\$by = '((?:launch|slot):[0-9a-f-]{1,40})'$/m.exec(script)?.[1] ?? 'none'
     // A tab or a named window, by placement.json: wt.exe by its one string.
-    if (kind === 'launcher' && script.includes('Start-Process wt.exe') && launcher === 'no-wt') return ok('refused wt self-switch: a tab needs Windows Terminal 1.19 or later\r\n')
-    if (kind === 'launcher' && script.includes('Start-Process wt.exe') && !script.includes('Start-Process -FilePath')) return ok(`claim ${by}\r\nlaunched tab ${/^\s*\$env:CLAUDE_SELF_TOOLS_WT_WINDOW = '([^']*)'$/m.exec(script)?.[1] ?? '-'}\r\n`)
+    if (kind === 'launcher' && script.includes('Start-Process $wtExe') && launcher === 'no-wt') return ok('refused wt self-switch: a tab needs Windows Terminal 1.19 or later\r\n')
+    if (kind === 'launcher' && script.includes('Start-Process $wtExe') && !script.includes('Start-Process -FilePath')) return ok(`claim ${by}\r\nlaunched tab ${/^\s*\$env:CLAUDE_SELF_TOOLS_WT_WINDOW = '([^']*)'$/m.exec(script)?.[1] ?? '-'}\r\n`)
     if (kind === 'launcher' && launcher === 'refuses') return ok('refused launcher self-switch: claude-launch.ps1 is not where it must be\r\n')
     if (kind === 'launcher') return launcher === 'opens' || launcher === 'no-wt' ? ok(`claim ${by}\r\nlaunched window - 100\r\n`) : ok('self-switch: no claude on PATH\r\n', 4)
     if (kind === 'slot') {
@@ -2296,7 +2296,8 @@ describe('the trampoline: a final command that checks again when it is dequeued'
   // The plugin's hooks load apart from a test's modules, so a test can't flip the `go` they use: these run
   // once GO_VIA itself is flipped. The S2 round ran them so, against a copy of the plugin with the constant changed:
   // the stand-down passes; the /exit does not yet, as the kit refuses a command from a command.run hook (M17b).
-  const afterFlip: typeof test = GO_VIA === 'trampoline' ? test : () => undefined
+  // On a flip, 'through it' fails until the design's Trampoline C: the flip's checklist names it.
+  const afterFlip: typeof test = GO_VIA === 'trampoline' ? test : (...args) => test(`skipped until GO_VIA flips: ${args[0]}`, () => undefined)
   /** What the engine does with the queued command: runs it, through the plugin's own hook. */
   const dequeue = async ($: TestDollar, clock: { advance: (ms: number) => Promise<void> }, args: string): Promise<void> => {
     await $.command.run({ command: 'self-switch-go', args, origin: { kind: 'plugin', name: 'self-switch' }, presentation: { isFullscreen: false, columns: 120 } })
@@ -2368,8 +2369,10 @@ describe('placement.json: where the new window goes', () => {
     await $.session.start(start)
     await switchNow($, clock)
     const script = runs.find(r => r.kind === 'launcher')?.script ?? ''
-    expect(script).toContain('Start-Process wt.exe -ArgumentList $wtLine')
-    expect(script).toContain(`$by = 'launch:${T}'`)
+    expect(script).toContain('Start-Process $wtExe -ArgumentList $wtLine')
+    // This switch's own claim, on the tab's line too: a later launch that takes the lock over turns this tab away.
+    expect(script).toContain(`$by = '${LAUNCH}'`)
+    expect(script).toContain(`-Claim ${LAUNCH} `)
     expect(script).toContain(`-Resume ${T} -WaitFor `)
     expect(script).toContain("$env:CLAUDE_SELF_TOOLS_WT_WINDOW = 'claude-4'")
     // In the probe that judged: the slots, for whether the window has room.
@@ -2384,8 +2387,8 @@ describe('placement.json: where the new window goes', () => {
     await switchNow($, clock)
     const launches = runs.filter(r => r.kind === 'launcher').map(r => r.script)
     expect(launches).toHaveLength(2)
-    expect(launches[0]).toContain('Start-Process wt.exe')
-    expect(launches[1]).not.toContain('Start-Process wt.exe')
+    expect(launches[0]).toContain('Start-Process $wtExe')
+    expect(launches[1]).not.toContain('Start-Process $wtExe')
     expect(commands).toEqual([{ command: 'exit' }])
   })
 

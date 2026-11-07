@@ -559,14 +559,15 @@ async function resume($: EngineInterface, held: Login, p: Pending, now: number):
   await $.state.set(loginRef, { ...held, pending: { ...p, resumed: true } })
   await $.state.set(resumesRef, { ...((await getResumes($)) ?? {}), sentAt: now })
   const said = resumedSaid(turn?.error, now - (turn?.at ?? now))
-  $.ui.log(`self-remote-control: ${said}`, { to: 'debug' })
+  let outcome: string
   try {
     const sent = await within($, $.prompt.submit({ text: RESUME }), SUBMIT_WAIT_MS)
-    if (sent === 'late') return `the resume is queued, to run once the session is idle (${said})`
-    return sent.drop === undefined ? said : `resume not sent: ${sent.drop}`
+    outcome = sent === 'late' ? `the resume is queued, to run once the session is idle (${said})` : sent.drop === undefined ? said : `resume not sent: ${sent.drop}`
   } catch (err) {
-    return `resume not sent: ${why(err)}`
+    outcome = `resume not sent: ${why(err)}`
   }
+  $.ui.log(`self-remote-control: ${outcome}`, { to: 'debug' })
+  return outcome
 }
 
 /** Whether a /login in this session holds a change back. */

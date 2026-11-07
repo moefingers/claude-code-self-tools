@@ -21,6 +21,7 @@
     { "name": "no layout", "file": { "v": 1 } },
     { "name": "an unknown key at the top", "file": { "v": 1, "layout": [], "extra": 1 } },
     { "name": "a window called 0", "file": { "v": 1, "layout": [ { "window": "0", "tabs": ["t"], "folder": "{{FOLDER}}" } ] } },
+    { "name": "a window called _quake", "file": { "v": 1, "layout": [ { "window": "_quake", "tabs": ["t"], "folder": "{{FOLDER}}" } ] } },
     { "name": "a window called last", "file": { "v": 1, "layout": [ { "window": "last", "tabs": ["t"], "folder": "{{FOLDER}}" } ] } },
     { "name": "a window called LAST", "file": { "v": 1, "layout": [ { "window": "LAST", "tabs": ["t"], "folder": "{{FOLDER}}" } ] } },
     { "name": "a window called new", "file": { "v": 1, "layout": [ { "window": "new", "tabs": ["t"], "folder": "{{FOLDER}}" } ] } },

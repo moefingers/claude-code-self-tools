@@ -102,8 +102,8 @@ function engine(on: On, { env = {}, placement, refuses = () => undefined, wake, 
     const by = /^\$by = '((?:launch|slot):[0-9a-f-]{1,40})'$/m.exec(script)?.[1] ?? 'none'
     const refused = refuses(script)
     if (refused !== undefined) return ok(`${refused}\r\n`)
-    if (script.includes('Start-Process wt.exe') && !script.includes('Start-Process -FilePath')) return ok(`claim ${by}\r\nlaunched tab claude-1\r\n`)
-    if (script.includes('Start-Process wt.exe')) return ok(`claim ${by}\r\nlaunched window claude-overflow\r\n`)
+    if (script.includes('Start-Process $wtExe') && !script.includes('Start-Process -FilePath')) return ok(`claim ${by}\r\nlaunched tab claude-1\r\n`)
+    if (script.includes('Start-Process $wtExe')) return ok(`claim ${by}\r\nlaunched window claude-overflow\r\n`)
     return ok(`claim ${by}\r\nlaunched window - 17716\r\n`)
   })
   /** The trampoline's own command, once queued: a test dequeues it, as the engine would. */
@@ -138,8 +138,11 @@ test('tab: same goes by this tab\'s stamp: a tab in that window, running the slo
   await restart($, clock)
   expect(scripts).toHaveLength(1)
   const script = scripts[0] ?? ''
-  expect(script).toContain(`$by = 'launch:${ID}'`)
-  expect(script).toContain('Start-Process wt.exe -ArgumentList $wtLine -PassThru')
+  // This restart's own claim, on the tab's line too: a later launch that takes the lock over turns this tab away.
+  const by = /^\$by = '(launch:[0-9a-f-]{36})'\r?$/m.exec(script)?.[1]
+  expect(by).not.toBe(`launch:${ID}`)
+  expect(script).toContain(`-Claim ${by} `)
+  expect(script).toContain('Start-Process $wtExe -ArgumentList $wtLine -PassThru')
   expect(script).toContain("$env:CLAUDE_SELF_TOOLS_WT_WINDOW = 'claude-1'")
   expect(script).toContain("$env:CLAUDE_SELF_TOOLS_WT_TAB = 'system-overhaul'")
   expect(script).toContain(`-Resume ${ID} -WaitFor 100-134062345688901240`)
@@ -167,7 +170,7 @@ test('no placement.json: today\'s window', async ($, on) => {
   const { scripts, clock } = engine(on, { env: STAMP })
   await $.session.start(start)
   await restart($, clock)
-  expect(scripts[0]).not.toContain('Start-Process wt.exe')
+  expect(scripts[0]).not.toContain('Start-Process $wtExe')
   expect(scripts[0]).toContain('$window = Start-Process -FilePath')
 })
 
@@ -175,7 +178,7 @@ test('a bad file means no placement: today\'s window, said once in the log', asy
   const { scripts, logs, clock } = engine(on, { env: STAMP, placement: JSON.stringify({ v: 1, layout: [{ window: '0', tabs: ['t'], folder: 'C:\\x' }] }) })
   await $.session.start(start)
   await restart($, clock)
-  expect(scripts[0]).not.toContain('Start-Process wt.exe')
+  expect(scripts[0]).not.toContain('Start-Process $wtExe')
   expect(logs.filter(line => line.startsWith('placement.json is not of its shape')).length).toBeLessThanOrEqual(1)
 })
 
@@ -194,7 +197,16 @@ test('refused for want of Windows Terminal, or the slot runner: the next place, 
   expect(scripts).toHaveLength(3)
   expect(scripts[0]).toContain('-w claude-1 nt')
   expect(scripts[1]).toContain('-w claude-overflow')
-  expect(scripts[2]).not.toContain('Start-Process wt.exe')
+  expect(scripts[2]).not.toContain('Start-Process $wtExe')
+  expect(commands).toEqual([{ command: 'exit' }])
+})
+
+test("a place the launch can't be built for (a config folder Windows Terminal would expand): the next place, not a refused restart (N3)", async ($, on) => {
+  const { scripts, commands, clock } = engine(on, { env: { ...STAMP, CLAUDE_CONFIG_DIR: 'C:\\config%x' }, placement: FILE })
+  await $.session.start(start)
+  await restart($, clock)
+  expect(scripts).toHaveLength(1)
+  expect(scripts[0]).toContain('$window = Start-Process -FilePath')
   expect(commands).toEqual([{ command: 'exit' }])
 })
 
@@ -228,7 +240,8 @@ test("the trampoline: GO_VIA ships as 'direct', its command registered all the s
 // The plugin's hooks load apart from a test's modules, so a test can't flip the `go` they use: these run
 // once GO_VIA itself is flipped. The S2 round ran them so, against a copy of the plugin with the constant changed:
 // the stand-down passes; the /exit does not yet, as the kit refuses a command from a command.run hook (M17b).
-const afterFlip: typeof test = GO_VIA === 'trampoline' ? test : () => undefined
+// On a flip, 'through it: dequeued' fails until the design's Trampoline C: the flip's checklist names it.
+const afterFlip: typeof test = GO_VIA === 'trampoline' ? test : (...args) => test(`skipped until GO_VIA flips: ${args[0]}`, () => undefined)
 /** What the engine does with the queued command: runs it, through the plugin's own hook. */
 async function dequeue($: TestDollar, clock: { advance: (ms: number) => Promise<void> }, args: string): Promise<void> {
   await $.command.run({ command: 'self-restart-go', args, origin: { kind: 'plugin', name: 'self-restart' }, presentation: { isFullscreen: false, columns: 120 } })

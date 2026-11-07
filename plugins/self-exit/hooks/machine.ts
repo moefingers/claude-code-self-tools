@@ -80,6 +80,9 @@ export const SESSION_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9
 /** The Windows folder as SystemRoot names it: a drive and one plain folder, such as C:\Windows. */
 export const SYSTEM_ROOT = /^[A-Za-z]:\\[A-Za-z0-9_ -]{1,64}$/
 
+/** A launch's own claim: what a tab's slot runner is told, and compares the lock with. */
+export const LAUNCH_CLAIM = /^launch:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
+
 /** Who a claim lock names: a slot runner by its pid and creation time, or one launch by a UUID. */
 export const CLAIM_BY = /^(?:slot:\d{1,10}-\d{1,20}|launch:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/
 
@@ -483,13 +486,13 @@ export const REGISTRY_VERSION_MARKERS = ['v', 'schema', 'schemaVersion', 'format
 export const LAUNCH_LINE_TRUSTED_AFTER_MS = 60_000
 
 /** The SHA-256 of plugins/self-switch/slot/claude-slot.ps1, as it is committed. */
-export const SLOT_SCRIPT_SHA256 = 'a4d7a5ac0ac6afb70d2d50d4bc5a02a4988a14537404c664a767668e2b675f09'
+export const SLOT_SCRIPT_SHA256 = '529c4a1aad907c2c00e9077afe77a1ebc90f0d3e8e8ab1e80f9f6dbf4c1be076'
 
 /**
  * The SHA-256 of plugins/self-switch/slot/claude-layout.ps1, as it is committed: a release pin, tested and
  * printed in the README for the person to compare. Nothing runs that script but the person, by hand.
  */
-export const LAYOUT_SCRIPT_SHA256 = '9c8cecc81b87618c68fb70fef671998969ea3af970c2a511fa2344fd44f15bdf'
+export const LAYOUT_SCRIPT_SHA256 = '40e311729d3aeea177c77bb0aee07eb9ae3c6bd88ea3e3d2bca08a29d686bf6e'
 
 /** Input idle for this long before any launch of another process (PM2): a null reading is not idle. */
 export const INPUT_IDLE_MS = 60_000
@@ -922,6 +925,7 @@ const GET_CREATED = ['function Get-Created($p) { if ($null -eq $p.CreationDate) 
 const FIND_SLOT = [
   '$slot = $null',
   '$slotOk = $false',
+  '$slotStale = $false',
   '$slotSeen = $false',
   String.raw`if ($null -ne $session -and $null -ne $up -and $up.Name -eq "powershell.exe" -and "$($up.CommandLine)" -match "-File\s+(\x22?)(?<path>[A-Za-z]:\\[^\x22]*?\\claude-slot\.ps1)\1(\s|\z)") {`,
   '  $slotPath = $Matches["path"]',
@@ -932,6 +936,14 @@ const FIND_SLOT = [
   '  $slot = [ordered]@{ pid = [long]$up.ProcessId; created = $slotCreated; id = "$($up.ProcessId)-$slotCreated"; path = $slotPath; sha256 = $slotHash }',
   '  if ($null -ne $slotHashError) { $slot["hashError"] = $slotHashError }',
   `  $slotOk = $slotHash -eq '${SLOT_SCRIPT_SHA256}'`,
+  // The file's hash says what a new run would be, not what this process runs: left with Ctrl+C it reads no
+  // record, and started before a newer copy it runs older code. Its own beacon, by its id, says both.
+  '  if ($slotOk) {',
+  '    $slotLook = $null',
+  '    if ($null -ne $state) { try { $slotLook = Get-Beacon ([IO.File]::ReadAllText((Join-Path $state ("slots\\" + $slot["id"] + ".state.json")), [Text.Encoding]::UTF8) | ConvertFrom-Json) } catch { $slotLook = $null } }',
+  `    if ($null -eq $slotLook -or $slotLook["sha256"] -cne '${SLOT_SCRIPT_SHA256}') { $slotOk = $false; $slotStale = $true }`,
+  '  }',
+  '  $slot["live"] = $slotOk',
   String.raw`} elseif ($null -ne $session -and $null -ne $up -and ($up.Name -eq "powershell.exe" -or $up.Name -eq "pwsh.exe") -and "$($up.CommandLine)" -match "claude-slot\.ps1") { $slotSeen = $true }`,
 ]
 
@@ -1185,6 +1197,7 @@ const GET_BEACON = [
   '  $o = [ordered]@{ state = $b.state; since = [long]$b.since; configDir = $b.configDir }',
   String.raw`  if ($b.window -is [string] -and $b.window -cmatch "^[A-Za-z0-9_-]{1,40}\z") { $o["window"] = $b.window }`,
   String.raw`  if ($b.tab -is [string] -and $b.tab -cmatch "^[A-Za-z0-9 ._-]{1,40}\z") { $o["tab"] = $b.tab }`,
+  String.raw`  if ($b.sha256 -is [string] -and $b.sha256 -cmatch "^[0-9a-f]{64}\z") { $o["sha256"] = $b.sha256 }`,
   '  return $o',
   '}',
 ]
@@ -1248,8 +1261,8 @@ export type ProbeInput = {
   readonly configDirs: readonly string[]
   /** stateFolder(%LOCALAPPDATA%): where the claim locks are; absent, they are neither read nor taken. */
   readonly stateDir?: string
-  /** The folder holding heavy-slot.sh's .gate-lock folders, when there is one. */
-  readonly heavySlotRoot?: string
+  /** The folder holding heavy-slot.sh's .gate-lock folders; null: this machine has none. Required with `slots`, whose answer says which it was (`heavyChecked`). */
+  readonly heavySlotRoot?: string | null
   /** Read the left record of each asked-about conversation (needs `stateDir`), its MAC checked inside the script. */
   readonly left?: boolean
   /**
@@ -1387,6 +1400,7 @@ export function parseLeftRead(stdout: string): { readonly left: readonly LeftEnt
 
 /** The probe script. Throws on any input that isn't what it must be, so nothing else is spliced in. */
 export function probeScript(input: ProbeInput): string {
+  if (input.slots === true && input.heavySlotRoot === undefined) throw new Error('the slots mode names its heavy-slot folder (null: this machine has none): heavySlotRoot')
   const ids = input.ids.map(checkId)
   if (ids.length < 1 || ids.length > 8) throw new Error('the probe asks about 1 to 8 conversations')
   const take = input.take === undefined ? undefined : checkId(input.take)
@@ -1395,7 +1409,7 @@ export function probeScript(input: ProbeInput): string {
   const configDirs = input.configDirs.map(dir => checkFolder('a config folder', dir))
   const state = input.stateDir === undefined ? undefined : checkFolder('the state folder', input.stateDir)
   if (take !== undefined && state === undefined) throw new Error('the probe claims only with the state folder')
-  const heavy = input.heavySlotRoot === undefined ? undefined : checkFolder('the heavy-slot folder', input.heavySlotRoot)
+  const heavy = input.heavySlotRoot === undefined || input.heavySlotRoot === null ? undefined : checkFolder('the heavy-slot folder', input.heavySlotRoot)
   if (input.left === true && state === undefined) throw new Error('the probe reads left records only with the state folder')
   // Each asked-about conversation's left record, its path built here from the checked id.
   const leftRead = input.left === true && state !== undefined ? leftReadLines(state, ids) : []
@@ -1419,7 +1433,8 @@ export function probeScript(input: ProbeInput): string {
     ...GET_CREATED,
     ...GET_CLASS,
     ...GET_CLI,
-    ...(slots ? [...GET_SHA256, ...GET_BEACON] : []),
+    ...GET_BEACON,
+    ...(slots ? GET_SHA256 : []),
     // This session's claude.exe: the nearest above the probe, then the top of an unbroken run of
     // claude.exe parents, so a helper process of the session's own is never taken for the session.
     '$session = $null',
@@ -1573,7 +1588,7 @@ export function probeScript(input: ProbeInput): string {
     '$result = [ordered]@{ v = 1; self = [long]$PID; session = $sessionOut; slot = $slot; procs = $procs; registry = $registry; transcripts = $transcripts; locks = $locks; claim = $claim; heavy = $heavy; freeKb = $freeKb; errors = $errors }',
     'if ($slotSeen) { $result["slotSeen"] = $true }',
     ...(leftRead.length > 0 ? ['$result["left"] = $leftOut'] : []),
-    ...(slots ? ['$result["slots"] = $slotsOut', '$result["heavyWaiters"] = $heavyWaiters', '$result["heavyBusy"] = $heavyBusy', '$result["room"] = $room', '$result["inputIdleSec"] = $inputIdleSec', '$result["holders"] = $holdersOut'] : []),
+    ...(slots ? ['$result["heavyChecked"] = ($null -ne $heavyRoot)', '$result["slots"] = $slotsOut', '$result["heavyWaiters"] = $heavyWaiters', '$result["heavyBusy"] = $heavyBusy', '$result["room"] = $room', '$result["inputIdleSec"] = $inputIdleSec', '$result["holders"] = $holdersOut'] : []),
     '$result | ConvertTo-Json -Compress -Depth 6',
   ].join('\r\n')
 }
@@ -1642,7 +1657,7 @@ export type LockEntry =
   | { readonly id: string; readonly mtime: number; readonly ok: false }
 
 /** A slot runner's beacon, each field checked: idle or running, since when, its stamp when it has one, and its config folder. */
-export type SlotBeacon = { readonly state: 'idle' | 'running'; readonly since: number; readonly window?: string; readonly tab?: string; readonly configDir: string }
+export type SlotBeacon = { readonly state: 'idle' | 'running'; readonly since: number; readonly window?: string; readonly tab?: string; readonly configDir: string; readonly sha256?: string }
 
 /** A slot runner found running: its pid and creation FILETIME, its id, its script's hash, the claude.exe it runs now, and its beacon. */
 export type SlotRunner = { readonly pid: number; readonly created: string; readonly id: string; readonly sha256: string | null; readonly child: number | null; readonly beacon: SlotBeacon | null }
@@ -1653,7 +1668,7 @@ export type LockHolder = { readonly id: string; readonly pid: number; readonly c
 export type ClaimResult = { readonly id: string; readonly taken: true; readonly by: string } | { readonly id: string; readonly taken: false; readonly why: string }
 
 /** The slot runner: its pid, its creation FILETIME and its id (`<pid>-<created>`) as exact strings, its script and that script's hash. */
-export type SlotParent = { readonly pid: number; readonly created: string; readonly id: string; readonly path: string; readonly sha256: string | null; readonly hashError?: string }
+export type SlotParent = { readonly pid: number; readonly created: string; readonly id: string; readonly path: string; readonly sha256: string | null; readonly hashError?: string; readonly live?: boolean }
 
 export type HeavySlot = { readonly slot: '.gate-lock' | '.gate-lock-2'; readonly winpid: number | null }
 
@@ -1683,6 +1698,8 @@ export type Probe = {
   /** heavy-slot's live waiters and busy slots (0 to 2); null with no heavy-slot folder, or none read. */
   readonly heavyWaiters: number | null
   readonly heavyBusy: number | null
+  /** Slots mode: whether heavy-slot's folders were read (true), or the caller named none on this machine (false). */
+  readonly heavyChecked?: boolean
   /** The sessions running (a Claude Code command left out), from a probe in slots mode. */
   readonly room: number | null
   /** Whole seconds since the machine's last input; null when unread, which no launch takes as idle. */
@@ -1764,12 +1781,13 @@ const GO_ID = /^wu_[a-z0-9]{1,40}$/
 /** A beacon as the probe printed it, checked; null for one not of its shape, which counts as none: no launch picks that slot. */
 function slotBeacon(value: unknown): SlotBeacon | null {
   if (!isRecord(value)) return null
-  for (const key of Object.keys(value)) if (!['state', 'since', 'window', 'tab', 'configDir'].includes(key)) return null
-  const { state, since, window, tab, configDir } = value
+  for (const key of Object.keys(value)) if (!['state', 'since', 'window', 'tab', 'configDir', 'sha256'].includes(key)) return null
+  const { state, since, window, tab, configDir, sha256 } = value
   if ((state !== 'idle' && state !== 'running') || !isCount(since) || !isSafeFolder(configDir)) return null
   if (window !== undefined && !isWindowName(window)) return null
   if (tab !== undefined && (typeof tab !== 'string' || !TAB_LABEL.test(tab))) return null
-  return { state, since, configDir, ...(window === undefined ? {} : { window: window as string }), ...(tab === undefined ? {} : { tab: tab as string }) }
+  if (sha256 !== undefined && (typeof sha256 !== 'string' || !SHA256.test(sha256))) return null
+  return { state, since, configDir, ...(window === undefined ? {} : { window: window as string }), ...(tab === undefined ? {} : { tab: tab as string }), ...(sha256 === undefined ? {} : { sha256: sha256 as string }) }
 }
 
 /** One left record as the probe printed it, every field checked. */
@@ -1821,7 +1839,7 @@ export function parseProbe(stdout: string): Probe | { error: string } {
     return { error: "the probe's answer is not JSON" }
   }
   try {
-    const top = fields(raw, 'the answer', ['v', 'self', 'session', 'slot', 'procs', 'registry', 'transcripts', 'locks', 'claim', 'heavy', 'freeKb', 'errors'], ['slotSeen', 'left', 'slots', 'heavyWaiters', 'heavyBusy', 'room', 'inputIdleSec', 'holders'])
+    const top = fields(raw, 'the answer', ['v', 'self', 'session', 'slot', 'procs', 'registry', 'transcripts', 'locks', 'claim', 'heavy', 'freeKb', 'errors'], ['slotSeen', 'left', 'slots', 'heavyChecked', 'heavyWaiters', 'heavyBusy', 'room', 'inputIdleSec', 'holders'])
     if ('slotSeen' in top && (top.slotSeen !== true || top.slot !== null)) bad('the answer says a slot runner was seen, but not as one')
     if (top.v !== 1) bad('the answer is not version 1')
     if (!isPid(top.self)) bad("the probe's own pid is not a pid")
@@ -1833,7 +1851,8 @@ export function parseProbe(stdout: string): Probe | { error: string } {
     }
     let slot: SlotParent | null = null
     if (top.slot !== null) {
-      const s = fields(top.slot, 'the slot', ['pid', 'created', 'id', 'path', 'sha256'], ['hashError'])
+      const s = fields(top.slot, 'the slot', ['pid', 'created', 'id', 'path', 'sha256'], ['hashError', 'live'])
+      if ('live' in s && typeof s.live !== 'boolean') bad("the slot's live is not true or false")
       if ('hashError' in s && (typeof s.hashError !== 'string' || s.hashError.length > 2000)) bad("the slot's hash error is not a line of text")
       if (!isPid(s.pid) || !isTicks(s.created)) bad('the slot is not a pid and a time as a string')
       if (s.id !== `${s.pid}-${s.created}`) bad("the slot's id is not its pid and time")
@@ -1846,6 +1865,7 @@ export function parseProbe(stdout: string): Probe | { error: string } {
         path: s.path as string,
         sha256: s.sha256 as string | null,
         ...(typeof s.hashError === 'string' ? { hashError: s.hashError } : {}),
+        ...(typeof s.live === 'boolean' ? { live: s.live } : {}),
       }
     }
     const procs = list(top.procs, 'the processes').map((value): ProcessEntry => {
@@ -1978,6 +1998,7 @@ export function parseProbe(stdout: string): Probe | { error: string } {
       slots,
       heavyWaiters: countOrNull('heavyWaiters', 'the heavy-slot waiters'),
       heavyBusy: countOrNull('heavyBusy', 'the heavy slots busy', 2),
+      ...('heavyChecked' in top ? { heavyChecked: top.heavyChecked === true || (top.heavyChecked === false ? false : bad('the answer says neither that heavy-slot was read nor that it was not')) } : {}),
       room: countOrNull('room', 'the sessions running'),
       inputIdleSec: countOrNull('inputIdleSec', 'the input idle'),
       holders,
@@ -2667,10 +2688,16 @@ export const SLOT_NOT_RECOGNISED =
   "this pane runs claude-slot.ps1 some other way than the slot runner the plugin recognises (Windows PowerShell, powershell.exe -File with the script's absolute path), so it is no slot"
 
 /** Why a slot runner found under this session isn't used, as the leaving row and the toast say it. */
+export const SLOT_NOT_LIVE = "this pane's slot runner doesn't say it reads records at the shipped hash: it was left with Ctrl+C, or it runs an older copy (restart the pane)"
+
 export function slotFallback(slot: SlotParent): string {
   if (slot.sha256 === null) return `slot hash unreadable: ${slot.hashError === undefined ? 'no reason given' : oneLine(slot.hashError, 200)}`
+  if (slot.sha256 === SLOT_SCRIPT_SHA256) return SLOT_NOT_LIVE
   return "this pane's claude-slot.ps1 has another SHA-256 than the one shipped (an edited or older copy: copy the shipped script and restart the pane)"
 }
+
+/** Whether this pane's slot runner takes a record: the shipped hash on disk, and in the beacon of the process running it. */
+export const slotVerified = (slot: SlotParent | null): boolean => slot !== null && slot.sha256 === SLOT_SCRIPT_SHA256 && slot.live === true
 
 /**
  * How conversation `to` comes to this pane, from the probe that judged it (\u00a75.3 of the design):
@@ -2706,7 +2733,7 @@ export function pickTransport(
   if (name === undefined || !sameProject(name, there.project)) return { refusal: `${to}'s folder ${folder} is not where its transcript's project is (${there.project})` }
   const slot = probe.slot
   // The slot's id as the probe printed it: a FILETIME through a JavaScript number would not round-trip.
-  if (slot !== null && slot.sha256 === SLOT_SCRIPT_SHA256) return { transport: 'slot', slot: slot.id, folder }
+  if (slot !== null && slotVerified(slot)) return { transport: 'slot', slot: slot.id, folder }
   if (pane !== undefined && PANE_TOKEN.test(pane.token) && paneFallback(probe, pane.pane) === undefined && paneReads(pane.pane, configCount) === undefined) return { transport: 'pane', token: pane.token, folder }
   if (slot !== null) return { transport: 'window', folder, fallback: slotFallback(slot) }
   if (probe.slotSeen) return { transport: 'window', folder, fallback: SLOT_NOT_RECOGNISED }
@@ -2727,8 +2754,8 @@ export function pickTransport(
 //   claude has exited, or an idle one elsewhere, its record written with CreateNew (the runner's own
 //   checks: the claim, the project or a new id, RECHECK and the left record, its floor and cap), naming
 //   the launcher it runs by LAUNCH_SCRIPT_SHA256;
-// - `tab`: a tab in a named window of Windows Terminal (Start-Process wt.exe with one quoted string),
-//   running the slot runner with -Resume or -Start and -Launcher, by the one place and hash it is run from;
+// - `tab`: a tab in a named window of Windows Terminal (Start-Process of its full path with one quoted string),
+//   running the slot runner with -Resume or -Start, -Claim and -Launcher, by the one place and hash it is run from;
 // - `window`: a new window. With a name: as the tab, where Windows Terminal is new enough and the slot
 //   runner in place; else, or with `true`, Start-Process of Windows PowerShell by its known path, whose
 //   script waits for the caller's process when asked, then RECHECKs (and the left record's stat), checks
@@ -2747,7 +2774,8 @@ export function pickTransport(
 // milliseconds. A writer who can use it is the same OS user (T20), who can as well edit the unpinned
 // claude-wrapper.ps1 in the same folder, which the person's profile dot-sources, or run claude itself.
 // The hash stops a stale or edited copy, and names per version stop two versions of the plugins
-// trading one file: not that user.
+// trading one file: not that user. So a slot record's `launcher` names a file, it doesn't authorise one:
+// that same user can plant claude-launch-<its own digits>.ps1 and name it, or leave a high version for Enter.
 
 /** A launch's answer: `launched <transport> <label> [<pid>]`. */
 export const LAUNCH_ANSWER = /^launched (pane|slot|window|tab) ([A-Za-z0-9_.:-]{1,80})(?: (\d{1,10}))?\s*$/m
@@ -2766,7 +2794,7 @@ export const FALLBACK = /^fallback (.{1,1000}?)\s*$/m
  * - `{ pane: { token } }`: the caller's own tab, through the claude wrapper's ticket;
  * - `{ slot: id }`: a slot runner, by its id (`<pid>-<created>`): the caller's own pane's, for a launch
  *   that replaces its caller; else an idle one elsewhere;
- * - `{ tab: { window, title, pos?, size? } }`: a tab in that named window, running the slot runner;
+ * - `{ tab: { window, title, pos?, size? } }`: a tab in that named window, running the slot runner, under this launch's own claim;
  * - `{ window: { name, pos?, size? } }`: a new named window, as the tab, where Windows Terminal can;
  * - `{ window: true }`: a new window, running claude-launch.ps1;
  * - `'auto'`: this pane's slot when its runner is verified and takes the folder, else the window.
@@ -2820,10 +2848,10 @@ export type LaunchInput = {
   readonly checks?: LaunchChecks
   /** A left record's stat: the last look, wherever it is taken, refuses when the transcript changed since (\u00a73.4). */
   readonly left?: LeftStat
-  /** The cap `checks.floor` holds the sessions to: placement.json's limits.maxSessions, else LIMITS_DEFAULT's. */
+  /** The cap `checks.floor` holds the sessions to, named by the caller (placement.json's limits.maxSessions, else LIMITS_DEFAULT's): required with it. */
   readonly maxSessions?: number
-  /** The folder holding heavy-slot.sh's .gate-lock folders, for `checks.floor`; none: no heavy-slot to wait for. */
-  readonly heavySlotRoot?: string
+  /** The folder holding heavy-slot.sh's .gate-lock folders; null: this machine has none. Required with `checks.floor`: left out, it would skip the rule without a word. */
+  readonly heavySlotRoot?: string | null
   /** The caller's own claude.exe, which the pane, the slot or the window waits for before it resumes. */
   readonly waitForExit?: ProcessRef
   /** The pane's ticket's time: the caller's clock, now. */
@@ -3031,7 +3059,7 @@ const FRESH_CHECK = [
  * Gives back the claim lock this run took: read through a handle that keeps every writer out, and
  * deleted while it is held, only when it still names `$by`. Needs `$claimPath` and `$by`.
  */
-const RELEASE_CLAIM = [
+export const RELEASE_CLAIM = [
   'function Release-Claim {',
   "  try { $stream = [IO.File]::Open($claimPath, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]'Read, Delete') } catch { return }",
   '  try {',
@@ -3074,8 +3102,8 @@ export const wtFolder = (folder: string): string => (folder.length > 3 ? folder.
 /** What a tab's slot runner is opened to do. */
 export type TabRun =
   | { readonly idle: true }
-  | { readonly start: string; readonly name: string; readonly configDirs?: readonly string[] }
-  | { readonly resume: string; readonly waitFor?: ProcessRef; readonly configDirs?: readonly string[]; readonly left?: LeftStat }
+  | { readonly start: string; readonly name: string; readonly claim: string; readonly configDirs?: readonly string[] }
+  | { readonly resume: string; readonly claim: string; readonly waitFor?: ProcessRef; readonly configDirs?: readonly string[]; readonly left?: LeftStat }
 
 /**
  * The one string wt.exe is given for a tab (Start-Process's -ArgumentList, which joins an array with
@@ -3104,16 +3132,21 @@ export function wtTabLine(input: { readonly powershell: string; readonly stateDi
     if (fault !== undefined) throw new Error(`a config folder ${JSON.stringify(dir)} ${fault}, so it never reaches Windows Terminal`)
   }
   const named = dirs.length === 0 ? [] : ['-ConfigDirs', dirs.map(wtFolder).join('|')]
+  // Per launch, never of the conversation: a later launch that takes the lock over turns this tab away.
+  const claim = (by: string): string[] => {
+    if (!LAUNCH_CLAIM.test(by)) throw new Error(`a tab's claim is a launch's own: ${JSON.stringify(by)}`)
+    return ['-Claim', by]
+  }
   let doing: string[]
   if ('idle' in run) doing = ['-Idle']
   else if ('start' in run) {
     if (!SESSION_ID.test(run.start) || !AREA_NAME.test(run.name)) throw new Error('a tab starts a session id under a session name')
-    doing = ['-Start', run.start, '-Name', run.name, ...named, '-Launcher', LAUNCH_SCRIPT_SHA256]
+    doing = ['-Start', run.start, '-Name', run.name, ...named, ...claim(run.claim), '-Launcher', LAUNCH_SCRIPT_SHA256]
   } else {
     if (!SESSION_ID.test(run.resume)) throw new Error('a tab resumes a session id')
     const waits = run.waitFor === undefined ? [] : ['-WaitFor', `${run.waitFor.pid}-${run.waitFor.created}`]
     const left = run.left === undefined ? [] : 'size' in run.left ? ['-LeftSize', String(run.left.size), '-LeftMtime', String(run.left.mtime)] : ['-LeftExitAt', String(run.left.exitAt)]
-    doing = ['-Resume', run.resume, ...waits, ...named, ...left, '-Launcher', LAUNCH_SCRIPT_SHA256]
+    doing = ['-Resume', run.resume, ...waits, ...named, ...left, ...claim(run.claim), '-Launcher', LAUNCH_SCRIPT_SHA256]
   }
   return [
     '-w',
@@ -3161,9 +3194,10 @@ function checkLaunch(input: LaunchInput) {
   // A launch of another process adds a process, in a pane or a window the person may be typing in.
   if (waitFor === undefined && (checks.floor !== true || checks.input !== true)) throw new Error('a launch of another process checks the floor and the input idle (checks.floor, checks.input)')
   if (waitFor === undefined && input.kind === 'resume' && checks.live !== true) throw new Error('a resume that waits for nothing checks NOT LIVE now (checks.live)')
+  if (checks.floor === true && (input.heavySlotRoot === undefined || input.maxSessions === undefined)) throw new Error('a floor names its heavy-slot folder (null: this machine has none) and its cap: heavySlotRoot, maxSessions')
   const maxSessions = input.maxSessions ?? LIMITS_DEFAULT.maxSessions
   if (!isCount(maxSessions, 40) || maxSessions < 1) throw new Error(`the cap is not a whole number from 1 to 40: ${JSON.stringify(input.maxSessions)}`)
-  const heavyRoot = input.heavySlotRoot === undefined ? undefined : checkFolder('the heavy-slot folder', input.heavySlotRoot)
+  const heavyRoot = input.heavySlotRoot === undefined || input.heavySlotRoot === null ? undefined : checkFolder('the heavy-slot folder', input.heavySlotRoot)
   if (input.kind === 'start') {
     if (typeof input.name !== 'string' || !AREA_NAME.test(input.name)) throw new Error(`a start's name is not a session name: ${JSON.stringify(input.name)}`)
     if (checks.fresh !== true) throw new Error('a start checks that its id is new (checks.fresh)')
@@ -3182,10 +3216,10 @@ function checkLaunch(input: LaunchInput) {
   let stamp: { readonly window: string; readonly tab: string } | undefined
   const tabRun = (): TabRun =>
     input.kind === 'start'
-      ? { start: id, name: input.name as string, configDirs }
-      : { resume: id, ...(waitFor === undefined ? {} : { waitFor }), configDirs, ...(input.left === undefined ? {} : { left: input.left }) }
+      ? { start: id, name: input.name as string, claim: input.claim, configDirs }
+      : { resume: id, claim: input.claim, ...(waitFor === undefined ? {} : { waitFor }), configDirs, ...(input.left === undefined ? {} : { left: input.left }) }
   const tabOf = (tab: WtTab): string => {
-    if (input.claim !== `launch:${id}`) throw new Error("a tab's or a named window's slot runner takes only the claim naming launch:<its id>")
+    if (!LAUNCH_CLAIM.test(input.claim)) throw new Error("a tab's or a named window's slot runner takes only a launch's own claim, launch:<uuid>")
     return wtTabLine({ powershell: input.powershell, stateDir: state, window: tab.window, title: tab.title, ...(tab.pos === undefined ? {} : { pos: tab.pos }), ...(tab.size === undefined ? {} : { size: tab.size }), folder, run: tabRun() })
   }
   if (where === 'auto') {
@@ -3278,6 +3312,7 @@ function slotIdleLines(state: string, slot: string): string[] {
     '$slotBeacon = $null',
     `try { $slotBeacon = Get-Beacon ([IO.File]::ReadAllText(${literal(slotBeaconPath(state, slot))}, [Text.Encoding]::UTF8) | ConvertFrom-Json) } catch { $slotBeacon = $null }`,
     "if ($null -eq $slotBeacon -or $slotBeacon['state'] -cne 'idle') { Refuse 'slot' 'that slot''s beacon does not say idle' }",
+    `if ($slotBeacon['sha256'] -cne '${SLOT_SCRIPT_SHA256}') { Refuse 'slot' 'that slot''s beacon does not say it runs the shipped hash: restart the pane' }`,
     `if (([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() - [long]$slotBeacon['since']) -lt ${SLOT_IDLE_MIN_MS}) { Refuse 'slot' 'that slot went idle less than ${SLOT_IDLE_MIN_MS / 1000} seconds ago' }`,
     `$slot = [ordered]@{ id = '${slot}' }`,
   ]
@@ -3290,6 +3325,20 @@ function slotIdleLines(state: string, slot: string): string[] {
 const READ_WT_VERSION = [
   '$wtVersion = $null',
   "try { $wtFound = @(Get-AppxPackage -Name 'Microsoft.WindowsTerminal*' | ForEach-Object { [version]$_.Version } | Sort-Object -Descending); if ($wtFound.Count -gt 0) { $wtVersion = $wtFound[0] } } catch { $wtVersion = $null }",
+]
+
+/**
+ * Whether the process waited for has gone, by asking it: one that has exited stays in the process table while
+ * anyone holds a handle on it, so Get-Process would still find it, and the launch would refuse for nothing. Anything
+ * but "no such process" that can't be read counts as still there.
+ */
+export const TEST_GONE = [
+  'function Test-Gone($processId) {',
+  '  $h = $null',
+  '  try { $h = [Diagnostics.Process]::GetProcessById([int]$processId); return $h.HasExited }',
+  '  catch { return ($_.Exception -is [ArgumentException] -or $_.Exception.InnerException -is [ArgumentException]) }',
+  '  finally { if ($null -ne $h) { $h.Dispose() } }',
+  '}',
 ]
 
 /**
@@ -3315,6 +3364,9 @@ function windowScript(v: { id: string; kind: 'resume' | 'start'; name?: string; 
     '$ErrorActionPreference = "Stop"',
     '$ProgressPreference = "SilentlyContinue"',
     PSMODULEPATH_RESET,
+    // Its session is in no tab of a named window: the stamp of the one that launched it would send a later `same` there.
+    '$env:CLAUDE_SELF_TOOLS_WT_WINDOW = $null',
+    '$env:CLAUDE_SELF_TOOLS_WT_TAB = $null',
     `$id = '${v.id}'`,
     ...(resume ? [] : [`$name = '${v.name}'`]),
     `$by = '${v.by}'`,
@@ -3334,7 +3386,7 @@ function windowScript(v: { id: string; kind: 'resume' | 'start'; name?: string; 
     '$refusal = $null',
     ...(v.waitFor === undefined
       ? []
-      : [`if (Get-Process -Id ${v.waitFor.pid} -ErrorAction SilentlyContinue) { $refusal = "The old process is still running, so the session is not resumed here: two copies would both write to it." }`]),
+      : [...TEST_GONE, `if (-not (Test-Gone ${v.waitFor.pid})) { $refusal = "The old process is still running, so the session is not resumed here: two copies would both write to it." }`]),
     // Right before claude: whether anything holds the conversation now (L1, L2), and the left record's stat.
     'if ($null -eq $refusal) {',
     '  $live = $null',
@@ -3438,7 +3490,7 @@ export function launchScriptText(input: LaunchInput): string {
           `$env:CLAUDE_SELF_TOOLS_WT_WINDOW = ${literal(v.stamp.window)}`,
           `$env:CLAUDE_SELF_TOOLS_WT_TAB = ${literal(v.stamp.tab)}`,
           `if ((Get-Sha256 $slotScript) -cne '${SLOT_SCRIPT_SHA256}') { throw ("the slot runner is not at " + $slotScript + " with the SHA-256 this plugin ships") }`,
-          '$window = Start-Process wt.exe -ArgumentList $wtLine -PassThru',
+          '$window = Start-Process $wtExe -ArgumentList $wtLine -PassThru',
           `$placed = '${transport} ${v.label ?? ''}'`,
         ]
   const leftField = input.left === undefined ? '' : 'size' in input.left ? `; left = [ordered]@{ size = ${input.left.size}; mtime = ${input.left.mtime} }` : `; left = [ordered]@{ exitAt = ${input.left.exitAt} }`
@@ -3471,9 +3523,10 @@ export function launchScriptText(input: LaunchInput): string {
   ]
   /** This pane's slot runner, verified, and the folder its runner takes: absolute, no quote, the conversation's own. */
   const slotCheck = [
+    ...GET_BEACON,
     ...FIND_SLOT,
     '$slotFallback = $null',
-    'if ($null -ne $slot -and -not $slotOk) { if ($null -ne $slotHashError) { $slotFallback = "slot hash unreadable: " + $slotHashError } else { $slotFallback = "this pane" + [char]39 + "s claude-slot.ps1 has another SHA-256 than the one shipped" } }',
+    'if ($null -ne $slot -and -not $slotOk) { if ($null -ne $slotHashError) { $slotFallback = "slot hash unreadable: " + $slotHashError } elseif ($slotStale) { $slotFallback = "this pane" + [char]39 + "s slot runner does not say it reads records at the shipped hash: it was left with Ctrl+C, or it runs an older copy (restart the pane)" } else { $slotFallback = "this pane" + [char]39 + "s claude-slot.ps1 has another SHA-256 than the one shipped" } }',
     'if ($slotSeen) { $slotFallback = "this pane runs claude-slot.ps1 some other way than the slot runner the plugin recognises (Windows PowerShell, powershell.exe -File with the script" + [char]39 + "s absolute path), so it is no slot" }',
     ...(input.kind === 'start'
       ? []
@@ -3493,7 +3546,9 @@ export function launchScriptText(input: LaunchInput): string {
       : [
           ...READ_WT_VERSION,
           `$slotScript = ${literal(slotScriptPath(v.state))}`,
-          `$wtOld = $null -eq $wtVersion -or $wtVersion -lt [version]'${WT_MIN.stamps}'`,
+          // By its full path, under the state folder's parent: a bare name would search the conversation's own folder too.
+          "$wtExe = Join-Path (Split-Path -Parent $state) 'Microsoft\\WindowsApps\\wt.exe'",
+          `$wtOld = $null -eq $wtVersion -or $wtVersion -lt [version]'${WT_MIN.stamps}' -or -not (Test-Path -LiteralPath $wtExe -PathType Leaf)`,
           `$slotAway = (Get-Sha256 $slotScript) -cne '${SLOT_SCRIPT_SHA256}'`,
           ...(transport === 'tab'
             ? [
@@ -3860,9 +3915,12 @@ export function floorNeedKb(probe: Probe): number {
  * slots busy, or heavy-slot's folders unread), `cap` (the sessions at `maxSessions`, or unread). A pure
  * function: only advisory, as the launch reads each again in its own run (checks.floor).
  */
-export function floorOk(probe: Probe, maxSessions: number = LIMITS_DEFAULT.maxSessions): 'ok' | 'memory' | 'heavy' | 'cap' {
+export function floorOk(probe: Probe, maxSessions: number): 'ok' | 'memory' | 'heavy' | 'cap' {
+  if (!isCount(maxSessions, 40) || maxSessions < 1) throw new Error(`the cap is not a whole number from 1 to 40: ${JSON.stringify(maxSessions)}`)
   if (probe.freeKb === null || probe.freeKb < floorNeedKb(probe)) return 'memory'
   if (probe.errors.some(e => e.source === 'heavy')) return 'heavy'
+  // A reading that doesn't say whether heavy-slot was looked at isn't a floor's: only a named none skips it.
+  if (probe.heavyChecked === undefined) return 'heavy'
   if ((probe.heavyWaiters ?? 0) > 0 || (probe.heavyBusy ?? 0) >= 2) return 'heavy'
   if (probe.room === null || probe.room >= maxSessions) return 'cap'
   return 'ok'
@@ -3880,7 +3938,7 @@ export function idleSlots(probe: Probe, placement: Placement | null, opts: { rea
   return (probe.slots ?? [])
     .filter(slot => {
       const beacon = slot.beacon
-      if (slot.sha256 !== SLOT_SCRIPT_SHA256 || slot.child !== null || beacon === null || beacon.state !== 'idle') return false
+      if (slot.sha256 !== SLOT_SCRIPT_SHA256 || slot.child !== null || beacon === null || beacon.state !== 'idle' || beacon.sha256 !== SLOT_SCRIPT_SHA256) return false
       if (opts.now - beacon.since < SLOT_IDLE_MIN_MS) return false
       if (!sameFolder(beacon.configDir, opts.configDir)) return false
       const tag = beacon.window === undefined ? undefined : placement?.workspaces?.[beacon.window]
@@ -3937,11 +3995,20 @@ function placedLegs(probe: Probe, placement: Placement | null, opts: PickOptions
   if (fault !== undefined) return { legs: [], why: `its folder ${fault}, so no tab or named window` }
   const legs: LaunchWhere[] = []
   const said: string[] = []
+  // Only for a caller that names a workspace: a move of this session's own, which names none, goes where it goes.
+  const taggedElsewhere = (window: string): boolean => {
+    const tag = placement.workspaces?.[window]
+    return opts.workspace !== undefined && tag !== undefined && tag !== opts.workspace
+  }
   for (const leg of section.prefer) {
     if (leg === 'tab' && section.tab !== undefined) {
       const window = section.tab.window === 'same' ? opts.stamp?.window : section.tab.window
       if (window === undefined || !isWindowName(window)) {
         said.push('this tab carries no window stamp')
+        continue
+      }
+      if (taggedElsewhere(window)) {
+        said.push(`window ${window} is tagged for another workspace`)
         continue
       }
       const maxTabs = 'maxTabs' in section.tab ? (section.tab as { maxTabs: number }).maxTabs : undefined
@@ -3955,7 +4022,8 @@ function placedLegs(probe: Probe, placement: Placement | null, opts: PickOptions
     }
     if (leg === 'window') {
       const named = section.window ?? placement.launch?.window
-      if (named !== undefined) legs.push({ window: named })
+      if (named !== undefined && taggedElsewhere(named.name)) said.push(`window ${named.name} is tagged for another workspace`)
+      else if (named !== undefined) legs.push({ window: named })
       else said.push('the placement names no window')
     }
   }
@@ -3987,7 +4055,7 @@ export function pickLaunchTransport(probe: Probe, placement: Placement | null, o
     const tab = opts.pane
     if (tab !== undefined && PANE_TOKEN.test(tab.token) && paneFallback(probe, tab.pane) === undefined && paneReads(tab.pane, opts.configCount) === undefined && (!opts.needsLeft || paneNoLeft(tab.pane) === undefined)) return { where: { pane: { token: tab.token } } }
     const slot = probe.slot
-    if (slot !== null && slot.sha256 === SLOT_SCRIPT_SHA256) return { where: { slot: slot.id } }
+    if (slot !== null && slotVerified(slot)) return { where: { slot: slot.id } }
     const fallback = slot !== null ? slotFallback(slot) : probe.slotSeen ? SLOT_NOT_RECOGNISED : undefined
     if (opts.needsInput === true && !inputIdle(probe)) return notIdle
     const { legs } = placedLegs(probe, placement, opts)
@@ -4012,12 +4080,9 @@ export function pickLaunchTransport(probe: Probe, placement: Placement | null, o
   return { where: next, ...(then.length === 0 ? {} : { then }) }
 }
 
-/** The claim a place takes, when the place decides it: its slot's, or for a tab's or a named window's slot runner, `launch:<id>`. Undefined: a launch's own, any. */
-export function claimOf(where: LaunchWhere, id: string): string | undefined {
-  if (where === 'auto' || 'pane' in where) return undefined
-  if ('slot' in where) return `slot:${where.slot}`
-  if ('tab' in where || where.window !== true) return `launch:${id}`
-  return undefined
+/** The claim a place takes, when the place decides it: its slot's. Undefined: a launch's own, fresh for each launch, a tab's and a named window's too (the tab names it to its runner), so a later launch that takes the lock over turns an earlier one away. */
+export function claimOf(where: LaunchWhere): string | undefined {
+  return where !== 'auto' && 'slot' in where ? `slot:${where.slot}` : undefined
 }
 
 /** The label a tab or a named window gets for a resume, when the placement gives none: of letters, digits and a hyphen. */
@@ -4077,7 +4142,7 @@ export function releaseScript(input: { readonly stateDir: string; readonly id: s
 }
 
 /** The relock script's answer: the lock re-owned, none there, one naming another, or one held by a taker throughout. */
-export const RELOCKED = /^(relocked|absent|not-ours|busy)\s*$/m
+export const RELOCKED = /^(relocked|absent|not-ours|busy|held)\s*$/m
 
 /**
  * Re-owns the claim lock on `id` to `holder` (review gap 7): a launch whose process is stuck at a dialog
@@ -4110,12 +4175,16 @@ export function relockScript(input: { readonly stateDir: string; readonly id: st
     '    try { $lock = $text | ConvertFrom-Json } catch { $lock = $null }',
     `    if ($null -eq $lock -or $lock.by -cne '${by}') { $answer = 'not-ours' }`,
     '    else {',
+    // A different holder, still running, stays: two launches stuck under one `by` hold what each holds.
+    `      $held = $false; if ($null -ne $lock.holder -and $lock.holder.pid -is [ValueType] -and "$($lock.holder.created)" -match '^\\d{1,20}\\z' -and -not ([long]$lock.holder.pid -eq ${input.holder.pid} -and "$($lock.holder.created)" -ceq '${input.holder.created}')) { $other = Get-CimInstance -ClassName Win32_Process -Filter ("ProcessId = " + [long]$lock.holder.pid) -Property ProcessId, CreationDate; if ($null -ne $other -and [math]::Abs($other.CreationDate.ToFileTimeUtc() - [long]"$($lock.holder.created)") -le ${PROC_START_TOLERANCE}) { $held = $true } }`,
+    "      if ($held) { $answer = 'held' } else {",
     `      $bytes = [Text.Encoding]::UTF8.GetBytes(([ordered]@{ v = $lock.v; by = $lock.by; pid = $lock.pid; created = $lock.created; at = $lock.at; transport = $lock.transport; holder = [ordered]@{ pid = ${input.holder.pid}; created = '${input.holder.created}' } } | ConvertTo-Json -Compress -Depth 3))`,
     '      [void]$stream.Seek(0, [IO.SeekOrigin]::Begin)',
     '      $stream.SetLength(0)',
     '      $stream.Write($bytes, 0, $bytes.Length)',
     '      $stream.Flush()',
     "      $answer = 'relocked'",
+    '      }',
     '    }',
     '  } finally { $stream.Dispose() }',
     '}',
@@ -4288,8 +4357,6 @@ export type PaneTicket = {
   readonly left?: LeftStat
 }
 
-/** The claim a ticket names: one launch's. */
-const LAUNCH_CLAIM = /^launch:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
 
 /**
  * Why the claude wrapper doesn't use a ticket, each as it prints it, in the order it checks them; it
@@ -5354,7 +5421,7 @@ export async function goAnswer($: EngineInterface, go: Go, args: string): Promis
 export const WINDOW_NAME = /^[A-Za-z0-9_-]{1,40}$/
 
 /** Whether `name` is a window name WT takes as a name, never as `-w 0`, `-w -1`, `new` or `last`. */
-export const isWindowName = (name: unknown): name is string => typeof name === 'string' && WINDOW_NAME.test(name) && !/^-?\d+$/.test(name) && !/^(?:new|last)$/i.test(name)
+export const isWindowName = (name: unknown): name is string => typeof name === 'string' && WINDOW_NAME.test(name) && !/^-?\d+$/.test(name) && !/^(?:new|last|_quake)$/i.test(name)
 
 /** A tab's label. */
 export const TAB_LABEL = /^[A-Za-z0-9 ._-]{1,40}$/

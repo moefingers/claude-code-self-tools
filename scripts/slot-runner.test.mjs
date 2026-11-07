@@ -32,7 +32,7 @@ function runnerProblems(text) {
   const has = line => text.includes(line)
   const code = text.split('\n').filter(line => !line.trimStart().startsWith('#')).join('\n')
 
-  need(has('param([switch]$Idle, [string]$Start, [string]$Name, [string]$Resume, [string]$WaitFor, [string]$ConfigDirs, [string]$LeftSize, [string]$LeftMtime, [string]$LeftExitAt, [string]$Launcher)'), 'its parameters')
+  need(has('param([switch]$Idle, [string]$Start, [string]$Name, [string]$Resume, [string]$WaitFor, [string]$ConfigDirs, [string]$LeftSize, [string]$LeftMtime, [string]$LeftExitAt, [string]$Launcher, [string]$Claim)'), 'its parameters')
   need(text.indexOf(machine.PSMODULEPATH_RESET) > 0 && text.indexOf(machine.PSMODULEPATH_RESET) < text.indexOf('$me = Get-CimInstance'), 'PSModulePath reset at the top')
   need(!code.includes('Get-FileHash') && !/\bbash\b|\bmsys\b|\/proc\//i.test(code), 'no Get-FileHash, no bash')
   for (const flag of ['--permission-mode', '--dangerously-skip-permissions', 'bypassPermissions', '--allow-dangerously', 'acceptEdits']) need(!has(flag), `no ${flag}`)
@@ -67,7 +67,21 @@ function runnerProblems(text) {
   // -Start, -Name, -Resume, each with its checks.
   need(has("if ($null -eq $why -and $id -cnotmatch $SessionId) { $why = 'its id is not a session id (a lowercase UUID)' }"), 'an argument\'s id checked')
   need(has("if ($null -eq $why -and $Start -and $Name -cnotmatch $AreaName) { $why = '-Start takes -Name: lowercase letters, digits and hyphens' }"), 'the name pattern for -Start')
-  need(has("if ($null -eq $why -and -not (Test-Claim $id ('launch:' + $id))) { $why = 'the claim lock on that conversation does not name this tab''s launch' }"), "-Start and -Resume need the claim naming launch:<id>")
+  need(has("if ($null -eq $why -and -not (Test-Claim $id $Claim)) { $why = 'the claim lock on that conversation does not name this tab''s launch' }"), "-Start and -Resume need the lock naming this launch's own -Claim")
+  need(has("if ($null -eq $why -and $Claim -cnotmatch $LaunchClaim) { $why = 'it names no claim of its own (-Claim),"), "-Claim of a launch's shape required")
+  // A tab that waits isn't idle (F2); keys typed meanwhile never reach claude (F5); a refusal gives the claim back and says the line (F7).
+  const waiting = text.indexOf("Write-Beacon 'running'\n    $asked = Get-Asked")
+  need(waiting > 0 && text.indexOf('$asked = Get-Asked', waiting) > waiting && code.includes("if ($null -ne $asked) { Start-Claude $asked }\n    Write-Beacon 'idle'"), 'a tab says running while it waits, idle once it has refused')
+  need(has("if ($null -eq $why -and (Test-KeyPending)) { $why = 'you were typing here, and claude would have read it as its prompt'; Clear-Keys }") && text.indexOf('(Test-KeyPending)) { $why = ') > text.indexOf('$why = Get-Live $id $dirs\n      if ($null -eq $why -and $leftArgs.Count -gt 0) {', text.indexOf('function Get-Asked')), 'a tab refuses console input, after the wait and the last look')
+  need(has('if ($id -cmatch $SessionId -and $Claim -cmatch $LaunchClaim) { Give-Back $id $Claim }') && has('Say-ByHand $id $(if ($Start) { $Name } else { $null }) $here') && text.indexOf('{ Give-Back $id $Claim }') < text.indexOf("Write-Host ('This tab did not run"), 'a refusing tab gives its claim back and says the line')
+  need((code.match(/Refuse-Record \$text/g) ?? []).length === 2 && has("if ($named) { Give-Back $id ('slot:' + $slotId) }") && has('if ($named) { Say-ByHand $id'), 'a refused record gives the claim back and says the line')
+  need(has('{ Give-Back $run.Resume $held }') && has('{ Give-Back $run.Start $held }') && has('{ Say-ByHand $run.Resume $null $run.Dir }'), 'a changed launcher gives the claim back and says the line')
+  need(has("if (Test-Shape $folder) { \" -Dir '\" + $folder + \"'\" }"), 'the line names its folder')
+  // The beacon says what this process runs (F4), read once as it starts.
+  // After the wait: asked of the process, as one that has exited stays in the table while a handle is open on it.
+  need(has("if (-not (Test-Gone $parts[0])) { $why = 'the old process is still running' }") && !code.includes('Get-Process -Id'), 'the old process asked whether it has exited')
+  need(has('try { $ownSha = Get-Sha256 $PSCommandPath }') && has("$beacon['sha256'] = $ownSha"), 'its beacon says the hash it started from')
+  need(has('if ($dirs.Count -gt 1) { $run.ConfigDir = @($dirs[1..($dirs.Count - 1)]) }') && !code.includes('ConfigDir = $dirs'), 'the launcher told only the folders it does not read already')
   need(has("if ($null -eq $why -and $Resume -and -not (Test-Project $here $id)) { $why ="), "-Resume's folder must be its project")
   need(has('if ($Start) { $why = Get-NotFresh $id $dirs }'), '-Start re-checks freshness')
 
@@ -105,7 +119,7 @@ function runnerProblems(text) {
   need(has('$beaconPath = Join-Path $state (\'slots\\\' + $slotId + \'.state.json\')'), 'its beacon')
   need(has("Write-Beacon 'running'") && has("Write-Beacon 'idle'") && has("Write-Beacon 'left'"), 'at each state')
   need(has("$stampWindow = $env:CLAUDE_SELF_TOOLS_WT_WINDOW") && has("$stampTab = $env:CLAUDE_SELF_TOOLS_WT_TAB"), 'its stamp')
-  need(has("if ($stampWindow -cnotmatch '^[A-Za-z0-9_-]{1,40}\\z' -or $stampWindow -match '^-?\\d+\\z' -or $stampWindow -match '^(new|last)\\z') { $stampWindow = $null }"), 'a bad stamp dropped')
+  need(has("if ($stampWindow -cnotmatch '^[A-Za-z0-9_-]{1,40}\\z' -or $stampWindow -match '^-?\\d+\\z' -or $stampWindow -match '^(new|last|_quake)\\z') { $stampWindow = $null }"), 'a bad stamp dropped')
   need(has("$beacon['claude'] = $used"), 'the beacon records which claude')
   need(text.split('\n')[6].includes('-File "%LOCALAPPDATA%\\claude-self-tools\\claude-slot.ps1" -Idle'), 'the header documents the profile line with -Idle')
   return problems
@@ -120,6 +134,8 @@ test('its last look is RECHECK and LEFT_RECHECK, line for line, and its folder r
   for (const line of machine.LEFT_RECHECK) assert.ok(script.includes(`    ${line}\n`), `missing from the slot runner's left look: ${line}`)
   for (const line of machine.GET_CLI) assert.ok(script.includes(`${line}\n`), `missing from the slot runner's Get-Cli: ${line}`)
   for (const line of machine.GET_SHA256) assert.ok(script.includes(`${line}\n`), `missing from the slot runner's Get-Sha256: ${line}`)
+  for (const line of machine.RELEASE_CLAIM) assert.ok(script.includes(`${line}\n`), `missing from the slot runner's Release-Claim: ${line}`)
+  for (const line of machine.TEST_GONE) assert.ok(script.includes(`${line}\n`), `missing from the slot runner's Test-Gone: ${line}`)
   const shape = text => text.slice(text.indexOf('function Test-Shape($path) {'), text.indexOf('# Whether a running Claude Code holds conversation'))
   assert.equal(shape(script), shape(launcher))
 })
@@ -135,7 +151,17 @@ for (const [name, from, to, expect] of [
   ['Enter in the same poll no longer refusing the record', 'if ($keyed) { [void](Get-Next $true) }', '', /same poll as a record/],
   ['the floor self-check removed for a start record', 'if ($null -eq $why) { $why = Get-FloorWhy $isStart }', '', /floor and cap/],
   ['the floor self-check removed for -Start and -Resume', 'if ($null -eq $why) { $why = Get-FloorWhy $true }', '', /the floor and the cap/],
-  ['-Resume without its claim check', "if ($null -eq $why -and -not (Test-Claim $id ('launch:' + $id))) {", 'if ($false) {', /naming launch:<id>/],
+  ['-Resume without its claim check', "if ($null -eq $why -and -not (Test-Claim $id $Claim)) {", 'if ($false) {', /this launch's own -Claim/],
+  ['F1: the claim back to one per conversation', "(Test-Claim $id $Claim)", "(Test-Claim $id ('launch:' + $id))", /this launch's own -Claim/],
+  ['F1: a tab with no -Claim used all the same', "if ($null -eq $why -and $Claim -cnotmatch $LaunchClaim) {", 'if ($false) {', /-Claim of a launch's shape/],
+  ['the old process looked for in the table', 'if (-not (Test-Gone $parts[0])) {', 'if (Get-Process -Id ([int]$parts[0]) -ErrorAction SilentlyContinue) {', /asked whether it has exited/],
+  ['F2: a tab that waits saying idle', "Write-Beacon 'running'\n    $asked = Get-Asked", "Write-Beacon 'idle'\n    $asked = Get-Asked", /says running while it waits/],
+  ['F4: a beacon that says no hash', "$beacon['sha256'] = $ownSha", "$beacon['x'] = $ownSha", /the hash it started from/],
+  ['F5: a tab letting typed keys through', "if ($null -eq $why -and (Test-KeyPending)) {", 'if ($false) {', /refuses console input/],
+  ['F7: a refusing tab keeping its claim', 'if ($id -cmatch $SessionId -and $Claim -cmatch $LaunchClaim) { Give-Back $id $Claim }', '', /gives its claim back/],
+  ['F7: a refused record keeping its claim', "if ($named) { Give-Back $id ('slot:' + $slotId) }", '', /refused record gives the claim back/],
+  ['F7: the line without its folder', "if (Test-Shape $folder) { \" -Dir '\" + $folder + \"'\" } else { '' }", "''", /the line names its folder/],
+  ['N5: the launcher told every folder', '$run.ConfigDir = @($dirs[1..($dirs.Count - 1)])', '$run.ConfigDir = $dirs', /does not read already/],
   ['a start record without its claim check', "if ($null -eq $why -and -not (Test-Claim $id ('slot:' + $slotId))) {", 'if ($false) {', /names this slot/],
   ['the record deleted after it is judged', '    [IO.File]::Delete($recordPath)\n', '', /deleted before anything/],
   ['the left look removed from a resume record', 'if ($null -eq $why -and $leftArgs.Count -gt 0) {', 'if ($false) {', /left record's stat in both/],

@@ -46,6 +46,7 @@ const raw = (change = {}) => ({
   freeKb: 32 * GIB_KB,
   errors: [],
   slots: [],
+  heavyChecked: true,
   heavyWaiters: 0,
   heavyBusy: 0,
   room: 3,
@@ -58,7 +59,7 @@ const probeOf = (m, change) => {
   if ('error' in parsed) throw new Error(parsed.error)
   return parsed
 }
-const idleRunner = (m, change = {}, beacon = {}) => ({ pid: 21, created: '134062345678901240', id: `21-134062345678901240`, sha256: m.SLOT_SCRIPT_SHA256, child: null, beacon: { state: 'idle', since: NOW - 60_000, configDir: CONFIG, ...beacon }, ...change })
+const idleRunner = (m, change = {}, beacon = {}) => ({ pid: 21, created: '134062345678901240', id: `21-134062345678901240`, sha256: m.SLOT_SCRIPT_SHA256, child: null, beacon: { state: 'idle', since: NOW - 60_000, configDir: CONFIG, sha256: m.SLOT_SCRIPT_SHA256, ...beacon }, ...change })
 const PICK = { replacing: false, configCount: 1, needsLeft: false, configDir: CONFIG, now: NOW }
 
 const placementOf = (m, change = {}) => {
@@ -67,7 +68,7 @@ const placementOf = (m, change = {}) => {
   return read.placement
 }
 
-const launchInput = (change = {}) => ({ powershell: POWERSHELL, kind: 'resume', id: T, folder: 'C:\\work\\my repo\\', claim: `launch:${T}`, configDirs: [CONFIG, 'D:\\other cfg'], stateDir: STATE, where: { window: true }, waitForExit: { pid: 100, created: '134062345688901240' }, ...change })
+const launchInput = (change = {}) => ({ powershell: POWERSHELL, kind: 'resume', id: T, folder: 'C:\\work\\my repo\\', claim: `launch:${T}`, configDirs: [CONFIG, 'D:\\other cfg'], stateDir: STATE, where: { window: true }, waitForExit: { pid: 100, created: '134062345688901240' }, maxSessions: 12, heavySlotRoot: null, ...change })
 /** One script per place, each with what it must ask for. */
 const scriptsOf = m => ({
   slotStart: m.launchScriptText(launchInput({ kind: 'start', id: FRESH, name: 'dealerwrap', claim: `slot:${SLOT}`, where: { slot: SLOT }, waitForExit: undefined, checks: { ...FLOOR_CHECKS, fresh: true }, heavySlotRoot: 'O:\\heavy' })),
@@ -84,8 +85,8 @@ const CHECKS = {
   launchArguments(m) {
     const s = scriptsOf(m)
     const line = wtLineOf(s.tabStart)
-    assert.equal(line, `-w claude-4 --pos 960,540 --size 160,42 nt --title dealerwrap --suppressApplicationTitle -d "C:\\work\\my repo" -- ${POWERSHELL} -NoExit -NoProfile -ExecutionPolicy RemoteSigned -File "${STATE}\\claude-slot.ps1" -Start ${FRESH} -Name dealerwrap -ConfigDirs "${CONFIG}|D:\\other cfg" -Launcher ${m.LAUNCH_SCRIPT_SHA256}`)
-    assert.equal(wtLineOf(s.tabResume), `-w claude-1 nt --title system-overhaul --suppressApplicationTitle -d "C:\\work\\my repo" -- ${POWERSHELL} -NoExit -NoProfile -ExecutionPolicy RemoteSigned -File "${STATE}\\claude-slot.ps1" -Resume ${T} -WaitFor 100-134062345688901240 -ConfigDirs "${CONFIG}|D:\\other cfg" -Launcher ${m.LAUNCH_SCRIPT_SHA256}`)
+    assert.equal(line, `-w claude-4 --pos 960,540 --size 160,42 nt --title dealerwrap --suppressApplicationTitle -d "C:\\work\\my repo" -- ${POWERSHELL} -NoExit -NoProfile -ExecutionPolicy RemoteSigned -File "${STATE}\\claude-slot.ps1" -Start ${FRESH} -Name dealerwrap -ConfigDirs "${CONFIG}|D:\\other cfg" -Claim launch:${FRESH} -Launcher ${m.LAUNCH_SCRIPT_SHA256}`)
+    assert.equal(wtLineOf(s.tabResume), `-w claude-1 nt --title system-overhaul --suppressApplicationTitle -d "C:\\work\\my repo" -- ${POWERSHELL} -NoExit -NoProfile -ExecutionPolicy RemoteSigned -File "${STATE}\\claude-slot.ps1" -Resume ${T} -WaitFor 100-134062345688901240 -ConfigDirs "${CONFIG}|D:\\other cfg" -Claim launch:${T} -Launcher ${m.LAUNCH_SCRIPT_SHA256}`)
     for (const script of Object.values(s)) {
       for (const flag of PERMISSION) assert.ok(!script.includes(flag), flag)
       const wt = wtLineOf(script)
@@ -96,7 +97,7 @@ const CHECKS = {
     }
     // The largest inputs: 8 config folders of 240 characters, and a folder of 240.
     const long = tag => `C:\\${`${tag}\\${'x'.repeat(40)}\\`.repeat(6)}`.slice(0, 240).replace(/\\+$/, '')
-    const line2 = m.wtTabLine({ powershell: POWERSHELL, stateDir: long('state'), window: 'w'.repeat(40), title: 't'.repeat(40), folder: long('work'), run: { resume: T, waitFor: { pid: 4294967295, created: '99999999999999999999' }, configDirs: Array.from({ length: 8 }, (_, i) => long(`c${i}`)), left: { size: 9007199254740991, mtime: 9007199254740991 } } })
+    const line2 = m.wtTabLine({ powershell: POWERSHELL, stateDir: long('state'), window: 'w'.repeat(40), title: 't'.repeat(40), folder: long('work'), run: { resume: T, claim: `launch:${T}`, waitFor: { pid: 4294967295, created: '99999999999999999999' }, configDirs: Array.from({ length: 8 }, (_, i) => long(`c${i}`)), left: { size: 9007199254740991, mtime: 9007199254740991 } } })
     assert.ok(line2.length < 24_000)
   },
   quoting(m) {
@@ -107,7 +108,7 @@ const CHECKS = {
     assert.equal(m.wtFolder('C:\\a b\\'), 'C:\\a b')
     assert.equal(m.wtFolder('C:\\'), 'C:\\')
     const s = scriptsOf(m).tabStart
-    assert.ok(s.includes('$window = Start-Process wt.exe -ArgumentList $wtLine -PassThru'), 'one string, never an array')
+    assert.ok(s.includes('$window = Start-Process $wtExe -ArgumentList $wtLine -PassThru'), 'one string, never an array')
     // A folder and a slot path with a space come out quoted; a trailing backslash is stripped.
     assert.ok(wtLineOf(s).includes('-d "C:\\work\\my repo" --'))
     assert.ok(wtLineOf(s).includes(`-File "${STATE}\\claude-slot.ps1"`))
@@ -116,7 +117,7 @@ const CHECKS = {
     const s = scriptsOf(m).tabStart
     assert.ok(s.includes(`$slotScript = '${STATE}\\claude-slot.ps1'`), 'the slot script from its one place')
     const hash = s.lastIndexOf(`if ((Get-Sha256 $slotScript) -cne '${m.SLOT_SCRIPT_SHA256}') { throw`)
-    const start = s.indexOf('$window = Start-Process wt.exe')
+    const start = s.indexOf('$window = Start-Process $wtExe')
     assert.ok(hash > 0 && hash < start, 'its hash checked in the same script, just before')
     assert.equal(s.slice(hash, start).split('\r\n').length, 2, 'right before')
     assert.ok(wtLineOf(s).includes(` -- ${POWERSHELL} `))
@@ -139,7 +140,7 @@ const CHECKS = {
       assert.throws(() => m.launchScriptText(launchInput({ where: { tab: { window: name, title: 'a' } } })), name)
       assert.throws(() => m.launchScriptText(launchInput({ where: { window: { name } } })), name)
     }
-    assert.throws(() => m.launchScriptText(launchInput({ claim: `launch:${FRESH}`, where: { tab: { window: 'a', title: 'a' } } })), /launch:<its id>/)
+    assert.throws(() => m.launchScriptText(launchInput({ claim: `slot:${SLOT}`, where: { tab: { window: 'a', title: 'a' } } })), /launch's own claim/)
   },
   moduleReset(m) {
     for (const [name, script] of Object.entries(scriptsOf(m))) {
@@ -148,7 +149,7 @@ const CHECKS = {
       const version = script.indexOf('Get-AppxPackage')
       if (version >= 0) assert.ok(script.indexOf(m.PSMODULEPATH_RESET) < version, name)
     }
-    assert.equal(m.probeScript({ ids: [T], configDirs: [CONFIG], stateDir: STATE, slots: true }).split('\r\n').indexOf(m.PSMODULEPATH_RESET), 2)
+    assert.equal(m.probeScript({ ids: [T], configDirs: [CONFIG], stateDir: STATE, slots: true, heavySlotRoot: null }).split('\r\n').indexOf(m.PSMODULEPATH_RESET), 2)
     assert.equal(m.relockScript({ stateDir: STATE, id: T, by: `launch:${T}`, holder: { pid: 1, created: '1' } }).split('\r\n').indexOf(m.PSMODULEPATH_RESET), 2)
   },
   inputIdle(m) {
@@ -168,26 +169,35 @@ const CHECKS = {
     assert.ok(s.includes('GetLastInputInfo'))
   },
   floorRules(m) {
-    assert.equal(m.floorOk(probeOf(m)), 'ok')
+    assert.equal(m.floorOk(probeOf(m), 12), 'ok')
     // 6 GB governs while the largest is small; 4 GB + the largest past it.
-    assert.equal(m.floorOk(probeOf(m, { freeKb: 6 * GIB_KB - 1 })), 'memory', 'the 6 GB term')
-    assert.equal(m.floorOk(probeOf(m, { freeKb: 6 * GIB_KB })), 'ok')
+    assert.equal(m.floorOk(probeOf(m, { freeKb: 6 * GIB_KB - 1 }), 12), 'memory', 'the 6 GB term')
+    assert.equal(m.floorOk(probeOf(m, { freeKb: 6 * GIB_KB }), 12), 'ok')
     const large = raw().procs.map(p => (p.pid === 100 ? { ...p, privateBytes: 5 * GIB } : p))
-    assert.equal(m.floorOk(probeOf(m, { procs: large, freeKb: 9 * GIB_KB - 1 })), 'memory', 'the largest-private-bytes term')
-    assert.equal(m.floorOk(probeOf(m, { procs: large, freeKb: 9 * GIB_KB })), 'ok')
+    assert.equal(m.floorOk(probeOf(m, { procs: large, freeKb: 9 * GIB_KB - 1 }), 12), 'memory', 'the largest-private-bytes term')
+    assert.equal(m.floorOk(probeOf(m, { procs: large, freeKb: 9 * GIB_KB }), 12), 'ok')
     // None read: the largest counts as 2 GB, under the 6 GB here.
     const unread = raw().procs.map(({ privateBytes, ...p }) => p)
     assert.equal(m.floorNeedKb(probeOf(m, { procs: unread })), 6 * GIB_KB)
-    assert.equal(m.floorOk(probeOf(m, { freeKb: null })), 'memory', 'unread')
-    assert.equal(m.floorOk(probeOf(m, { heavyWaiters: 1 })), 'heavy', 'a heavy waiter')
-    assert.equal(m.floorOk(probeOf(m, { heavyBusy: 2 })), 'heavy', 'both slots busy')
-    assert.equal(m.floorOk(probeOf(m, { heavyBusy: 1 })), 'ok', 'one slot busy')
-    assert.equal(m.floorOk(probeOf(m, { errors: ['heavy:'] })), 'heavy', "heavy-slot's folders unread")
-    assert.equal(m.floorOk(probeOf(m, { heavyWaiters: null, heavyBusy: null })), 'ok', 'no heavy-slot on this machine')
-    assert.equal(m.floorOk(probeOf(m, { room: 12 })), 'cap')
-    assert.equal(m.floorOk(probeOf(m, { room: 11 })), 'ok')
+    assert.equal(m.floorOk(probeOf(m, { freeKb: null }), 12), 'memory', 'unread')
+    assert.equal(m.floorOk(probeOf(m, { heavyWaiters: 1 }), 12), 'heavy', 'a heavy waiter')
+    assert.equal(m.floorOk(probeOf(m, { heavyBusy: 2 }), 12), 'heavy', 'both slots busy')
+    assert.equal(m.floorOk(probeOf(m, { heavyBusy: 1 }), 12), 'ok', 'one slot busy')
+    assert.equal(m.floorOk(probeOf(m, { errors: ['heavy:'] }), 12), 'heavy', "heavy-slot's folders unread")
+    assert.equal(m.floorOk(probeOf(m, { heavyWaiters: null, heavyBusy: null }), 12), 'ok', 'no heavy-slot on this machine')
+    assert.equal(m.floorOk(probeOf(m, { room: 12 }), 12), 'cap')
+    assert.equal(m.floorOk(probeOf(m, { room: 11 }), 12), 'ok')
     assert.equal(m.floorOk(probeOf(m, { room: 6 }), 6), 'cap', 'the cap as placement names it')
-    assert.equal(m.floorOk(probeOf(m, { room: null })), 'cap', 'unread')
+    assert.throws(() => m.floorOk(probeOf(m)), /the cap/, 'never a default')
+    assert.equal(m.floorOk(probeOf(m, { heavyChecked: undefined }), 12), 'heavy', 'a reading that does not say whether heavy-slot was looked at')
+    assert.equal(m.floorOk(probeOf(m, { heavyChecked: false, heavyWaiters: null, heavyBusy: null }), 12), 'ok', 'named none')
+    // Required: left out, a floor would skip heavy-slot and fall to the default cap without a word (F8).
+    assert.throws(() => m.launchScriptText(launchInput({ claim: `slot:${SLOT}`, where: { slot: SLOT }, waitForExit: undefined, checks: { ...FLOOR_CHECKS, live: true }, heavySlotRoot: undefined })), /heavySlotRoot, maxSessions/)
+    assert.throws(() => m.launchScriptText(launchInput({ claim: `slot:${SLOT}`, where: { slot: SLOT }, waitForExit: undefined, checks: { ...FLOOR_CHECKS, live: true }, maxSessions: undefined })), /heavySlotRoot, maxSessions/)
+    assert.ok(!m.launchScriptText(launchInput({ claim: `slot:${SLOT}`, where: { slot: SLOT }, waitForExit: undefined, checks: { ...FLOOR_CHECKS, live: true } })).includes('$heavyRoot ='), 'null: this machine has none')
+    assert.throws(() => m.probeScript({ ids: [T], configDirs: [CONFIG], stateDir: STATE, slots: true }), /heavySlotRoot/)
+    assert.ok(m.probeScript({ ids: [T], configDirs: [CONFIG], stateDir: STATE, slots: true, heavySlotRoot: null }).includes('$result["heavyChecked"] = ($null -ne $heavyRoot)'))
+    assert.equal(m.floorOk(probeOf(m, { room: null }), 12), 'cap', 'unread')
     assert.deepEqual(m.LIMITS_DEFAULT, { minFreeGb: 5, maxSessions: 12 })
     assert.deepEqual([m.INPUT_IDLE_MS, m.SLOT_IDLE_MIN_MS, m.FLOOR_MIN_GB, m.HEAVY_FLOOR_GB], [60_000, 10_000, 6, 4])
   },
@@ -270,10 +280,10 @@ const CHECKS = {
     // A replacing launch's input rule only when it asks (PM6).
     assert.equal(m.pickLaunchTransport(probeOf(m, { inputIdleSec: 1 }), null, { ...mine, needsInput: true }).wait, 'input')
     assert.deepEqual(m.pickLaunchTransport(probeOf(m, { inputIdleSec: 1 }), null, mine).where, { window: true })
-    assert.equal(m.claimOf({ slot: SLOT }, T), `slot:${SLOT}`)
-    assert.equal(m.claimOf({ tab: { window: 'a', title: 'a' } }, T), `launch:${T}`)
-    assert.equal(m.claimOf({ window: { name: 'a' } }, T), `launch:${T}`)
-    assert.equal(m.claimOf({ window: true }, T), undefined)
+    assert.equal(m.claimOf({ slot: SLOT }), `slot:${SLOT}`)
+    assert.equal(m.claimOf({ tab: { window: 'a', title: 'a' } }), undefined, 'a launch\'s own, fresh each time')
+    assert.equal(m.claimOf({ window: { name: 'a' } }), undefined)
+    assert.equal(m.claimOf({ window: true }), undefined)
   },
   slotRecord(m) {
     const s = scriptsOf(m)
@@ -298,7 +308,7 @@ const CHECKS = {
     assert.throws(() => m.launchScriptText(launchInput({ claim: `launch:${T}`, where: { slot: SLOT }, waitForExit: undefined, checks: { ...FLOOR_CHECKS, live: true } })), /slot's claim/)
   },
   beaconsOfRunners(m) {
-    const p = m.probeScript({ ids: [T], configDirs: [CONFIG], stateDir: STATE, slots: true })
+    const p = m.probeScript({ ids: [T], configDirs: [CONFIG], stateDir: STATE, slots: true, heavySlotRoot: null })
     // A beacon is read only for a runner found running, by its own id: never by listing the folder.
     assert.ok(p.includes('$beaconFile = Join-Path $state ("slots\\" + $runnerId + ".state.json")'))
     assert.ok(!/Get-ChildItem[^\r\n]*slots/.test(p))
@@ -383,6 +393,7 @@ const CHECKS = {
       return w.slice(from, end).split("''").join("'")
     })()
     assert.ok(inner.includes(`$handPath = '${STATE}\\claude-launch.ps1'`))
+    assert.ok(inner.includes('if (-not (Test-Gone 100)) { $refusal = ') && !inner.includes('Get-Process -Id'), 'the old process asked whether it has exited')
     assert.ok(inner.includes(`"& '" + $handPath + "' -Resume " + $id + " -Dir '" + $folder + "'"`), 'N2')
     assert.ok(/Write-Host \$refusal\r\n.*\r\n {2}Release-Claim\r\n {2}Read-Host/.test(inner), 'N5: the refusal gives the claim back before it waits')
     assert.ok(inner.includes('function Release-Claim {'))
@@ -529,6 +540,63 @@ const CHECKS = {
     assert.deepEqual(found.map(b => b.kind), ['wake'])
     assert.match(found[0].howToStop, /cancel_wake/)
   },
+  perLaunchClaim(m) {
+    // F1: two launches of one conversation name two claims, each on its own tab's line.
+    const one = `launch:${FRESH}`
+    const two = `launch:${OTHER}`
+    const line = claim => wtLineOf(m.launchScriptText(launchInput({ claim, where: { tab: { window: 'a', title: 'a' } } })))
+    assert.ok(line(one).includes(`-Claim ${one} `) && line(two).includes(`-Claim ${two} `))
+    assert.ok(m.launchScriptText(launchInput({ claim: one, where: { window: { name: 'a' } } })).includes(`-Claim ${one} `))
+    assert.throws(() => m.wtTabLine({ powershell: POWERSHELL, stateDir: STATE, window: 'a', title: 'a', folder: 'C:\\work', run: { resume: T, claim: `slot:${SLOT}` } }), /launch's own/)
+    assert.throws(() => m.launchScriptText(launchInput({ claim: `slot:${SLOT}`, where: { window: { name: 'a' } } })), /names a launch's claim/)
+  },
+  slotLive(m) {
+    // F4: the pane's slot by what it runs: the file's hash, and its own beacon, by its id, at that hash.
+    const slot = live => ({ slot: { pid: 20, created: '134062345678901240', id: SLOT, path: `${STATE}\\claude-slot.ps1`, sha256: m.SLOT_SCRIPT_SHA256, ...(live === undefined ? {} : { live }) } })
+    const pick = change => m.pickLaunchTransport(probeOf(m, change), null, { ...PICK, replacing: true })
+    assert.deepEqual(pick(slot(true)).where, { slot: SLOT })
+    for (const stale of [false, undefined]) {
+      assert.deepEqual(pick(slot(stale)).where, { window: true })
+      assert.equal(pick(slot(stale)).fallback, m.SLOT_NOT_LIVE)
+    }
+    const script = m.probeScript({ ids: [T], configDirs: [CONFIG], stateDir: STATE })
+    assert.ok(script.includes(`if ($null -eq $slotLook -or $slotLook["sha256"] -cne '${m.SLOT_SCRIPT_SHA256}') { $slotOk = $false; $slotStale = $true }`))
+    assert.ok(script.indexOf('function Get-Beacon') < script.indexOf('$slotLook = Get-Beacon'), 'defined before it is called')
+    const auto = m.launchScriptText(launchInput({ where: 'auto' }))
+    assert.ok(auto.includes('elseif ($slotStale) { $slotFallback ='), 'auto: a window, saying why')
+    assert.ok(auto.indexOf('function Get-Beacon') < auto.indexOf('$slotLook = Get-Beacon'), 'defined before it is called')
+    // A slot elsewhere: its beacon says what it runs, or it is passed over.
+    const place = placementOf(m)
+    assert.deepEqual(m.idleSlots(probeOf(m, { slots: [idleRunner(m, {}, { sha256: 'e'.repeat(64) })] }), place, { configDir: CONFIG, now: NOW }), [], 'older code still running')
+    assert.ok(scriptsOf(m).slotStart.includes(`if ($slotBeacon['sha256'] -cne '${m.SLOT_SCRIPT_SHA256}') { Refuse 'slot'`))
+  },
+  workspaceTabs(m) {
+    // F3: a tab or a named window tagged for another workspace is passed over, saying so.
+    const read = m.readPlacement(JSON.stringify({ v: 1, layout: [], launch: { prefer: ['tab', 'window'], tab: { window: 'claude-4', maxTabs: 2 }, window: { name: 'claude-overflow' } }, workspaces: { 'claude-4': 'default', 'claude-overflow': 'default' } }))
+    if ('errors' in read) throw new Error(read.errors.join('; '))
+    const pick = workspace => m.pickLaunchTransport(probeOf(m, { slots: [] }), read.placement, { ...PICK, ...(workspace === undefined ? {} : { workspace }), title: 't', folder: 'C:\\work' })
+    assert.deepEqual(pick('default').where, { tab: { window: 'claude-4', title: 't' } }, 'its own')
+    assert.equal(pick('w_abcdefghijkl').wait, 'slot', 'another workspace: neither')
+    assert.match(pick('w_abcdefghijkl').why, /window claude-4 is tagged for another workspace; window claude-overflow is tagged for another workspace/)
+    assert.ok(pick(undefined).where !== undefined, 'a caller that names no workspace is not held to one')
+  },
+  wtByItsPath(m) {
+    // N2: never a bare name, which would search the conversation's own folder too.
+    const s = scriptsOf(m).tabStart
+    assert.ok(s.includes("$wtExe = Join-Path (Split-Path -Parent $state) 'Microsoft\\WindowsApps\\wt.exe'"))
+    assert.ok(s.includes('-or -not (Test-Path -LiteralPath $wtExe -PathType Leaf)'))
+    assert.ok(!/Start-Process wt/.test(s))
+    // N4: a plain window keeps no tab's stamp.
+    assert.ok(scriptsOf(m).plain.includes("$env:CLAUDE_SELF_TOOLS_WT_WINDOW = $null") && scriptsOf(m).plain.includes("$env:CLAUDE_SELF_TOOLS_WT_TAB = $null"))
+    // N1: reserved for quake mode.
+    assert.equal(m.isWindowName('_quake'), false)
+  },
+  relockHolder(m) {
+    // N12: a different holder, still running, stays.
+    const s = m.relockScript({ stateDir: STATE, id: T, by: `launch:${FRESH}`, holder: { pid: 77, created: '134062345678901240' } })
+    assert.ok(s.includes("if ($held) { $answer = 'held' } else {"))
+    assert.equal(m.RELOCKED.exec('held\r\n')?.[1], 'held')
+  },
   leftAtLastLook(m) {
     // D1: every stat a window takes, claude-launch.ps1 takes.
     assert.ok(m.LAUNCH_SCRIPT_TEXT.includes("$Whole = '^\\d{1,16}\\z'"))
@@ -551,13 +619,13 @@ test('a tab runs the slot runner, never claude: no claude flag on its line', () 
 const FAULTS = [
   ['a --permission-mode added to the wt string', 'launchArguments', "    '--suppressApplicationTitle',\n", "    '--suppressApplicationTitle',\n    '--permission-mode',\n    'bypassPermissions',\n"],
   ['a script back on -EncodedCommand in the wt string', 'launchArguments', '    ...doing,\n', "    '-EncodedCommand',\n    'AAAA',\n    ...doing,\n"],
-  ['an array passed to -ArgumentList', 'quoting', '$window = Start-Process wt.exe -ArgumentList $wtLine -PassThru', '$window = Start-Process wt.exe -ArgumentList ($wtLine -split " ") -PassThru'],
+  ['an array passed to -ArgumentList', 'quoting', '$window = Start-Process $wtExe -ArgumentList $wtLine -PassThru', '$window = Start-Process $wtExe -ArgumentList ($wtLine -split " ") -PassThru'],
   ['the quoting removed', 'quoting', '  return `"${element}"`\n', '  return element\n'],
   ['the trailing-backslash strip removed', 'quoting', "(folder.length > 3 ? folder.replace(/\\\\+$/, '') : folder)", 'folder'],
   ["the slot path taken from a parent's command line", 'pinnedPaths', '`$slotScript = ${literal(slotScriptPath(v.state))}`,', "'$slotScript = $Matches[\"path\"]',"],
   ['the hash check moved out of the launching script', 'pinnedPaths', '          `if ((Get-Sha256 $slotScript) -cne \'${SLOT_SCRIPT_SHA256}\') { throw ("the slot runner is not at " + $slotScript + " with the SHA-256 this plugin ships") }`,\n', ''],
   ['a percent sign let through to wt', 'folders', "((path as string).includes('%') ? 'holds a percent sign (%), which Windows Terminal expands' : undefined)", 'undefined'],
-  ['`last` taken as a window name', 'folders', '!/^(?:new|last)$/i.test(name)', '!/^(?:new)$/i.test(name)'],
+  ['`last` taken as a window name', 'folders', '!/^(?:new|last|_quake)$/i.test(name)', '!/^(?:new|_quake)$/i.test(name)'],
   ['a C1 control let through', 'folders', '\\u007f-\\u009f]/\n\n/**\n * Whether `path` is fit', '\\u007f]/\n\n/**\n * Whether `path` is fit'],
   ['the PSModulePath reset removed from the launch', 'moduleReset', "    PSMODULEPATH_RESET,\n    '[Console]::OutputEncoding = [Text.Encoding]::UTF8',\n    `$tool = ", "    '[Console]::OutputEncoding = [Text.Encoding]::UTF8',\n    `$tool = "],
   ['null read as idle', 'inputIdle', 'probe.inputIdleSec !== null && probe.inputIdleSec * 1000 >= INPUT_IDLE_MS', 'probe.inputIdleSec === null || probe.inputIdleSec * 1000 >= INPUT_IDLE_MS'],
@@ -586,6 +654,7 @@ const FAULTS = [
   ['the projects scan limited to one config folder', 'freshness', "  'foreach ($dir in $configDirs) {',\n  '  $projects = Join-Path $dir \"projects\"',\n  '  if ($null -eq $fresh", "  'foreach ($dir in @($configDirs[0])) {',\n  '  $projects = Join-Path $dir \"projects\"',\n  '  if ($null -eq $fresh"],
   ["relock's by check removed", 'relock', "`    if ($null -eq $lock -or $lock.by -cne '${by}') { $answer = 'not-ours' }`,", "`    if ($null -eq $lock) { $answer = 'not-ours' }`,"],
   ['the by-hand line back to a bare name', 'windowRefusal', `\`"& '" + $handPath + "' -Resume " + $id + " -Dir '" + $folder + "'"\``, `'"claude-launch.ps1 -Resume " + $id + " -Dir " + $folder'`],
+  ['the old process looked for in the table, in the window', 'windowRefusal', 'if (-not (Test-Gone ${v.waitFor.pid})) {', 'if (Get-Process -Id ${v.waitFor.pid} -ErrorAction SilentlyContinue) {'],
   ['a refusing window keeping the claim', 'windowRefusal', "  `  Write-Host (\"Once it is safe, resume it yourself: \" + ${byHand})`,\n    '  Release-Claim',\n".replace('  `  Write', '    `  Write'), "    `  Write-Host (\"Once it is safe, resume it yourself: \" + ${byHand})`,\n"],
   ['a window withdrawn left waiting', 'windowRefusal', `          '  if ($transport -eq "window" -and $null -ne $window) { try { $window.Kill() } catch { } }',\n`, ''],
   ['GO_VIA shipped as the trampoline', 'trampoline', "export const GO_VIA: 'trampoline' | 'direct' = 'direct'", "export const GO_VIA: 'trampoline' | 'direct' = 'trampoline'"],
@@ -599,8 +668,22 @@ const FAULTS = [
   ['readExit dropping the wake-up', 'exitInputs', '...(wake === undefined ? {} : { wake }) }', '}'],
   ['a start record naming no launcher', 'slotRecord', "configDirs = [object[]]$configDirs; launcher = '${LAUNCH_SCRIPT_SHA256}' } | ConvertTo-Json -Compress`", 'configDirs = [object[]]$configDirs } | ConvertTo-Json -Compress`'],
   ['a resume record naming no launcher', 'slotRecord', "configDirs = [object[]]$configDirs; launcher = '${LAUNCH_SCRIPT_SHA256}'${leftField} } | ConvertTo-Json -Compress -Depth 3`", 'configDirs = [object[]]$configDirs${leftField} } | ConvertTo-Json -Compress -Depth 3`'],
-  ['a tab starting with no -Launcher', 'launchArguments', "'-Name', run.name, ...named, '-Launcher', LAUNCH_SCRIPT_SHA256]", "'-Name', run.name, ...named]"],
-  ['a tab resuming with no -Launcher', 'launchArguments', "...named, ...left, '-Launcher', LAUNCH_SCRIPT_SHA256]", '...named, ...left]'],
+  ['a tab starting with no -Launcher', 'launchArguments', "'-Name', run.name, ...named, ...claim(run.claim), '-Launcher', LAUNCH_SCRIPT_SHA256]", "'-Name', run.name, ...named, ...claim(run.claim)]"],
+  ['a tab resuming with no -Launcher', 'launchArguments', "...named, ...left, ...claim(run.claim), '-Launcher', LAUNCH_SCRIPT_SHA256]", '...named, ...left, ...claim(run.claim)]'],
+  ['F1: a tab line with no -Claim', 'launchArguments', "...named, ...left, ...claim(run.claim), '-Launcher', LAUNCH_SCRIPT_SHA256]", "...named, ...left, '-Launcher', LAUNCH_SCRIPT_SHA256]"],
+  ['F1: any claim let through to a tab', 'perLaunchClaim', 'if (!LAUNCH_CLAIM.test(by)) throw', 'if (false) throw'],
+  ['F1: claimOf back to one per conversation', 'pickRules', "return where !== 'auto' && 'slot' in where ? `slot:${where.slot}` : undefined", "return where !== 'auto' && 'slot' in where ? `slot:${where.slot}` : where !== 'auto' && 'tab' in where ? 'launch:x' : undefined"],
+  ['F3: the workspace tag ignored on tabs and named windows', 'workspaceTabs', 'return opts.workspace !== undefined && tag !== undefined && tag !== opts.workspace', 'return false'],
+  ['F3: a caller naming no workspace held to one', 'workspaceTabs', 'return opts.workspace !== undefined && tag !== undefined && tag !== opts.workspace', 'return tag !== undefined && tag !== opts.workspace'],
+  ["F4: this pane's slot by the file's hash alone", 'slotLive', 'slot.sha256 === SLOT_SCRIPT_SHA256 && slot.live === true', 'slot.sha256 === SLOT_SCRIPT_SHA256'],
+  ["F4: this pane's slot by the file's hash alone, in the script", 'slotLive', "$slotOk = $false; $slotStale = $true }`", "$slotStale = $true }`"],
+  ['F4: a slot elsewhere running older code', 'slotLive', " || beacon.sha256 !== SLOT_SCRIPT_SHA256) return false", ') return false'],
+  ['F4: a slot elsewhere running older code, in the script', 'slotLive', "if ($slotBeacon['sha256'] -cne '${SLOT_SCRIPT_SHA256}') { Refuse 'slot'", "if ($false) { Refuse 'slot'"],
+  ['F8: a floor with its heavy-slot folder and cap left out', 'floorRules', 'if (checks.floor === true && (input.heavySlotRoot === undefined || input.maxSessions === undefined)) throw', 'if (false) throw'],
+  ['F8: the slots mode with no word on heavy-slot', 'floorRules', 'if (input.slots === true && input.heavySlotRoot === undefined) throw', 'if (false) throw'],
+  ['F8: floorOk reading no word as none', 'floorRules', "if (probe.heavyChecked === undefined) return 'heavy'", ''],
+  ['N2: wt by its bare name', 'wtByItsPath', '$window = Start-Process $wtExe -ArgumentList', '$window = Start-Process wt.exe -ArgumentList'],
+  ["N12: a live holder's lock taken", 'relockHolder', "if ($held) { $answer = 'held' } else {", "if ($false) { $answer = 'held' } else {"],
   ['the left stat left off a tab', 'leftAtLastLook', "...(input.left === undefined ? {} : { left: input.left }) }\n  const tabOf", "}\n  const tabOf"],
 ]
 

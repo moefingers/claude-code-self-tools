@@ -27,12 +27,14 @@
 # What it does:
 # - It keeps a beacon, %LOCALAPPDATA%\claude-self-tools\slots\<pid>-<created>.state.json: idle or running,
 #   since when, the window and tab it was stamped with (CLAUDE_SELF_TOOLS_WT_WINDOW, _TAB, each checked,
-#   else left out), its config folder and which claude it runs. Written at its start, at each claude
+#   else left out), its config folder, which claude it runs, and the SHA-256 this process started from, which
+#   tells a launch what it really runs. It says running from before a tab's wait, so no launch takes it for idle. Written at its start, at each claude
 #   start and each time it goes idle. A launch of another session uses a slot only when it says idle.
-# - With -Start <uuid> -Name <name> -Launcher <sha256> (a tab a launch opened): the claim lock on that id must name
-#   launch:<uuid>, the id must be new on this machine, and its floor and cap below must hold; then
+# - With -Start <uuid> -Name <name> -Claim launch:<uuid> -Launcher <sha256> (a tab a launch opened): the claim
+#   lock on that id must name that launch's own -Claim, so a later launch that took it over turns this tab
+#   away; console input pending refuses it, or claude would read it as its prompt; the id must be new on this machine, and its floor and cap below must hold; then
 #   claude --session-id <uuid> --name <name> here.
-# - With -Resume <uuid> -Launcher <sha256> (a tab a launch opened): the same claim; this folder must be that conversation's
+# - With -Resume <uuid> -Claim launch:<uuid> -Launcher <sha256> (a tab a launch opened): the same claim and input; this folder must be that conversation's
 #   own (its project holds its transcript); no running Claude Code holds it (read right then), and, given
 #   a left record's stat (-LeftSize and -LeftMtime, or -LeftExitAt), its transcript is unchanged since; its
 #   floor and cap; then claude --resume <uuid> here. -WaitFor <pid>-<created> first waits up to 10 minutes
@@ -52,14 +54,16 @@
 # - Its own floor and cap, whatever a record or an argument says: before a start, or a -Resume, free
 #   memory of at least limits.minFreeGb (default 5) and fewer Claude Codes running than
 #   limits.maxSessions (default 12), from placement.json beside this script; before a `resume` record
-#   (a switch, which replaces a process), the cap only. A refusal is printed here.
+#   (a switch, which replaces a process), the cap only.
+# - A refusal is printed here, with the line to run by hand, and the claim it holds is given back, so the
+#   conversation doesn't read as held for 15 minutes on nothing.
 # - With no record it waits: Enter starts a new Claude Code here, and a record that arrives meanwhile is
 #   honoured (it looks every 200 ms). Ctrl+C leaves the slot, at a PowerShell prompt.
 #
 # It passes claude no other argument: no permission flag of any kind. A resumed session starts in the
 # mode a new session would.
 
-param([switch]$Idle, [string]$Start, [string]$Name, [string]$Resume, [string]$WaitFor, [string]$ConfigDirs, [string]$LeftSize, [string]$LeftMtime, [string]$LeftExitAt, [string]$Launcher)
+param([switch]$Idle, [string]$Start, [string]$Name, [string]$Resume, [string]$WaitFor, [string]$ConfigDirs, [string]$LeftSize, [string]$LeftMtime, [string]$LeftExitAt, [string]$Launcher, [string]$Claim)
 
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
@@ -70,6 +74,7 @@ $AreaName = '^[a-z0-9][a-z0-9-]{0,39}\z'
 $ProcessRef = '^\d{1,10}-\d{1,20}\z'
 $Whole = '^\d{1,16}\z'
 $Sha256 = '^[0-9a-f]{64}\z'
+$LaunchClaim = '^launch:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\z'
 $MaxAgeMs = 120000
 $WaitSeconds = 600
 $DefaultMinFreeGb = 5
@@ -89,7 +94,7 @@ $own = if ($env:CLAUDE_CONFIG_DIR) { $env:CLAUDE_CONFIG_DIR } else { Join-Path $
 
 # The stamps a layout or an overflow tab carries: each checked, a bad one dropped.
 $stampWindow = $env:CLAUDE_SELF_TOOLS_WT_WINDOW
-if ($stampWindow -cnotmatch '^[A-Za-z0-9_-]{1,40}\z' -or $stampWindow -match '^-?\d+\z' -or $stampWindow -match '^(new|last)\z') { $stampWindow = $null }
+if ($stampWindow -cnotmatch '^[A-Za-z0-9_-]{1,40}\z' -or $stampWindow -match '^-?\d+\z' -or $stampWindow -match '^(new|last|_quake)\z') { $stampWindow = $null }
 $stampTab = $env:CLAUDE_SELF_TOOLS_WT_TAB
 if ($stampTab -cnotmatch '^[A-Za-z0-9 ._-]{1,40}\z') { $stampTab = $null }
 
@@ -99,6 +104,18 @@ function Get-Sha256($path) {
   $hasher = [Security.Cryptography.SHA256]::Create()
   try { return [BitConverter]::ToString($hasher.ComputeHash([IO.File]::ReadAllBytes($path))).Replace("-", "").ToLowerInvariant() } finally { $hasher.Dispose() }
 }
+
+# Whether the process waited for has gone, by asking it: TEST_GONE in the plugins' machine code, line for line.
+function Test-Gone($processId) {
+  $h = $null
+  try { $h = [Diagnostics.Process]::GetProcessById([int]$processId); return $h.HasExited }
+  catch { return ($_.Exception -is [ArgumentException] -or $_.Exception.InnerException -is [ArgumentException]) }
+  finally { if ($null -ne $h) { $h.Dispose() } }
+}
+
+# What this process runs: the file as it starts, once. A newer copy over it later changes nothing here.
+$ownSha = $null
+try { $ownSha = Get-Sha256 $PSCommandPath } catch { $ownSha = $null }
 
 # The claude claude-launch.ps1 finds, for the beacon: its first choice, else the first on PATH.
 function Get-ClaudePath {
@@ -122,6 +139,7 @@ function Write-Beacon($now) {
     if ($null -ne $stampTab) { $beacon['tab'] = $stampTab }
     $used = Get-ClaudePath
     if ($null -ne $used) { $beacon['claude'] = $used }
+    if ($null -ne $ownSha) { $beacon['sha256'] = $ownSha }
     [void][IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($beaconPath))
     $temp = $beaconPath + '.' + [guid]::NewGuid().ToString('N') + '.tmp'
     [IO.File]::WriteAllText($temp, ($beacon | ConvertTo-Json -Compress))
@@ -299,6 +317,46 @@ function Join-Dirs($more) {
 
 function Test-KeyPending { try { return [Console]::KeyAvailable } catch { return $false } }
 
+# Keys typed while a tab waited, read off: they were never for its Enter.
+function Clear-Keys { try { while ([Console]::KeyAvailable) { [void][Console]::ReadKey($true) } } catch { } }
+
+# Gives the claim back while it names $by: RELEASE_CLAIM in the plugins' machine code, line for line.
+function Release-Claim {
+  try { $stream = [IO.File]::Open($claimPath, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]'Read, Delete') } catch { return }
+  try {
+    $reader = New-Object IO.StreamReader($stream, [Text.Encoding]::UTF8, $true, 4096, $true)
+    $text = $reader.ReadToEnd()
+    $reader.Dispose()
+    $lock = $null
+    try { $lock = $text | ConvertFrom-Json } catch { $lock = $null }
+    if ($null -ne $lock -and $lock.by -ceq $by) { try { [IO.File]::Delete($claimPath) } catch { } }
+  } finally { $stream.Dispose() }
+}
+function Give-Back($id, $by) {
+  $claimPath = Join-Path $state ('claims\' + $id + '.lock')
+  Release-Claim
+}
+
+# The line that runs a refused conversation by hand: in its own folder, or --resume looks in another project.
+function Say-ByHand($id, $name, $folder) {
+  $dir = if (Test-Shape $folder) { " -Dir '" + $folder + "'" } else { '' }
+  if ($null -eq $name) { Write-Host ('Once it is safe, resume it yourself: & ''' + $handCopy + ''' -Resume ' + $id + $dir) }
+  elseif ($name -cmatch $AreaName) { Write-Host ('Once it is safe, start it yourself: & ''' + $handCopy + ''' -Start ' + $id + ' -Name ' + $name + $dir) }
+}
+
+# A refused record: its claim, this slot's, given back first, so that once this is said the lock is free; then
+# what was wrong, and the line to run it by hand.
+function Refuse-Record($text, $said) {
+  $r = $null
+  try { $r = $text | ConvertFrom-Json } catch { $r = $null }
+  $id = $null
+  if ($null -ne $r) { $id = if ($null -ne $r.start) { $r.start } else { $r.resume } }
+  $named = $id -is [string] -and $id -cmatch $SessionId
+  if ($named) { Give-Back $id ('slot:' + $slotId) }
+  Write-Host $said
+  if ($named) { Say-ByHand $id $(if ($null -ne $r.start) { "$($r.name)" } else { $null }) $r.folder }
+}
+
 # The record left for this pane, used once: $null, or what to run. $keyed: a key was read in this poll.
 function Get-Next($keyed) {
   if (-not (Test-Path -LiteralPath $recordPath -PathType Leaf)) { return $null }
@@ -313,7 +371,7 @@ function Get-Next($keyed) {
   } catch { return $null }
   # You win: console input pending, or a key in this same poll, refuses it.
   if ($keyed -or (Test-KeyPending)) {
-    Write-Host 'A record to run a conversation in this pane was refused: you were typing here. Nothing started.'
+    Refuse-Record $text 'A record to run a conversation in this pane was refused: you were typing here. Nothing started.'
     return $null
   }
   $why = $null
@@ -365,11 +423,11 @@ function Get-Next($keyed) {
     }
   }
   if ($null -ne $why) {
-    Write-Host ('A record to run a conversation in this pane was not used: ' + $why + '.')
-    if (-not $isStart -and $null -ne $record -and $record.resume -is [string] -and $record.resume -cmatch $SessionId) { Write-Host ('Once it is safe, resume it yourself: & ''' + $handCopy + ''' -Resume ' + $record.resume) }
+    Refuse-Record $text ('A record to run a conversation in this pane was not used: ' + $why + '.')
     return $null
   }
-  $run = @{ Launcher = $record.launcher; Dir = $record.folder; ConfigDir = $dirs }
+  $run = @{ Launcher = $record.launcher; Claim = ('slot:' + $slotId); Dir = $record.folder }
+  if ($dirs.Count -gt 1) { $run.ConfigDir = @($dirs[1..($dirs.Count - 1)]) }
   if ($isStart) { $run.Start = $id; $run.Name = $record.name } else { $run.Resume = $id; foreach ($k in $leftArgs.Keys) { $run[$k] = $leftArgs[$k] } }
   return $run
 }
@@ -385,6 +443,7 @@ function Get-Asked {
   if ($null -eq $why -and $id -cnotmatch $SessionId) { $why = 'its id is not a session id (a lowercase UUID)' }
   if ($null -eq $why -and $Start -and $Name -cnotmatch $AreaName) { $why = '-Start takes -Name: lowercase letters, digits and hyphens' }
   if ($null -eq $why -and $Launcher -cnotmatch $Sha256) { $why = 'it names no launcher by its SHA-256 (-Launcher), so a plugin older than this slot runner opened it: update the plugins, then launch it again' }
+  if ($null -eq $why -and $Claim -cnotmatch $LaunchClaim) { $why = 'it names no claim of its own (-Claim), so a plugin older than this slot runner opened it: update the plugins, then launch it again' }
   $named = @()
   if ($null -eq $why -and $ConfigDirs) {
     $named = @($ConfigDirs.Split('|'))
@@ -407,12 +466,12 @@ function Get-Asked {
       if ($null -ne $old -and [math]::Abs($old.CreationDate.ToFileTimeUtc() - [long]$parts[1]) -le 10000) {
         Write-Host ('Waiting for the old Claude Code process (' + $parts[0] + ') to exit, then resuming here.')
         Wait-Process -Id ([int]$parts[0]) -Timeout $WaitSeconds -ErrorAction SilentlyContinue
-        if (Get-Process -Id ([int]$parts[0]) -ErrorAction SilentlyContinue) { $why = 'the old process is still running' }
+        if (-not (Test-Gone $parts[0])) { $why = 'the old process is still running' }
       }
     }
   }
   if ($null -eq $why) { $why = Get-FloorWhy $true }
-  if ($null -eq $why -and -not (Test-Claim $id ('launch:' + $id))) { $why = 'the claim lock on that conversation does not name this tab''s launch' }
+  if ($null -eq $why -and -not (Test-Claim $id $Claim)) { $why = 'the claim lock on that conversation does not name this tab''s launch' }
   $here = (Get-Location).ProviderPath
   if ($null -eq $why -and $Resume -and -not (Test-Project $here $id)) { $why = 'this folder is not that conversation''s own: no transcript of it under the folder''s project' }
   if ($null -eq $why) {
@@ -425,11 +484,17 @@ function Get-Asked {
       }
     }
   }
+  # You win: what was typed while this tab waited would land in claude's prompt, an Enter submitting it.
+  if ($null -eq $why -and (Test-KeyPending)) { $why = 'you were typing here, and claude would have read it as its prompt'; Clear-Keys }
   if ($null -ne $why) {
+    # Its claim back first: once this is said, the lock is free.
+    if ($id -cmatch $SessionId -and $Claim -cmatch $LaunchClaim) { Give-Back $id $Claim }
     Write-Host ('This tab did not run what it was opened for: ' + $why + '.')
+    if ($id -cmatch $SessionId) { Say-ByHand $id $(if ($Start) { $Name } else { $null }) $here }
     return $null
   }
-  $run = @{ Launcher = $Launcher; Dir = $here; ConfigDir = $dirs }
+  $run = @{ Launcher = $Launcher; Claim = $Claim; Dir = $here }
+  if ($dirs.Count -gt 1) { $run.ConfigDir = @($dirs[1..($dirs.Count - 1)]) }
   if ($Start) { $run.Start = $id; $run.Name = $Name } else { $run.Resume = $id; foreach ($k in $leftArgs.Keys) { $run[$k] = $leftArgs[$k] } }
   return $run
 }
@@ -460,18 +525,20 @@ function Get-NewestLauncher {
 # run of a launcher here would meet the machine's own policy (Restricted, by default).
 function Start-Claude($run) {
   $sha = $run.Launcher
+  $held = $run.Claim
   $run.Remove('Launcher')
+  $run.Remove('Claim')
   if ($null -eq $sha) {
-    Write-Host ('Nothing started: no claude-launch-<hash>.ps1 in ' + $state + ' has the SHA-256 its name gives, and only such a copy starts claude here. A launch (a switch, a restart) puts one there. Or leave this slot with Ctrl+C, and run yours by hand: & ''' + $handCopy + '''')
+    Write-Host ('Nothing started: no claude-launch-<hash>.ps1 in ' + $state + ' has the SHA-256 its name gives, and only such a copy starts claude here. A launch (a switch, a restart) puts one there, and the copy for you to run by hand, ' + $handCopy + ', beside it. Then leave this slot with Ctrl+C to run that.')
     return
   }
   $launcherPath = Join-Path $state ('claude-launch-' + $sha.Substring(0, 8) + '.ps1')
   $actual = $null
   try { $actual = Get-Sha256 $launcherPath } catch { $actual = $null }
   if ($actual -cne $sha) {
+    if ($run.ContainsKey('Resume')) { Give-Back $run.Resume $held } elseif ($run.ContainsKey('Start')) { Give-Back $run.Start $held }
     Write-Host ('Nothing started: ' + $launcherPath + ' does not have the SHA-256 ' + $sha + '. It is missing, or it changed after a launch put it there. Launch it again: a launch puts it back.')
-    if ($run.ContainsKey('Resume')) { Write-Host ('Once it is safe, resume it yourself: & ''' + $handCopy + ''' -Resume ' + $run.Resume + ' -Dir ''' + $run.Dir + '''') }
-    elseif ($run.ContainsKey('Start')) { Write-Host ('Or start it yourself: & ''' + $handCopy + ''' -Start ' + $run.Start + ' -Name ' + $run.Name + ' -Dir ''' + $run.Dir + '''') }
+    if ($run.ContainsKey('Resume')) { Say-ByHand $run.Resume $null $run.Dir } elseif ($run.ContainsKey('Start')) { Say-ByHand $run.Start $run.Name $run.Dir }
     return
   }
   Write-Beacon 'running'
@@ -483,12 +550,16 @@ function Start-Claude($run) {
 }
 
 try {
-  Write-Beacon 'idle'
-  if ($Start -or $Resume -or $Name -or $WaitFor -or $Launcher) {
+  if ($Start -or $Resume -or $Name -or $WaitFor -or $Launcher -or $Claim) {
+    # A tab that waits to run what it was opened for is no idle slot: a launch's record would lie unread until
+    # that claude has gone, by when it is too old.
+    Write-Beacon 'running'
     $asked = Get-Asked
     if ($null -ne $asked) { Start-Claude $asked }
-  } elseif (-not $Idle) {
-    Start-Claude @{ Launcher = (Get-NewestLauncher) }
+    Write-Beacon 'idle'
+  } else {
+    Write-Beacon 'idle'
+    if (-not $Idle) { Start-Claude @{ Launcher = (Get-NewestLauncher) } }
   }
   $said = $false
   while ($true) {

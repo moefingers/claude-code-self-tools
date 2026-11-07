@@ -62,6 +62,8 @@ const input = (change: Partial<LaunchInput> = {}): LaunchInput => ({
   stateDir: STATE,
   where: { window: true },
   waitForExit: { pid: 100, created: ft(2) },
+  maxSessions: 12,
+  heavySlotRoot: null,
   ...change,
 })
 
@@ -255,7 +257,7 @@ describe('the checks, the claim and the place, in one run, in that order', () =>
     const inner = innerOf(SCRIPTS[0]?.[1] ?? '')
     const wait = inner.indexOf('Wait-Process -Id 100 -Timeout 600 -ErrorAction SilentlyContinue')
     expect(wait).toBeGreaterThan(0)
-    expect(inner.indexOf('if (Get-Process -Id 100 -ErrorAction SilentlyContinue) { $refusal = "The old process is still running')).toBeGreaterThan(wait)
+    expect(inner.indexOf('if (-not (Test-Gone 100)) { $refusal = "The old process is still running')).toBeGreaterThan(wait)
     for (const line of RECHECK) expect(inner.indexOf(`    ${line}`)).toBeGreaterThan(wait)
     expect(inner.indexOf('$lock.by -cne $by')).toBeGreaterThan(inner.indexOf(`    ${RECHECK[RECHECK.length - 1]}`))
     expect(inner.indexOf('& $launchPath')).toBeGreaterThan(inner.indexOf('$lock.by -cne $by'))

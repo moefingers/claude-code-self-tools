@@ -510,7 +510,7 @@ async function restartNow($: EngineInterface, value: Queued): Promise<void> {
   else {
     /** The claim the script printed it took, once it took one. */
     let claim: string | undefined
-    /** This launch's own claim: a fresh launch's, which the script names and takes; a tab's or a named window's runner takes only `launch:<id>`. */
+    /** This launch's own claim: a fresh launch's, which the script names and takes, and a tab or a named window is told. */
     let ours = ''
     /** The run ended without a clean answer (an exit code, no answer, a timeout): it may have placed something. */
     let unclean = false
@@ -519,7 +519,7 @@ async function restartNow($: EngineInterface, value: Queued): Promise<void> {
     // Terminal or the slot runner.
     const legs = await restartLegs($, site.state, judged.probe, launch, pane)
     for (const [n, where] of legs.entries()) {
-      ours = claimOf(where, launch.id) ?? `launch:${crypto.randomUUID()}`
+      ours = claimOf(where) ?? `launch:${crypto.randomUUID()}`
       claim = undefined
       unclean = false
       opened = undefined
@@ -540,7 +540,16 @@ async function restartNow($: EngineInterface, value: Queued): Promise<void> {
           tool: 'self-restart',
           deadline: now + LAUNCH_DEADLINE_MS,
         }
-        const call = buildLaunch(input)
+        let call: ReturnType<typeof buildLaunch>
+        try {
+          call = buildLaunch(input)
+        } catch (err) {
+          refusedFor = 'build'
+          opened = `the launch can't be made: ${why(err)}`
+          if (n === legs.length - 1) break
+          $.ui.log(`the placed restart wasn't used: ${oneLine(opened, 300)}. The next place is tried.`)
+          continue
+        }
         const run = await $.process.run(call.argv, {
           stdin: call.stdin,
           cwd: launch.cwd,

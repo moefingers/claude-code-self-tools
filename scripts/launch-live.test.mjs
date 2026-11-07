@@ -15,7 +15,7 @@ import { join } from 'node:path'
 import { after, before, describe, test } from 'node:test'
 import { pathToFileURL } from 'node:url'
 import { gzipSync } from 'node:zlib'
-import { compileStub, fence, underStub, WINDOWS_POWERSHELL } from './stub.mjs'
+import { compileStub, fence, noWindow, underStub, WINDOWS_POWERSHELL } from './stub.mjs'
 import { ROOT } from './sync-shared.mjs'
 
 const machine = await import(pathToFileURL(join(ROOT, 'shared', 'hooks', 'machine.ts')).href)
@@ -68,16 +68,6 @@ function envOf(dirs, extra = {}) {
 const runsOf = dirs => {
   const log = join(dirs.root, 'claude-runs.jsonl')
   return existsSync(log) ? readFileSync(log, 'utf8').split('\n').filter(Boolean).map(line => JSON.parse(line)) : []
-}
-
-/** A launch script with Start-Process replaced by a throw: a fault in a test can never open a window. It throws itself when one is left that isn't so guarded (D3): a renamed anchor can't silently take the guard away. */
-const noWindow = script => {
-  const at = '$window = Start-Process'
-  const guarded = script.includes(at) ? script.split(at).join(`throw 'a test never opens a window'; ${at}`) : script
-  const starts = (guarded.match(/Start-Process/g) ?? []).length
-  const held = (guarded.match(/throw 'a test never opens a window'; \$window = Start-Process/g) ?? []).length
-  assert.equal(starts, held, 'every Start-Process in a script a test runs is guarded')
-  return guarded
 }
 
 /** A resume's launch into the lab, under a fresh launch's claim. */
@@ -276,7 +266,7 @@ function runWindow(inner, dirs, extra = {}) {
 /** A window's launch in the lab, not waiting (no old process here), its claim in place, the launcher installed. */
 function windowLab(change = {}) {
   const dirs = lab()
-  const input = launchInput(dirs, { checks: { live: true, floor: true, input: true }, ...change })
+  const input = launchInput(dirs, { checks: { live: true, floor: true, input: true }, heavySlotRoot: null, maxSessions: 12, ...change })
   const inner = innerOf(machine.launchScriptText(input))
   mkdirSync(join(dirs.state, 'claims'), { recursive: true })
   writeFileSync(machine.claimPath(dirs.state, input.id), claimText(input.claim, 4))

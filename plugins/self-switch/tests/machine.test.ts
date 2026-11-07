@@ -1090,7 +1090,7 @@ describe('the scripts, as text', () => {
 
   test('the restart launch says why it passed over a slot runner, on a line of its own after the claim', () => {
     expect(restart).toContain(
-      'if ($null -ne $slot -and -not $slotOk) { if ($null -ne $slotHashError) { $slotFallback = "slot hash unreadable: " + $slotHashError } else { $slotFallback = "this pane" + [char]39 + "s claude-slot.ps1 has another SHA-256 than the one shipped" } }',
+      'if ($null -ne $slot -and -not $slotOk) { if ($null -ne $slotHashError) { $slotFallback = "slot hash unreadable: " + $slotHashError } elseif ($slotStale) { $slotFallback = "this pane" + [char]39 + "s slot runner does not say it reads records at the shipped hash: it was left with Ctrl+C, or it runs an older copy (restart the pane)" } else { $slotFallback = "this pane" + [char]39 + "s claude-slot.ps1 has another SHA-256 than the one shipped" } }',
     )
     const said = restart.indexOf('[Console]::Out.WriteLine("fallback " + ($slotFallback -split "\\r?\\n")[0])')
     expect(said).toBeGreaterThan(restart.indexOf('[Console]::Out.WriteLine("claim " + $by)'))

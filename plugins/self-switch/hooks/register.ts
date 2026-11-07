@@ -97,7 +97,6 @@ import {
   agentsHeld,
   agentsWayOut,
   blockersText,
-  claimOf,
   exitBlockers,
   isBusyAgent,
   LAUNCH_RUN_MS,
@@ -804,7 +803,7 @@ function logNewKeys($: EngineInterface, found: Probe): void {
 async function probe($: EngineInterface, ctx: Context, to: string): Promise<Probe | { failure: string }> {
   try {
     // With a placement, the slots too: whether an overflow window has room for a tab.
-    const script = probeScript({ ids: [ctx.own, to], take: to, configDirs: ctx.configDirs, stateDir: ctx.state, left: true, ...(ctx.placement === null ? {} : { slots: true }), ...(ctx.heavySlotRoot === undefined ? {} : { heavySlotRoot: ctx.heavySlotRoot }) })
+    const script = probeScript({ ids: [ctx.own, to], take: to, configDirs: ctx.configDirs, stateDir: ctx.state, left: true, ...(ctx.heavySlotRoot === undefined ? {} : { heavySlotRoot: ctx.heavySlotRoot }), ...(ctx.placement === null ? {} : { slots: true, heavySlotRoot: ctx.heavySlotRoot ?? null }) })
     const call = powershellCall(ctx.powershell, script)
     const run = await $.process.run(call.argv, { stdin: call.stdin, cwd: ctx.folder, timeoutMs: PROBE_MS })
     if (run.exitCode !== 0) return { failure: `it exited ${run.exitCode}${brief(run.stderr) === '' ? '' : `: ${brief(run.stderr)}`}` }
@@ -1057,13 +1056,11 @@ async function switchNow($: EngineInterface, value: Queued): Promise<void> {
   }
   const { found, by, beat, live, plain } = looked
   /**
-   * The claim the launch names: the probe's, or a fresh launch's when a slot's claim must become a
-   * window's (the launch takes it over: the same process holds both). Both are given back on a release.
+   * The claim the launch names: the probe's own, fresh for each switch, which a tab or a named window is
+   * told too. So a later launch that takes the lock over turns an earlier one away.
    */
-  let claim = by
   const free = async (): Promise<void> => {
     if (by !== undefined) await release($, ctx.powershell, ctx.state, to, by)
-    if (claim !== undefined && claim !== by) await release($, ctx.powershell, ctx.state, to, claim)
   }
   const held = async (said: string): Promise<void> => {
     await free()
@@ -1086,17 +1083,14 @@ async function switchNow($: EngineInterface, value: Queued): Promise<void> {
   const pick: Transport = tabNoLeft !== undefined && picked.transport === 'pane' ? { transport: 'window', folder: picked.folder } : picked
   if (picked.transport === 'slot' && by !== `slot:${picked.slot}`) return held("the claim lock doesn't name this pane's slot")
   // The window: where placement.json puts it (launch.prefer), each place tried in turn while it is refused
-  // for want of Windows Terminal or the slot runner, the plain window last. A tab's or a named window's slot
-  // runner takes only the claim naming launch:<to>, which the launch takes over from the probe's (the
-  // same process holds both).
+  // for want of Windows Terminal or the slot runner, the plain window last.
   const legs: readonly LaunchWhere[] = (() => {
     if (pick.transport !== 'window' || ctx.placement === null) return [{ window: true } as const]
     const placed = pickLaunchTransport(found, ctx.placement, { replacing: true, using: 'launch', configCount: ctx.configDirs.length, needsLeft: false, title: resumeTitle(to), folder: pick.folder })
     return 'where' in placed ? [placed.where, ...(placed.then ?? [])] : [{ window: true } as const]
   })()
-  if (legs.some(leg => claimOf(leg, to) !== undefined)) claim = `launch:${to}`
   /** The claim the ticket, the record or the window names. */
-  const named = claim ?? by
+  const named = by
   if ((pick.transport === 'window' || pick.transport === 'pane') && !named.startsWith('launch:')) return held("the claim lock doesn't name a launch")
   const left = pick.transport === 'pane' && tab !== undefined && 'pane' in tab && paneNoLeft(tab.pane) !== undefined ? undefined : live.waived
   const own: ProcessRef | undefined = found.session === null ? undefined : { pid: found.session.pid, created: found.session.created }

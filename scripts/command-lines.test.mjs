@@ -29,6 +29,8 @@ const commandLine = argv => argv.map(a => (/[\s"]/.test(a) ? `"${a}"` : a)).join
 /** A launch through the shared launcher, with the largest inputs it takes. */
 const launchFor = change => machine.launchScriptText({
   powershell: POWERSHELL,
+  maxSessions: 12,
+  heavySlotRoot: null,
   kind: 'resume',
   id: T,
   folder: resumeIn,

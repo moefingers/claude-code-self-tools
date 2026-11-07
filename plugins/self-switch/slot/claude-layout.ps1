@@ -14,15 +14,15 @@
 #
 # What it does:
 # - It checks the file by the rules of readPlacement in the plugins' machine code (one shared list of good
-#   and bad files holds the two equal): window names of letters, digits, _ and -, never 0, last, new, -1 or
-#   all digits; tab labels; folders absolute, there, with no quote, semicolon or % (Windows Terminal expands
+#   and bad files holds the two equal): window names of letters, digits, _ and -, never 0, last, new, _quake,
+#   -1 or all digits; tab labels; folders absolute, there, with no quote, semicolon or % (Windows Terminal expands
 #   a % in them); positions and sizes in range; unknown keys refused, naming them. Anything wrong, and it
 #   says what, and runs nothing.
 # - It needs the slot runner at %LOCALAPPDATA%\claude-self-tools\claude-slot.ps1, with the SHA-256 the
 #   plugins ship, read by .NET; and with -Apply, Windows Terminal of 1.19 or later (it forwards a tab's
 #   environment, which the tab's stamp needs).
 # - For each window in order, for each tab, it sets CLAUDE_SELF_TOOLS_WT_WINDOW and CLAUDE_SELF_TOOLS_WT_TAB
-#   in its own process, then runs wt.exe by Start-Process with one quoted string: the window by its name,
+#   in its own process, then runs wt.exe, by its full path under %LOCALAPPDATA%\Microsoft\WindowsApps, by Start-Process with one quoted string: the window by its name,
 #   its position and size on the first tab only, and the tab running the slot runner with -Idle. So no
 #   tab starts a Claude Code: Enter does that, or a launch. 2 seconds between calls, since Windows Terminal
 #   creates a window by name asynchronously. A window of that name that is there already simply gains tabs.
@@ -40,7 +40,7 @@ $ProgressPreference = 'SilentlyContinue'
 $env:PSModulePath = @([Environment]::GetFolderPath("MyDocuments") + "\WindowsPowerShell\Modules", [Environment]::GetFolderPath("ProgramFiles") + "\WindowsPowerShell\Modules", [Environment]::GetFolderPath("System") + "\WindowsPowerShell\v1.0\Modules") -join ";"
 
 # The slot runner this release ships.
-$SlotSha = 'a4d7a5ac0ac6afb70d2d50d4bc5a02a4988a14537404c664a767668e2b675f09'
+$SlotSha = '529c4a1aad907c2c00e9077afe77a1ebc90f0d3e8e8ab1e80f9f6dbf4c1be076'
 # Set by Claude Code in the processes it starts, and NO_COLOR: LAUNCH_ENV_CLEAR in the plugins' machine code.
 $Clear = 'CLAUDE_CODE_CHILD_SESSION', 'CLAUDECODE', 'CLAUDE_CODE_SESSION_ID', 'CLAUDE_PID', 'CLAUDE_EFFORT', 'CLAUDE_CODE_BRIDGE_SESSION_ID', 'CLAUDE_CODE_MESSAGING_SOCKET', 'CLAUDE_CODE_MESSAGING_TOKEN', 'CLAUDE_CODE_REMOTE', 'CLAUDE_CODE_REMOTE_SESSION_ID', 'CLAUDE_JOB_DIR', 'AI_AGENT', 'CLAUDE_CODE_ENTRYPOINT', 'CLAUDE_CODE_EXECPATH', 'CLAUDE_CODE_SESSION_ATTENDED', 'CLAUDE_CODE_SSE_PORT', 'NO_COLOR'
 foreach ($n in $Clear) { [Environment]::SetEnvironmentVariable($n, [NullString]::Value, [EnvironmentVariableTarget]::Process) }
@@ -62,7 +62,7 @@ $script:Errors = New-Object System.Collections.ArrayList
 function Add-Fault($what) { [void]$script:Errors.Add($what) }
 function Test-Object($value) { return ($value -is [Management.Automation.PSCustomObject]) }
 function Test-Whole($value, $low, $high) { return (($value -is [int] -or $value -is [long]) -and $value -ge $low -and $value -le $high) }
-function Test-WindowName($name) { return ($name -is [string] -and $name -cmatch '^[A-Za-z0-9_-]{1,40}\z' -and $name -notmatch '^-?\d+\z' -and $name -notmatch '^(new|last)\z') }
+function Test-WindowName($name) { return ($name -is [string] -and $name -cmatch '^[A-Za-z0-9_-]{1,40}\z' -and $name -notmatch '^-?\d+\z' -and $name -notmatch '^(new|last|_quake)\z') }
 function Test-TabLabel($label) { return ($label -is [string] -and $label -cmatch '^[A-Za-z0-9 ._-]{1,40}\z') }
 function Test-Shape($path) {
   if ($path -isnot [string] -or $path.Length -lt 3 -or $path.Length -gt 240) { return $false }
@@ -189,7 +189,7 @@ function Get-PlacementFaults($doc) {
 # quotes when it holds a space; refused when it holds a double quote, or would end a quoted element in a
 # backslash, which would escape the closing quote. wtArgument in the plugins' machine code.
 function ConvertTo-WtArgument($element) {
-  if ($element -eq '' -or $element.Contains('"')) { Stop-Layout ('an argument for Windows Terminal is empty or holds a double quote: ' + $element + '.') }
+  if ($element -eq '' -or $element.Contains('"') -or $element.Contains(';') -or $element.Contains('%')) { Stop-Layout ('an argument for Windows Terminal is empty, or holds a double quote, a semicolon or a percent sign: ' + $element + '.') }
   if ($element -notmatch '\s') { return $element }
   if ($element.EndsWith('\')) { Stop-Layout ('an argument with a space ends in a backslash: ' + $element + '.') }
   return '"' + $element + '"'
@@ -211,6 +211,9 @@ if ($script:Errors.Count -gt 0) {
 $slotScript = Join-Path $state 'claude-slot.ps1'
 $powershell = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
 if (-not (Test-WtFolder $slotScript)) { Stop-Layout ('the slot runner''s path holds a quote, a semicolon or a %: ' + $slotScript + '.') }
+if (-not (Test-WtFolder $powershell)) { Stop-Layout ('Windows PowerShell''s path holds a quote, a semicolon or a %: ' + $powershell + '.') }
+# By its full path: a bare name would search the current folder too.
+$wtExe = Join-Path $env:LOCALAPPDATA 'Microsoft\WindowsApps\wt.exe'
 
 # Every tab's stamp and wt string, in order.
 $commands = New-Object System.Collections.ArrayList
@@ -244,12 +247,13 @@ try {
   if ($found.Count -gt 0) { $terminal = $found[0] }
 } catch { $terminal = $null }
 if ($null -eq $terminal -or $terminal -lt [version]'1.19') { Stop-Layout 'Windows Terminal of 1.19 or later is not installed: a tab''s stamp needs it to forward the environment.' }
+if (-not (Test-Path -LiteralPath $wtExe -PathType Leaf)) { Stop-Layout ('Windows Terminal is not at ' + $wtExe + ', where this script runs it from.') }
 
 foreach ($c in $commands) {
   $env:CLAUDE_SELF_TOOLS_WT_WINDOW = $c.window
   $env:CLAUDE_SELF_TOOLS_WT_TAB = $c.tab
   Write-Host ('[' + $c.window + ' / ' + $c.tab + '] wt.exe ' + $c.line)
-  Start-Process wt.exe -ArgumentList $c.line
+  Start-Process $wtExe -ArgumentList $c.line
   Start-Sleep -Seconds 2
 }
 exit 0

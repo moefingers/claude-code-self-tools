@@ -35,7 +35,7 @@ export type RawProbe = {
   v: 1
   self: number
   session: { pid: number; created: string } | null
-  slot: { pid: number; created: string; id: string; path: string; sha256: string | null; hashError?: string } | null
+  slot: { pid: number; created: string; id: string; path: string; sha256: string | null; hashError?: string; live?: boolean } | null
   slotSeen?: true
   procs: RawProcess[]
   registry: RawRegistry[]
@@ -141,6 +141,7 @@ export function inSlot(probe: RawProbe, sha256: string | null = SLOT_SCRIPT_SHA2
     id: `20-${ft(1)}`,
     path: 'C:\\Users\\u\\AppData\\Local\\claude-self-tools\\claude-slot.ps1',
     sha256,
+    live: sha256 === SLOT_SCRIPT_SHA256,
     ...(hashError === undefined ? {} : { hashError }),
   }
   if (sha256 === SLOT_SCRIPT_SHA256) {

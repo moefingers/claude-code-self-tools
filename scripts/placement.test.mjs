@@ -154,7 +154,7 @@ function layoutProblems(text) {
   const reset = code.indexOf(machine.PSMODULEPATH_RESET)
   need(reset > 0 && reset < code.indexOf('Get-AppxPackage'), 'PSModulePath is reset before Windows Terminal\'s version is read')
   const gate = code.indexOf('if (-not $Apply) {')
-  const launch = code.indexOf('Start-Process wt.exe -ArgumentList $c.line')
+  const launch = code.indexOf('Start-Process $wtExe -ArgumentList $c.line')
   need(gate > 0 && launch > gate, 'nothing runs before the -Apply gate')
   need(/if \(-not \$Apply\) \{[\s\S]*?\n  exit 0\n\}/.test(code), 'without -Apply it exits having run nothing')
   need((code.match(/Start-Process/g) ?? []).length === 1, 'one Start-Process')
@@ -172,6 +172,16 @@ function layoutProblems(text) {
   need(!/\bbash\b|\bmsys\b/i.test(code), 'no bash')
   return problems
 }
+
+test('wtArgument and the layout script refuse the same elements, and the layout checks every path it hands wt (N6); wt by its full path (N2)', () => {
+  const code = readFileSync(join(ROOT, 'plugins', 'self-switch', 'slot', 'claude-layout.ps1'), 'utf8')
+  assert.ok(code.includes("if ($element -eq '' -or $element.Contains('\"') -or $element.Contains(';') -or $element.Contains('%')) {"))
+  for (const bad of ['', 'a"b', 'a;b', 'a%b']) assert.throws(() => machine.wtArgument(bad), bad)
+  assert.ok(code.includes('if (-not (Test-WtFolder $powershell)) {'))
+  assert.ok(code.includes("$wtExe = Join-Path $env:LOCALAPPDATA 'Microsoft\\WindowsApps\\wt.exe'"))
+  assert.ok(code.includes('if (-not (Test-Path -LiteralPath $wtExe -PathType Leaf)) { Stop-Layout'))
+  assert.ok(!code.split('\n').some(line => !line.trimStart().startsWith('#') && /Start-Process wt/.test(line)))
+})
 
 test('the layout script, as text: -WhatIf by default, wt by Start-Process with one string, the slot script pinned and hash-checked first', () => {
   assert.deepEqual(layoutProblems(layout), [])
@@ -203,7 +213,7 @@ describe('planted faults in the layout script and the validators, each caught', 
   })
 
   test('`last` accepted by the PowerShell validator alone: the two then disagree on the shared list', () => {
-    const { path } = copyWith('last', "$name -notmatch '^(new|last)\\z'", "$name -notmatch '^(new)\\z'")
+    const { path } = copyWith('last', "$name -notmatch '^(new|last|_quake)\\z'", "$name -notmatch '^(new|_quake)\\z'")
     const lastCase = fixture.bad.find(c => c.name === 'a window called last')
     assert.equal(psTakes(lastCase.file, path, 'fault').code, 0, 'the copy takes it')
     assert.ok('errors' in machine.readPlacement(textOf(lastCase.file)), 'readPlacement still refuses it')
@@ -211,7 +221,7 @@ describe('planted faults in the layout script and the validators, each caught', 
 
   test('`last` accepted by readPlacement alone: the two then disagree on the shared list', async () => {
     const text = readFileSync(MACHINE, 'utf8')
-    const faulty = text.split('!/^(?:new|last)$/i.test(name)').join('!/^(?:new)$/i.test(name)')
+    const faulty = text.split('!/^(?:new|last|_quake)$/i.test(name)').join('!/^(?:new|_quake)$/i.test(name)')
     assert.notEqual(faulty, text)
     const path = join(work, 'machine-last.ts')
     writeFileSync(path, faulty)

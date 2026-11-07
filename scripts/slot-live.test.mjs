@@ -15,7 +15,7 @@ import { freemem, tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { after, before, describe, test } from 'node:test'
 import { pathToFileURL } from 'node:url'
-import { compileStub, fence, holder, underStub, WINDOWS_POWERSHELL } from './stub.mjs'
+import { compileStub, fence, holder, noWindow, underStub, WINDOWS_POWERSHELL } from './stub.mjs'
 import { ROOT } from './sync-shared.mjs'
 
 const machine = await import(pathToFileURL(join(ROOT, 'shared', 'hooks', 'machine.ts')).href)
@@ -31,7 +31,7 @@ before(() => {
   stub = compileStub(work)
 })
 after(() => {
-  if (work !== undefined) rmSync(work, { recursive: true, force: true })
+  if (work !== undefined) rmSync(work, { recursive: true, force: true, maxRetries: 20, retryDelay: 250 })
 })
 
 /** A hand copy that says so if a slot runner ever runs it: a file beside it, and no claude. Of a version no launch replaces. */
@@ -48,11 +48,13 @@ function otherLauncher(dirs, version, mark) {
 }
 /** The argument a launch's tab carries: this release's pin. */
 const PIN = ['-Launcher', machine.LAUNCH_SCRIPT_SHA256]
+/** And its own claim, as a launch names it on the line. */
+const tab = by => ['-Claim', by, ...PIN]
 
 /** One run's folders: a home whose .local\bin holds the stub, the state folder with the launcher at its hash's name, a hand copy no runner may run, and the runner, a config folder, the conversation's folder. */
-function lab() {
+function lab({ local = 'local' } = {}) {
   const root = mkdtempSync(join(work, 'run-'))
-  const dirs = { root, home: join(root, 'home'), local: join(root, 'local'), config: join(root, 'config'), other: join(root, 'config two'), folder: join(root, 'work folder') }
+  const dirs = { root, home: join(root, 'home'), local: join(root, local), config: join(root, 'config'), other: join(root, 'config two'), folder: join(root, 'work folder') }
   for (const dir of Object.values(dirs)) mkdirSync(dir, { recursive: true })
   mkdirSync(join(dirs.home, '.local', 'bin'), { recursive: true })
   copyFileSync(stub, join(dirs.home, '.local', 'bin', 'claude.exe'))
@@ -61,6 +63,9 @@ function lab() {
   writeFileSync(machine.launchScriptPath(state), machine.LAUNCH_SCRIPT_TEXT)
   writeFileSync(machine.launchHandPath(state), HAND_COPY)
   copyFileSync(RUNNER, join(state, 'claude-slot.ps1'))
+  // Where a launch looks for Windows Terminal, under this fence: a file that is never run.
+  mkdirSync(join(dirs.local, 'Microsoft', 'WindowsApps'), { recursive: true })
+  writeFileSync(join(dirs.local, 'Microsoft', 'WindowsApps', 'wt.exe'), '')
   // Limits no real machine's sessions or memory get in the way of: the tests that need others write their own.
   writeFileSync(machine.placementPath(state), JSON.stringify({ v: 1, layout: [], limits: { minFreeGb: 1, maxSessions: 40 } }))
   return { ...dirs, state, script: join(state, 'claude-slot.ps1') }
@@ -108,6 +113,30 @@ function beaconId(dirs, pid) {
 
 const beaconOf = (dirs, id) => JSON.parse(readFileSync(machine.slotBeaconPath(dirs.state, id), 'utf8'))
 
+/** The machine's own input and memory stand aside: these tests are about the place, and must not depend on the person's keyboard. */
+const steady = script =>
+  script
+    .replace('$idleMs = [ClaudeSelfToolsInput]::IdleMs()', '$idleMs = 120000')
+    .replace('$needBytes = [math]::Max(', '$freeKb = [long]999999999; $needBytes = [math]::Max(')
+
+/** A launch script with Windows Terminal's version given, and wt's one string written to a file: wt is never run. */
+const fakeWt = (script, file) =>
+  script
+    .replace('$wtOld = $null -eq $wtVersion', "$wtVersion = [version]'1.22'; $wtOld = $null -eq $wtVersion")
+    .split('$window = Start-Process $wtExe -ArgumentList $wtLine -PassThru')
+    .join(`[IO.File]::WriteAllText('${file}', $wtLine); $window = $null`)
+
+/** The string wt is handed, split as Windows splits a command line (CommandLineToArgvW). */
+function argvOf(dirs, line) {
+  const file = join(dirs.root, `split-${randomUUID()}.txt`)
+  writeFileSync(file, line)
+  const type = 'using System; using System.Runtime.InteropServices; public static class Argv { [DllImport("shell32.dll", CharSet = CharSet.Unicode)] static extern IntPtr CommandLineToArgvW(string line, out int count); [DllImport("kernel32.dll")] static extern IntPtr LocalFree(IntPtr p); public static string[] Split(string line) { int n; IntPtr p = CommandLineToArgvW("x " + line, out n); string[] r = new string[n - 1]; for (int i = 1; i < n; i++) { r[i - 1] = Marshal.PtrToStringUni(Marshal.ReadIntPtr(p, i * IntPtr.Size)); } LocalFree(p); return r; } }'
+  const script = `Add-Type -TypeDefinition '${type}'; ConvertTo-Json -Compress -InputObject ([Argv]::Split([IO.File]::ReadAllText('${file}')))`
+  const ran = spawnSync(WINDOWS_POWERSHELL, ['-NoProfile', '-NonInteractive', '-EncodedCommand', machine.encodeCommand(script)], { env: envOf(dirs), encoding: 'utf8', windowsHide: true })
+  assert.equal(ran.status, 0, ran.stderr)
+  return JSON.parse(ran.stdout)
+}
+
 /** Waits for `check` to be true, up to `ms`. */
 async function until(check, what, ms = 30_000) {
   const end = Date.now() + ms
@@ -119,13 +148,24 @@ async function until(check, what, ms = 30_000) {
       ok = false
     }
     if (ok) return
-    if (Date.now() > end) throw new Error(`never came: ${what}`)
+    if (Date.now() > end) throw new Error(`never came: ${typeof what === 'function' ? what() : what}`)
     await new Promise(resolve => setTimeout(resolve, 100))
   }
 }
 
 const lockText = (by, pid = 4) => JSON.stringify({ v: 1, by, pid, created: '1', at: Date.now(), transport: 'slot' })
-const claim = (dirs, id, by) => writeFileSync(machine.claimPath(dirs.state, id), lockText(by))
+/** Writes the claim lock. A runner reading or releasing one holds it for a moment: tried again then, as the machine's own takers do. */
+function claim(dirs, id, by) {
+  for (let tries = 0; ; tries += 1) {
+    try {
+      writeFileSync(machine.claimPath(dirs.state, id), lockText(by))
+      return
+    } catch (err) {
+      if (err.code !== 'EBUSY' || tries >= 40) throw err
+      spawnSync(process.execPath, ['-e', 'setTimeout(() => {}, 50)'])
+    }
+  }
+}
 /** Writes conversation `id`'s transcript under `folder`'s project. */
 function transcript(dirs, id, folder = dirs.folder, config = dirs.config) {
   const project = join(config, 'projects', machine.projectName(folder))
@@ -262,14 +302,14 @@ describe('the slot runner, run for real against the stub', { skip: !isWindows &&
   test('-Start: the claim must name launch:<id>; the id must be new; then claude here, and the tab goes on as an idle slot', async () => {
     const dirs = lab()
     const bare = randomUUID()
-    const wrong = startRunner(dirs, ['-Start', bare, '-Name', 'dealerwrap', ...PIN])
+    const wrong = startRunner(dirs, ['-Start', bare, '-Name', 'dealerwrap', ...tab(`launch:${bare}`)])
     try {
       await until(() => /does not name this tab's launch/.test(wrong.out()), `the refusal\n${wrong.out()}`)
       assert.equal(runsOf(dirs).length, 0)
     } finally {
       wrong.stop()
     }
-    const badName = startRunner(dirs, ['-Start', randomUUID(), '-Name', 'Not A Name', ...PIN])
+    const badName = startRunner(dirs, ['-Start', randomUUID(), '-Name', 'Not A Name', ...tab(`launch:${randomUUID()}`)])
     try {
       await until(() => /-Start takes -Name/.test(badName.out()), `the refusal\n${badName.out()}`)
     } finally {
@@ -277,7 +317,7 @@ describe('the slot runner, run for real against the stub', { skip: !isWindows &&
     }
     const fresh = randomUUID()
     claim(dirs, fresh, `launch:${fresh}`)
-    const runner = startRunner(dirs, ['-Start', fresh, '-Name', 'dealerwrap', '-ConfigDirs', `${dirs.config}|${dirs.other}`, ...PIN])
+    const runner = startRunner(dirs, ['-Start', fresh, '-Name', 'dealerwrap', '-ConfigDirs', `${dirs.config}|${dirs.other}`, ...tab(`launch:${fresh}`)])
     try {
       await until(() => runsOf(dirs).length === 1, `the run\n${runner.out()}`)
       assert.deepEqual(runsOf(dirs)[0].args, ['--session-id', fresh, '--name', 'dealerwrap'])
@@ -292,15 +332,18 @@ describe('the slot runner, run for real against the stub', { skip: !isWindows &&
     const dirs = lab()
     const id = randomUUID()
     const path = transcript(dirs, id)
-    claim(dirs, id, `launch:${id}`)
-    const elsewhere = startRunner(dirs, ['-Resume', id, ...PIN], { cwd: dirs.root })
+    const by = `launch:${randomUUID()}`
+    // A refusal gives the claim back: each of these is a launch of its own.
+    claim(dirs, id, by)
+    const elsewhere = startRunner(dirs, ['-Resume', id, ...tab(by)], { cwd: dirs.root })
     try {
       await until(() => /this folder is not that conversation's own/.test(elsewhere.out()), `the refusal\n${elsewhere.out()}`)
     } finally {
       elsewhere.stop()
     }
     const named = await holder({ stub, work, env: envOf(dirs), args: ['--resume', id] })
-    const held = startRunner(dirs, ['-Resume', id, ...PIN])
+    claim(dirs, id, by)
+    const held = startRunner(dirs, ['-Resume', id, ...tab(by)])
     try {
       await until(() => /it is open elsewhere: process \d+ names it on its command line \(L2\)/.test(held.out()), `the refusal\n${held.out()}`)
     } finally {
@@ -310,7 +353,8 @@ describe('the slot runner, run for real against the stub', { skip: !isWindows &&
     const when = new Date(Date.now() - 60_000)
     utimesSync(path, when, when)
     const mtime = Math.round(statSync(path).mtimeMs)
-    const changed = startRunner(dirs, ['-Resume', id, '-LeftSize', '999', '-LeftMtime', String(mtime), ...PIN])
+    claim(dirs, id, by)
+    const changed = startRunner(dirs, ['-Resume', id, '-LeftSize', '999', '-LeftMtime', String(mtime), ...tab(by)])
     try {
       await until(() => /its transcript changed since it was left/.test(changed.out()), `the refusal\n${changed.out()}`)
       assert.equal(runsOf(dirs).length, 0)
@@ -318,7 +362,8 @@ describe('the slot runner, run for real against the stub', { skip: !isWindows &&
       changed.stop()
     }
     const size = statSync(path).size
-    const runner = startRunner(dirs, ['-Resume', id, '-LeftSize', String(size), '-LeftMtime', String(mtime), ...PIN])
+    claim(dirs, id, by)
+    const runner = startRunner(dirs, ['-Resume', id, '-LeftSize', String(size), '-LeftMtime', String(mtime), ...tab(by)])
     try {
       await until(() => runsOf(dirs).length === 1, `the run\n${runner.out()}`)
       assert.deepEqual(runsOf(dirs)[0].args, ['--resume', id])
@@ -344,6 +389,116 @@ describe('the slot runner, run for real against the stub', { skip: !isWindows &&
     }
   })
 
+  test('F1: two tabs waiting on one process, the second launch having taken the lock: only the one the lock names resumes; the other says so, and leaves the lock', async () => {
+    const dirs = lab()
+    const id = randomUUID()
+    transcript(dirs, id)
+    const old = await holder({ stub, work, env: envOf(dirs) })
+    const first = `launch:${randomUUID()}`
+    const second = `launch:${randomUUID()}`
+    claim(dirs, id, second)
+    const waits = ({ pid, created }) => ['-WaitFor', `${pid}-${created}`]
+    const tabA = startRunner(dirs, ['-Resume', id, ...waits(old), ...tab(first)])
+    const tabB = startRunner(dirs, ['-Resume', id, ...waits(old), ...tab(second)])
+    try {
+      await until(() => /Waiting for the old Claude Code/.test(tabA.out()) && /Waiting for the old Claude Code/.test(tabB.out()), `both wait\n${tabA.out()}\n${tabB.out()}`)
+      old.stop()
+      await until(() => runsOf(dirs).length >= 1, () => `the resume\nA:\n${tabA.out()}\nB:\n${tabB.out()}`)
+      await until(() => /does not name this tab's launch/.test(tabA.out()), `the first turned away\n${tabA.out()}`)
+      assert.deepEqual(runsOf(dirs).map(run => run.args), [['--resume', id]], 'one copy writes it')
+      assert.equal(JSON.parse(readFileSync(machine.claimPath(dirs.state, id), 'utf8')).by, second, 'the one turned away leaves the lock that names the other')
+    } finally {
+      old.stop()
+      tabA.stop()
+      tabB.stop()
+    }
+  })
+
+  test('F1: a tab whose launch was withdrawn stays away when a later launch claims the conversation', async () => {
+    const dirs = lab()
+    const id = randomUUID()
+    transcript(dirs, id)
+    claim(dirs, id, `launch:${randomUUID()}`)
+    const withdrawn = startRunner(dirs, ['-Resume', id, ...tab(`launch:${randomUUID()}`)])
+    try {
+      await until(() => /does not name this tab's launch/.test(withdrawn.out()), `turned away\n${withdrawn.out()}`)
+      assert.equal(runsOf(dirs).length, 0)
+    } finally {
+      withdrawn.stop()
+    }
+  })
+
+  test('F2: a tab that waits says running, so no launch takes it for idle; once it refuses, idle', async () => {
+    const dirs = lab()
+    const id = randomUUID()
+    transcript(dirs, id)
+    const old = await holder({ stub, work, env: envOf(dirs) })
+    const runner = startRunner(dirs, ['-Resume', id, '-WaitFor', `${old.pid}-${old.created}`, ...tab(`launch:${randomUUID()}`)])
+    try {
+      await until(() => /Waiting for the old Claude Code/.test(runner.out()), `it waits\n${runner.out()}`)
+      assert.equal(beaconOf(dirs, runner.id()).state, 'running')
+      old.stop()
+      await until(() => beaconOf(dirs, runner.id()).state === 'idle', `idle after\n${runner.out()}`)
+      assert.equal(runsOf(dirs).length, 0)
+    } finally {
+      old.stop()
+      runner.stop()
+    }
+  })
+
+  test('F7: a tab that refuses gives its claim back and says the line to run, in its folder; a record that is refused does too', async () => {
+    const dirs = lab()
+    const id = randomUUID()
+    const path = transcript(dirs, id)
+    const by = `launch:${randomUUID()}`
+    claim(dirs, id, by)
+    const refused = startRunner(dirs, ['-Resume', id, '-LeftSize', '999', '-LeftMtime', String(Math.round(statSync(path).mtimeMs)), ...tab(by)])
+    try {
+      await until(() => /Once it is safe, resume it yourself: & '.+claude-launch\.ps1' -Resume [0-9a-f-]{36} -Dir '.+work folder'/.test(refused.out()), `the line\n${refused.out()}`)
+      assert.ok(!existsSync(machine.claimPath(dirs.state, id)), 'given back')
+    } finally {
+      refused.stop()
+    }
+    // A lock naming another is not this one's to give back.
+    const other = `launch:${randomUUID()}`
+    claim(dirs, id, other)
+    const elsewhere = startRunner(dirs, ['-Resume', id, ...tab(by)])
+    try {
+      await until(() => /does not name this tab's launch/.test(elsewhere.out()), elsewhere.out())
+      assert.equal(JSON.parse(readFileSync(machine.claimPath(dirs.state, id), 'utf8')).by, other)
+    } finally {
+      elsewhere.stop()
+    }
+    const runner = startRunner(dirs, ['-Idle'])
+    try {
+      await until(() => runner.id() !== undefined, 'the beacon')
+      const slot = runner.id()
+      claim(dirs, id, `slot:${slot}`)
+      record(dirs, slot, { v: 1, resume: id, folder: dirs.folder, at: Date.now(), left: { size: 999, mtime: 1 } })
+      await until(() => /Once it is safe, resume it yourself: & '.+claude-launch\.ps1' -Resume [0-9a-f-]{36} -Dir '.+work folder'/.test(runner.out()), `the line\n${runner.out()}`)
+      assert.ok(!existsSync(machine.claimPath(dirs.state, id)), 'given back')
+      assert.equal(runsOf(dirs).length, 0)
+    } finally {
+      runner.stop()
+    }
+  })
+
+  test('N5: eight other config folders named: the launcher is told those, adds its own, and runs', async () => {
+    const dirs = lab()
+    const eight = Array.from({ length: 8 }, (_, i) => { const dir = join(dirs.root, `config-${i}`); mkdirSync(dir); return dir })
+    const runner = startRunner(dirs, ['-Idle'])
+    try {
+      await until(() => runner.id() !== undefined, 'the beacon')
+      const slot = runner.id()
+      const id = randomUUID()
+      transcript(dirs, id)
+      claim(dirs, id, `slot:${slot}`)
+      record(dirs, slot, { v: 1, resume: id, folder: dirs.folder, at: Date.now(), configDirs: eight })
+      await until(() => runsOf(dirs).length === 1, `the run\n${runner.out()}`)
+    } finally {
+      runner.stop()
+    }
+  })
   test('which launcher: a record names it by its hash; that copy runs, and the hand copy beside it never does', async () => {
     const dirs = lab()
     const runner = startRunner(dirs, ['-Idle'])
@@ -382,7 +537,7 @@ describe('the slot runner, run for real against the stub', { skip: !isWindows &&
       record(dirs, slot, { v: 1, resume: old, folder: dirs.folder, at: Date.now() }, { bare: true })
       const said = /it names no launcher by its SHA-256, so a plugin older than this slot runner wrote it: update the plugins, then launch it again/g
       await until(() => (runner.out().match(said) ?? []).length === 1, `the refusal\n${runner.out()}`)
-      assert.match(runner.out(), /Once it is safe, resume it yourself: & '.+claude-launch\.ps1' -Resume /)
+      await until(() => /Once it is safe, resume it yourself: & '.+claude-launch\.ps1' -Resume /.test(runner.out()), `the line\n${runner.out()}`)
       for (const launcher of ['not-a-hash', machine.LAUNCH_SCRIPT_SHA256.toUpperCase(), 12]) {
         record(dirs, slot, { v: 1, resume: old, folder: dirs.folder, at: Date.now(), launcher })
         await until(() => !existsSync(machine.slotRecordPath(dirs.state, slot)), 'read')
@@ -395,13 +550,21 @@ describe('the slot runner, run for real against the stub', { skip: !isWindows &&
     }
     const fresh = randomUUID()
     claim(dirs, fresh, `launch:${fresh}`)
-    const tab = startRunner(dirs, ['-Start', fresh, '-Name', 'dealerwrap'])
+    const opened = startRunner(dirs, ['-Start', fresh, '-Name', 'dealerwrap', '-Claim', `launch:${fresh}`])
     try {
-      await until(() => /it names no launcher by its SHA-256 \(-Launcher\), so a plugin older than this slot runner opened it: update the plugins, then launch it again/.test(tab.out()), `the refusal\n${tab.out()}`)
+      await until(() => /it names no launcher by its SHA-256 \(-Launcher\), so a plugin older than this slot runner opened it: update the plugins, then launch it again/.test(opened.out()), `the refusal\n${opened.out()}`)
       assert.equal(runsOf(dirs).length, 0)
       assert.ok(!handCopyRan(dirs))
     } finally {
-      tab.stop()
+      opened.stop()
+    }
+    // F1: no -Claim of a launch's shape, the same.
+    const named = startRunner(dirs, ['-Start', fresh, '-Name', 'dealerwrap', ...PIN])
+    try {
+      await until(() => /it names no claim of its own \(-Claim\), so a plugin older than this slot runner opened it/.test(named.out()), `the refusal\n${named.out()}`)
+      assert.equal(runsOf(dirs).length, 0)
+    } finally {
+      named.stop()
     }
   })
 
@@ -419,14 +582,17 @@ describe('the slot runner, run for real against the stub', { skip: !isWindows &&
       record(dirs, slot, { v: 1, resume: old, folder: dirs.folder, at: Date.now() })
       const said = /Nothing started: .+claude-launch-[0-9a-f]{8}\.ps1 does not have the SHA-256 [0-9a-f]{64}\. It is missing, or it changed after a launch put it there\. Launch it again: a launch puts it back\./g
       await until(() => (runner.out().match(said) ?? []).length === 1, `the refusal\n${runner.out()}`)
-      assert.match(runner.out(), /Once it is safe, resume it yourself: & '.+claude-launch\.ps1' -Resume [0-9a-f-]{36} -Dir '.+'/)
+      await until(() => /Once it is safe, resume it yourself: & '.+claude-launch\.ps1' -Resume [0-9a-f-]{36} -Dir '.+'/.test(runner.out()), `the line\n${runner.out()}`)
+      assert.ok(!existsSync(machine.claimPath(dirs.state, old)), 'a refusal gives the claim back')
       rmSync(path)
+      claim(dirs, old, `slot:${slot}`)
       record(dirs, slot, { v: 1, resume: old, folder: dirs.folder, at: Date.now() })
       await until(() => (runner.out().match(said) ?? []).length === 2, `missing\n${runner.out()}`)
       assert.equal(runsOf(dirs).length, 0)
       assert.ok(!handCopyRan(dirs))
       assert.equal(beaconOf(dirs, slot).state, 'idle', 'nothing ran: never said running')
       writeFileSync(path, machine.LAUNCH_SCRIPT_TEXT)
+      claim(dirs, old, `slot:${slot}`)
       record(dirs, slot, { v: 1, resume: old, folder: dirs.folder, at: Date.now() })
       await until(() => runsOf(dirs).length === 1, `put back\n${runner.out()}`)
       assert.deepEqual(runsOf(dirs)[0].args, ['--resume', old])
@@ -444,7 +610,7 @@ describe('the slot runner, run for real against the stub', { skip: !isWindows &&
     writeFileSync(edited.script, faulty)
     const fresh = randomUUID()
     claim(dirs, fresh, `launch:${fresh}`)
-    const bad = startRunner(edited, ['-Start', fresh, '-Name', 'dealerwrap', ...PIN])
+    const bad = startRunner(edited, ['-Start', fresh, '-Name', 'dealerwrap', ...tab(`launch:${fresh}`)])
     try {
       await until(() => handCopyRan(dirs), `the marker a run of the hand copy leaves\n${bad.out()}`)
     } finally {
@@ -454,7 +620,7 @@ describe('the slot runner, run for real against the stub', { skip: !isWindows &&
     rmSync(machine.launchScriptPath(dirs.state))
     const again = randomUUID()
     claim(dirs, again, `launch:${again}`)
-    const good = startRunner(dirs, ['-Start', again, '-Name', 'dealerwrap', ...PIN])
+    const good = startRunner(dirs, ['-Start', again, '-Name', 'dealerwrap', ...tab(`launch:${again}`)])
     try {
       await until(() => /Nothing started: .+ does not have the SHA-256/.test(good.out()), `the refusal\n${good.out()}`)
       assert.ok(!handCopyRan(dirs))
@@ -470,7 +636,7 @@ describe('the slot runner, run for real against the stub', { skip: !isWindows &&
     rmSync(machine.launchScriptPath(none.state))
     const alone = startRunner(none, [])
     try {
-      await until(() => /Nothing started: no claude-launch-<hash>\.ps1 in .+ has the SHA-256 its name gives, and only such a copy starts claude here\. A launch \(a switch, a restart\) puts one there\. Or leave this slot with Ctrl\+C, and run yours by hand: & '.+claude-launch\.ps1'/.test(alone.out()), `the words\n${alone.out()}`)
+      await until(() => /Nothing started: no claude-launch-<hash>\.ps1 in .+ has the SHA-256 its name gives, and only such a copy starts claude here\. A launch \(a switch, a restart\) puts one there, and the copy for you to run by hand, .+claude-launch\.ps1, beside it\./.test(alone.out()), `the words\n${alone.out()}`)
       assert.equal(runsOf(none).length, 0)
       assert.ok(!handCopyRan(none))
     } finally {
@@ -513,6 +679,102 @@ describe('the slot runner, run for real against the stub', { skip: !isWindows &&
 })
 
 describe("the probe's slots mode, and the launch's own run, against a running runner", { skip: !isWindows && 'Windows only', concurrency: 2 }, () => {
+  for (const [name, change, live] of [
+    ['its beacon as it runs', beacon => beacon, true],
+    ['left with Ctrl+C', beacon => ({ ...beacon, state: 'left' }), false],
+    ['still running an older copy', beacon => ({ ...beacon, sha256: 'e'.repeat(64) }), false],
+    ['a beacon with no hash, as a runner of version 1 has none at all', ({ sha256, ...beacon }) => (void sha256, beacon), false],
+  ]) {
+    test(`F4: this pane's slot, ${name}: ${live ? 'verified' : 'not, so a window, saying why'}`, async () => {
+      const dirs = lab()
+      const child = mkdtempSync(join(work, 'child-'))
+      const files = { self: join(child, 'self.json'), stdin: join(child, 'stdin.ps1'), out: join(child, 'out.txt'), err: join(child, 'err.txt') }
+      const text = JSON.stringify(change({ v: 1, state: 'running', since: 1, configDir: dirs.config, sha256: machine.SLOT_SCRIPT_SHA256 }))
+      const script = machine.probeScript({ ids: [randomUUID()], configDirs: [dirs.config], stateDir: dirs.state }).replace('$slot = $null', `foreach ($b in @(Get-ChildItem -LiteralPath '${join(dirs.state, 'slots')}' -Filter '*.state.json')) { [IO.File]::WriteAllText($b.FullName, '${text}') }; $slot = $null`)
+      writeFileSync(files.stdin, script)
+      const call = machine.powershellCall(WINDOWS_POWERSHELL, '')
+      const runner = startRunner(dirs, [], { env: { STUB_SELF: files.self, STUB_CHILD_EXE: call.argv[0], STUB_CHILD_ARGS: call.argv.slice(1).join(' '), STUB_CHILD_STDIN: files.stdin, STUB_CHILD_OUT: files.out, STUB_CHILD_ERR: files.err } })
+      try {
+        await until(() => existsSync(files.out) && readFileSync(files.out, 'utf8').includes('"procs"'), `the probe\n${runner.out()}`)
+        const probe = machine.parseProbe(readFileSync(files.out, 'utf8'))
+        assert.ok(!('error' in probe), JSON.stringify(probe))
+        assert.equal(probe.slot?.sha256, machine.SLOT_SCRIPT_SHA256)
+        assert.equal(machine.slotVerified(probe.slot), live)
+        const pick = machine.pickLaunchTransport(probe, null, { replacing: true, configCount: 1, needsLeft: false })
+        assert.deepEqual(pick.where, live ? { slot: probe.slot.id } : { window: true })
+        if (!live) assert.equal(pick.fallback, machine.SLOT_NOT_LIVE)
+      } finally {
+        runner.stop()
+      }
+    })
+  }
+
+  test('F6: a tab, its own run: the line wt is handed, split as Windows splits it, starts the real runner, which runs claude there; the folder and the state path hold spaces', async () => {
+    const dirs = lab({ local: 'local app' })
+    const fresh = randomUUID()
+    const by = `launch:${randomUUID()}`
+    const lineFile = join(dirs.root, 'wt-line.txt')
+    const input = { powershell: WINDOWS_POWERSHELL, kind: 'start', id: fresh, name: 'dealerwrap', folder: dirs.folder, claim: by, configDirs: [dirs.config], stateDir: dirs.state, where: { tab: { window: 'claude-4', title: 'dealerwrap', pos: [960, 540], size: [160, 42] } }, checks: { floor: true, input: true, fresh: true }, maxSessions: 40, heavySlotRoot: null, tool: 'coordinator' }
+    const ran = await underStub({ stub, work, env: envOf(dirs), script: () => noWindow(fakeWt(steady(machine.launchScriptText(input)), lineFile)) })
+    const answer = machine.parseLaunch(ran.stdout)
+    assert.deepEqual(answer.launched, { transport: 'tab', label: 'claude-4' }, ran.stdout + ran.stderr)
+    assert.equal(answer.claim, by)
+    const argv = argvOf(dirs, readFileSync(lineFile, 'utf8'))
+    assert.deepEqual(argv.slice(0, 2), ['-w', 'claude-4'])
+    assert.equal(argv[argv.indexOf('-d') + 1], dirs.folder)
+    const inner = argv.slice(argv.indexOf('--') + 1)
+    assert.equal(inner[0], WINDOWS_POWERSHELL)
+    assert.equal(inner[inner.indexOf('-File') + 1], dirs.script)
+    assert.equal(inner[inner.indexOf('-Claim') + 1], by)
+    assert.equal(inner[inner.indexOf('-Launcher') + 1], machine.LAUNCH_SCRIPT_SHA256)
+    const tabbed = spawn(inner[0], inner.slice(1), { env: envOf(dirs, { CLAUDE_SELF_TOOLS_WT_WINDOW: 'claude-4', CLAUDE_SELF_TOOLS_WT_TAB: 'dealerwrap' }), cwd: dirs.folder, windowsHide: true })
+    let out = ''
+    tabbed.stdout.on('data', chunk => (out += chunk))
+    tabbed.stderr.on('data', chunk => (out += chunk))
+    try {
+      await until(() => runsOf(dirs).length === 1, () => `the run\n${out}`)
+      assert.deepEqual(runsOf(dirs)[0].args, ['--session-id', fresh, '--name', 'dealerwrap'])
+      assert.equal(runsOf(dirs)[0].cwd, dirs.folder)
+      // Read until it reads: the runner may be replacing it as the stub exits.
+      let beacon
+      await until(() => (beacon = beaconOf(dirs, beaconId(dirs, tabbed.pid))) !== undefined, () => `the beacon\n${out}`)
+      assert.equal(beacon.window, 'claude-4')
+      assert.equal(beacon.sha256, machine.SLOT_SCRIPT_SHA256)
+    } finally {
+      tabbed.kill()
+    }
+  })
+
+  test('F6: a named window, its own run: the same runner by the same path; with no Windows Terminal there, the plain window', async () => {
+    const dirs = lab({ local: 'local app' })
+    const id = randomUUID()
+    transcript(dirs, id)
+    const by = `launch:${randomUUID()}`
+    const lineFile = join(dirs.root, 'wt-line.txt')
+    const input = { powershell: WINDOWS_POWERSHELL, kind: 'resume', id, folder: dirs.folder, claim: by, configDirs: [dirs.config], stateDir: dirs.state, where: { window: { name: 'claude-overflow', pos: [1920, 0], size: [140, 60] } }, checks: { floor: true, input: true, live: true }, maxSessions: 40, heavySlotRoot: null, tool: 'coordinator' }
+    const ran = await underStub({ stub, work, env: envOf(dirs), script: () => noWindow(fakeWt(steady(machine.launchScriptText(input)), lineFile)) })
+    assert.deepEqual(machine.parseLaunch(ran.stdout).launched, { transport: 'window', label: 'claude-overflow' }, ran.stdout + ran.stderr)
+    const argv = argvOf(dirs, readFileSync(lineFile, 'utf8'))
+    assert.deepEqual(argv.slice(0, 6), ['-w', 'claude-overflow', '--pos', '1920,0', '--size', '140,60'])
+    const inner = argv.slice(argv.indexOf('--') + 1)
+    const opened = spawn(inner[0], inner.slice(1), { env: envOf(dirs), cwd: argv[argv.indexOf('-d') + 1], windowsHide: true })
+    let out = ''
+    opened.stdout.on('data', chunk => (out += chunk))
+    opened.stderr.on('data', chunk => (out += chunk))
+    try {
+      await until(() => runsOf(dirs).length === 1, () => `the run\n${out}`)
+      assert.deepEqual(runsOf(dirs)[0].args, ['--resume', id])
+    } finally {
+      opened.kill()
+    }
+    // No Windows Terminal at its path: the plain window, which this test guards from opening.
+    rmSync(join(dirs.local, 'Microsoft', 'WindowsApps', 'wt.exe'))
+    const other = randomUUID()
+    transcript(dirs, other)
+    const plain = await underStub({ stub, work, env: envOf(dirs), script: () => noWindow(fakeWt(steady(machine.launchScriptText({ ...input, id: other })), lineFile)) })
+    assert.equal(machine.parseLaunch(plain.stdout).refused?.code, 'place', plain.stdout + plain.stderr)
+    assert.match(plain.stdout, /a test never opens a window/)
+  })
   test('every runner found, by its id and hash; a closed tab\'s beacon never read; an edited copy reads another hash; heavy-slot from its folders; a lock holder accounted as holding its id only; nothing but what the type names', async () => {
     const dirs = lab()
     const runner = startRunner(dirs, ['-Idle'])
@@ -558,12 +820,7 @@ describe("the probe's slots mode, and the launch's own run, against a running ru
     try {
       await until(() => runner.id() !== undefined, 'the beacon')
       const slot = runner.id()
-      /** The machine's own input and memory stand aside: this test is about the slot, and must not depend on the person's keyboard. */
-      const steady = script =>
-        script
-          .replace('$idleMs = [ClaudeSelfToolsInput]::IdleMs()', '$idleMs = 120000')
-          .replace('$needBytes = [math]::Max(', '$freeKb = [long]999999999; $needBytes = [math]::Max(')
-      const input = (id, change = {}) => ({ powershell: WINDOWS_POWERSHELL, kind: 'start', id, name: 'dealerwrap', folder: dirs.folder, claim: `slot:${slot}`, configDirs: [dirs.config], stateDir: dirs.state, where: { slot }, checks: { floor: true, input: true, fresh: true }, maxSessions: 40, tool: 'coordinator', ...change })
+      const input = (id, change = {}) => ({ powershell: WINDOWS_POWERSHELL, kind: 'start', id, name: 'dealerwrap', folder: dirs.folder, claim: `slot:${slot}`, configDirs: [dirs.config], stateDir: dirs.state, where: { slot }, checks: { floor: true, input: true, fresh: true }, maxSessions: 40, heavySlotRoot: null, tool: 'coordinator', ...change })
       // Idle under 10 s.
       const soon = randomUUID()
       const early = await underStub({ stub, work, env: envOf(dirs), script: () => steady(machine.launchScriptText(input(soon))) })
@@ -573,7 +830,13 @@ describe("the probe's slots mode, and the launch's own run, against a running ru
       // Idle long enough, by the beacon's own word.
       const beacon = beaconOf(dirs, slot)
       writeFileSync(machine.slotBeaconPath(dirs.state, slot), JSON.stringify({ ...beacon, since: Date.now() - 60_000 }))
-      // A record there already refuses, and is left: CreateNew. The runner would take it: a file it can't read yet.
+      // A record there already refuses: CreateNew. A file the runner would take at once, so a folder of that name, which it passes over.
+      const taken = randomUUID()
+      mkdirSync(machine.slotRecordPath(dirs.state, slot))
+      const second = await underStub({ stub, work, env: envOf(dirs), script: () => steady(machine.launchScriptText(input(taken))) })
+      assert.equal(machine.parseLaunch(second.stdout).refused?.code, 'place', second.stdout + second.stderr)
+      assert.ok(!existsSync(machine.claimPath(dirs.state, taken)), 'its claim given back')
+      rmSync(machine.slotRecordPath(dirs.state, slot), { recursive: true })
       // The launcher isn't there yet: the launch puts it there, and its record names it.
       rmSync(machine.launchScriptPath(dirs.state))
       const fresh = randomUUID()
@@ -594,8 +857,7 @@ describe("the probe's slots mode, and the launch's own run, against a running ru
   test('the launch reads its floor in its own run: free memory under the floor, and the cap, refuse before anything is taken; so does input not idle', async () => {
     const dirs = lab()
     const id = randomUUID()
-    const input = change => ({ powershell: WINDOWS_POWERSHELL, kind: 'start', id, name: 'dealerwrap', folder: dirs.folder, claim: `launch:${id}`, configDirs: [dirs.config], stateDir: dirs.state, where: { window: true }, checks: { floor: true, input: true, fresh: true }, tool: 'coordinator', ...change })
-    const noWindow = script => script.split('$window = Start-Process').join("throw 'a test never opens a window'; $window = Start-Process")
+    const input = change => ({ powershell: WINDOWS_POWERSHELL, kind: 'start', id, name: 'dealerwrap', folder: dirs.folder, claim: `launch:${randomUUID()}`, configDirs: [dirs.config], stateDir: dirs.state, where: { window: true }, checks: { floor: true, input: true, fresh: true }, maxSessions: 12, heavySlotRoot: null, tool: 'coordinator', ...change })
     const low = await underStub({ stub, work, env: envOf(dirs), script: () => noWindow(machine.launchScriptText(input({}))).replace('$needBytes = [math]::Max(', '$freeKb = [long]1024; $needBytes = [math]::Max(') })
     assert.equal(machine.parseLaunch(low.stdout).refused?.code, 'memory', low.stdout + low.stderr)
     const cap = await underStub({ stub, work, env: envOf(dirs), script: () => noWindow(machine.launchScriptText(input({}))).replace('$needBytes = [math]::Max(', '$freeKb = [long]999999999; $needBytes = [math]::Max(').replace(/\$room -ge 12\b/, '$room -ge 0') })
@@ -603,6 +865,25 @@ describe("the probe's slots mode, and the launch's own run, against a running ru
     const typing = await underStub({ stub, work, env: envOf(dirs), script: () => noWindow(machine.launchScriptText(input({ maxSessions: 40 }))).replace('$needBytes = [math]::Max(', '$freeKb = [long]999999999; $needBytes = [math]::Max(').replace('$idleMs = [ClaudeSelfToolsInput]::IdleMs()', '$idleMs = 1000') })
     assert.equal(machine.parseLaunch(typing.stdout).refused?.code, 'input', typing.stdout + typing.stderr)
     assert.ok(!existsSync(machine.claimPath(dirs.state, id)), 'nothing taken')
+  })
+
+  test('relockScript: a different holder, still running, stays (N12); one gone, or the same, is replaced', async () => {
+    const dirs = lab()
+    const id = randomUUID()
+    const by = `launch:${randomUUID()}`
+    const run = holderRef => spawnSync(WINDOWS_POWERSHELL, ['-NoProfile', '-NonInteractive', '-EncodedCommand', machine.encodeCommand(machine.relockScript({ stateDir: dirs.state, id, by, holder: holderRef }))], { env: envOf(dirs), encoding: 'utf8', windowsHide: true })
+    const stuck = await holder({ stub, work, env: envOf(dirs) })
+    try {
+      const mine = { pid: stuck.pid, created: stuck.created }
+      writeFileSync(machine.claimPath(dirs.state, id), JSON.stringify({ ...JSON.parse(lockText(by)), holder: mine }))
+      assert.equal(machine.RELOCKED.exec(run({ pid: 77, created: '134062345678901240' }).stdout)?.[1], 'held')
+      assert.deepEqual(JSON.parse(readFileSync(machine.claimPath(dirs.state, id), 'utf8')).holder, mine)
+      assert.equal(machine.RELOCKED.exec(run(mine).stdout)?.[1], 'relocked', 'the same one')
+      writeFileSync(machine.claimPath(dirs.state, id), JSON.stringify({ ...JSON.parse(lockText(by)), holder: { pid: 4, created: '1' } }))
+      assert.equal(machine.RELOCKED.exec(run(mine).stdout)?.[1], 'relocked', 'one gone')
+    } finally {
+      stuck.stop()
+    }
   })
 
   test('relockScript: rewrites only a lock naming this launch, adds the holder, keeps the rest; a lock naming another, or none, is left alone', () => {
