@@ -141,13 +141,13 @@ describe('lanes.json, written for real', { skip: !isWindows && 'Windows only', c
     const dirs = lab()
     const a = entry(dirs.folder)
     const b = entry(dirs.folder)
-    assert.match((await run(machine.lanesUpdateScript({ configDir: dirs.config, name: 'dealerwrap', entry: a }))).stdout, /^lanes dealerwrap\s*$/m)
-    assert.match((await run(machine.lanesUpdateScript({ configDir: dirs.config, name: 'ui-general', entry: b }))).stdout, /^lanes ui-general\s*$/m)
+    assert.match((await run(machine.lanesUpdateScript({ configDir: dirs.config, name: 'lane-x', entry: a }))).stdout, /^lanes lane-x\s*$/m)
+    assert.match((await run(machine.lanesUpdateScript({ configDir: dirs.config, name: 'lane-y', entry: b }))).stdout, /^lanes lane-y\s*$/m)
     const c = entry(dirs.folder)
-    await run(machine.lanesUpdateScript({ configDir: dirs.config, name: 'dealerwrap', entry: c }))
+    await run(machine.lanesUpdateScript({ configDir: dirs.config, name: 'lane-x', entry: c }))
     const read = machine.readLanes(readFileSync(machine.lanesPath(dirs.config), 'utf8'))
     assert.ok(!('error' in read), JSON.stringify(read))
-    assert.deepEqual(read.lanes, { dealerwrap: c, 'ui-general': b })
+    assert.deepEqual(read.lanes, { 'lane-x': c, 'lane-y': b })
   })
 
   test('two writers at once both land: the second waits for the lock the first holds', async () => {
@@ -163,8 +163,8 @@ describe('lanes.json, written for real', { skip: !isWindows && 'Windows only', c
     const dirs = lab()
     writeFileSync(`${machine.lanesPath(dirs.config)}.lock`, 'left behind')
     const started = Date.now()
-    const answer = await run(machine.lanesUpdateScript({ configDir: dirs.config, name: 'dealerwrap', entry: entry(dirs.folder) }))
-    assert.match(answer.stdout, /^lanes dealerwrap\s*$/m)
+    const answer = await run(machine.lanesUpdateScript({ configDir: dirs.config, name: 'lane-x', entry: entry(dirs.folder) }))
+    assert.match(answer.stdout, /^lanes lane-x\s*$/m)
     assert.ok(Date.now() - started < 8000, 'no stale-lock wait')
   })
 
@@ -172,7 +172,7 @@ describe('lanes.json, written for real', { skip: !isWindows && 'Windows only', c
     for (const text of ['{"v":2,"lanes":{}}', `{"v":1,"at":1,"lanes":{"Foo":${JSON.stringify(entry(lab().folder))},"foo":${JSON.stringify(entry(lab().folder))}}}`]) {
       const dirs = lab()
       writeFileSync(machine.lanesPath(dirs.config), text)
-      const answer = await run(machine.lanesUpdateScript({ configDir: dirs.config, name: 'dealerwrap', entry: entry(dirs.folder) }))
+      const answer = await run(machine.lanesUpdateScript({ configDir: dirs.config, name: 'lane-x', entry: entry(dirs.folder) }))
       assert.match(answer.stdout, /^refused file lanes\.json is not of its shape, so it is left as it is: .+ Fix it by hand, or move it aside \(rename it lanes\.json\.bad\), and the next write starts a new one/m)
       assert.equal(readFileSync(machine.lanesPath(dirs.config), 'utf8'), text)
     }

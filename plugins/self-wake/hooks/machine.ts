@@ -229,6 +229,7 @@ export const SLOT_ID = /^\d{1,10}-\d{1,20}$/
 const ID_FILES = {
   claim: { folder: 'claims', ending: '.lock', shape: SESSION_ID },
   left: { folder: 'left', ending: '.json', shape: SESSION_ID },
+  leftLock: { folder: 'left', ending: '.lock', shape: SESSION_ID },
   poke: { folder: 'poke', ending: '.json', shape: SESSION_ID },
   wake: { folder: 'wake', ending: '.json', shape: SESSION_ID },
   pending: { folder: 'pending', ending: '.json', shape: SESSION_ID },
@@ -376,7 +377,7 @@ export function plainOutput(text: string): string {
   const kept = (cut === -1 ? text : text.slice(0, cut)).replace(/<Objs\b[\s\S]*$/, '')
   // The error records' own words, where there are any: their message lines, never where in the script it stood.
   const said = cut === -1 ? [] : [...text.slice(cut).matchAll(/<S S="Error">([\s\S]*?)<\/S>/g)].map(m => clixmlText(m[1] ?? ''))
-  const reasons = said.join('\n').split(/\r?\n/).filter(line => line.trim() !== '' && !/^\s*(\+|At line:|At char:|~+\s*$)/.test(line))
+  const reasons = said.join('\n').split(/\r?\n/).filter(line => line.trim() !== '' && !/^\s*(\+|At line:|At char:|At .+:\d+ char:\d+|~+\s*$)/.test(line))
   return oneLine([kept, ...reasons].filter(part => part.trim() !== '').join(' '), 300)
 }
 
@@ -535,13 +536,13 @@ export const REGISTRY_VERSION_MARKERS = ['v', 'schema', 'schemaVersion', 'format
 export const LAUNCH_LINE_TRUSTED_AFTER_MS = 60_000
 
 /** The SHA-256 of plugins/self-switch/slot/claude-slot.ps1, as it is committed. */
-export const SLOT_SCRIPT_SHA256 = '97f84fba8aeef8bad0d7ba1a0dd3cff085aca955a992391894c47a511a2c9335'
+export const SLOT_SCRIPT_SHA256 = 'f90cc3b7c7f14642cc6f7454393fea06ed9ccc814049173f890113b99a7c3e8c'
 
 /**
  * The SHA-256 of plugins/self-switch/slot/claude-layout.ps1, as it is committed: a release pin, tested and
  * printed in the README for the person to compare. Nothing runs that script but the person, by hand.
  */
-export const LAYOUT_SCRIPT_SHA256 = '069451ed8337c24a810d291c4dc38e2538574283686b7f1c2228d6da193041ed'
+export const LAYOUT_SCRIPT_SHA256 = '1f3ede07759bb31b53e88bb00d83fa1735f9e05f44cc5849dff349182ccffeef'
 
 /** Input idle for this long before any launch of another process (PM2): a null reading is not idle. */
 export const INPUT_IDLE_MS = 60_000
@@ -3451,6 +3452,14 @@ export const TEST_GONE = [
   '}',
 ]
 
+/**
+ * How soon claude-launch.ps1's exit code 2 counts as its own refusal, in seconds: its last look, under load (the
+ * process table, then up to 3 reads 250 ms apart of each registry file it can't read), can take tens of seconds;
+ * a Claude Code session that ends with 2 after longer is no refusal. Only a marker of the launcher's own (a later
+ * version) tells them apart for sure.
+ */
+export const LAUNCH_REFUSED_SECONDS = 60
+
 /** How long the wait for an old process that outlasted the first wait looks each time, in seconds. */
 export const WAIT_POLL_SECONDS = 30
 
@@ -3524,9 +3533,11 @@ function windowScript(v: { id: string; kind: 'resume' | 'start'; name?: string; 
           'while (-not $gone) {',
           `  $gone = Wait-Gone ${v.waitFor.pid} '${v.waitFor.created}' ${WAIT_POLL_SECONDS}`,
           '  if ($gone) { break }',
-          '  $held = $null',
-          '  try { $held = Get-Content -LiteralPath $claimPath -Raw -Encoding UTF8 | ConvertFrom-Json } catch { $held = $null }',
-          '  if ($null -eq $held -or $held.by -cne $by) { $refusal = "The session is not resumed here: the claim on it no longer names this window (the move that opened it was taken back, or its time ran out)."; break }',
+          // Only a clear answer ends the wait: the claim gone, or naming another. One that can't be read now (being
+          // written, a sharing violation) is looked at again next time; the claim check below still fails closed.
+          '  $claimSays = "unknown"',
+          '  if (-not (Test-Path -LiteralPath $claimPath)) { $claimSays = "gone" } else { try { $held = Get-Content -LiteralPath $claimPath -Raw -Encoding UTF8 | ConvertFrom-Json; if ($null -ne $held -and $held.by -is [string]) { $claimSays = $(if ($held.by -ceq $by) { "ours" } else { "other" }) } } catch { $claimSays = "unknown" } }',
+          '  if ($claimSays -eq "gone" -or $claimSays -eq "other") { $refusal = "The session is not resumed here: the claim on it no longer names this window (the move that opened it was taken back, or its time ran out)."; break }',
           `  if (-not $toldLong -and $waitClock.Elapsed.TotalSeconds -ge ${WAIT_SECONDS}) { $toldLong = $true; Write-Host "It has not exited after ${WAIT_SECONDS / 60} minutes. This window keeps waiting while the move that opened it stands, and ${resume ? 'resumes' : 'starts'} the session when it goes. Close this window to give up." }`,
           '  Start-Sleep -Seconds 1',
           '}',
@@ -3580,7 +3591,7 @@ function windowScript(v: { id: string; kind: 'resume' | 'start'; name?: string; 
     // An error, or an end within seconds: the resume didn't take. Say how to resume by hand, and wait.
     `if ($code -ne 0 -or ((Get-Date) - $started).TotalSeconds -lt ${SHORT_RUN_SECONDS}) {`,
     // The launcher refused (its exit 2: its last look found the conversation open elsewhere, or no claude.exe): recorded.
-    `  if ($code -eq 2 -and ((Get-Date) - $started).TotalSeconds -lt ${SHORT_RUN_SECONDS}) { Write-Refused "claude-launch.ps1 ended at once with exit code 2: its last look refused the conversation (open elsewhere, or no way to tell), or Claude Code could not start" }`,
+    `  if ($code -eq 2 -and ((Get-Date) - $started).TotalSeconds -lt ${LAUNCH_REFUSED_SECONDS}) { Write-Refused "claude-launch.ps1 ended within a minute with exit code 2: its last look refused the conversation (open elsewhere, or no way to tell), or Claude Code could not start" }`,
     '  Write-Host "Claude Code ended (exit code $code)."',
     `  Write-Host ("If the session did not ${resume ? 'resume' : 'start'} here, do it yourself: " + ${byHand})`,
     // The launcher refused (its exit 2: nothing ran), or what ran has ended: this launch's own claim, so no one else's.
@@ -5229,6 +5240,19 @@ export function leftScript(input: LeftInput): string {
       : [
           `if ([long]$session.ProcessId -ne ${named.pid} -or [math]::Abs([long](Get-Created $session) - [long]'${named.created}') -gt ${PROC_START_TOLERANCE}) { 'refused process the process named is not the Claude Code this script runs under'; exit 0 }`,
         ]),
+    // One writer at a time per conversation (the coordinator's go and this plugin both write this record): a lock
+    // made new (CreateNew) and held as a handle no one else may open, deleted when it closes or this process ends (one
+    // there is another writer's, waited for), from before the transcript
+    // is stat-ed to after the record is in place. So the stat, the look for the same move and the write are one
+    // step, and a later writer stats the transcript after the earlier one has written.
+    `$leftLockPath = ${literal(idPath(state, 'leftLock', id))}`,
+    '[void][IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($leftLockPath))',
+    '$leftLock = $null',
+    'for ($try = 0; $try -lt 80 -and $null -eq $leftLock; $try++) {',
+    '  try { $leftLock = [IO.FileStream]::new($leftLockPath, [IO.FileMode]::CreateNew, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None, 4096, [IO.FileOptions]::DeleteOnClose) }',
+    `  catch { if (-not (${IS_IO} -or $_.Exception -is [UnauthorizedAccessException] -or $_.Exception.InnerException -is [UnauthorizedAccessException])) { throw }; Start-Sleep -Milliseconds 125 }`,
+    '}',
+    "if ($null -eq $leftLock) { 'refused lock another writer held this record for 10 seconds'; exit 0 }",
     // The transcript: exactly one, in the config folders given.
     '$found = New-Object System.Collections.ArrayList',
     'foreach ($dir in $configDirs) {',
@@ -5303,6 +5327,7 @@ export function leftScript(input: LeftInput): string {
     '    $written = $true',
     '  } catch { try { [IO.File]::Delete($temp) } catch { }; if ($try -ge 2) { throw } }',
     '}',
+    'try { $leftLock.Dispose() } catch { }',
     '"left " + $id',
   ].join('\r\n')
 }

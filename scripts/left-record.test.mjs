@@ -219,8 +219,8 @@ describe('#81: two writers of one move, the coordinator and self-switch', { skip
    * so their writes really race: the move of one fails on the file the other just made.
    */
   const gated = (script, gate, ready) => {
-    const at = script.indexOf('\r\n$written = $false')
-    assert.ok(at > 0, 'the write, after the first look')
+    const at = script.indexOf('\r\n$leftLockPath = ')
+    assert.ok(at > 0, 'before the lock: both race for it')
     const hold = [`New-Item -ItemType File -Path '${ready}' -Force | Out-Null`, `$gate = New-Object Threading.EventWaitHandle($false, [Threading.EventResetMode]::ManualReset, '${gate}')`, '[void]$gate.WaitOne(60000)'].join('\r\n')
     return `${script.slice(0, at)}\r\n${hold}${script.slice(at)}`
   }
@@ -243,6 +243,29 @@ describe('#81: two writers of one move, the coordinator and self-switch', { skip
       const read = await run(machine.leftReadScript({ stateDir: dirs.state, ids: [dirs.id], configDirs: [dirs.config] }))
       const parsed = machine.parseLeftRead(read.stdout)
       assert.ok(!('error' in parsed) && parsed.left.length === 1 && parsed.left[0].ok === true && parsed.left[0].macOk === true, read.stdout)
+    })
+  }
+
+  for (let rep = 1; rep <= 3; rep += 1) {
+    test(`R1 (delta): an earlier record already in place, both writers racing (${rep} of 3): one at a time, and the coordinator's go stands`, async () => {
+      const dirs = lab()
+      // The usual case: a record of an earlier move of this conversation, by another process.
+      const stale = await write(machine.leftScript({ stateDir: dirs.state, id: dirs.id, how: 'exit', configDirs: [dirs.config], by: 'self-switch' }))
+      assert.equal(machine.LEFT_WRITTEN.exec(stale.stdout)?.[1], dirs.id, stale.stdout + stale.stderr)
+      const gate = `left-race-${randomUUID()}`
+      const readyA = join(dirs.root, 'ready-a')
+      const readyB = join(dirs.root, 'ready-b')
+      const coordinator = gated(machine.leftScript({ stateDir: dirs.state, id: dirs.id, how: 'in-place', configDirs: [dirs.config], by: 'coordinator', go: GO }), gate, readyA)
+      const selfSwitch = gated(machine.leftScript({ stateDir: dirs.state, id: dirs.id, how: 'in-place', configDirs: [dirs.config], by: 'self-switch' }), gate, readyB)
+      const open = [`$gate = New-Object Threading.EventWaitHandle($false, [Threading.EventResetMode]::ManualReset, '${gate}')`, `$until = (Get-Date).AddSeconds(60); while (-not ((Test-Path '${readyA}') -and (Test-Path '${readyB}')) -and (Get-Date) -lt $until) { Start-Sleep -Milliseconds 20 }`, '[void]$gate.Set()'].join('\r\n')
+      const ran = await both(dirs, coordinator, selfSwitch, true, open)
+      assert.equal(ran.a, `A:0:left ${dirs.id}:0`, ran.all)
+      assert.equal(ran.b, `B:0:left ${dirs.id}:0`, ran.all)
+      const record = JSON.parse(readFileSync(join(dirs.state, 'left', `${dirs.id}.json`), 'utf8'))
+      assert.equal(record.how, 'in-place', ran.all)
+      assert.equal(record.by, 'coordinator', ran.all)
+      assert.equal(record.go, GO)
+      assert.ok(!existsSync(join(dirs.state, 'left', `${dirs.id}.lock`)), 'the lock is gone with its last holder')
     })
   }
 

@@ -154,9 +154,9 @@ launch({ powershell, kind: 'resume', id: own, folder: startFolder, claim: `launc
 // A switch's window to another project's conversation, its left record checked at the last look.
 launch({ ..., id: to, folder: toFolder, claim: probeClaim, where: { window: true }, left: live.waived, waitForExit, deadline, tool: 'self-switch' })
 // A start in an idle slot elsewhere: its floor, the input idle and its id checked new, in the one run that writes the record.
-launch({ ..., kind: 'start', id, name: 'dealerwrap', claim: `slot:${slot}`, where: { slot }, checks: { fresh: true, floor: true, input: true }, maxSessions, heavySlotRoot })
+launch({ ..., kind: 'start', id, name: 'lane-x', claim: `slot:${slot}`, where: { slot }, checks: { fresh: true, floor: true, input: true }, maxSessions, heavySlotRoot })
 // A resume in a tab of a named window.
-launch({ ..., id: to, folder: toFolder, claim: `launch:${to}`, where: { tab: { window: 'claude-4', title: 'dealerwrap' } }, checks: { live: true, floor: true, input: true } })
+launch({ ..., id: to, folder: toFolder, claim: `launch:${to}`, where: { tab: { window: 'claude-4', title: 'lane-x' } }, checks: { live: true, floor: true, input: true } })
 ```
 
 ### The launch environment
@@ -216,7 +216,7 @@ Copy the slot runner to `%LOCALAPPDATA%\claude-self-tools\claude-slot.ps1`; a pa
   4. Give a Windows Terminal profile the line under [Slots v2](#slots-v2), if you want new tabs to be slots too.
   5. Your choice: `firstWindowPreference: "persistedWindowLayout"` keeps the names, places and tabs across a restart of Windows Terminal; without it, run the script again.
 
-  Compare what you copied: LAYOUT_SCRIPT_SHA256: `069451ed8337c24a810d291c4dc38e2538574283686b7f1c2228d6da193041ed`. Nothing checks that at run time.
+  Compare what you copied: LAYOUT_SCRIPT_SHA256: `1f3ede07759bb31b53e88bb00d83fa1735f9e05f44cc5849dff349182ccffeef`. Nothing checks that at run time.
 
 ### The trampoline
 

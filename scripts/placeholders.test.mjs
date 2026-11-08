@@ -66,3 +66,22 @@ test('the shipped presets name generic lanes only, and what describes them names
     assert.deepEqual(names(text).filter(n => !known.has(n) && !WINDOW.test(n)), [], `${where}: names a lane the presets don't`)
   }
 })
+
+test("the README's launch() examples name generic lanes only", () => {
+  const readme = readFileSync(join(ROOT, 'README.md'), 'utf8')
+  const examples = readme.split('\n').filter(line => /^launch\(\{/.test(line.trim()))
+  assert.ok(examples.length > 0, 'the README has launch() examples')
+  const named = examples.flatMap(line => [...line.matchAll(/\b(?:name|title): '([^']*)'/g)].map(m => m[1]))
+  assert.ok(named.length > 0, 'they name a lane')
+  assert.deepEqual(named.filter(n => !GENERIC.test(n)), [])
+})
+
+test("a plugin's own tests, which install with it, name no machine folder and no person", () => {
+  const tests = readdirSync(join(ROOT, 'plugins')).flatMap(plugin => {
+    const dir = join(ROOT, 'plugins', plugin, 'tests')
+    try { return readdirSync(dir).map(name => join(dir, name)) } catch { return [] }
+  })
+  assert.ok(tests.length > 10)
+  const found = tests.filter(path => /redundant_local|\bMo\b|Mohammad/i.test(readFileSync(path, 'utf8'))).map(path => relative(ROOT, path))
+  assert.deepEqual(found, [])
+})

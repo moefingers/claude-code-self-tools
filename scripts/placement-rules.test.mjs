@@ -71,10 +71,10 @@ const placementOf = (m, change = {}) => {
 const launchInput = (change = {}) => ({ powershell: POWERSHELL, kind: 'resume', id: T, folder: 'C:\\work\\my repo\\', claim: `launch:${T}`, configDirs: [CONFIG, 'D:\\other cfg'], stateDir: STATE, where: { window: true }, waitForExit: { pid: 100, created: '134062345688901240' }, maxSessions: 12, heavySlotRoot: null, ...change })
 /** One script per place, each with what it must ask for. */
 const scriptsOf = m => ({
-  slotStart: m.launchScriptText(launchInput({ kind: 'start', id: FRESH, name: 'dealerwrap', claim: `slot:${SLOT}`, where: { slot: SLOT }, waitForExit: undefined, checks: { ...FLOOR_CHECKS, fresh: true }, heavySlotRoot: 'O:\\heavy' })),
+  slotStart: m.launchScriptText(launchInput({ kind: 'start', id: FRESH, name: 'lane-x', claim: `slot:${SLOT}`, where: { slot: SLOT }, waitForExit: undefined, checks: { ...FLOOR_CHECKS, fresh: true }, heavySlotRoot: 'O:\\heavy' })),
   slotResume: m.launchScriptText(launchInput({ claim: `slot:${SLOT}`, where: { slot: SLOT }, waitForExit: undefined, checks: { ...FLOOR_CHECKS, live: true }, heavySlotRoot: 'O:\\heavy', left: { size: 12, mtime: 34 } })),
-  tabStart: m.launchScriptText(launchInput({ kind: 'start', id: FRESH, name: 'dealerwrap', claim: `launch:${FRESH}`, where: { tab: { window: 'claude-4', title: 'dealerwrap', pos: [960, 540], size: [160, 42] } }, waitForExit: undefined, checks: { ...FLOOR_CHECKS, fresh: true } })),
-  tabResume: m.launchScriptText(launchInput({ where: { tab: { window: 'claude-1', title: 'system-overhaul' } } })),
+  tabStart: m.launchScriptText(launchInput({ kind: 'start', id: FRESH, name: 'lane-x', claim: `launch:${FRESH}`, where: { tab: { window: 'claude-4', title: 'lane-x', pos: [960, 540], size: [160, 42] } }, waitForExit: undefined, checks: { ...FLOOR_CHECKS, fresh: true } })),
+  tabResume: m.launchScriptText(launchInput({ where: { tab: { window: 'claude-1', title: 'lane-z' } } })),
   named: m.launchScriptText(launchInput({ where: { window: { name: 'claude-overflow', pos: [1920, 0], size: [140, 60] } } })),
   plain: m.launchScriptText(launchInput({ claim: `launch:${FRESH}` })),
 })
@@ -85,8 +85,8 @@ const CHECKS = {
   launchArguments(m) {
     const s = scriptsOf(m)
     const line = wtLineOf(s.tabStart)
-    assert.equal(line, `-w claude-4 --pos 960,540 --size 160,42 nt --title dealerwrap --suppressApplicationTitle -d "C:\\work\\my repo" -- ${POWERSHELL} -NoExit -NoProfile -ExecutionPolicy RemoteSigned -File "${STATE}\\claude-slot.ps1" -Start ${FRESH} -Name dealerwrap -ConfigDirs "${CONFIG}|D:\\other cfg" -Claim launch:${FRESH} -Launcher ${m.LAUNCH_SCRIPT_SHA256}`)
-    assert.equal(wtLineOf(s.tabResume), `-w claude-1 nt --title system-overhaul --suppressApplicationTitle -d "C:\\work\\my repo" -- ${POWERSHELL} -NoExit -NoProfile -ExecutionPolicy RemoteSigned -File "${STATE}\\claude-slot.ps1" -Resume ${T} -WaitFor 100-134062345688901240 -ConfigDirs "${CONFIG}|D:\\other cfg" -Claim launch:${T} -Launcher ${m.LAUNCH_SCRIPT_SHA256}`)
+    assert.equal(line, `-w claude-4 --pos 960,540 --size 160,42 nt --title lane-x --suppressApplicationTitle -d "C:\\work\\my repo" -- ${POWERSHELL} -NoExit -NoProfile -ExecutionPolicy RemoteSigned -File "${STATE}\\claude-slot.ps1" -Start ${FRESH} -Name lane-x -ConfigDirs "${CONFIG}|D:\\other cfg" -Claim launch:${FRESH} -Launcher ${m.LAUNCH_SCRIPT_SHA256}`)
+    assert.equal(wtLineOf(s.tabResume), `-w claude-1 nt --title lane-z --suppressApplicationTitle -d "C:\\work\\my repo" -- ${POWERSHELL} -NoExit -NoProfile -ExecutionPolicy RemoteSigned -File "${STATE}\\claude-slot.ps1" -Resume ${T} -WaitFor 100-134062345688901240 -ConfigDirs "${CONFIG}|D:\\other cfg" -Claim launch:${T} -Launcher ${m.LAUNCH_SCRIPT_SHA256}`)
     for (const script of Object.values(s)) {
       for (const flag of PERMISSION) assert.ok(!script.includes(flag), flag)
       const wt = wtLineOf(script)
@@ -261,8 +261,8 @@ const CHECKS = {
     assert.equal(m.idleSlots(probeOf(m, { slots: [idleRunner(m, {}, { window: 'claude-1' })] }), place, { configDir: CONFIG, now: NOW, workspace: 'w_abcdefghijkl' }).length, 1, 'untagged')
     // A tab with room, by its name, in the window's own place; the next place after it.
     const noneIdle = [idleRunner(m, { child: 100 })]
-    const picked = m.pickLaunchTransport(probeOf(m, { slots: noneIdle }), place, { ...PICK, title: 'dealerwrap' })
-    assert.deepEqual(picked.where, { tab: { window: 'claude-4', title: 'dealerwrap', pos: [960, 540], size: [160, 42] } })
+    const picked = m.pickLaunchTransport(probeOf(m, { slots: noneIdle }), place, { ...PICK, title: 'lane-x' })
+    assert.deepEqual(picked.where, { tab: { window: 'claude-4', title: 'lane-x', pos: [960, 540], size: [160, 42] } })
     assert.deepEqual(picked.then, [{ window: { name: 'claude-overflow', pos: [1920, 0], size: [140, 60] } }])
     // maxTabs: an overflow tab there (a slot stamped with the window, not of the layout's tabs) fills it: then the window.
     const overflow = [idleRunner(m, { child: 100 }, { window: 'claude-4', tab: 'overflow' })]
@@ -302,7 +302,7 @@ const CHECKS = {
       assert.ok(script.includes(`-cne '${m.SLOT_SCRIPT_SHA256}') { Refuse 'slot'`), 'of the shipped hash')
       assert.ok(script.includes("if ($p.Name -eq 'claude.exe' -and [long]$p.ParentProcessId -eq 20) { Refuse 'slot'"), 'childless')
     }
-    assert.ok(s.slotStart.includes("start = $id; name = 'dealerwrap'; folder = $folder;"))
+    assert.ok(s.slotStart.includes("start = $id; name = 'lane-x'; folder = $folder;"))
     // The launcher it runs: by this release's pin, whose copy the same run puts at that hash's name before the record.
     for (const script of [s.slotStart, s.slotResume]) {
       const named = script.indexOf(`launcher = '${m.LAUNCH_SCRIPT_SHA256}'`)
@@ -410,14 +410,16 @@ const CHECKS = {
     assert.ok(inner.includes('$other = $false; if ($created -and "$created" -ne "0") { try { $other = [math]::Abs($h.StartTime.ToFileTimeUtc() - [long]$created) -gt 10000 } catch { $other = $false } }; if ($other) { return $true }'), 'a pid given to another process is not the one waited for; an unread start time ("0") or one that can\'t be read waits by the pid')
     assert.ok(inner.includes('while (-not $gone) {\r\n'), 'a process that outlasts the first look: looked at again until it goes')
     // The claim read at every look: a move taken back ends the wait at once, said and recorded.
-    const look = inner.indexOf('  if ($null -eq $held -or $held.by -cne $by) { $refusal = ')
-    assert.ok(look > inner.indexOf('while (-not $gone) {') && inner.includes('  try { $held = Get-Content -LiteralPath $claimPath -Raw -Encoding UTF8 | ConvertFrom-Json } catch { $held = $null }'), 'the claim read at every look')
+    const look = inner.indexOf('  if ($claimSays -eq "gone" -or $claimSays -eq "other") { $refusal = ')
+    assert.ok(look > inner.indexOf('while (-not $gone) {') && inner.includes('  if (-not (Test-Path -LiteralPath $claimPath)) { $claimSays = "gone" } else { try { $held = Get-Content -LiteralPath $claimPath -Raw -Encoding UTF8 | ConvertFrom-Json; '), 'the claim read at every look')
     const cleared = inner.indexOf('$refusal = $null')
     assert.ok(cleared > 0 && cleared < inner.indexOf('while (-not $gone) {') && inner.split('$refusal = $null').length === 2, 'a refusal while waiting stands: it is not cleared after the wait')
     // The 10-minute line by the clock, never by the count of looks (a start time that can't be read makes each look short).
     assert.ok(inner.includes('  if (-not $toldLong -and $waitClock.Elapsed.TotalSeconds -ge 600) { $toldLong = $true; Write-Host '), 'the 10-minute line by the clock')
     // Exit 2 recorded as a refusal only at once: claude-launch.ps1's own refusal, never Claude Code's own exit code after a session.
-    assert.ok(inner.includes('  if ($code -eq 2 -and ((Get-Date) - $started).TotalSeconds -lt 10) { Write-Refused '), 'exit 2 recorded only at once')
+    assert.ok(inner.includes('  if ($code -eq 2 -and ((Get-Date) - $started).TotalSeconds -lt 60) { Write-Refused '), 'exit 2 recorded only within a minute (the launcher\'s last look under load)')
+    // R3 (delta): only a clear answer ends the wait: the claim gone, or naming another; one that can't be read is looked at again.
+    assert.ok(inner.includes('  if ($claimSays -eq "gone" -or $claimSays -eq "other") { $refusal = '), 'only a clear answer ends the wait')
     assert.ok(!inner.includes('The old process is still running'), 'no refusal for a process still running: it keeps waiting')
     // The refused record: every refusal and every error the window says is written for whoever comes looking.
     assert.ok(/Write-Refused \$refusal\r\n {2}Write-Host \$refusal/.test(inner), 'a refusal is recorded before it is said')
@@ -698,9 +700,10 @@ const FAULTS = [
   ['F1: the start time not checked: a reused pid waited for', 'windowRefusal', "$other = $false; if ($created -and \"$created\" -ne \"0\") { try { $other = [math]::Abs($h.StartTime.ToFileTimeUtc() - [long]$created) -gt 10000 } catch { $other = $false } }; if ($other) { return $true }; ", ''],
   ['R9: an unread start time ("0") read as another process: no wait at all', 'windowRefusal', ' -and "$created" -ne "0"', ''],
   ['S3: a window that gives up after its first look', 'windowRefusal', "          'while (-not $gone) {',", "          'if (-not $gone) {',"],
-  ['R4: the claim not read while waiting', 'windowRefusal', "          '  if ($null -eq $held -or $held.by -cne $by) { $refusal = \"The session is not resumed here: the claim on it no longer names this window (the move that opened it was taken back, or its time ran out).\"; break }',\n", ''],
+  ['R4: the claim not read while waiting', 'windowRefusal', "          '  if (-not (Test-Path -LiteralPath $claimPath)) { $claimSays = \"gone\" } else { try { $held = ", "          '  if ($false) { $claimSays = \"gone\" } else { try { $held = "],
   ['R4: a refusal while waiting cleared after the wait', 'windowRefusal', "    '$refusal = $null',\n    ...(v.waitFor === undefined", "    ...(v.waitFor === undefined"],
-  ['R5: exit 2 after a long session recorded as a refusal', 'windowRefusal', "`  if ($code -eq 2 -and ((Get-Date) - $started).TotalSeconds -lt ${SHORT_RUN_SECONDS}) {", "`  if ($code -eq 2) {"],
+  ['R5: exit 2 after a long session recorded as a refusal', 'windowRefusal', "`  if ($code -eq 2 -and ((Get-Date) - $started).TotalSeconds -lt ${LAUNCH_REFUSED_SECONDS}) {", "`  if ($code -eq 2) {"],
+  ['R3: a claim that cannot be read now ends the wait', 'windowRefusal', "'  if ($claimSays -eq \"gone\" -or $claimSays -eq \"other\") { $refusal = ", "'  if ($claimSays -ne \"ours\") { $refusal = "],
   ['S3: a refusal no one but the window hears of', 'windowRefusal', "    '  Write-Refused $refusal',\n", ''],
   ['S3: an error no one but the window hears of', 'windowRefusal', "    `  Write-Refused (\"claude-launch.ps1 stopped on an error: \" + $_.Exception.Message)`,\n", ''],
   ['a refusing window keeping the claim', 'windowRefusal', "  `  Write-Host (\"Once it is safe, resume it yourself: \" + ${byHand})`,\n    '  Release-Claim',\n".replace('  `  Write', '    `  Write'), "    `  Write-Host (\"Once it is safe, resume it yourself: \" + ${byHand})`,\n"],

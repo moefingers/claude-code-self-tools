@@ -122,7 +122,7 @@ function engine(on: On, { env = {}, placement, refuses = () => undefined, wake, 
 
 const start = { cwd: 'C:\\work\\repo', surface: 'terminal', isInteractive: true } as const
 const answered = { answer: 'done', durationMs: 1, turnId: 't1', isAborted: false, reason: 'answer' } as const
-const STAMP = { CLAUDE_SELF_TOOLS_WT_WINDOW: 'claude-1', CLAUDE_SELF_TOOLS_WT_TAB: 'system-overhaul' }
+const STAMP = { CLAUDE_SELF_TOOLS_WT_WINDOW: 'claude-1', CLAUDE_SELF_TOOLS_WT_TAB: 'lane-z' }
 
 type TestDollar = Parameters<Extract<Parameters<typeof test>[1], (...args: never[]) => unknown>>[0]
 
@@ -144,7 +144,7 @@ test('tab: same goes by this tab\'s stamp: a tab in that window, running the slo
   expect(script).toContain(`-Claim ${by} `)
   expect(script).toContain('Start-Process $wtExe -ArgumentList $wtLine -PassThru')
   expect(script).toContain("$env:CLAUDE_SELF_TOOLS_WT_WINDOW = 'claude-1'")
-  expect(script).toContain("$env:CLAUDE_SELF_TOOLS_WT_TAB = 'system-overhaul'")
+  expect(script).toContain("$env:CLAUDE_SELF_TOOLS_WT_TAB = 'lane-z'")
   expect(script).toContain(`-Resume ${ID} -WaitFor 100-134062345688901240`)
   expect(commands).toEqual([{ command: 'exit' }])
   expect(toasts.join(' ')).toContain('a new tab in window claude-1 resumes this session')

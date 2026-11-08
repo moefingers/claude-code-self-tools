@@ -419,6 +419,24 @@ describe('S3: the window waits for the old process by its handle, keeps waiting,
     }
   })
 
+  test('R3 (delta): a claim that cannot be read for a moment (held open by a writer) keeps the window waiting; it resumes when the old process goes', async () => {
+    const dirs = lab()
+    const old = await holder({ stub, work, env: envOf(dirs), ms: 9000 })
+    try {
+      const waitFor = { pid: old.pid, created: old.created }
+      const waiting = windowLab({ waitForExit: waitFor, checks: {} })
+      const claim = machine.claimPath(waiting.dirs.state, waiting.input.id)
+      // A writer holds the lock open, sharing nothing, for 4 seconds of the wait's looks.
+      const blocker = spawn(WINDOWS_POWERSHELL, ['-NoProfile', '-NonInteractive', '-Command', `$s = [IO.File]::Open('${claim}', 'Open', 'ReadWrite', 'None'); Start-Sleep -Seconds 4; $s.Dispose()`], { windowsHide: true, stdio: 'ignore' })
+      const ran = await runWindow(shortWait(waiting.inner, waitFor), waiting.dirs)
+      blocker.kill()
+      assert.doesNotMatch(ran.out, /no longer names this window/)
+      assert.equal(ran.runs.length, 1, ran.out)
+    } finally {
+      old.stop()
+    }
+  })
+
   test('a refusal and an error are recorded at refused\\<id>.json for whoever comes looking; a run that resumes records none', async () => {
     const refused = windowLab()
     writeFileSync(machine.launchScriptPath(refused.dirs.state), `${machine.LAUNCH_SCRIPT_TEXT}# one line more\n`)

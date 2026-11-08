@@ -97,7 +97,7 @@ function runnerProblems(text) {
   // look at the table; and one that outlasts the first wait is looked at again until it goes (F1, S3).
   need(has('          $gone = Wait-Gone $parts[0] $parts[1] 30\n') && !code.includes('Wait-Process') && !code.includes('Get-Process -Id'), 'the old process waited for by its handle and asked whether it has exited')
   need(has('        while (-not $gone) {\n') && !code.includes('the old process is still running'), 'a tab keeps waiting for a process that outlasts the first look')
-  need(has("          if (-not (Test-Claim $id $Claim)) { $why = ") && has('          if (-not $toldLong -and $waitClock.Elapsed.TotalSeconds -ge $WaitSeconds) {'), 'the claim read at every look, and the 10-minute line by the clock')
+  need(has('          $claimSays = Get-ClaimSays $id $Claim\n') && has('          if (-not $toldLong -and $waitClock.Elapsed.TotalSeconds -ge $WaitSeconds) {'), 'the claim read at every look, and the 10-minute line by the clock')
   need(has("($parts[1] -eq '0' -or [math]::Abs($old.CreationDate.ToFileTimeUtc() - [long]$parts[1]) -le 10000)"), 'an unread start time waits by the pid')
   need(has("; if ($run.ContainsKey('Resume') -or $run.ContainsKey('Start')) { Write-Refused $(if ($run.ContainsKey('Start')) { $run.Start } else { $run.Resume }) $held"), "the launcher's hash refusal recorded")
   // F1 4: the session count passes over a Claude Code that has exited and is on its way out of the table.
@@ -105,7 +105,8 @@ function runnerProblems(text) {
   // S3: every refusal recorded for whoever comes looking, at <state>\refused\<id>.json.
   need(has("  if ($named) { Write-Refused $id ('slot:' + $slotId)"), "a record's refusal recorded")
   need(has("    if ($id -cmatch $SessionId) { Write-Refused $id $Claim $(if ($Start) { 'start' } else { 'resume' }) $here"), "a tab's refusal recorded")
-  need(has("  if ($null -ne $heldId -and ($null -ne $threw -or ($code -eq 2 -and ((Get-Date) - $ranFrom).TotalSeconds -lt 10))) { Write-Refused $heldId $held"), "a launcher's refusal (exit 2 at once) or error recorded")
+  need(has("  if ($null -ne $heldId -and ($null -ne $threw -or ($code -eq 2 -and ((Get-Date) - $ranFrom).TotalSeconds -lt 60))) { Write-Refused $heldId $held"), "a launcher's refusal (exit 2 at once) or error recorded")
+  need(has("          if ($claimSays -eq 'gone' -or $claimSays -eq 'other') { $why = ") && has("[IO.FileShare]'ReadWrite, Delete'"), 'a look that cannot read the claim keeps waiting, and never blocks a writer')
   need(has("    $final = Join-Path $state ('refused\\' + $id + '.json')"), 'at its id-shaped path')
   need(has('try { $ownSha = Get-Sha256 $PSCommandPath }') && has("$beacon['sha256'] = $ownSha"), 'its beacon says the hash it started from')
   need(has('if ($dirs.Count -gt 1) { $run.ConfigDir = @($dirs[1..($dirs.Count - 1)]) }') && !code.includes('ConfigDir = $dirs'), 'the launcher told only the folders it does not read already')
@@ -183,9 +184,10 @@ for (const [name, from, to, expect] of [
   ['F1: a tab with no -Claim used all the same', "if ($null -eq $why -and $Claim -cnotmatch $LaunchClaim) {", 'if ($false) {', /-Claim of a launch's shape/],
   ['F1: the old process waited for by Wait-Process again', '          $gone = Wait-Gone $parts[0] $parts[1] 30\n', '          Wait-Process -Id ([int]$parts[0]) -Timeout 30 -ErrorAction SilentlyContinue; $gone = Test-Gone $parts[0] $parts[1]\n', /asked whether it has exited/],
   ['S3: a tab that gives up after its first look', '        while (-not $gone) {\n', '        if (-not $gone) {\n', /keeps waiting/],
-  ['R4: the claim not read while waiting', "          if (-not (Test-Claim $id $Claim)) { $why = ", "          if ($false) { $why = ", /claim read at every look/],
+  ['R4: the claim not read while waiting', "          $claimSays = Get-ClaimSays $id $Claim\n", "          $claimSays = 'ours'\n", /claim read at every look/],
   ['R5: the hash refusal not recorded', "; if ($run.ContainsKey('Resume') -or $run.ContainsKey('Start')) { Write-Refused", "; if ($false) { Write-Refused", /hash refusal recorded/],
-  ['R5: exit 2 after a long session recorded', " -or ($code -eq 2 -and ((Get-Date) - $ranFrom).TotalSeconds -lt 10))) {", " -or $code -eq 2)) {", /exit 2 at once/],
+  ['R5: exit 2 after a long session recorded', " -or ($code -eq 2 -and ((Get-Date) - $ranFrom).TotalSeconds -lt 60))) {", " -or $code -eq 2)) {", /exit 2 at once/],
+  ['R3: a claim that cannot be read now ends the wait', "          if ($claimSays -eq 'gone' -or $claimSays -eq 'other') { $why = ", "          if ($claimSays -ne 'ours') { $why = ", /keeps waiting, and never blocks/],
   ['F1 4: the cap counting a Claude Code that has exited', " -or (Get-Cli $p) -or (Test-Exited $p)) { continue }", " -or (Get-Cli $p)) { continue }", /has exited/],
   ["S3: a tab's refusal no one hears of", "    if ($id -cmatch $SessionId) { Write-Refused $id $Claim", "    if ($false) { Write-Refused $id $Claim", /refusal recorded/],
   ['F2: a tab that waits saying idle', "Write-Beacon 'running'\n    $asked = Get-Asked", "Write-Beacon 'idle'\n    $asked = Get-Asked", /says running while it waits/],

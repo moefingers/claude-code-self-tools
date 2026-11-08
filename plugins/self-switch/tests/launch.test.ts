@@ -75,7 +75,7 @@ function noWait(change: Partial<LaunchInput> = {}): LaunchInput {
 }
 
 /** A start's launch: a new id and name in a window, its id checked new, after nothing. */
-const START = noWait({ kind: 'start', name: 'dealerwrap', checks: { fresh: true, floor: true, input: true } })
+const START = noWait({ kind: 'start', name: 'lane-x', checks: { fresh: true, floor: true, input: true } })
 
 /** The checks a launch of another process must ask for. */
 const ANOTHER = { floor: true, input: true, live: true }
@@ -90,9 +90,9 @@ const SCRIPTS: [string, string][] = [
   ["this pane's slot", launchScriptText(input({ where: { slot: SLOT }, claim: `slot:${SLOT}` }))],
   ["'auto' (self-restart's)", launchScriptText(input({ id: W, folder: REPO, where: 'auto' }))],
   ['an idle slot elsewhere, a resume', launchScriptText(noWait({ where: { slot: SLOT }, claim: `slot:${SLOT}`, checks: ANOTHER, left: { size: 12, mtime: 34 } }))],
-  ['an idle slot elsewhere, a start', launchScriptText(noWait({ kind: 'start', name: 'dealerwrap', where: { slot: SLOT }, claim: `slot:${SLOT}`, checks: { fresh: true, floor: true, input: true }, heavySlotRoot: 'O:\\heavy' }))],
+  ['an idle slot elsewhere, a start', launchScriptText(noWait({ kind: 'start', name: 'lane-x', where: { slot: SLOT }, claim: `slot:${SLOT}`, checks: { fresh: true, floor: true, input: true }, heavySlotRoot: 'O:\\heavy' }))],
   ['a tab, a resume that waits', launchScriptText(input({ where: { tab: { window: 'claude-1', title: 'tab one' } }, claim: `launch:${T}`, left: { exitAt: NOW - 60_000 } }))],
-  ['a tab, a start', launchScriptText(noWait({ kind: 'start', name: 'dealerwrap', where: { tab: { window: 'claude-4', title: 'dealerwrap', pos: [960, 540], size: [160, 42] } }, claim: `launch:${T}`, checks: { fresh: true, floor: true, input: true } }))],
+  ['a tab, a start', launchScriptText(noWait({ kind: 'start', name: 'lane-x', where: { tab: { window: 'claude-4', title: 'lane-x', pos: [960, 540], size: [160, 42] } }, claim: `launch:${T}`, checks: { fresh: true, floor: true, input: true } }))],
   ['a named window', launchScriptText(noWait({ where: { window: { name: 'claude-overflow', pos: [1920, 0], size: [140, 60] } }, claim: `launch:${T}`, checks: ANOTHER }))],
 ]
 
@@ -137,7 +137,7 @@ describe('launch(): one powershellCall, the script on standard input', () => {
       releaseScript({ stateDir: STATE, id: T, by: LAUNCH }),
       claimCheckScript({ stateDir: STATE, id: T, by: LAUNCH, configDirs: [CONFIG] }),
       leftScript({ stateDir: STATE, id: T, how: 'exit', configDirs: [CONFIG], by: 'self-switch' }),
-      lanesUpdateScript({ configDir: CONFIG, name: 'dealerwrap', entry: { session: T, folder: ELSEWHERE, ws: 'default', at: NOW } }),
+      lanesUpdateScript({ configDir: CONFIG, name: 'lane-x', entry: { session: T, folder: ELSEWHERE, ws: 'default', at: NOW } }),
     ]
     for (const script of [...SCRIPTS.map(([, s]) => s), ...others]) {
       const lines = script.split('\r\n')
@@ -258,7 +258,7 @@ describe('the checks, the claim and the place, in one run, in that order', () =>
     // F1: waited for by its handle, then looked at again until it goes (S3): no refusal for one still running.
     const wait = inner.search(/ {2}\$gone = Wait-Gone 100 '\d+' 30\r\n/)
     expect(wait).toBeGreaterThan(0)
-    expect(inner.indexOf('  if ($null -eq $held -or $held.by -cne $by) { $refusal = ', wait)).toBeGreaterThan(wait)
+    expect(inner.indexOf('  if ($claimSays -eq "gone" -or $claimSays -eq "other") { $refusal = ', wait)).toBeGreaterThan(wait)
     expect(inner).not.toContain('The old process is still running')
     // Read from the wait on: RECHECK has lines as plain as a closing brace, which the functions above it hold too.
     for (const line of RECHECK) expect(inner.indexOf(`    ${line}`, wait)).toBeGreaterThan(wait)
@@ -288,7 +288,7 @@ describe('the checks, the claim and the place, in one run, in that order', () =>
     expect(script).toContain('$text.IndexOf($id, [StringComparison]::OrdinalIgnoreCase) -ge 0) { $fresh = "the registry file " + $f.Name + " names it" }')
     expect(script).toContain('"$($p.CommandLine)".IndexOf($id, [StringComparison]::OrdinalIgnoreCase) -ge 0) { $fresh = "process " + $p.ProcessId + " names it on its command line" }')
     expect(script).toContain("if ($null -ne $fresh) { Refuse 'fresh' $fresh }")
-    expect(script).toContain("$name = ''dealerwrap''")
+    expect(script).toContain("$name = ''lane-x''")
     for (const name of ['', 'Dealerwrap', 'deal wrap', "x'; calc", '-x', 'a'.repeat(41)]) expect(() => launchScriptText({ ...START, name })).toThrow()
     expect(() => launchScriptText({ ...START, checks: { floor: true, input: true } })).toThrow(/checks\.fresh/)
     expect(() => launchScriptText({ ...START, where: { pane: { token: TOKEN } }, now: NOW })).toThrow(/window/)

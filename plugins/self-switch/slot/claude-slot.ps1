@@ -320,6 +320,20 @@ function Get-FloorWhy($memory) {
   return $null
 }
 
+# What the claim lock on conversation $id says of $by, for a wait: 'gone', 'other', 'ours', or 'unknown' (being
+# written, or a sharing violation: looked at again next time). Read sharing everything, so it never blocks a writer.
+function Get-ClaimSays($id, $by) {
+  $path = Join-Path $state ('claims\' + $id + '.lock')
+  if (-not (Test-Path -LiteralPath $path)) { return 'gone' }
+  try {
+    $stream = [IO.File]::Open($path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]'ReadWrite, Delete')
+    try { $text = (New-Object IO.StreamReader($stream, [Text.Encoding]::UTF8)).ReadToEnd() } finally { $stream.Dispose() }
+    $lock = $text | ConvertFrom-Json
+    if ($null -ne $lock -and $lock.by -is [string]) { if ($lock.by -ceq $by) { return 'ours' } else { return 'other' } }
+  } catch { }
+  return 'unknown'
+}
+
 # Whether the claim lock on conversation $id names $by.
 function Test-Claim($id, $by) {
   $lock = $null
@@ -509,7 +523,8 @@ function Get-Asked {
           $gone = Wait-Gone $parts[0] $parts[1] 30
           if ($gone) { break }
           # The claim at every look: a launch taken back (its claim released, or taken over) ends the wait at once.
-          if (-not (Test-Claim $id $Claim)) { $why = 'the claim lock on that conversation no longer names this tab''s launch: the move that opened it was taken back, or its time ran out'; break }
+          $claimSays = Get-ClaimSays $id $Claim
+          if ($claimSays -eq 'gone' -or $claimSays -eq 'other') { $why = 'the claim lock on that conversation no longer names this tab''s launch: the move that opened it was taken back, or its time ran out'; break }
           if (-not $toldLong -and $waitClock.Elapsed.TotalSeconds -ge $WaitSeconds) { $toldLong = $true; Write-Host ('It has not exited after ' + [int]($WaitSeconds / 60) + ' minutes. This tab keeps waiting while the move that opened it stands, and resumes the session when it goes. Close this tab to give up.') }
           Start-Sleep -Seconds 1
         }
@@ -601,7 +616,7 @@ function Start-Claude($run) {
   $heldId = if ($run.ContainsKey('Resume')) { $run.Resume } elseif ($run.ContainsKey('Start')) { $run.Start } else { $null }
   $gaveBack = $null -ne $heldId -and ($null -ne $threw -or ($held -cmatch $LaunchClaim -and $code -ne 0))
   if ($gaveBack) { Give-Back $heldId $held }
-  if ($null -ne $heldId -and ($null -ne $threw -or ($code -eq 2 -and ((Get-Date) - $ranFrom).TotalSeconds -lt 10))) { Write-Refused $heldId $held $(if ($run.ContainsKey('Start')) { 'start' } else { 'resume' }) $run.Dir $(if ($null -ne $threw) { 'claude-launch.ps1 stopped on an error: ' + $threw } else { 'claude-launch.ps1 ended at once with exit code 2: its last look refused the conversation (open elsewhere, or no way to tell), or Claude Code could not start' }) }
+  if ($null -ne $heldId -and ($null -ne $threw -or ($code -eq 2 -and ((Get-Date) - $ranFrom).TotalSeconds -lt 60))) { Write-Refused $heldId $held $(if ($run.ContainsKey('Start')) { 'start' } else { 'resume' }) $run.Dir $(if ($null -ne $threw) { 'claude-launch.ps1 stopped on an error: ' + $threw } else { 'claude-launch.ps1 ended within a minute with exit code 2: its last look refused the conversation (open elsewhere, or no way to tell), or Claude Code could not start' }) }
   if ($null -ne $threw) { Write-Host ('claude-launch.ps1 stopped on an error, so Claude Code may not have started here: ' + $threw) }
   if ($gaveBack) { Say-ByHand $heldId $(if ($run.ContainsKey('Start')) { $run.Name } else { $null }) $run.Dir }
   Write-Beacon 'idle'

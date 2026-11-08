@@ -890,6 +890,10 @@ function notWritten($: EngineInterface, id: string, reason: string, code?: strin
   const count = code === 'transcript' ? /^(\d+) transcripts/.exec(reason)?.[1] : undefined
   if (count === '0') return
   const short = id.slice(0, 8)
+  if (code === 'key') {
+    $.ui.log(`self-switch couldn't record that this session left conversation ${short}, and won't until this is fixed: ${oneLine(reason, 400)}`)
+    return
+  }
   if (count !== undefined) {
     $.ui.log(`self-switch didn't record that this session left conversation ${short}: its transcript is in ${count} project folders on this machine, and a switch back to it is refused until only one is left.`)
     return
@@ -1364,14 +1368,16 @@ async function switchNow($: EngineInterface, value: Queued): Promise<void> {
       exitLeft = { state: ctx.state, id: ctx.own, leaving: own }
       // An exit that took ends this module with the session, and this never fires.
       $.clock.after(CHECK_MS, () => {
+        /** What the placement opened: a tab in a named window, a named window, or a plain new one. */
+        const opened = placedAt === undefined ? 'The new window' : placedAt.replace(/^a new /, 'The new ')
         const waits =
           pick.transport === 'slot'
             ? 'The slot honours its record for 2 minutes, then gives up'
             : pick.transport === 'pane'
               ? "This tab's claude wrapper honours its ticket for 2 minutes, then gives up"
-              : 'The new window resumes the conversation if this session exits within 15 minutes of the switch; then the switch\'s claim is released, and the window gives up'
+              : `${opened} resumes the conversation if this session exits within about 15 minutes of the switch; then the switch's claim is released, and it gives up`
         $.ui.toast(`The exit ran, but the session is still open. ${waits}.`)
-        void tellModel($, `The switch's exit ran, but this session is still open (a dialog may have been answered no). ${waits}. The claim on ${to} is released 15 minutes after the switch.`)
+        void tellModel($, `The switch's exit ran, but this session is still open (a dialog may have been answered no). ${waits}. The claim on ${to} is released about 15 minutes after the switch.`)
       })
     },
   })

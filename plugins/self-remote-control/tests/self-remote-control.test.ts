@@ -350,13 +350,13 @@ test('with resume, the next turn starts with what happened, and the model gets n
   const { commands, prompts, toasts, clock, session } = engine(on)
   await $.session.start(start)
 
-  const queued = await $.tool.call({ tool: TOOL, action: 'connect', name: 'billing export', resume: ' Tell Mo it is reachable. ' })
-  expect(queued.result).toMatch(/ Then the session resumes with: Tell Mo it is reachable\.$/)
+  const queued = await $.tool.call({ tool: TOOL, action: 'connect', name: 'billing export', resume: ' Tell the owner it is reachable. ' })
+  expect(queued.result).toMatch(/ Then the session resumes with: Tell the owner it is reachable\.$/)
   await $.turn.complete({ ...answered, turnId: 't1' })
   await clock.advance(5000)
   expect(commands).toEqual(['remote-control billing export'])
   expect(toasts).toContain('Remote Control connected as "billing export".')
-  expect(prompts).toEqual(['Remote Control connected as "billing export". Resume: Tell Mo it is reachable.'])
+  expect(prompts).toEqual(['Remote Control connected as "billing export". Resume: Tell the owner it is reachable.'])
   expect(session.appended()).toEqual([])
 })
 
@@ -375,14 +375,14 @@ test('with resume, a connect that does not take starts a turn that says so', asy
   const { commands, prompts, toasts, rc, clock, session } = engine(on, { failsToConnect: true })
   await $.session.start(start)
 
-  await $.tool.call({ tool: TOOL, action: 'connect', name: 'billing export', resume: 'Tell Mo how it went.' })
+  await $.tool.call({ tool: TOOL, action: 'connect', name: 'billing export', resume: 'Tell the owner how it went.' })
   await $.turn.complete({ ...answered, turnId: 't1' })
   await clock.advance(20000)
   expect(commands).toEqual(['remote-control billing export'])
   expect(rc.description).toBe(NOT_CONNECTED)
   expect(toasts).toContain('Remote Control: the command ran, but the session does not read as connected yet.')
   expect(prompts).toEqual([
-    'The remote-control command ran, but this session did not read as connected a few seconds later; check with remote_control status. Resume: Tell Mo how it went.',
+    'The remote-control command ran, but this session did not read as connected a few seconds later; check with remote_control status. Resume: Tell the owner how it went.',
   ])
   expect(session.appended()).toEqual([])
 })
@@ -391,7 +391,7 @@ test('a resume the engine drops falls back to the note', async ($, on) => {
   const { prompts, toasts, clock, session } = engine(on, { failsToConnect: true, dropped: 'a Stop hook blocked it' })
   await $.session.start(start)
 
-  await $.tool.call({ tool: TOOL, action: 'connect', name: 'billing export', resume: 'Tell Mo how it went.' })
+  await $.tool.call({ tool: TOOL, action: 'connect', name: 'billing export', resume: 'Tell the owner how it went.' })
   await $.turn.complete({ ...answered, turnId: 't1' })
   await clock.advance(20000)
   expect(prompts).toEqual([])
