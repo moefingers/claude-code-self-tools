@@ -414,7 +414,7 @@ test('heavy-slot.sh: $HEAVY_SLOT_SCRIPT first, else the first above the served r
   const bashStyle = `/${DUMMY_SLOT[0].toLowerCase()}/${DUMMY_SLOT.slice(3).replace(/\\/g, '/')}`
   assert.equal(parse({ HEAVY_SLOT_SCRIPT: bashStyle }).slotScript.toLowerCase(), DUMMY_SLOT.toLowerCase())
   assert.equal(real.parseArgs(['--name', 'web', '--dir', app, '--port', '3999', '--slot-script', bashStyle, '--', process.execPath]).slotScript.toLowerCase(), DUMMY_SLOT.toLowerCase())
-  assert.equal(real.fromBashPath('/o/redundant_local/heavy-slot.sh'), 'O:\\redundant_local\\heavy-slot.sh')
+  assert.equal(real.fromBashPath('/c/path/to/heavy-slot.sh'), 'C:\\path\\to\\heavy-slot.sh')
   for (const bad of ['heavy-slot.sh', '/usr/bin/heavy-slot.sh', '.\\heavy-slot.sh']) assert.throws(() => parse({ HEAVY_SLOT_SCRIPT: bad }), /HEAVY_SLOT_SCRIPT must be a full path/, bad)
   assert.throws(() => parse({ HEAVY_SLOT_SCRIPT: join(top, 'missing.sh') }), /no heavy-slot.sh at .*missing\.sh \(HEAVY_SLOT_SCRIPT\)/)
   assert.throws(() => parse({ HEAVY_SLOT_SCRIPT: '/q/no/such/heavy-slot.sh' }), /no heavy-slot.sh at Q:\\no\\such\\heavy-slot\.sh \(HEAVY_SLOT_SCRIPT\)/)

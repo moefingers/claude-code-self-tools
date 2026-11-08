@@ -518,12 +518,15 @@ function Get-Asked {
         Write-Host ('Waiting for the old Claude Code process (' + $parts[0] + ') to exit, then resuming here.')
         $waitClock = [Diagnostics.Stopwatch]::StartNew()
         $toldLong = $false
+        $unread = 0
         $gone = $false
         while (-not $gone) {
           $gone = Wait-Gone $parts[0] $parts[1] 30
           if ($gone) { break }
           # The claim at every look: a launch taken back (its claim released, or taken over) ends the wait at once.
           $claimSays = Get-ClaimSays $id $Claim
+          if ($claimSays -eq 'unknown') { $unread++ } else { $unread = 0 }
+          if ($unread -ge 10) { $why = 'the claim lock on that conversation could not be read for 10 looks in a row (about 5 minutes), so whether the move that opened it still stands is unknown'; break }
           if ($claimSays -eq 'gone' -or $claimSays -eq 'other') { $why = 'the claim lock on that conversation no longer names this tab''s launch: the move that opened it was taken back, or its time ran out'; break }
           if (-not $toldLong -and $waitClock.Elapsed.TotalSeconds -ge $WaitSeconds) { $toldLong = $true; Write-Host ('It has not exited after ' + [int]($WaitSeconds / 60) + ' minutes. This tab keeps waiting while the move that opened it stands, and resumes the session when it goes. Close this tab to give up.') }
           Start-Sleep -Seconds 1

@@ -3,7 +3,7 @@
 // Examples use placeholders (C:\path\to\work, "the owner"). The CHANGELOG is history and is left as it was written;
 // tests are fixtures. Run with `node --test "scripts/*.test.mjs"`.
 import assert from 'node:assert/strict'
-import { readdirSync, readFileSync, statSync } from 'node:fs'
+import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs'
 import { join, relative } from 'node:path'
 import { test } from 'node:test'
 import { pathToFileURL } from 'node:url'
@@ -83,5 +83,41 @@ test("a plugin's own tests, which install with it, name no machine folder and no
   })
   assert.ok(tests.length > 10)
   const found = tests.filter(path => /redundant_local|\bMo\b|Mohammad/i.test(readFileSync(path, 'utf8'))).map(path => relative(ROOT, path))
+  assert.deepEqual(found, [])
+})
+
+/**
+ * Real lane and project names to keep out of what ships, one per line: a local file, gitignored, so the names
+ * themselves are never committed. Without it, this part of the scan is skipped, said in the run.
+ */
+const NAMES_FILE = join(ROOT, 'scripts', 'real-names.local.txt')
+/** Text as a name is looked for in it: lowercase, spaces, hyphens and underscores dropped. */
+const squash = text => text.toLowerCase().replace(/[\s_-]+/g, '')
+/** The user names a test's profile path may give: placeholders. */
+const PLACEHOLDER_USERS = new Set(['u', 'tester', 'user', 'you', 'me'])
+/** An email a test may use: a reserved domain (example.com, .invalid), or a URL's user:password@host. */
+const FAKE_EMAIL = /(?:^|\.)(?:example\.(?:com|org|net)|[a-z0-9-]+\.invalid)$/i
+
+test("a plugin's own tests name no real lane, no email, and no user profile's path", t => {
+  const tests = readdirSync(join(ROOT, 'plugins')).flatMap(plugin => {
+    const dir = join(ROOT, 'plugins', plugin, 'tests')
+    try { return readdirSync(dir).map(name => join(dir, name)) } catch { return [] }
+  })
+  const names = existsSync(NAMES_FILE) ? readFileSync(NAMES_FILE, 'utf8').split(/\r?\n/).map(squash).filter(n => n.length >= 4) : []
+  if (names.length === 0) t.diagnostic(`no ${relative(ROOT, NAMES_FILE)}: the real-name part of this scan is skipped`)
+  const found = []
+  for (const path of tests) {
+    const text = readFileSync(path, 'utf8')
+    const where = relative(ROOT, path)
+    const flat = squash(text)
+    for (const name of names) if (flat.includes(name)) found.push(`${where}: a real lane's name`)
+    for (const m of text.matchAll(/([A-Za-z0-9._%+-]+)@([A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+)/g)) {
+      const before = text[(m.index ?? 0) - 1] ?? ''
+      if (FAKE_EMAIL.test(m[2] ?? '') || /:\/\/[^\s'"]*$/.test(text.slice(Math.max(0, (m.index ?? 0) - 40), m.index)) || before === ':') continue
+      found.push(`${where}: an email (${m[0]})`)
+    }
+    // A profile path names a placeholder user (u, tester, user), never a real one.
+    for (const m of text.matchAll(/\b[A-Za-z]:\\{1,2}Users\\{1,2}([A-Za-z0-9._-]+)/g)) if (!PLACEHOLDER_USERS.has((m[1] ?? '').toLowerCase())) found.push(`${where}: a user profile's path (${m[0]})`)
+  }
   assert.deepEqual(found, [])
 })

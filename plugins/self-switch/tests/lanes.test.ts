@@ -68,7 +68,7 @@ describe('lanesUpdateScript: one entry merged under a lock, the file replaced wh
   })
 
   test('a bad name, id, folder, window, tab or workspace is refused before anything is written', () => {
-    expect(() => lanesUpdateScript({ configDir: CONFIG, name: 'Dealer Wrap', entry: ENTRY })).toThrow()
+    expect(() => lanesUpdateScript({ configDir: CONFIG, name: 'Lane X', entry: ENTRY })).toThrow()
     expect(() => lanesUpdateScript({ configDir: CONFIG, name: "x'; calc", entry: ENTRY })).toThrow()
     for (const change of [{ session: 'x' }, { folder: 'C:\\a;b' }, { folder: "C:\\o'brien" }, { window: 'last' }, { window: '0' }, { tab: "a'b" }, { ws: 'nope' }, { at: Number.NaN }]) {
       expect(() => lanesUpdateScript({ configDir: CONFIG, name: 'lane-x', entry: { ...ENTRY, ...change } as never })).toThrow()

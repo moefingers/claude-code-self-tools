@@ -107,6 +107,7 @@ function runnerProblems(text) {
   need(has("    if ($id -cmatch $SessionId) { Write-Refused $id $Claim $(if ($Start) { 'start' } else { 'resume' }) $here"), "a tab's refusal recorded")
   need(has("  if ($null -ne $heldId -and ($null -ne $threw -or ($code -eq 2 -and ((Get-Date) - $ranFrom).TotalSeconds -lt 60))) { Write-Refused $heldId $held"), "a launcher's refusal (exit 2 at once) or error recorded")
   need(has("          if ($claimSays -eq 'gone' -or $claimSays -eq 'other') { $why = ") && has("[IO.FileShare]'ReadWrite, Delete'"), 'a look that cannot read the claim keeps waiting, and never blocks a writer')
+  need(has("          if ($claimSays -eq 'unknown') { $unread++ } else { $unread = 0 }\n") && has("          if ($unread -ge 10) { $why = "), 'a claim unreadable for 10 looks in a row ends the wait')
   need(has("    $final = Join-Path $state ('refused\\' + $id + '.json')"), 'at its id-shaped path')
   need(has('try { $ownSha = Get-Sha256 $PSCommandPath }') && has("$beacon['sha256'] = $ownSha"), 'its beacon says the hash it started from')
   need(has('if ($dirs.Count -gt 1) { $run.ConfigDir = @($dirs[1..($dirs.Count - 1)]) }') && !code.includes('ConfigDir = $dirs'), 'the launcher told only the folders it does not read already')
@@ -187,6 +188,7 @@ for (const [name, from, to, expect] of [
   ['R4: the claim not read while waiting', "          $claimSays = Get-ClaimSays $id $Claim\n", "          $claimSays = 'ours'\n", /claim read at every look/],
   ['R5: the hash refusal not recorded', "; if ($run.ContainsKey('Resume') -or $run.ContainsKey('Start')) { Write-Refused", "; if ($false) { Write-Refused", /hash refusal recorded/],
   ['R5: exit 2 after a long session recorded', " -or ($code -eq 2 -and ((Get-Date) - $ranFrom).TotalSeconds -lt 60))) {", " -or $code -eq 2)) {", /exit 2 at once/],
+  ['R5 (final): a claim unreadable for ever holds the wait for ever', "          if ($unread -ge 10) { $why = ", "          if ($false) { $why = ", /unreadable for 10 looks/],
   ['R3: a claim that cannot be read now ends the wait', "          if ($claimSays -eq 'gone' -or $claimSays -eq 'other') { $why = ", "          if ($claimSays -ne 'ours') { $why = ", /keeps waiting, and never blocks/],
   ['F1 4: the cap counting a Claude Code that has exited', " -or (Get-Cli $p) -or (Test-Exited $p)) { continue }", " -or (Get-Cli $p)) { continue }", /has exited/],
   ["S3: a tab's refusal no one hears of", "    if ($id -cmatch $SessionId) { Write-Refused $id $Claim", "    if ($false) { Write-Refused $id $Claim", /refusal recorded/],

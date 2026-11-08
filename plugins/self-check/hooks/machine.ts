@@ -536,13 +536,13 @@ export const REGISTRY_VERSION_MARKERS = ['v', 'schema', 'schemaVersion', 'format
 export const LAUNCH_LINE_TRUSTED_AFTER_MS = 60_000
 
 /** The SHA-256 of plugins/self-switch/slot/claude-slot.ps1, as it is committed. */
-export const SLOT_SCRIPT_SHA256 = 'f90cc3b7c7f14642cc6f7454393fea06ed9ccc814049173f890113b99a7c3e8c'
+export const SLOT_SCRIPT_SHA256 = '80ad3f9a4a142b87098883010c6bed8d2291515dc18ef8bf3b49406e8df0c30f'
 
 /**
  * The SHA-256 of plugins/self-switch/slot/claude-layout.ps1, as it is committed: a release pin, tested and
  * printed in the README for the person to compare. Nothing runs that script but the person, by hand.
  */
-export const LAYOUT_SCRIPT_SHA256 = '1f3ede07759bb31b53e88bb00d83fa1735f9e05f44cc5849dff349182ccffeef'
+export const LAYOUT_SCRIPT_SHA256 = '6582b11a3846175b2eb167673d2dfce47095660acba96c7a15e11b2aca33f543'
 
 /** Input idle for this long before any launch of another process (PM2): a null reading is not idle. */
 export const INPUT_IDLE_MS = 60_000
@@ -3460,6 +3460,9 @@ export const TEST_GONE = [
  */
 export const LAUNCH_REFUSED_SECONDS = 60
 
+/** How many looks in a row a waiting window or tab may find its claim unreadable before it gives up: about 5 minutes. */
+export const CLAIM_UNREAD_LOOKS = 10
+
 /** How long the wait for an old process that outlasted the first wait looks each time, in seconds. */
 export const WAIT_POLL_SECONDS = 30
 
@@ -3529,6 +3532,7 @@ function windowScript(v: { id: string; kind: 'resume' | 'start'; name?: string; 
           // move taken back (its claim released, or taken over) ends the wait at once. The last look below still decides.
           '$waitClock = [Diagnostics.Stopwatch]::StartNew()',
           '$toldLong = $false',
+          '$unread = 0',
           '$gone = $false',
           'while (-not $gone) {',
           `  $gone = Wait-Gone ${v.waitFor.pid} '${v.waitFor.created}' ${WAIT_POLL_SECONDS}`,
@@ -3538,6 +3542,9 @@ function windowScript(v: { id: string; kind: 'resume' | 'start'; name?: string; 
           '  $claimSays = "unknown"',
           '  if (-not (Test-Path -LiteralPath $claimPath)) { $claimSays = "gone" } else { try { $held = Get-Content -LiteralPath $claimPath -Raw -Encoding UTF8 | ConvertFrom-Json; if ($null -ne $held -and $held.by -is [string]) { $claimSays = $(if ($held.by -ceq $by) { "ours" } else { "other" }) } } catch { $claimSays = "unknown" } }',
           '  if ($claimSays -eq "gone" -or $claimSays -eq "other") { $refusal = "The session is not resumed here: the claim on it no longer names this window (the move that opened it was taken back, or its time ran out)."; break }',
+          // One that can't be read look after look (a file no one can open) ends the wait too, saying so.
+          '  if ($claimSays -eq "unknown") { $unread++ } else { $unread = 0 }',
+          `  if ($unread -ge ${CLAIM_UNREAD_LOOKS}) { $refusal = "The session is not resumed here: the claim on it could not be read for ${CLAIM_UNREAD_LOOKS} looks in a row (about 5 minutes), so whether the move that opened it still stands is unknown."; break }`,
           `  if (-not $toldLong -and $waitClock.Elapsed.TotalSeconds -ge ${WAIT_SECONDS}) { $toldLong = $true; Write-Host "It has not exited after ${WAIT_SECONDS / 60} minutes. This window keeps waiting while the move that opened it stands, and ${resume ? 'resumes' : 'starts'} the session when it goes. Close this window to give up." }`,
           '  Start-Sleep -Seconds 1',
           '}',
@@ -5241,15 +5248,19 @@ export function leftScript(input: LeftInput): string {
           `if ([long]$session.ProcessId -ne ${named.pid} -or [math]::Abs([long](Get-Created $session) - [long]'${named.created}') -gt ${PROC_START_TOLERANCE}) { 'refused process the process named is not the Claude Code this script runs under'; exit 0 }`,
         ]),
     // One writer at a time per conversation (the coordinator's go and this plugin both write this record): a lock
-    // made new (CreateNew) and held as a handle no one else may open, deleted when it closes or this process ends (one
-    // there is another writer's, waited for), from before the transcript
-    // is stat-ed to after the record is in place. So the stat, the look for the same move and the write are one
-    // step, and a later writer stats the transcript after the earlier one has written.
+    // opened or made and held as a handle no one else may open, deleted when it closes or this process ends, as
+    // lanes.json's is, from before the transcript is stat-ed to after the record is in place. So the stat, the look
+    // for the same move and the write are one step, and a later writer stats the transcript after the earlier one has
+    // written. A lock another holds is a sharing violation, waited for; one an OS crash left, held by no one, is
+    // simply opened, and deleted when this one closes. The take-back (withdrawLeft, in self-switch) writes outside
+    // it: it overwrites only an exit record of this very process, read just before, which neither writer's same-move
+    // rule matches; a write that lands between its read and its overwrite is lost, which reads as no record (live for
+    // 10 minutes), the safe side.
     `$leftLockPath = ${literal(idPath(state, 'leftLock', id))}`,
     '[void][IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($leftLockPath))',
     '$leftLock = $null',
     'for ($try = 0; $try -lt 80 -and $null -eq $leftLock; $try++) {',
-    '  try { $leftLock = [IO.FileStream]::new($leftLockPath, [IO.FileMode]::CreateNew, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None, 4096, [IO.FileOptions]::DeleteOnClose) }',
+    '  try { $leftLock = [IO.FileStream]::new($leftLockPath, [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None, 4096, [IO.FileOptions]::DeleteOnClose) }',
     `  catch { if (-not (${IS_IO} -or $_.Exception -is [UnauthorizedAccessException] -or $_.Exception.InnerException -is [UnauthorizedAccessException])) { throw }; Start-Sleep -Milliseconds 125 }`,
     '}',
     "if ($null -eq $leftLock) { 'refused lock another writer held this record for 10 seconds'; exit 0 }",

@@ -1,2 +1,3 @@
 plugins/*/.claude-plugin/types/
 node_modules/
+scripts/real-names.local.txt

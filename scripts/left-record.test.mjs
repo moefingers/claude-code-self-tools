@@ -314,3 +314,104 @@ describe('#81: two writers of one move, the coordinator and self-switch', { skip
     assert.equal(record.by, 'coordinator')
   })
 })
+
+describe('the left record lock (S3 final)', { skip: !isWindows && 'Windows only', concurrency: false }, () => {
+  const GO = 'wu_abc123'
+  const lockOf = dirs => join(dirs.state, 'left', `${dirs.id}.lock`)
+  /** Holds writer A right after it has taken the lock, before it stats the transcript: a file says it holds it. */
+  const heldAfterLock = (script, gate, holding) => {
+    const line = "if ($null -eq $leftLock) { 'refused lock another writer held this record for 10 seconds'; exit 0 }"
+    const at = script.indexOf(line)
+    assert.ok(at > 0, 'the lock, taken')
+    const end = at + line.length
+    const hold = [`New-Item -ItemType File -Path '${holding}' -Force | Out-Null`, `$gate = New-Object Threading.EventWaitHandle($false, [Threading.EventResetMode]::ManualReset, '${gate}')`, '[void]$gate.WaitOne(60000)'].join('\r\n')
+    return `${script.slice(0, end)}\r\n${hold}${script.slice(end)}`
+  }
+
+  test("R2 (final): while writer A holds the lock, writer B waits, writing nothing: the earlier record stays; once A lets go, both say written and the coordinator's go stands", async () => {
+    const dirs = lab()
+    const stale = await write(machine.leftScript({ stateDir: dirs.state, id: dirs.id, how: 'exit', configDirs: [dirs.config], by: 'self-switch' }))
+    assert.equal(machine.LEFT_WRITTEN.exec(stale.stdout)?.[1], dirs.id, stale.stdout + stale.stderr)
+    const gate = `left-held-${randomUUID()}`
+    const holding = join(dirs.root, 'holding')
+    const a = join(dirs.root, 'a.ps1')
+    const b = join(dirs.root, 'b.ps1')
+    writeFileSync(a, heldAfterLock(machine.leftScript({ stateDir: dirs.state, id: dirs.id, how: 'in-place', configDirs: [dirs.config], by: 'self-switch' }), gate, holding))
+    writeFileSync(b, machine.leftScript({ stateDir: dirs.state, id: dirs.id, how: 'in-place', configDirs: [dirs.config], by: 'coordinator', go: GO }))
+    const record = join(dirs.state, 'left', `${dirs.id}.json`)
+    const script = [
+      "$ProgressPreference = 'SilentlyContinue'",
+      `function Start-Ps($file) { $i = New-Object Diagnostics.ProcessStartInfo('${POWERSHELL}', ('-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "' + $file + '"')); $i.UseShellExecute = $false; $i.CreateNoWindow = $true; $i.RedirectStandardOutput = $true; $i.RedirectStandardError = $true; return [Diagnostics.Process]::Start($i) }`,
+      `$gate = New-Object Threading.EventWaitHandle($false, [Threading.EventResetMode]::ManualReset, '${gate}')`,
+      `$pa = Start-Ps '${a}'`,
+      `$until = (Get-Date).AddSeconds(60); while (-not (Test-Path '${holding}') -and (Get-Date) -lt $until) { Start-Sleep -Milliseconds 20 }`,
+      `$pb = Start-Ps '${b}'`,
+      'Start-Sleep -Seconds 4',
+      '"B-WAITING:" + (-not $pb.HasExited)',
+      `"RECORD:" + (Get-Content -LiteralPath '${record}' -Raw | ConvertFrom-Json).how`,
+      '[void]$gate.Set()',
+      '$oa = $pa.StandardOutput.ReadToEnd(); $ea = $pa.StandardError.ReadToEnd(); $pa.WaitForExit()',
+      '$ob = $pb.StandardOutput.ReadToEnd(); $eb = $pb.StandardError.ReadToEnd(); $pb.WaitForExit()',
+      '"A:" + $pa.ExitCode + ":" + $oa.Trim() + ":" + ([regex]::Matches($ea, "S=.Error.")).Count',
+      '"B:" + $pb.ExitCode + ":" + $ob.Trim() + ":" + ([regex]::Matches($eb, "S=.Error.")).Count',
+    ].join('\r\n')
+    const ran = await write(script)
+    const all = ran.stdout + ran.stderr
+    assert.match(ran.stdout, /^B-WAITING:True\r?$/m, all)
+    assert.match(ran.stdout, /^RECORD:exit\r?$/m, all)
+    assert.match(ran.stdout, new RegExp(`^A:0:left ${dirs.id}:0\\r?$`, 'm'), all)
+    assert.match(ran.stdout, new RegExp(`^B:0:left ${dirs.id}:0\\r?$`, 'm'), all)
+    const final = JSON.parse(readFileSync(record, 'utf8'))
+    assert.equal(final.by, 'coordinator', all)
+    assert.equal(final.go, GO)
+    assert.ok(!existsSync(lockOf(dirs)), 'the lock is gone with its last holder')
+  })
+
+  /** Holds the lock from outside, sharing nothing, for `seconds`; resolves once it is held. */
+  async function hold(dirs, seconds) {
+    const held = join(dirs.root, `held-${randomUUID()}`)
+    mkdirSync(join(dirs.state, 'left'), { recursive: true })
+    const child = spawn(POWERSHELL, ['-NoProfile', '-NonInteractive', '-Command', `$s = [IO.FileStream]::new('${lockOf(dirs)}', 'OpenOrCreate', 'ReadWrite', 'None'); New-Item -ItemType File -Path '${held}' -Force | Out-Null; Start-Sleep -Seconds ${seconds}; $s.Dispose()`], { windowsHide: true, stdio: 'ignore' })
+    const until = Date.now() + 30_000
+    while (!existsSync(held) && Date.now() < until) await new Promise(resolve => setTimeout(resolve, 50))
+    assert.ok(existsSync(held), 'the outside holder took the lock')
+    return child
+  }
+
+  test('R2 (final): a holder that never lets go: the writer waits about 10 seconds, then answers refused lock, writing nothing', async () => {
+    const dirs = lab()
+    const child = await hold(dirs, 30)
+    try {
+      const started = Date.now()
+      const ran = await write(machine.leftScript({ stateDir: dirs.state, id: dirs.id, how: 'in-place', configDirs: [dirs.config], by: 'self-switch' }))
+      const took = Date.now() - started
+      assert.match(ran.stdout, /^refused lock another writer held this record for 10 seconds\s*$/m, ran.stdout + ran.stderr)
+      assert.ok(took > 8000, `it waited for the lock (${took} ms)`)
+      assert.ok(!existsSync(join(dirs.state, 'left', `${dirs.id}.json`)), 'nothing written')
+    } finally {
+      child.kill()
+    }
+  })
+
+  test('R2 (final): a holder that lets go within the wait: the writer takes the lock then, and writes', async () => {
+    const dirs = lab()
+    const child = await hold(dirs, 3)
+    try {
+      const ran = await write(machine.leftScript({ stateDir: dirs.state, id: dirs.id, how: 'in-place', configDirs: [dirs.config], by: 'self-switch' }))
+      assert.equal(machine.LEFT_WRITTEN.exec(ran.stdout)?.[1], dirs.id, ran.stdout + ran.stderr)
+    } finally {
+      child.kill()
+    }
+  })
+
+  test('R1 (final): a lock file an OS crash left behind, held by no one, is opened at once and deleted on close, never waited out', async () => {
+    const dirs = lab()
+    mkdirSync(join(dirs.state, 'left'), { recursive: true })
+    writeFileSync(lockOf(dirs), '')
+    const started = Date.now()
+    const ran = await write(machine.leftScript({ stateDir: dirs.state, id: dirs.id, how: 'in-place', configDirs: [dirs.config], by: 'self-switch' }))
+    assert.equal(machine.LEFT_WRITTEN.exec(ran.stdout)?.[1], dirs.id, ran.stdout + ran.stderr)
+    assert.ok(Date.now() - started < 8000, 'no wait for a lock no one holds')
+    assert.ok(!existsSync(lockOf(dirs)), 'the leftover is gone')
+  })
+})

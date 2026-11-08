@@ -289,7 +289,7 @@ describe('the checks, the claim and the place, in one run, in that order', () =>
     expect(script).toContain('"$($p.CommandLine)".IndexOf($id, [StringComparison]::OrdinalIgnoreCase) -ge 0) { $fresh = "process " + $p.ProcessId + " names it on its command line" }')
     expect(script).toContain("if ($null -ne $fresh) { Refuse 'fresh' $fresh }")
     expect(script).toContain("$name = ''lane-x''")
-    for (const name of ['', 'Dealerwrap', 'deal wrap', "x'; calc", '-x', 'a'.repeat(41)]) expect(() => launchScriptText({ ...START, name })).toThrow()
+    for (const name of ['', 'Lanex', 'lane x', "x'; calc", '-x', 'a'.repeat(41)]) expect(() => launchScriptText({ ...START, name })).toThrow()
     expect(() => launchScriptText({ ...START, checks: { floor: true, input: true } })).toThrow(/checks\.fresh/)
     expect(() => launchScriptText({ ...START, where: { pane: { token: TOKEN } }, now: NOW })).toThrow(/window/)
   })

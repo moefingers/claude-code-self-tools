@@ -2550,3 +2550,16 @@ describe('S3 delta', () => {
     expect(said[0]).not.toContain('10 minutes')
   })
 })
+
+describe('S3 final', () => {
+  test("R1: a record's lock another writer held for 10 seconds: those words, never that the record was made", async ($, on) => {
+    const made = engine(on, { leftOut: { stdout: 'refused lock another writer held this record for 10 seconds\r\n', stderr: '', exitCode: 0 } })
+    await $.session.start(start)
+    await $.classic.SessionStart({ source: 'startup', session_id: W })
+    await $.classic.SessionStart({ source: 'resume', session_id: T })
+    await made.clock.advance(5000)
+    expect(made.screen.filter(line => /record/.test(line))).toEqual([
+      `self-switch couldn't record that this session left conversation ${W.slice(0, 8)}: another writer (the coordinator, or self-switch in another session) held the lock on its record for 10 seconds; so for about 10 minutes after it leaves, a switch back to it is refused as if it were still open.`,
+    ])
+  })
+})

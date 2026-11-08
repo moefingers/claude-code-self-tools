@@ -420,6 +420,7 @@ const CHECKS = {
     assert.ok(inner.includes('  if ($code -eq 2 -and ((Get-Date) - $started).TotalSeconds -lt 60) { Write-Refused '), 'exit 2 recorded only within a minute (the launcher\'s last look under load)')
     // R3 (delta): only a clear answer ends the wait: the claim gone, or naming another; one that can't be read is looked at again.
     assert.ok(inner.includes('  if ($claimSays -eq "gone" -or $claimSays -eq "other") { $refusal = '), 'only a clear answer ends the wait')
+    assert.ok(inner.includes('  if ($claimSays -eq "unknown") { $unread++ } else { $unread = 0 }') && inner.includes('  if ($unread -ge 10) { $refusal = '), 'a claim unreadable for 10 looks in a row ends the wait, saying so')
     assert.ok(!inner.includes('The old process is still running'), 'no refusal for a process still running: it keeps waiting')
     // The refused record: every refusal and every error the window says is written for whoever comes looking.
     assert.ok(/Write-Refused \$refusal\r\n {2}Write-Host \$refusal/.test(inner), 'a refusal is recorded before it is said')
@@ -704,6 +705,7 @@ const FAULTS = [
   ['R4: a refusal while waiting cleared after the wait', 'windowRefusal', "    '$refusal = $null',\n    ...(v.waitFor === undefined", "    ...(v.waitFor === undefined"],
   ['R5: exit 2 after a long session recorded as a refusal', 'windowRefusal', "`  if ($code -eq 2 -and ((Get-Date) - $started).TotalSeconds -lt ${LAUNCH_REFUSED_SECONDS}) {", "`  if ($code -eq 2) {"],
   ['R3: a claim that cannot be read now ends the wait', 'windowRefusal', "'  if ($claimSays -eq \"gone\" -or $claimSays -eq \"other\") { $refusal = ", "'  if ($claimSays -ne \"ours\") { $refusal = "],
+  ['R5 (final): a claim unreadable for ever holds the wait for ever', 'windowRefusal', "  if ($unread -ge ${CLAIM_UNREAD_LOOKS}) {", "  if ($false) {"],
   ['S3: a refusal no one but the window hears of', 'windowRefusal', "    '  Write-Refused $refusal',\n", ''],
   ['S3: an error no one but the window hears of', 'windowRefusal', "    `  Write-Refused (\"claude-launch.ps1 stopped on an error: \" + $_.Exception.Message)`,\n", ''],
   ['a refusing window keeping the claim', 'windowRefusal', "  `  Write-Host (\"Once it is safe, resume it yourself: \" + ${byHand})`,\n    '  Release-Claim',\n".replace('  `  Write', '    `  Write'), "    `  Write-Host (\"Once it is safe, resume it yourself: \" + ${byHand})`,\n"],

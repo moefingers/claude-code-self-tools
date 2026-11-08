@@ -890,6 +890,10 @@ function notWritten($: EngineInterface, id: string, reason: string, code?: strin
   const count = code === 'transcript' ? /^(\d+) transcripts/.exec(reason)?.[1] : undefined
   if (count === '0') return
   const short = id.slice(0, 8)
+  if (code === 'lock') {
+    $.ui.log(`self-switch couldn't record that this session left conversation ${short}: another writer (the coordinator, or self-switch in another session) held the lock on its record for 10 seconds; so for about 10 minutes after it leaves, a switch back to it is refused as if it were still open.`)
+    return
+  }
   if (code === 'key') {
     $.ui.log(`self-switch couldn't record that this session left conversation ${short}, and won't until this is fixed: ${oneLine(reason, 400)}`)
     return
@@ -1305,7 +1309,7 @@ async function switchNow($: EngineInterface, value: Queued): Promise<void> {
       if ('placed' in tried) {
         placed = true
         if (tried.placed === 'tab') placedAt = `a new tab in window ${tried.label}`
-        else if (tried.label !== '-') placedAt = `a new window, ${tried.label}`
+        else if (tried.label !== '-') placedAt = `a new window, ${tried.label},`
         placedFallback = tried.fallback
         break
       }
