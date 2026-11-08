@@ -78,7 +78,7 @@ function sources() {
 }
 
 test('the folders scanned for are the machine code\'s own, each once', () => {
-  assert.deepEqual([...machine.ID_FOLDERS].sort(), ['claims', 'gate', 'left', 'panes', 'pending', 'poke', 'selfcheck', 'slots', 'wake'])
+  assert.deepEqual([...machine.ID_FOLDERS].sort(), ['claims', 'gate', 'left', 'panes', 'pending', 'poke', 'refused', 'selfcheck', 'slots', 'wake'])
   for (const folder of machine.ID_FOLDERS) assert.ok(machine.idPathOrNone('C:\\state', 'left', '00000000-0000-4000-a000-000000000001') !== undefined && typeof folder === 'string')
 })
 

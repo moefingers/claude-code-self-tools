@@ -165,7 +165,8 @@ test('the exit runs only once the turn has ended, after the reason and note are 
   expect(commands).toEqual(['exit'])
 
   const rows = JSON.stringify(session.appended())
-  expect(rows).toMatch(/ended at its own request \(exit_after_turn\)\. Reason: The brief is done and the PR is open\. Note for whoever resumes it: Review comments on PR 12\./)
+  expect(rows).not.toMatch(/This session ended/)
+  expect(rows).toMatch(/This session asked to end here \(exit_after_turn\), and \/exit ran\. Reason: The brief is done and the PR is open\. Note for whoever resumes it: Review comments on PR 12\./)
   expect(logs.some(l => /The brief is done/.test(l))).toBe(true)
   expect(toasts.some(t => /Exiting/.test(t))).toBe(true)
   // An exit sends no prompt, and an exit that took never comes back to say it didn't.
@@ -250,7 +251,7 @@ test('a message that starts a turn before the exit has run cancels it, and says 
   expect(toasts.some(t => /Exit cancelled: a new turn started/.test(t))).toBe(true)
   const rows = JSON.stringify(session.appended())
   expect(rows).toMatch(/exit you queued didn't run: a new turn started/)
-  expect(rows).not.toMatch(/ended at its own request/)
+  expect(rows).not.toMatch(/asked to end here/)
 })
 
 test("a subagent's turn, starting or ending, leaves the queued exit alone", async ($, on) => {
@@ -315,7 +316,7 @@ test('on Windows, a background shell under the session refuses the call, naming 
 
   const refused = await $.tool.call({ tool: TOOL, reason: 'Done.' })
   expect(refused.deny).toBe(
-    'Not queued: the background shell bash.exe 505 runs under this session (a background job of the Bash, PowerShell or Monitor tool): stop it with TaskStop (the task id its Bash, PowerShell or Monitor call gave), or let it finish. Each would make /exit stop at its confirmation, or end with the session: stop them, then call again.',
+    'Not queued: the shell bash.exe 505 runs under this session (a background job of the Bash, PowerShell or Monitor tool, or a tool call still finishing): stop it with TaskStop (the task id its Bash, PowerShell or Monitor call gave), or let it finish; if you started no background job, it is a tool call still finishing (self-check\'s check at a resume runs one): call again in a moment. Each would make /exit stop at its confirmation, or end with the session: stop them, then call again.',
   )
   // The probe asked of this session alone, and claimed nothing.
   expect(probes).toHaveLength(1)
@@ -403,7 +404,7 @@ test('a blocker that appears before the exit is armed refuses at the arm: nothin
   expect(commands).toEqual([])
   expect(toasts).toContain('Exit cancelled: cron 7f3a9c21 (Every 5 minutes: \u00abcheck the deploy\u00bb) is set to wake this session: delete it with CronDelete (id 7f3a9c21).')
   expect(JSON.stringify(session.appended())).toMatch(/The exit you queued didn't run: cron 7f3a9c21/)
-  expect(JSON.stringify(session.appended())).not.toMatch(/ended at its own request/)
+  expect(JSON.stringify(session.appended())).not.toMatch(/asked to end here/)
   expect(marks(writes)).toEqual(['exit', 'exit', 'done'])
 })
 
@@ -417,7 +418,7 @@ test('on Windows, a background shell started before the exit is armed refuses at
   await clock.advance(1000)
   expect(commands).toEqual([])
   expect(probes).toHaveLength(2)
-  expect(toasts.some(t => t.startsWith('Exit cancelled: the background shell bash.exe 505 runs under this session'))).toBe(true)
+  expect(toasts.some(t => t.startsWith('Exit cancelled: the shell bash.exe 505 runs under this session'))).toBe(true)
 })
 
 // The pending marker the coordinator reads.
@@ -494,4 +495,12 @@ test('self-wake on with no marker holds: unknown holds (S1-9)', async ($, on) =>
   await $.session.start(start)
   const refused = await $.tool.call({ tool: TOOL, reason: 'done' })
   expect(refused.deny).toContain('whether a wake-up is pending')
+})
+
+test("the owner's design: the description says a exit runs only when the session is idle, why, and what a turn that starts first does", async ($, on) => {
+  const { described } = engine(on)
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  const said = described.join(' ')
+  expect(said).toContain("It can run only when the session is idle: Claude Code queues a plugin's command behind anything already waiting (a message typed during this turn, a background task's notification) and has no slot between turns ahead of them. A turn that starts first cancels the exit")
+  expect(said).toContain('under a nonstop stream of work and notifications it may not run for a long time')
 })

@@ -365,7 +365,7 @@ test("the window leaves the launch environment to claude-launch.ps1: it clears a
   for (const name of [...SESSION_MARKERS, 'WT_SESSION', 'WT_PROFILE_ID', 'CLAUDE_CODE_DISABLE_BG_SHELL_PRESSURE_REAP', 'CLAUDE_CODE_FORCE_SESSION_PERSISTENCE']) expect(script).not.toContain(name)
   // claude-launch.ps1, from its pinned place (its hash's own name), after the wait and the last look.
   expect(script).toContain(`$launchPath = 'C:\\Users\\u\\AppData\\Local\\claude-self-tools\\claude-launch-${LAUNCH_SCRIPT_SHA256.slice(0, 8)}.ps1'`)
-  expect(script.indexOf('& $launchPath -Resume $id -Dir $folder')).toBeGreaterThan(script.indexOf('Wait-Process'))
+  expect(script.indexOf('& $launchPath -Resume $id -Dir $folder')).toBeGreaterThan(script.indexOf('$gone = Wait-Gone'))
 })
 
 test('the encoded command is the script as UTF-16LE base64', () => {
@@ -403,7 +403,9 @@ test('an exit that does not run leaves the window waiting, and says so', async (
   await $.turn.complete(answered)
   await clock.advance(1000)
   expect(toasts.some(t => /Exit didn't run/.test(t))).toBe(true)
-  expect(JSON.stringify(session.appended())).toMatch(/waits up to 10 minutes/)
+  // A window that outlasts its first wait keeps waiting: no word of giving up after 10 minutes.
+  expect(JSON.stringify(session.appended())).toMatch(/keeps waiting for this process to exit/)
+  expect(JSON.stringify(session.appended())).not.toMatch(/10 minutes|gives up and says so/)
 })
 
 test('the process that resumes the session sends the first prompt once, and only for that session', async ($, on) => {

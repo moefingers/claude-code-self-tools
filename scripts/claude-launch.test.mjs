@@ -16,7 +16,7 @@ import { tmpdir } from 'node:os'
 import { join, relative } from 'node:path'
 import { after, before, describe, test } from 'node:test'
 import { pathToFileURL } from 'node:url'
-import { compileStub, holder } from './stub.mjs'
+import { compileStub, holder, stubWork } from './stub.mjs'
 import { ROOT } from './sync-shared.mjs'
 
 const LAUNCH = join(ROOT, 'plugins', 'self-switch', 'slot', 'claude-launch.ps1')
@@ -197,7 +197,7 @@ let stub
 
 before(() => {
   if (!isWindows) return
-  work = mkdtempSync(join(tmpdir(), 'claude-launch-test-'))
+  work = stubWork('claude-launch-test-')
   stub = compileStub(work)
 })
 

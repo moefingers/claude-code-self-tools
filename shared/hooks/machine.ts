@@ -234,6 +234,7 @@ const ID_FILES = {
   pending: { folder: 'pending', ending: '.json', shape: SESSION_ID },
   selfcheck: { folder: 'selfcheck', ending: '.json', shape: SESSION_ID },
   gate: { folder: 'gate', ending: '.json', shape: SESSION_ID },
+  refused: { folder: 'refused', ending: '.json', shape: SESSION_ID },
   pane: { folder: 'panes', ending: '.json', shape: PANE_TOKEN },
   paneTicket: { folder: 'panes', ending: '.next.json', shape: PANE_TOKEN },
   slotRecord: { folder: 'slots', ending: '.next.json', shape: SLOT_ID },
@@ -302,6 +303,30 @@ export const pokePath = (state: string, id: string): string => idPath(state, 'po
 /** self-wake's marker for conversation `id`. Throws on an id that isn't a session id. */
 export const wakePath = (state: string, id: string): string => idPath(state, 'wake', id)
 
+/**
+ * A refused launch's record: `<state>\refused\<conversation>.json`, what a window or a slot runner writes when it
+ * refuses after the process that asked for it has gone, so the refusal reaches someone other than that window.
+ * `{ v: 1, id, kind: 'resume' | 'start', by, at (milliseconds, a string), folder, why }`. The coordinator reads it;
+ * until then a person, by hand (the README says how).
+ */
+export const refusedPath = (state: string, id: string): string => idPath(state, 'refused', id)
+
+/** A refused record, checked; undefined when it isn't one. Each field is the script's, and this file is trusted no further than its shape. */
+export type RefusedRecord = { readonly id: string; readonly kind: 'resume' | 'start'; readonly by: string; readonly at: number; readonly folder: string; readonly why: string }
+
+export function readRefused(text: string): RefusedRecord | undefined {
+  let raw: unknown
+  try {
+    raw = JSON.parse(text.charCodeAt(0) === 0xfeff ? text.slice(1) : text)
+  } catch {
+    return undefined
+  }
+  if (typeof raw !== 'object' || raw === null) return undefined
+  const { v, id, kind, by, at, folder, why } = raw as Record<string, unknown>
+  if (v !== 1 || typeof id !== 'string' || !SESSION_ID.test(id) || (kind !== 'resume' && kind !== 'start') || typeof by !== 'string' || typeof at !== 'string' || !/^\d{1,16}$/.test(at) || typeof folder !== 'string' || typeof why !== 'string') return undefined
+  return { id, kind, by, at: Number(at), folder, why: oneLine(why, 400) }
+}
+
 // ---------------------------------------------------------------------------------------------
 // Another session's words, as data.
 
@@ -341,6 +366,17 @@ export function oneLine(text: string, max = QUOTED_MAX): string {
  * with a backslash, so the quote can't be closed early. At most QUOTED_MAX characters inside the
  * quotes, escapes included; an escape is never cut in half.
  */
+/**
+ * What a script's output says, fit to show a person: one line, at most 300 characters, and nothing of a raw
+ * PowerShell error record (the `#< CLIXML` and `<Objs ...>` text Windows PowerShell writes to a redirected error
+ * stream), which says nothing a person can use. Empty when nothing is left.
+ */
+export function plainOutput(text: string): string {
+  const cut = text.indexOf('#< CLIXML')
+  const kept = (cut === -1 ? text : text.slice(0, cut)).replace(/<Objs\b[\s\S]*$/, '')
+  return oneLine(kept, 300)
+}
+
 export function quoted(text: string): string {
   let inside = oneLine(text, Number.MAX_SAFE_INTEGER).replace(/[\\\u00ab\u00bb]/g, c => `\\${c}`)
   if (inside.length > QUOTED_MAX) {
@@ -486,13 +522,13 @@ export const REGISTRY_VERSION_MARKERS = ['v', 'schema', 'schemaVersion', 'format
 export const LAUNCH_LINE_TRUSTED_AFTER_MS = 60_000
 
 /** The SHA-256 of plugins/self-switch/slot/claude-slot.ps1, as it is committed. */
-export const SLOT_SCRIPT_SHA256 = '21cd4444cc3c24844df43b02a3497bd48821543a756502a61cb698261c44a999'
+export const SLOT_SCRIPT_SHA256 = 'd68c8f0e0957a26678d3a225f71039dbfdae5e2457629ee180fa50a2b1440b59'
 
 /**
  * The SHA-256 of plugins/self-switch/slot/claude-layout.ps1, as it is committed: a release pin, tested and
  * printed in the README for the person to compare. Nothing runs that script but the person, by hand.
  */
-export const LAYOUT_SCRIPT_SHA256 = '8e02f0c59e8a5817eb581b8b6ff85c7551d3b1c4fa021849a17afa2e80ac2b39'
+export const LAYOUT_SCRIPT_SHA256 = 'd112702a2dcff0322e581667942de2567599c915559deb4bd15dc505c47d0d3c'
 
 /** Input idle for this long before any launch of another process (PM2): a null reading is not idle. */
 export const INPUT_IDLE_MS = 60_000
@@ -826,7 +862,7 @@ export const PSMODULEPATH_RESET =
  * And NO_COLOR, which Claude Code sets to 1 in its tool shells: a session started from one would draw
  * no colour. claude-launch.ps1 clears these (LAUNCH_ENV_CLEAR), and no other; the claude wrapper and the
  * layout script keep the same list (it is the person's own `claude`, and its tabs start idle). Never one a person sets otherwise; never
- * CLAUDE_CODE_DISABLE_BG_SHELL_PRESSURE_REAP (LAUNCH_ENV_SET keeps it on: Mo's choice); never
+ * CLAUDE_CODE_DISABLE_BG_SHELL_PRESSURE_REAP (LAUNCH_ENV_SET keeps it on: the owner's choice); never
  * WT_SESSION or WT_PROFILE_ID (Claude Code's terminal detection reads WT_SESSION on Windows to draw its
  * Unicode prompt and its links: cleared, a resumed session showed `>` and no links).
  */
@@ -860,7 +896,7 @@ export const LAUNCH_ENV_CLEAR: readonly string[] = [...SESSION_MARKERS]
 /**
  * The launch environment, set by claude-launch.ps1 right before claude: transcripts on whatever marker
  * a later Claude Code adds that LAUNCH_ENV_CLEAR doesn't clear yet; and the background-shell
- * memory-pressure reap kept off (Mo's choice, 2026-11-04: the page file carries the load).
+ * memory-pressure reap kept off (the owner's choice, 2026-11-04: the page file carries the load).
  */
 export const LAUNCH_ENV_SET: Readonly<Record<string, string>> = {
   CLAUDE_CODE_FORCE_SESSION_PERSISTENCE: '1',
@@ -891,6 +927,9 @@ export const LEFT_AHEAD_MS = 5000
 
 /** A heartbeat this long after a left record's `at` says the conversation ran again: no waiver. */
 export const LEFT_BEAT_GRACE_MS = 10_000
+
+/** A left record this recent, of the same id, how and process, is the same move: a second writer takes it as written (leftScript). */
+export const LEFT_SAME_MOVE_MS = 30_000
 
 // ---------------------------------------------------------------------------------------------
 // PowerShell the scripts share. Each fragment is lines of Windows PowerShell 5.1.
@@ -1030,9 +1069,15 @@ const TAKE_CLAIM = [
  * listed by Win32_Process even while a handle to it is open (seen in PowerShell 5.1 and 7), so this
  * is for a process that exits between the table's read and the look, or a Windows that lists one.
  */
+/**
+ * Whether a process of the table has exited, by asking it: one that has can still be listed for a moment after
+ * its exit code reads. Anything but "no such process" that can't be read counts as still there. Needs `$p.ProcessId`.
+ */
+export const TEST_EXITED = 'function Test-Exited($p) { $h = $null; try { $h = [Diagnostics.Process]::GetProcessById([int]$p.ProcessId); return $h.HasExited } catch { return ($_.Exception -is [ArgumentException] -or $_.Exception.InnerException -is [ArgumentException]) } finally { if ($null -ne $h) { $h.Dispose() } } }'
+
 export const RECHECK = [
   '$live = $null',
-  'function Test-Exited($p) { $h = $null; try { $h = [Diagnostics.Process]::GetProcessById([int]$p.ProcessId); return $h.HasExited } catch { return ($_.Exception -is [ArgumentException] -or $_.Exception.InnerException -is [ArgumentException]) } finally { if ($null -ne $h) { $h.Dispose() } } }',
+  TEST_EXITED,
   '$procs = @{}',
   'foreach ($p in (Get-CimInstance -ClassName Win32_Process -Property ProcessId, Name, CreationDate, CommandLine)) { $procs[[int]$p.ProcessId] = $p }',
   // The table's time, read as soon as it is: a process started less than 60 s before it keeps L2.
@@ -1103,6 +1148,27 @@ export const GET_CLI = [
   '}',
 ]
 
+/** The one folder, under the temp folder, every test stub claude.exe runs from (scripts/stub.mjs): what Get-Aside passes over. */
+export const TEST_STUB_FOLDER = 'claude-self-tools-test-stubs'
+
+/**
+ * Get-Aside: a claude.exe that holds no conversation and has no registry entry, though it is no Claude Code
+ * command: Claude Code's own daemon (`daemon ...`) and the pty host of a background session (`--bg-pty-host`),
+ * which /fork and /background start, and a test stub, by its folder (TEST_STUB_FOLDER under the temp folder).
+ * Liveness counts it as accounted, so that none refuses every switch on the machine while it runs; the session
+ * count and the floor still count it. A second real install, or one under another config folder, is what the
+ * unaccounted rule guards against, and stays unaccounted: only these three are passed over. Only the answer
+ * leaves the script. Needs ExecutablePath in the table.
+ */
+export const GET_ASIDE = [
+  'function Get-Aside($p) {',
+  '  if ("$($p.Name)".ToLowerInvariant() -ne "claude.exe") { return $false }',
+  `  if ("$($p.ExecutablePath)".StartsWith([IO.Path]::GetTempPath() + '${TEST_STUB_FOLDER}\\', [StringComparison]::OrdinalIgnoreCase)) { return $true }`,
+  String.raw`  if ("$($p.CommandLine)" -notmatch '^\s*("[^"]*"|\S+)\s*(?<rest>.*)$') { return $false }`,
+  String.raw`  return ($Matches["rest"] -match '^(daemon|--bg-pty-host)(\s|$)')`,
+  '}',
+]
+
 /**
  * A claude.exe in its last 70 to 120 ms reads an empty command line, so Get-Cli can't tell it is a
  * Claude Code command, and it would read as unaccounted. Each claude.exe whose command line reads
@@ -1114,7 +1180,7 @@ export const READ_BLANK_AGAIN = [
   'if ($blank.Count -gt 0) {',
   '  Start-Sleep -Milliseconds 300',
   '  foreach ($b in $blank) {',
-  '    $again = Get-CimInstance -ClassName Win32_Process -Filter "ProcessId = $([int]$b.ProcessId)" -Property ProcessId, ParentProcessId, Name, CreationDate, CommandLine',
+  '    $again = Get-CimInstance -ClassName Win32_Process -Filter "ProcessId = $([int]$b.ProcessId)" -Property ProcessId, ParentProcessId, Name, CreationDate, CommandLine, ExecutablePath',
   '    if ($null -eq $again -or $again.CreationDate -ne $b.CreationDate) { $table.Remove([int]$b.ProcessId) } else { $table[[int]$b.ProcessId] = $again }',
   '  }',
   '}',
@@ -1188,7 +1254,9 @@ const READ_HEAVY = [
  */
 const COUNT_SESSIONS = [
   '$room = 0',
-  'foreach ($p in @($table.Values)) { if ($p.Name -ne "claude.exe" -or (Get-Cli $p)) { continue }; $above = Get-Parent $p; if ($null -ne $above -and $above.Name -eq "claude.exe") { continue }; $room++ }',
+  TEST_EXITED,
+  // A claude.exe that has exited and is on its way out of the table is no session: it would refuse at the cap for nothing.
+  'foreach ($p in @($table.Values)) { if ($p.Name -ne "claude.exe" -or (Get-Cli $p) -or (Test-Exited $p)) { continue }; $above = Get-Parent $p; if ($null -ne $above -and $above.Name -eq "claude.exe") { continue }; $room++ }',
 ]
 
 /** The fields of a beacon a reader takes, each checked; `$null` for one not of its shape. */
@@ -1429,12 +1497,13 @@ export function probeScript(input: ProbeInput): string {
     '$errors = New-Object System.Collections.ArrayList',
     // Every process once, by id: everything below reads only this table.
     '$table = @{}',
-    `foreach ($p in (Get-CimInstance -ClassName Win32_Process -Property ProcessId, ParentProcessId, Name, CreationDate, CommandLine${slots ? ', PrivatePageCount' : ''})) { $table[[int]$p.ProcessId] = $p }`,
+    `foreach ($p in (Get-CimInstance -ClassName Win32_Process -Property ProcessId, ParentProcessId, Name, CreationDate, CommandLine, ExecutablePath${slots ? ', PrivatePageCount' : ''})) { $table[[int]$p.ProcessId] = $p }`,
     ...READ_BLANK_AGAIN,
     ...GET_PARENT,
     ...GET_CREATED,
     ...GET_CLASS,
     ...GET_CLI,
+    ...GET_ASIDE,
     ...GET_BEACON,
     ...(slots ? GET_SHA256 : []),
     // This session's claude.exe: the nearest above the probe, then the top of an unbroken run of
@@ -1464,6 +1533,7 @@ export function probeScript(input: ProbeInput): string {
     '  $cls = Get-Class $p',
     '  if ($null -ne $cls) { $o["cls"] = $cls }',
     '  if (Get-Cli $p) { $o["cli"] = $true }',
+    '  if (Get-Aside $p) { $o["aside"] = $true }',
     ...(slots ? ['  if ($p.Name -eq "claude.exe" -and $null -ne $p.PrivatePageCount) { $o["privateBytes"] = [long]$p.PrivatePageCount }'] : []),
     '  $found = @([regex]::Matches("$($p.CommandLine)", $named, "IgnoreCase") | ForEach-Object { $_.Groups[4].Value.ToLowerInvariant() } | Select-Object -Unique)',
     '  if ($found.Count -gt 0) { $o["ids"] = [object[]]$found }',
@@ -1608,6 +1678,8 @@ export type ProcessEntry = {
   readonly cls?: ProcessClass
   readonly ids?: readonly string[]
   readonly cli?: true
+  /** `aside`: a claude.exe of Claude Code's own /fork or /background machinery, or a test stub (Get-Aside): no registry entry, none needed. */
+  readonly aside?: true
   /** A claude.exe's private bytes (Win32_Process.PrivatePageCount), from a probe in slots mode. */
   readonly privateBytes?: number
 }
@@ -1871,9 +1943,10 @@ export function parseProbe(stdout: string): Probe | { error: string } {
       }
     }
     const procs = list(top.procs, 'the processes').map((value): ProcessEntry => {
-      const p = fields(value, 'a process', ['pid', 'ppid', 'created', 'name'], ['cls', 'ids', 'cli', 'privateBytes'])
+      const p = fields(value, 'a process', ['pid', 'ppid', 'created', 'name'], ['cls', 'ids', 'cli', 'aside', 'privateBytes'])
       if ('privateBytes' in p && !isCount(p.privateBytes)) bad("a process's private bytes are not a number")
       if ('cli' in p && (p.cli !== true || typeof p.name !== 'string' || p.name.toLowerCase() !== 'claude.exe')) bad('a process is a Claude Code command but not a claude.exe')
+      if ('aside' in p && (p.aside !== true || typeof p.name !== 'string' || p.name.toLowerCase() !== 'claude.exe')) bad("a process is set aside but not a claude.exe")
       if (!isPid(p.pid) || !isPid(p.ppid) || !isTicks(p.created)) bad('a process has no pid, parent or time as a string')
       if (typeof p.name !== 'string' || (p.name !== '' && !NAME.test(p.name))) bad("a process's name is not a plain name")
       if ('cls' in p && !(PROCESS_CLASSES as readonly unknown[]).includes(p.cls)) bad("a process's class is not one of the fixed list")
@@ -1887,6 +1960,7 @@ export function parseProbe(stdout: string): Probe | { error: string } {
         ...('cls' in p ? { cls: p.cls as ProcessClass } : {}),
         ...(ids !== undefined ? { ids: ids as string[] } : {}),
         ...(p.cli === true ? { cli: true as const } : {}),
+        ...(p.aside === true ? { aside: true as const } : {}),
         ...('privateBytes' in p ? { privateBytes: p.privateBytes as number } : {}),
       }
     })
@@ -2150,7 +2224,8 @@ export function newRegistryKeys(probe: Probe, seen: Set<string>): string[] {
 function underCli(table: Map<number, ProcessEntry>, p: ProcessEntry): boolean {
   let at: ProcessEntry | undefined = p
   for (let i = 0; i < 8 && at !== undefined && isClaude(at); i += 1) {
-    if (at.cli === true) return true
+    // A Claude Code command, or Claude Code's own /fork and /background machinery, or a test stub (Get-Aside).
+    if (at.cli === true || at.aside === true) return true
     at = parentOf(table, at)
   }
   return false
@@ -3338,16 +3413,42 @@ const READ_WT_VERSION = [
 ]
 
 /**
- * Whether the process waited for has gone, by asking it: one that has exited stays in the process table while
- * anyone holds a handle on it, so Get-Process would still find it, and the launch would refuse for nothing. Anything
- * but "no such process" that can't be read counts as still there.
+ * Whether the process waited for has gone, by asking it (Test-Gone), and the wait for it by its handle (Wait-Gone).
+ * A process's exit code reads set as soon as its last user thread has ended, tens of milliseconds before the process
+ * is signaled and dropped from the process table, and longer under load (no ceiling was found), so a wait that stops
+ * at the exit code (Wait-Process) can return with the process still listed, and a look at the table then would find
+ * it and refuse the launch for nothing. WaitForExit waits on the handle being signaled, past that gap. `$created` is
+ * the process's start time (FILETIME as a string): a process id the system gave to another process reads as gone,
+ * since it isn't the one waited for. Anything but "no such process" that can't be read counts as still there.
  */
 export const TEST_GONE = [
-  'function Test-Gone($processId) {',
+  'function Test-Gone($processId, $created) {',
   '  $h = $null',
-  '  try { $h = [Diagnostics.Process]::GetProcessById([int]$processId); return $h.HasExited }',
+  '  try { $h = [Diagnostics.Process]::GetProcessById([int]$processId); if ($created -and [math]::Abs($h.StartTime.ToFileTimeUtc() - [long]$created) -gt 10000) { return $true }; return $h.HasExited }',
   '  catch { return ($_.Exception -is [ArgumentException] -or $_.Exception.InnerException -is [ArgumentException]) }',
   '  finally { if ($null -ne $h) { $h.Dispose() } }',
+  '}',
+  'function Wait-Gone($processId, $created, $seconds) {',
+  '  $h = $null',
+  '  try { $h = [Diagnostics.Process]::GetProcessById([int]$processId); if (-not $created -or [math]::Abs($h.StartTime.ToFileTimeUtc() - [long]$created) -le 10000) { [void]$h.WaitForExit([int]$seconds * 1000) } } catch { } finally { if ($null -ne $h) { $h.Dispose() } }',
+  '  return (Test-Gone $processId $created)',
+  '}',
+]
+
+/** How long the wait for an old process that outlasted the first wait looks each time, in seconds. */
+export const WAIT_POLL_SECONDS = 30
+
+/**
+ * Writes the refused record of `$id` (read back by readRefused) to `$refusedPath`, whole: never throws, so what its
+ * caller says next is said. Needs `$id`, `$by`, `$folder`, `$refusedPath`, `$refusedKind`.
+ */
+const WRITE_REFUSED = [
+  'function Write-Refused($why) {',
+  '  try {',
+  '    $final = $refusedPath',
+  '    $text = [ordered]@{ v = 1; id = $id; kind = $refusedKind; by = $by; at = [string][DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds(); folder = $folder; why = [string]$why } | ConvertTo-Json -Compress',
+  ...WRITE_WHOLE.map(line => `    ${line}`),
+  '  } catch { }',
   '}',
 ]
 
@@ -3367,6 +3468,7 @@ function windowScript(v: { id: string; kind: 'resume' | 'start'; name?: string; 
   // A line that runs as it is printed: the script's whole path, and the folder quoted, whatever it holds
   // (neither can hold a quote). The copy kept for use by hand: the one this window pins may be what changed.
   const byHand = resume ? `"& '" + $handPath + "' -Resume " + $id + " -Dir '" + $folder + "'"` : `"& '" + $handPath + "' -Start " + $id + " -Name " + $name + " -Dir '" + $folder + "'"`
+  const refusedAt = literal(idPath(v.state, 'refused', v.id))
   // The numbers were checked whole (leftRecheck) before they reach here.
   const leftArgs = v.left === undefined ? '' : 'size' in v.left ? ` -LeftSize '${v.left.size}' -LeftMtime '${v.left.mtime}'` : ` -LeftExitAt '${v.left.exitAt}'`
   const runs = resume ? `& $launchPath -Resume $id -Dir $folder -ConfigDir $configDirs${leftArgs}` : '& $launchPath -Start $id -Name $name -Dir $folder -ConfigDir $configDirs'
@@ -3387,16 +3489,22 @@ function windowScript(v: { id: string; kind: 'resume' | 'start'; name?: string; 
     `$handPath = ${literal(launchHandPath(v.state))}`,
     ...GET_SHA256,
     ...RELEASE_CLAIM,
+    // The record of a refusal, for whoever comes looking (the coordinator, or a person, by hand): this
+    // window may be the only place it is said. Written whole, and it never throws.
+    `$refusedPath = ${refusedAt}`,
+    `$refusedKind = '${resume ? 'resume' : 'start'}'`,
+    ...WRITE_REFUSED,
     ...(v.waitFor === undefined
       ? []
       : [
+          ...TEST_GONE,
           `Write-Host ("Waiting for the old Claude Code process (${v.waitFor.pid}) to exit, then ${resume ? 'resuming' : 'starting'} session " + $id + " here.")`,
-          `Wait-Process -Id ${v.waitFor.pid} -Timeout ${WAIT_SECONDS} -ErrorAction SilentlyContinue`,
+          `$gone = Wait-Gone ${v.waitFor.pid} '${v.waitFor.created}' ${WAIT_SECONDS}`,
+          `if (-not $gone) { Write-Host "It has not exited after ${WAIT_SECONDS / 60} minutes. This window keeps waiting, and ${resume ? 'resumes' : 'starts'} the session when it goes. Close this window to give up." }`,
+          // A process that outlasts the first wait: looked at again until it goes (the claim and the last look below still decide).
+          `while (-not $gone) { $gone = Wait-Gone ${v.waitFor.pid} '${v.waitFor.created}' ${WAIT_POLL_SECONDS}; if (-not $gone) { Start-Sleep -Seconds 2 } }`,
         ]),
     '$refusal = $null',
-    ...(v.waitFor === undefined
-      ? []
-      : [...TEST_GONE, `if (-not (Test-Gone ${v.waitFor.pid})) { $refusal = "The old process is still running, so the session is not resumed here: two copies would both write to it." }`]),
     // Right before claude: whether anything holds the conversation now (L1, L2), and the left record's stat.
     'if ($null -eq $refusal) {',
     '  $live = $null',
@@ -3423,6 +3531,7 @@ function windowScript(v: { id: string; kind: 'resume' | 'start'; name?: string; 
     // A window that refuses gives the claim back, while it still names this window, so the conversation
     // doesn't read as held for 15 minutes on nothing (N5).
     'if ($null -ne $refusal) {',
+    '  Write-Refused $refusal',
     '  Write-Host $refusal',
     `  Write-Host ("Once it is safe, resume it yourself: " + ${byHand})`,
     '  Release-Claim',
@@ -3435,6 +3544,7 @@ function windowScript(v: { id: string; kind: 'resume' | 'start'; name?: string; 
     `  ${runs}`,
     '  $code = $LASTEXITCODE',
     '} catch {',
+    `  Write-Refused ("claude-launch.ps1 stopped on an error: " + $_.Exception.Message)`,
     `  Write-Host ("claude-launch.ps1 stopped on an error, so the session may not have ${resume ? 'resumed' : 'started'} here: " + $_.Exception.Message)`,
     `  Write-Host ("Once it is safe, ${resume ? 'resume' : 'start'} it yourself: " + ${byHand})`,
     '  Release-Claim',
@@ -3443,6 +3553,8 @@ function windowScript(v: { id: string; kind: 'resume' | 'start'; name?: string; 
     '}',
     // An error, or an end within seconds: the resume didn't take. Say how to resume by hand, and wait.
     `if ($code -ne 0 -or ((Get-Date) - $started).TotalSeconds -lt ${SHORT_RUN_SECONDS}) {`,
+    // The launcher refused (its exit 2: its last look found the conversation open elsewhere, or no claude.exe): recorded.
+    '  if ($code -eq 2) { Write-Refused "the launcher refused it: its last look found the conversation open elsewhere, or could not tell" }',
     '  Write-Host "Claude Code ended (exit code $code)."',
     `  Write-Host ("If the session did not ${resume ? 'resume' : 'start'} here, do it yourself: " + ${byHand})`,
     // The launcher refused (its exit 2: nothing ran), or what ran has ended: this launch's own claim, so no one else's.
@@ -4674,10 +4786,16 @@ type JobClass = 'shell' | 'build' | 'heavy-slot'
 
 /** What each job class is, as a blocker names it. */
 const JOB_WHAT: Readonly<Record<JobClass, (p: ProcessEntry) => string>> = {
-  shell: p => `the background shell ${p.name} ${p.pid} runs under this session (a background job of the Bash, PowerShell or Monitor tool)`,
+  shell: p => `the shell ${p.name} ${p.pid} runs under this session (a background job of the Bash, PowerShell or Monitor tool, or a tool call still finishing)`,
   build: p => `${p.name} ${p.pid} under this session is a build, test or lint`,
   'heavy-slot': p => `a heavy-slot job (${p.name} ${p.pid}) runs under this session`,
 }
+
+/**
+ * How to clear a shell under the session: stop the job, or, when no background job was started, wait: a tool call
+ * still finishing reads the same (self-check's check at a resume runs one for a few seconds).
+ */
+const SHELL_WAY = "stop it with TaskStop (the task id its Bash, PowerShell or Monitor call gave), or let it finish; if you started no background job, it is a tool call still finishing (self-check's check at a resume runs one): call again in a moment"
 
 /** A process's job class, or undefined when its class is none of them. */
 const jobClass = (p: ProcessEntry): JobClass | undefined => (p.cls === 'shell' || p.cls === 'build' || p.cls === 'heavy-slot' ? p.cls : undefined)
@@ -4739,7 +4857,7 @@ export function exitBlockers(input: ExitInputs): ExitBlocker[] {
           kind: 'shell',
           id: String(p.pid),
           what: JOB_WHAT[jobClass(p) ?? 'shell'](p),
-          howToStop: 'stop it with TaskStop (the task id its Bash, PowerShell or Monitor call gave), or let it finish',
+          howToStop: (jobClass(p) ?? 'shell') === 'shell' ? SHELL_WAY : 'stop it with TaskStop (the task id its Bash, PowerShell or Monitor call gave), or let it finish',
         })
       }
     }
@@ -4890,7 +5008,7 @@ export async function runProbe($: EngineInterface, target: { readonly powershell
     const call = powershellCall(target.powershell, probeScript({ ids: [target.id], configDirs: [] }))
     const run = await $.process.run(call.argv, { stdin: call.stdin, timeoutMs: PROBE_MS })
     if (run.exitCode !== 0) {
-      const err = oneLine(run.stderr, 300)
+      const err = plainOutput(run.stderr)
       return `it exited ${run.exitCode}${err === '' ? '' : `: ${err}`}`
     }
     const probe = parseProbe(run.stdout)
@@ -5122,7 +5240,19 @@ export function leftScript(input: LeftInput): string {
     '$record["mac"] = $mac',
     '$final = $leftPath',
     '$text = $record | ConvertTo-Json -Compress -Depth 4',
-    ...WRITE_WHOLE,
+    // The same move's record already there (the coordinator's go and this plugin each write one for an in-place go,
+    // whichever gets here first): it stands, and this one counts as written. The same move: the same id and how, by
+    // this very process, within LEFT_SAME_MOVE_MS, over the same transcript size and time, and naming the go this
+    // write names, if any. Any other record is replaced, as it always is; one that appears between the look and the
+    // move (the move then fails: the file exists) is looked at again, and replaced when it isn't the same move.
+    `function Test-SameLeft { $e = $null; try { $e = Get-Content -LiteralPath $leftPath -Raw -Encoding UTF8 | ConvertFrom-Json } catch { return $false }; if ($null -eq $e -or $null -eq $e.transcript -or $e.id -cne $id -or $e.how -cne $how -or "$($e.pid)" -cne $f.pid -or "$($e.created)" -cne $f.created -or "$($e.transcript.size)" -cne $f.size -or "$($e.transcript.mtime)" -cne $f.mtime -or ($go -ne '' -and "$($e.go)" -cne $go)) { return $false }; $apart = $null; try { $apart = [long]$f.at - [long]"$($e.at)" } catch { return $false }; return ($apart -ge 0 -and $apart -le ${LEFT_SAME_MOVE_MS}) }`,
+    'if (Test-SameLeft) { "left " + $id; exit 0 }',
+    'try {',
+    ...WRITE_WHOLE.map(line => `  ${line}`),
+    '} catch {',
+    '  if (Test-SameLeft) { "left " + $id; exit 0 }',
+    ...WRITE_WHOLE.map(line => `  ${line}`),
+    '}',
     '"left " + $id',
   ].join('\r\n')
 }

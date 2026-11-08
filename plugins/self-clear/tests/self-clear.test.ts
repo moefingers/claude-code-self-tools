@@ -273,3 +273,11 @@ test('a subagent that has not ended holds, whatever its status: an idle teammate
     expect((await $.tool.call({ tool: TOOL, why: 'complete', handoff: 'Go on.' })).deny).toBeUndefined()
   }
 })
+
+test("the owner's design: the description says a clear runs only when the session is idle, why, and what a turn that starts first does", async ($, on) => {
+  const { described } = engine(on)
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  const said = described.join(' ')
+  expect(said).toContain("It can run only when the session is idle: Claude Code queues a plugin's command behind anything already waiting (a message typed during this turn, a background task's notification) and has no slot between turns ahead of them. A turn that starts first cancels the clear")
+  expect(said).toContain('under a nonstop stream of work and notifications it may not run for a long time')
+})

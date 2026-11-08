@@ -176,7 +176,7 @@ describe('launch(): one powershellCall, the script on standard input', () => {
     expect(inner.lastIndexOf('try {', run)).toBeGreaterThan(inner.indexOf('$started = Get-Date'))
     const caught = inner.indexOf('} catch {', run)
     expect(caught).toBeGreaterThan(run)
-    expect(inner.slice(caught)).toMatch(/^\} catch \{\r\n  Write-Host \("claude-launch\.ps1 stopped on an error, so the session may not have resumed here: " \+ \$_\.Exception\.Message\)\r\n  Write-Host \("Once it is safe, resume it yourself: " \+ "& '" \+ \$handPath \+ "' -Resume " \+ \$id \+ " -Dir '" \+ \$folder \+ "'"\)\r\n  Release-Claim\r\n  Read-Host "Press Enter to close this window" \| Out-Null\r\n  exit 1\r\n\}/)
+    expect(inner.slice(caught)).toMatch(/^\} catch \{\r\n  Write-Refused \("claude-launch\.ps1 stopped on an error: " \+ \$_\.Exception\.Message\)\r\n  Write-Host \("claude-launch\.ps1 stopped on an error, so the session may not have resumed here: " \+ \$_\.Exception\.Message\)\r\n  Write-Host \("Once it is safe, resume it yourself: " \+ "& '" \+ \$handPath \+ "' -Resume " \+ \$id \+ " -Dir '" \+ \$folder \+ "'"\)\r\n  Release-Claim\r\n  Read-Host "Press Enter to close this window" \| Out-Null\r\n  exit 1\r\n\}/)
   })
 
   test('no environment is changed but PSModulePath: the launch environment is claude-launch.ps1\'s alone', () => {
@@ -222,7 +222,7 @@ describe('launch(): one powershellCall, the script on standard input', () => {
       expect(INSTALL_LAUNCHER.join('\n')).not.toMatch(/WriteAllBytes\(\$path|WriteAllText\(\$path|Set-Content|Out-File/)
       const inner = innerOf(script)
       expect(inner.indexOf(`(Get-Sha256 $launchPath) -cne '${LAUNCH_SCRIPT_SHA256}'`)).toBeLessThan(inner.indexOf('& $launchPath'))
-      expect(inner.indexOf(`(Get-Sha256 $launchPath) -cne '${LAUNCH_SCRIPT_SHA256}'`)).toBeGreaterThan(inner.indexOf('Wait-Process'))
+      expect(inner.indexOf(`(Get-Sha256 $launchPath) -cne '${LAUNCH_SCRIPT_SHA256}'`)).toBeGreaterThan(inner.indexOf('$gone = Wait-Gone'))
       expect(script).toContain('[Security.Cryptography.SHA256]::Create()')
       expect(script).not.toContain('Get-FileHash')
     }
@@ -255,15 +255,17 @@ describe('the checks, the claim and the place, in one run, in that order', () =>
 
   test('a launch that waits takes its last look after the wait: in the window, RECHECK and the folder and the claim, then claude-launch.ps1', () => {
     const inner = innerOf(SCRIPTS[0]?.[1] ?? '')
-    const wait = inner.indexOf('Wait-Process -Id 100 -Timeout 600 -ErrorAction SilentlyContinue')
+    // F1: waited for by its handle, then looked at again until it goes (S3): no refusal for one still running.
+    const wait = inner.search(/\$gone = Wait-Gone 100 '\d+' 600\r\n/)
     expect(wait).toBeGreaterThan(0)
-    expect(inner.indexOf('if (-not (Test-Gone 100)) { $refusal = "The old process is still running')).toBeGreaterThan(wait)
+    expect(inner.indexOf('while (-not $gone) { $gone = Wait-Gone 100 ')).toBeGreaterThan(wait)
+    expect(inner).not.toContain('The old process is still running')
     // Read from the wait on: RECHECK has lines as plain as a closing brace, which the functions above it hold too.
     for (const line of RECHECK) expect(inner.indexOf(`    ${line}`, wait)).toBeGreaterThan(wait)
     expect(inner.indexOf('$lock.by -cne $by')).toBeGreaterThan(inner.indexOf(`    ${RECHECK[RECHECK.length - 1]}`, wait))
     expect(inner.indexOf('& $launchPath')).toBeGreaterThan(inner.indexOf('$lock.by -cne $by'))
     // waitForExit skipped: no wait, no last look after it. A test that plants it must fail here.
-    expect(innerOf(launchScriptText(noWait({ checks: ANOTHER })))).not.toContain('Wait-Process')
+    expect(innerOf(launchScriptText(noWait({ checks: ANOTHER })))).not.toContain('Wait-Gone ')
   })
 
   test('a launch that does not wait checks NOT LIVE now (and the left record), before the claim; one that waits is refused that check', () => {

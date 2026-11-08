@@ -108,13 +108,37 @@ function Get-Sha256($path) {
   try { return [BitConverter]::ToString($hasher.ComputeHash([IO.File]::ReadAllBytes($path))).Replace("-", "").ToLowerInvariant() } finally { $hasher.Dispose() }
 }
 
-# Whether the process waited for has gone, by asking it: TEST_GONE in the plugins' machine code, line for line.
-function Test-Gone($processId) {
+# Whether the process waited for has gone, by asking it (Test-Gone), and the wait for it by its handle (Wait-Gone):
+# TEST_GONE in the plugins' machine code, line for line. An exit code reads set tens of milliseconds before a process
+# is signaled and dropped from the table, so Wait-Process alone can return with it still listed.
+function Test-Gone($processId, $created) {
   $h = $null
-  try { $h = [Diagnostics.Process]::GetProcessById([int]$processId); return $h.HasExited }
+  try { $h = [Diagnostics.Process]::GetProcessById([int]$processId); if ($created -and [math]::Abs($h.StartTime.ToFileTimeUtc() - [long]$created) -gt 10000) { return $true }; return $h.HasExited }
   catch { return ($_.Exception -is [ArgumentException] -or $_.Exception.InnerException -is [ArgumentException]) }
   finally { if ($null -ne $h) { $h.Dispose() } }
 }
+function Wait-Gone($processId, $created, $seconds) {
+  $h = $null
+  try { $h = [Diagnostics.Process]::GetProcessById([int]$processId); if (-not $created -or [math]::Abs($h.StartTime.ToFileTimeUtc() - [long]$created) -le 10000) { [void]$h.WaitForExit([int]$seconds * 1000) } } catch { } finally { if ($null -ne $h) { $h.Dispose() } }
+  return (Test-Gone $processId $created)
+}
+
+# The record of a refusal, for whoever comes looking: this tab may be the only place it is said, and nobody may be
+# watching it (a refused restart otherwise tells no one). <state>\refused\<conversation>.json: the coordinator
+# reads it; a person, by hand. Whole, and it never throws.
+function Write-Refused($id, $by, $kind, $folder, $said) {
+  try {
+    $final = Join-Path $state ('refused\' + $id + '.json')
+    $text = [ordered]@{ v = 1; id = $id; kind = $kind; by = $by; at = [string][DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds(); folder = [string]$folder; why = [string]$said } | ConvertTo-Json -Compress
+    $temp = $final + '.' + [guid]::NewGuid().ToString() + '.tmp'
+    [void][IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($final))
+    [IO.File]::WriteAllText($temp, $text)
+    try { if ([IO.File]::Exists($final)) { [IO.File]::Replace($temp, $final, [NullString]::Value) } else { [IO.File]::Move($temp, $final) } }
+    catch { [IO.File]::Delete($temp); throw }
+  } catch { }
+}
+
+function Test-Exited($p) { $h = $null; try { $h = [Diagnostics.Process]::GetProcessById([int]$p.ProcessId); return $h.HasExited } catch { return ($_.Exception -is [ArgumentException] -or $_.Exception.InnerException -is [ArgumentException]) } finally { if ($null -ne $h) { $h.Dispose() } } }
 
 # What this process runs: the file as it starts, once. A newer copy over it later changes nothing here.
 $ownSha = $null
@@ -285,7 +309,8 @@ function Get-FloorWhy($memory) {
     foreach ($p in (Get-CimInstance -ClassName Win32_Process -Property ProcessId, ParentProcessId, Name, CreationDate, CommandLine)) { $all[[int]$p.ProcessId] = $p }
     $count = 0
     foreach ($p in $all.Values) {
-      if ($p.Name -ne 'claude.exe' -or (Get-Cli $p)) { continue }
+      # A Claude Code that has exited and is on its way out of the table is no session: it would refuse at the cap for nothing.
+      if ($p.Name -ne 'claude.exe' -or (Get-Cli $p) -or (Test-Exited $p)) { continue }
       $up = $all[[int]$p.ParentProcessId]
       if ($null -ne $up -and $up.Name -eq 'claude.exe' -and $up.CreationDate -le $p.CreationDate) { continue }
       $count++
@@ -364,6 +389,7 @@ function Refuse-Record($text, $said) {
   if ($null -ne $r) { $id = if ($null -ne $r.start) { $r.start } else { $r.resume } }
   $named = $id -is [string] -and $id -cmatch $SessionId
   if ($named) { Give-Back $id ('slot:' + $slotId) }
+  if ($named) { Write-Refused $id ('slot:' + $slotId) $(if ($null -ne $r.start) { 'start' } else { 'resume' }) $r.folder $said }
   Write-Host $said
   if ($named) { Say-ByHand $id $(if ($null -ne $r.start) { "$($r.name)" } else { $null }) $r.folder }
 }
@@ -468,7 +494,7 @@ function Get-Asked {
     elseif (-not $LeftSize -or -not $LeftMtime -or $LeftSize -cnotmatch $Whole -or $LeftMtime -cnotmatch $Whole) { $why = '-LeftSize and -LeftMtime go together, whole numbers' }
     else { $leftArgs = @{ LeftSize = $LeftSize; LeftMtime = $LeftMtime } }
   }
-  # The process this tab replaces, by its id and its start: it is waited for, up to 10 minutes.
+  # The process this tab replaces, by its id and its start: waited for, however long it takes (the claim and the last look below still decide).
   if ($null -eq $why -and $WaitFor) {
     if (-not $Resume -or $WaitFor -cnotmatch $ProcessRef) { $why = '-WaitFor goes with -Resume, as <pid>-<created>' }
     else {
@@ -476,8 +502,9 @@ function Get-Asked {
       $old = Get-CimInstance -ClassName Win32_Process -Filter "ProcessId = $([long]$parts[0])" -Property ProcessId, CreationDate
       if ($null -ne $old -and [math]::Abs($old.CreationDate.ToFileTimeUtc() - [long]$parts[1]) -le 10000) {
         Write-Host ('Waiting for the old Claude Code process (' + $parts[0] + ') to exit, then resuming here.')
-        Wait-Process -Id ([int]$parts[0]) -Timeout $WaitSeconds -ErrorAction SilentlyContinue
-        if (-not (Test-Gone $parts[0])) { $why = 'the old process is still running' }
+        $gone = Wait-Gone $parts[0] $parts[1] $WaitSeconds
+        if (-not $gone) { Write-Host ('It has not exited after ' + [int]($WaitSeconds / 60) + ' minutes. This tab keeps waiting, and resumes the session when it goes. Close this tab to give up.') }
+        while (-not $gone) { $gone = Wait-Gone $parts[0] $parts[1] 30; if (-not $gone) { Start-Sleep -Seconds 2 } }
       }
     }
   }
@@ -500,6 +527,7 @@ function Get-Asked {
   if ($null -ne $why) {
     # Its claim back first: once this is said, the lock is free.
     if ($id -cmatch $SessionId -and $Claim -cmatch $LaunchClaim) { Give-Back $id $Claim }
+    if ($id -cmatch $SessionId) { Write-Refused $id $Claim $(if ($Start) { 'start' } else { 'resume' }) $here ('This tab did not run what it was opened for: ' + $why + '.') }
     Write-Host ('This tab did not run what it was opened for: ' + $why + '.')
     if ($id -cmatch $SessionId) { Say-ByHand $id $(if ($Start) { $Name } else { $null }) $here }
     return $null
@@ -565,6 +593,7 @@ function Start-Claude($run) {
   $heldId = if ($run.ContainsKey('Resume')) { $run.Resume } elseif ($run.ContainsKey('Start')) { $run.Start } else { $null }
   $gaveBack = $null -ne $heldId -and ($null -ne $threw -or ($held -cmatch $LaunchClaim -and $code -ne 0))
   if ($gaveBack) { Give-Back $heldId $held }
+  if ($null -ne $heldId -and ($null -ne $threw -or $code -eq 2)) { Write-Refused $heldId $held $(if ($run.ContainsKey('Start')) { 'start' } else { 'resume' }) $run.Dir $(if ($null -ne $threw) { 'claude-launch.ps1 stopped on an error: ' + $threw } else { 'the launcher refused it: its last look found the conversation open elsewhere, or could not tell' }) }
   if ($null -ne $threw) { Write-Host ('claude-launch.ps1 stopped on an error, so Claude Code may not have started here: ' + $threw) }
   if ($gaveBack) { Say-ByHand $heldId $(if ($run.ContainsKey('Start')) { $run.Name } else { $null }) $run.Dir }
   Write-Beacon 'idle'

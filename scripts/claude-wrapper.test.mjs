@@ -18,6 +18,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { after, before, describe, test } from 'node:test'
 import { pathToFileURL } from 'node:url'
+import { stubWork } from './stub.mjs'
 import { ROOT } from './sync-shared.mjs'
 
 const isWindows = process.platform === 'win32'
@@ -541,7 +542,7 @@ function looksRight(answers) {
 
 before(() => {
   if (!isWindows) return
-  work = mkdtempSync(join(tmpdir(), 'claude-wrapper-test-'))
+  work = stubWork('claude-wrapper-test-')
   stub = join(work, 'claude.exe')
   // Windows PowerShell's Add-Type compiles the stub with the .NET Framework's own compiler.
   const compile = spawnSync(

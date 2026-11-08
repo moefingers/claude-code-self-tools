@@ -403,7 +403,18 @@ const CHECKS = {
       return w.slice(from, end).split("''").join("'")
     })()
     assert.ok(inner.includes(`$handPath = '${STATE}\\claude-launch.ps1'`))
-    assert.ok(inner.includes('if (-not (Test-Gone 100)) { $refusal = ') && !inner.includes('Get-Process -Id'), 'the old process asked whether it has exited')
+    // F1: waited for by its handle and start time (WaitForExit, past the gap between the exit code and the signal), asked
+    // whether it has gone, never looked for in the table; and a process that outlasts the first wait looked at again until it goes.
+    assert.ok(/\$gone = Wait-Gone 100 '\d+' 600\r\n/.test(inner) && !inner.includes('Wait-Process') && !inner.includes('Get-Process -Id'), 'the old process waited for by its handle and asked whether it has exited')
+    assert.ok(inner.includes('[void]$h.WaitForExit([int]$seconds * 1000)'), 'WaitForExit, not Wait-Process')
+    assert.ok(inner.includes('if ($created -and [math]::Abs($h.StartTime.ToFileTimeUtc() - [long]$created) -gt 10000) { return $true }'), 'a pid given to another process is not the one waited for')
+    assert.ok(/while \(-not \$gone\) \{ \$gone = Wait-Gone 100 '\d+' 30; if \(-not \$gone\) \{ Start-Sleep -Seconds 2 \} \}/.test(inner), 'a process that outlasts the first wait: looked at again until it goes')
+    assert.ok(!inner.includes('The old process is still running'), 'no refusal for a process still running: it keeps waiting')
+    // The refused record: every refusal and every error the window says is written for whoever comes looking.
+    assert.ok(/Write-Refused \$refusal\r\n {2}Write-Host \$refusal/.test(inner), 'a refusal is recorded before it is said')
+    assert.ok(inner.includes('  Write-Refused ("claude-launch.ps1 stopped on an error: " + $_.Exception.Message)'), 'an error is recorded')
+    assert.ok(inner.includes('  if ($code -eq 2) { Write-Refused '), "the launcher's refusal is recorded")
+    assert.ok(inner.includes(`$refusedPath = '${STATE}\\refused\\`), 'at its id-shaped path')
     assert.ok(inner.includes(`"& '" + $handPath + "' -Resume " + $id + " -Dir '" + $folder + "'"`), 'N2')
     assert.ok(/Write-Host \$refusal\r\n.*\r\n {2}Release-Claim\r\n {2}Read-Host/.test(inner), 'N5: the refusal gives the claim back before it waits')
     assert.ok(inner.includes('function Release-Claim {'))
@@ -674,7 +685,12 @@ const FAULTS = [
   ['the projects scan limited to one config folder', 'freshness', "  'foreach ($dir in $configDirs) {',\n  '  $projects = Join-Path $dir \"projects\"',\n  '  if ($null -eq $fresh", "  'foreach ($dir in @($configDirs[0])) {',\n  '  $projects = Join-Path $dir \"projects\"',\n  '  if ($null -eq $fresh"],
   ["relock's by check removed", 'relock', "`    if ($null -eq $lock -or $lock.by -cne '${by}') { $answer = 'not-ours' }`,", "`    if ($null -eq $lock) { $answer = 'not-ours' }`,"],
   ['the by-hand line back to a bare name', 'windowRefusal', `\`"& '" + $handPath + "' -Resume " + $id + " -Dir '" + $folder + "'"\``, `'"claude-launch.ps1 -Resume " + $id + " -Dir " + $folder'`],
-  ['the old process looked for in the table, in the window', 'windowRefusal', 'if (-not (Test-Gone ${v.waitFor.pid})) {', 'if (Get-Process -Id ${v.waitFor.pid} -ErrorAction SilentlyContinue) {'],
+  ['F1: the old process waited for by Wait-Process again, in the window', 'windowRefusal', "`$gone = Wait-Gone ${v.waitFor.pid} '${v.waitFor.created}' ${WAIT_SECONDS}`,", "`Wait-Process -Id ${v.waitFor.pid} -Timeout ${WAIT_SECONDS} -ErrorAction SilentlyContinue; $gone = -not (Get-Process -Id ${v.waitFor.pid} -ErrorAction SilentlyContinue)`,"],
+  ['F1: WaitForExit swapped for a wait that stops at the exit code', 'windowRefusal', "[void]$h.WaitForExit([int]$seconds * 1000)", "Wait-Process -Id $processId -Timeout $seconds -ErrorAction SilentlyContinue"],
+  ['F1: the start time not checked: a reused pid waited for', 'windowRefusal', "if ($created -and [math]::Abs($h.StartTime.ToFileTimeUtc() - [long]$created) -gt 10000) { return $true }; ", ''],
+  ['S3: a window that gives up after its first wait', 'windowRefusal', "          `while (-not $gone) { $gone = Wait-Gone ${v.waitFor.pid} '${v.waitFor.created}' ${WAIT_POLL_SECONDS}; if (-not $gone) { Start-Sleep -Seconds 2 } }`,\n", ''],
+  ['S3: a refusal no one but the window hears of', 'windowRefusal', "    '  Write-Refused $refusal',\n", ''],
+  ['S3: an error no one but the window hears of', 'windowRefusal', "    `  Write-Refused (\"claude-launch.ps1 stopped on an error: \" + $_.Exception.Message)`,\n", ''],
   ['a refusing window keeping the claim', 'windowRefusal', "  `  Write-Host (\"Once it is safe, resume it yourself: \" + ${byHand})`,\n    '  Release-Claim',\n".replace('  `  Write', '    `  Write'), "    `  Write-Host (\"Once it is safe, resume it yourself: \" + ${byHand})`,\n"],
   ['a window withdrawn left waiting', 'windowRefusal', `          '  if ($transport -eq "window" -and $null -ne $window) { try { $window.Kill() } catch { } }',\n`, ''],
   ['GO_VIA shipped as the trampoline', 'trampoline', "export const GO_VIA: 'trampoline' | 'direct' = 'direct'", "export const GO_VIA: 'trampoline' | 'direct' = 'trampoline'"],

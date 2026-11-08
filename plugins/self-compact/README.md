@@ -11,7 +11,9 @@ Lets a session compact its own conversation at the break between two pieces of w
 
 ## How it behaves
 
-- **The compaction waits for the turn to end.** Claude Code can't compact while a turn is running, so the call queues it. If a message you sent starts a new turn first, the compaction waits for that turn to end as well.
+- **The compaction runs as the turn ends.** Claude Code can't compact while a turn is running, so the call queues it. By default (`when: "between-turns"`) it compacts from the turn's end itself, ahead of anything queued meanwhile (a message you typed, a background task's notification), which then runs on the compacted conversation; nothing is lost. If a queued turn has started by then, it compacts at that turn's end.
+- **Or once the session is idle** (`when: "idle"`): half a second after a turn ends, and only if no turn has started by then, so anything queued goes first. Under a steady stream of work and notifications that can be a long way off.
+- **Only compacting can run between turns.** Claude Code queues a plugin's command (`/exit`, `/clear`, `/resume`, `/reload-plugins`, `/mcp`, `/rename`) behind anything waiting, at the lowest priority, so the other `_after_turn` tools run when the session is idle, and say so.
 - **With `resume`, the session carries on.** Once compacted, it sends itself the `resume` message, which starts a new turn. If Claude Code skips the compaction, the message is still sent and says so. Without `resume`, the session waits for your next message.
 - **One resume per compaction.** A resumed turn compacts again only if it calls the tool again.
 - **An interrupted turn cancels it**, with a notice.

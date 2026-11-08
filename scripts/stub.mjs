@@ -5,7 +5,8 @@
 // its parents finds the stub. It never runs Claude Code, and refuses a USERPROFILE or LOCALAPPDATA
 // outside the test's temporary folder. Not a test file: scripts/*.test.mjs import it.
 import { spawn, spawnSync } from 'node:child_process'
-import { existsSync, mkdtempSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { ROOT } from './sync-shared.mjs'
@@ -15,8 +16,20 @@ const machine = await import(pathToFileURL(join(ROOT, 'shared', 'hooks', 'machin
 export const SYSTEM_ROOT = process.env.SystemRoot ?? 'C:\\Windows'
 export const WINDOWS_POWERSHELL = join(SYSTEM_ROOT, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe')
 
-/** The stub, compiled into `dir` as claude.exe; its path. */
+/**
+ * A test's own temporary folder, under the one folder every stub claude.exe runs from (machine.TEST_STUB_FOLDER in
+ * the temp folder): the probe sets a claude.exe there aside (Get-Aside), so a stub that runs while a real session
+ * switches doesn't refuse that switch as an unaccounted Claude Code.
+ */
+export function stubWork(prefix) {
+  const root = join(tmpdir(), machine.TEST_STUB_FOLDER)
+  mkdirSync(root, { recursive: true })
+  return mkdtempSync(join(root, prefix))
+}
+
+/** The stub, compiled into `dir` as claude.exe; its path. A dir outside stubWork's folder is refused: the stub would hold up every switch while it runs. */
 export function compileStub(dir) {
+  if (!dir.toLowerCase().startsWith(join(tmpdir(), machine.TEST_STUB_FOLDER).toLowerCase() + '\\')) throw new Error(`a stub claude.exe goes under ${join(tmpdir(), machine.TEST_STUB_FOLDER)} (stubWork), not ${dir}`)
   const stub = join(dir, 'claude.exe')
   const source = join(ROOT, 'scripts', 'claude-wrapper-stub.cs')
   const compile = spawnSync(WINDOWS_POWERSHELL, ['-NoProfile', '-NonInteractive', '-Command', `Add-Type -TypeDefinition ([IO.File]::ReadAllText('${source}')) -OutputAssembly '${stub}' -OutputType ConsoleApplication`], { encoding: 'utf8', windowsHide: true })

@@ -114,6 +114,8 @@ type Options = {
   liveResume?: TestDollar
   /** self-wake in this session (its tool listed), and its marker's text for this conversation, if there is one. */
   wake?: { present: boolean; marker?: string }
+  /** What the left record's script answers, in place of writing one: its output, its error output and its exit code. */
+  leftOut?: { stdout: string; stderr: string; exitCode: number }
 }
 
 /** The engine beneath the plugin; and what it was asked to run, write and say. */
@@ -142,6 +144,7 @@ function engine(
     wake = { present: false },
     crons = [],
     markOn,
+    leftOut,
   }: Options = {},
 ) {
   const runs: Run[] = []
@@ -151,6 +154,7 @@ function engine(
   const prompts: { text: string; origin: unknown }[] = []
   const toasts: string[] = []
   const logs: string[] = []
+  const screen: string[] = []
   const writes: { path: string; text: string }[] = []
   const described: string[] = []
   const world = { id, agents, probe: probe ?? machine(), gate, worktrees: git.worktrees ?? [REPO], diffs: {} as Record<string, string>, untrackedTime: NOW - HOUR, cwd, wake, crons }
@@ -239,6 +243,8 @@ function engine(
   })
   on('ui.log', (_, e) => {
     logs.push(String(e.text))
+    // What a person reads: every line but the debug log's.
+    if ((e as { to?: string }).to !== 'debug') screen.push(String(e.text))
     return answer({ value: undefined })
   })
   on('agent.list', () => answer({ value: world.agents.map((a, i) => ({ id: `a${i}`, type: 'general-purpose', ...a })) }))
@@ -359,6 +365,7 @@ function engine(
       if (paneAnswer === 'agent' || paneAnswer === 'other') world.agents = [...world.agents, { description: 'Lint', status: 'running' }]
       return ok(`claim ${by}\r\nlaunched pane ${TOKEN}\r\n`)
     }
+    if (kind === 'left' && leftOut !== undefined) return { value: { ...leftOut, isStdoutTruncated: false, isStderrTruncated: false } }
     if (kind === 'left') {
       const left = /^\$id = '([0-9a-f-]{36})'$/m.exec(script)?.[1] ?? ''
       const how = literalOf('how')
@@ -393,7 +400,7 @@ function engine(
   // The left record's runs are their own: lefts() (and the tests of the left record) read them.
   const kinds = () => runs.map(r => r.kind).filter(k => k !== 'git' && k !== 'left')
   const lefts = () => runs.filter(r => r.kind === 'left')
-  return { runs, commands, prompts, toasts, logs, writes, files, described, clock, session, world, held, tickets, kinds, lefts, registered, queuedGo }
+  return { runs, commands, prompts, toasts, logs, screen, writes, files, described, clock, session, world, held, tickets, kinds, lefts, registered, queuedGo }
 }
 
 /** A session id's shape, for the fake's own parsing. */
@@ -556,6 +563,8 @@ describe('transports', () => {
 
     // The new window's process: the arrival says it too, before the wake-ups.
     world.id = T
+    // A new process: its plugin starts after the ticket was written, so the ticket is its.
+    await $.session.start(start)
     await $.classic.SessionStart({ source: 'resume', session_id: T })
     await clock.advance(1000)
     expect(texts(session).at(-1)).toContain(`It came here in a new window, not the slot of the pane it left: ${quoted(said)}. ${DROPPED_THERE} Your context is as you left it`)
@@ -680,6 +689,8 @@ describe("the claude wrapper's tab", () => {
 
     // The tab's resumed process: the arrival, the claim released.
     world.id = T
+    // A new process: its plugin starts after the ticket was written, so the ticket is its.
+    await $.session.start(start)
     await $.classic.SessionStart({ source: 'resume', session_id: T })
     await clock.advance(1000)
     expect(texts(session).at(-1)?.startsWith(`self-switch: a message from session \u00ab${W.slice(0, 8)}\u00bb.`)).toBe(true)
@@ -2406,5 +2417,70 @@ describe('placement.json: where the new window goes', () => {
     await $.session.start(start)
     await switchNow($, clock)
     expect(logs.filter(line => line.includes('CLAUDE_CODE_DISABLE_BG_SHELL_PRESSURE_REAP')).length).toBeLessThanOrEqual(1)
+  })
+})
+
+
+describe('S3: the words a person reads, and a ticket only for the process it is for', () => {
+  /** What Windows PowerShell writes to a redirected error stream when a script throws: a raw error record. */
+  const CLIXML = '#< CLIXML\r\n<Objs Version="1.1.0.1" xmlns="http://schemas.microsoft.com/powershell/2004/04"><S S="Error">Exception calling "Move" with "2" argument(s): "Cannot create a file when that file already exists."_x000D__x000A_</S></Objs>'
+
+  test("#81: a left record that isn't written says so in one plain sentence; the script's raw error goes to the debug log alone, never a CLIXML record on the screen", async ($, on) => {
+    const { screen, logs, lefts, clock } = engine(on, { leftOut: { stdout: '', stderr: CLIXML, exitCode: 1 } })
+    await $.session.start(start)
+    await $.classic.SessionStart({ source: 'startup', session_id: W })
+    // In place, as the arriving side writes it: the SessionStart of the conversation arrived at.
+    await $.classic.SessionStart({ source: 'resume', session_id: T })
+    await clock.advance(5000)
+    expect(lefts()).toHaveLength(1)
+    expect(logs.join('\n')).toContain("couldn't record")
+    const said = screen.filter(line => /couldn't record|left record/.test(line))
+    expect(said).toEqual([`self-switch couldn't record that this session left conversation ${W.slice(0, 8)}, so for about 10 minutes a switch back to it is refused as if it were still open.`])
+    expect(screen.some(line => /CLIXML|<Objs|Exception calling|exit 1/.test(line))).toBe(false)
+    expect(logs.some(line => line.startsWith(`the left record for ${W} wasn't written: `))).toBe(true)
+    expect(logs.some(line => /CLIXML|<Objs/.test(line))).toBe(false)
+  })
+
+  test("#81: a record the script says stands (the same move's, written first by the coordinator) is written: nothing is said", async ($, on) => {
+    const { screen, lefts, clock } = engine(on, { leftOut: { stdout: `left ${W}\r\n`, stderr: '', exitCode: 0 } })
+    await $.session.start(start)
+    await $.classic.SessionStart({ source: 'startup', session_id: W })
+    await $.classic.SessionStart({ source: 'resume', session_id: T })
+    await clock.advance(5000)
+    expect(lefts()).toHaveLength(1)
+    expect(screen.filter(line => /couldn't record|left record|10 minutes/.test(line))).toEqual([])
+  })
+
+  test('M27d: a switch refused at the last look writes no leaving row and leaves no ticket: nothing says it switched', async ($, on) => {
+    const { session, tickets, clock } = engine(on, { checkLive: 'it is open elsewhere: Claude Code 16252 holds it (L1)' })
+    await $.session.start(start)
+    await switchNow($, clock)
+    expect(tickets()).toEqual({})
+    expect(rows(session)).not.toMatch(/this session was switched away/)
+    expect(rows(session)).toContain("didn't happen after all: at the last look before /resume, it is open elsewhere: Claude Code 16252 holds it (L1)")
+  })
+
+  test("M27d: an in-place move's ticket is taken only by the process that wrote it: a session resuming that conversation by hand leaves it", async ($, on) => {
+    const ticket = { at: NOW - MINUTE, from: OTHER, by: LAUNCH, transport: 'in-place', reason: 'Billing is next.', notes: 'notes/billing.md', resume: 'Run the invoice tests.' }
+    const { prompts, tickets, clock } = engine(on, { id: T, store: { switches: { [T]: ticket } } })
+    await $.session.start(start)
+    await $.classic.SessionStart({ source: 'resume', session_id: T })
+    await clock.advance(1000)
+    expect(prompts).toEqual([])
+    expect(tickets()[T]).toBeDefined()
+  })
+
+  test("M27d: a ticket for a process a move starts (a window, a slot, a tab) isn't taken by one already running when it was written", async ($, on) => {
+    const ticket = { at: NOW + 30_000, from: OTHER, by: LAUNCH, transport: 'window', reason: 'Billing is next.', notes: 'notes/billing.md' }
+    const { prompts, session, tickets, held, clock } = engine(on, { id: T })
+    await $.session.start(start)
+    await clock.advance(MINUTE)
+    // Written by another process half a minute after this one started.
+    held.set('switches', { [T]: ticket })
+    await $.classic.SessionStart({ source: 'resume', session_id: T })
+    await clock.advance(1000)
+    expect(prompts).toEqual([])
+    expect(texts(session).some(text => text.includes('self-switch: a message from session'))).toBe(false)
+    expect(tickets()[T]).toBeDefined()
   })
 })

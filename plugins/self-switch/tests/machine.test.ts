@@ -209,6 +209,18 @@ describe('liveness', () => {
     ).toBe('unknown')
   })
 
+  test("M27 finding 2: Claude Code's /fork daemon, its pty host and a test stub (marked aside by the probe) are accounted, so none refuses every switch; L2 still reads them, and any other claude.exe stays unknown", () => {
+    const set = (p: RawProbe) => {
+      p.procs.push({ pid: 720, ppid: 21, created: ft(90), name: 'claude.exe', aside: true }, { pid: 721, ppid: 21, created: ft(91), name: 'claude.exe', aside: true })
+    }
+    expect(live(set)).toEqual({ verdict: 'not-live', evidence: [] })
+    expect(live(p => (set(p), p.procs.push({ pid: 722, ppid: 21, created: ft(92), name: 'claude.exe' }))).evidence).toEqual([
+      "unknown: claude.exe 722 isn't in any registry this plugin knows (another config folder, or a version without one)",
+    ])
+    // The pty host's line names the session it hosts after `--`: L2 all the same.
+    expect(live(p => p.procs.push({ pid: 723, ppid: 21, created: ft(93), name: 'claude.exe', aside: true, ids: [T] })).evidence).toEqual(['L2: claude.exe 723 names it on its command line'])
+  })
+
   test('a Claude Code command (claude plugin ..., marked cli by the probe) and the claude.exe it starts are accounted; L2 still reads them', () => {
     const plugin = (p: RawProbe) => {
       p.procs.push({ pid: 700, ppid: 21, created: ft(70), name: 'claude.exe', cli: true })
@@ -235,7 +247,7 @@ describe('liveness', () => {
       'if ($blank.Count -gt 0) {',
       '  Start-Sleep -Milliseconds 300',
       '  foreach ($b in $blank) {',
-      '    $again = Get-CimInstance -ClassName Win32_Process -Filter "ProcessId = $([int]$b.ProcessId)" -Property ProcessId, ParentProcessId, Name, CreationDate, CommandLine',
+      '    $again = Get-CimInstance -ClassName Win32_Process -Filter "ProcessId = $([int]$b.ProcessId)" -Property ProcessId, ParentProcessId, Name, CreationDate, CommandLine, ExecutablePath',
       '    if ($null -eq $again -or $again.CreationDate -ne $b.CreationDate) { $table.Remove([int]$b.ProcessId) } else { $table[[int]$b.ProcessId] = $again }',
       '  }',
       '}',
@@ -987,7 +999,7 @@ describe('the scripts, as text', () => {
 
   test('the launcher: the wait, the re-check, the claim, the folder, then claude-launch.ps1 by its pinned path and hash', () => {
     for (const script of [restart, window]) {
-      const wait = script.indexOf('Wait-Process -Id 100')
+      const wait = script.indexOf('$gone = Wait-Gone 100 ')
       const recheck = script.indexOf(RECHECK[2] ?? '', wait)
       const claimCheck = script.indexOf('the claim on it no longer names this window')
       const folder = script.indexOf('-not (Test-Path -LiteralPath $folder -PathType Container)', claimCheck)

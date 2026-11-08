@@ -15,7 +15,7 @@ import { join } from 'node:path'
 import { after, before, describe, test } from 'node:test'
 import { pathToFileURL } from 'node:url'
 import { gzipSync } from 'node:zlib'
-import { compileStub, fence, noWindow, underStub, WINDOWS_POWERSHELL } from './stub.mjs'
+import { compileStub, fence, holder, noWindow, underStub, WINDOWS_POWERSHELL, stubWork } from './stub.mjs'
 import { ROOT } from './sync-shared.mjs'
 
 const machine = await import(pathToFileURL(join(ROOT, 'shared', 'hooks', 'machine.ts')).href)
@@ -26,7 +26,7 @@ let stub
 
 before(() => {
   if (!isWindows) return
-  work = mkdtempSync(join(tmpdir(), 'launch-live-'))
+  work = stubWork('launch-live-')
   stub = compileStub(work)
 })
 
@@ -271,8 +271,13 @@ function windowLab(change = {}) {
   mkdirSync(join(dirs.state, 'claims'), { recursive: true })
   writeFileSync(machine.claimPath(dirs.state, input.id), claimText(input.claim, 4))
   writeFileSync(machine.launchScriptPath(dirs.state), machine.LAUNCH_SCRIPT_TEXT)
+  labs.set(input, dirs)
   return { dirs, input, inner }
 }
+
+/** The folders of a windowLab, by its input. */
+const labs = new Map()
+const windowLabDirs = input => labs.get(input)
 
 describe("the window's own script, run as the window runs it (hidden, here)", { skip: !isWindows && 'Windows only', concurrency: 2 }, () => {
   test('claude-launch.ps1 from its hashed name, with every config folder: claude --resume <id> in the folder, the launch environment applied', async () => {
@@ -348,5 +353,66 @@ describe("the window's own script, run as the window runs it (hidden, here)", { 
     const zero = await runWindow(normal.inner, normal.dirs)
     assert.equal(zero.code, 0, zero.out)
     assert.ok(existsSync(machine.claimPath(normal.dirs.state, normal.input.id)), `left\n${zero.out}`)
+  })
+})
+
+describe('S3: the window waits for the old process by its handle, keeps waiting, and records a refusal', { skip: !isWindows && 'Windows only', concurrency: 2 }, () => {
+  /** The window's first wait, shortened from 10 minutes to 2 seconds for the test: nothing else changes. */
+  const shortWait = (inner, waitFor) => {
+    const line = `$gone = Wait-Gone ${waitFor.pid} '${waitFor.created}' ${machine.WAIT_SECONDS}`
+    assert.ok(inner.includes(line), 'the wait line as the window has it')
+    return inner.split(line).join(`$gone = Wait-Gone ${waitFor.pid} '${waitFor.created}' 2`)
+  }
+
+  test('a process that outlasts the first wait is waited for until it goes, and then the session resumes (no refusal, no giving up)', async () => {
+    const dirs = lab()
+    const old = await holder({ stub, work, env: envOf(dirs), ms: 7000 })
+    try {
+      const { inner, input } = windowLab({ waitForExit: { pid: old.pid, created: old.created }, checks: {} })
+      void dirs
+      const ran = await runWindow(shortWait(inner, { pid: old.pid, created: old.created }), windowLabDirs(input))
+      assert.match(ran.out, /It has not exited after 10 minutes\. This window keeps waiting, and resumes the session when it goes\./)
+      assert.doesNotMatch(ran.out, /still running/)
+      assert.equal(ran.runs.length, 1, ran.out)
+      assert.deepEqual(ran.runs[0].args, ['--resume', input.id])
+    } finally {
+      old.stop()
+    }
+  })
+
+  test('a process id the system gave to another process is not the one waited for: no wait, the session resumes', async () => {
+    const dirs = lab()
+    const other = await holder({ stub, work, env: envOf(dirs), ms: 60_000 })
+    try {
+      // Its start time an hour off: the pid is another process's now.
+      const waitFor = { pid: other.pid, created: String(BigInt(other.created) - 36_000_000_000n) }
+      const { inner, input } = windowLab({ waitForExit: waitFor, checks: {} })
+      const started = Date.now()
+      const ran = await runWindow(inner, windowLabDirs(input))
+      assert.equal(ran.runs.length, 1, ran.out)
+      assert.ok(Date.now() - started < 60_000, 'no wait for the pid')
+    } finally {
+      other.stop()
+    }
+  })
+
+  test('a refusal and an error are recorded at refused\\<id>.json for whoever comes looking; a run that resumes records none', async () => {
+    const refused = windowLab()
+    writeFileSync(machine.launchScriptPath(refused.dirs.state), `${machine.LAUNCH_SCRIPT_TEXT}# one line more\n`)
+    await runWindow(refused.inner, refused.dirs)
+    const record = machine.readRefused(readFileSync(machine.refusedPath(refused.dirs.state, refused.input.id), 'utf8'))
+    assert.ok(record !== undefined, 'a record of its shape')
+    assert.equal(record.id, refused.input.id)
+    assert.equal(record.kind, 'resume')
+    assert.equal(record.by, refused.input.claim)
+    assert.equal(record.folder, refused.input.folder)
+    assert.match(record.why, /claude-launch\.ps1 is not at .+ with the SHA-256 this plugin ships/)
+    const threw = windowLab()
+    const inner = threw.inner.split('  & $launchPath -Resume').join("  throw 'claude.exe is locked by an update'; & $launchPath -Resume")
+    await runWindow(inner, threw.dirs)
+    assert.match(machine.readRefused(readFileSync(machine.refusedPath(threw.dirs.state, threw.input.id), 'utf8'))?.why ?? '', /stopped on an error: claude\.exe is locked by an update/)
+    const fine = windowLab()
+    await runWindow(fine.inner, fine.dirs)
+    assert.ok(!existsSync(machine.refusedPath(fine.dirs.state, fine.input.id)), 'none for a run that resumed')
   })
 })

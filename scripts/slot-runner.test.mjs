@@ -92,8 +92,18 @@ function runnerProblems(text) {
   need(has('  } catch { } finally { $stream.Dispose() }\n'), 'Release-Claim never throws')
   need(has('      for ($try = 0; $try -lt 3; $try++) {\n') && has('        if ($try -gt 0) { Start-Sleep -Milliseconds 250 }\n') && has('        try { [IO.File]::Delete($claimPath); break } catch { }\n'), 'the delete tried three times, 250 ms apart')
   // The beacon says what this process runs (F4), read once as it starts.
-  // After the wait: asked of the process, as one that has exited stays in the table while a handle is open on it.
-  need(has("if (-not (Test-Gone $parts[0])) { $why = 'the old process is still running' }") && !code.includes('Get-Process -Id'), 'the old process asked whether it has exited')
+  // The wait: by the process's handle and its start (WaitForExit): its exit code reads set tens of milliseconds before it is
+  // signaled and dropped from the table, so a wait that stops at the exit code can return with it still listed. Never a
+  // look at the table; and one that outlasts the first wait is looked at again until it goes (F1, S3).
+  need(has('        $gone = Wait-Gone $parts[0] $parts[1] $WaitSeconds\n') && !code.includes('Wait-Process') && !code.includes('Get-Process -Id'), 'the old process waited for by its handle and asked whether it has exited')
+  need(has('        while (-not $gone) { $gone = Wait-Gone $parts[0] $parts[1] 30; if (-not $gone) { Start-Sleep -Seconds 2 } }\n') && !code.includes("the old process is still running"), 'a tab keeps waiting for a process that outlasts the first wait')
+  // F1 4: the session count passes over a Claude Code that has exited and is on its way out of the table.
+  need(has("      if ($p.Name -ne 'claude.exe' -or (Get-Cli $p) -or (Test-Exited $p)) { continue }"), 'the cap counts no Claude Code that has exited')
+  // S3: every refusal recorded for whoever comes looking, at <state>\refused\<id>.json.
+  need(has("  if ($named) { Write-Refused $id ('slot:' + $slotId)"), "a record's refusal recorded")
+  need(has("    if ($id -cmatch $SessionId) { Write-Refused $id $Claim $(if ($Start) { 'start' } else { 'resume' }) $here"), "a tab's refusal recorded")
+  need(has("  if ($null -ne $heldId -and ($null -ne $threw -or $code -eq 2)) { Write-Refused $heldId $held"), "a launcher's refusal or error recorded")
+  need(has("    $final = Join-Path $state ('refused\\' + $id + '.json')"), 'at its id-shaped path')
   need(has('try { $ownSha = Get-Sha256 $PSCommandPath }') && has("$beacon['sha256'] = $ownSha"), 'its beacon says the hash it started from')
   need(has('if ($dirs.Count -gt 1) { $run.ConfigDir = @($dirs[1..($dirs.Count - 1)]) }') && !code.includes('ConfigDir = $dirs'), 'the launcher told only the folders it does not read already')
   need(has("if ($null -eq $why -and $Resume -and -not (Test-Project $here $id)) { $why ="), "-Resume's folder must be its project")
@@ -168,7 +178,10 @@ for (const [name, from, to, expect] of [
   ['-Resume without its claim check', "if ($null -eq $why -and -not (Test-Claim $id $Claim)) {", 'if ($false) {', /this launch's own -Claim/],
   ['F1: the claim back to one per conversation', "(Test-Claim $id $Claim)", "(Test-Claim $id ('launch:' + $id))", /this launch's own -Claim/],
   ['F1: a tab with no -Claim used all the same', "if ($null -eq $why -and $Claim -cnotmatch $LaunchClaim) {", 'if ($false) {', /-Claim of a launch's shape/],
-  ['the old process looked for in the table', 'if (-not (Test-Gone $parts[0])) {', 'if (Get-Process -Id ([int]$parts[0]) -ErrorAction SilentlyContinue) {', /asked whether it has exited/],
+  ['F1: the old process waited for by Wait-Process again', '        $gone = Wait-Gone $parts[0] $parts[1] $WaitSeconds\n', '        Wait-Process -Id ([int]$parts[0]) -Timeout $WaitSeconds -ErrorAction SilentlyContinue; $gone = Test-Gone $parts[0] $parts[1]\n', /asked whether it has exited/],
+  ['S3: a tab that gives up after its first wait', '        while (-not $gone) { $gone = Wait-Gone $parts[0] $parts[1] 30; if (-not $gone) { Start-Sleep -Seconds 2 } }\n', '', /keeps waiting/],
+  ['F1 4: the cap counting a Claude Code that has exited', " -or (Get-Cli $p) -or (Test-Exited $p)) { continue }", " -or (Get-Cli $p)) { continue }", /has exited/],
+  ["S3: a tab's refusal no one hears of", "    if ($id -cmatch $SessionId) { Write-Refused $id $Claim", "    if ($false) { Write-Refused $id $Claim", /refusal recorded/],
   ['F2: a tab that waits saying idle', "Write-Beacon 'running'\n    $asked = Get-Asked", "Write-Beacon 'idle'\n    $asked = Get-Asked", /says running while it waits/],
   ['F4: a beacon that says no hash', "$beacon['sha256'] = $ownSha", "$beacon['x'] = $ownSha", /the hash it started from/],
   ['F5: a tab letting typed keys through', "if ($null -eq $why -and (Test-KeyPending)) {", 'if ($false) {', /refuses console input/],

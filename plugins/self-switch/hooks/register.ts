@@ -135,6 +135,7 @@ import {
   newRegistryKeys,
   parseLaunch,
   pickTransport,
+  plainOutput,
   parseProbe,
   powershellCall,
   powershellPath,
@@ -152,7 +153,6 @@ import {
   slotRecordPath,
   stateFolder,
   SYSTEM_ROOT,
-  WAIT_SECONDS,
   wakeHold,
 } from './machine'
 import { configureUpdateCheck, loadUpdateCheck, withUpdateNotice } from './update-check'
@@ -167,6 +167,8 @@ const BUSY_AFTER = 3
 
 /** The plugin's store key for switches under way, by the conversation each resumes. */
 const SWITCHES = 'switches'
+/** A left record's script saying why it wrote nothing: its own plain words (leftScript). */
+const LEFT_REFUSED = /^refused [a-z]+ (.+)$/m
 /** The plugin's store key for when each conversation last switched away or arrived, by session id. */
 const RECENT = 'recentSwitches'
 /** The plugin's store keys for heartbeats: `alive:<session id>`. */
@@ -211,6 +213,7 @@ const DESCRIPTION = [
   '`reason` and `notes` (where your notes are) are required; both are recorded in this conversation and in the one resumed. `resume` is the message that starts the resumed conversation\'s first turn.',
   'Before anything runs it checks, and refuses saying why: when `to` is open, or may be open, anywhere on this machine; when anything still runs under this session (subagents, background Bash or Monitor jobs, git, builds, dev servers, a heavy slot); when an in-place switch would leave changes made since this conversation started uncommitted in the checkout both share; when a worktree named in `trees`, or the one this session works in, has uncommitted changes; within 2 minutes of a switch. Windows only, in a terminal.',
   '`trees` (optional): the git worktrees you worked in, absolute paths, each a worktree of the repository this session started in; each must be clean.',
+  "It can run only when the session is idle: Claude Code queues a plugin's command behind anything already waiting (a message typed during this turn, a background task's notification) and has no slot between turns ahead of them. A turn that starts first cancels the switch, and you are told, so nothing waiting is lost or carried into another conversation; under a nonstop stream of work and notifications it may not run for a long time, so call it again when the stream pauses.",
   'End the turn after calling it; the switch starts once your answer is shown.',
 ].join(' ')
 
@@ -258,6 +261,10 @@ let currentAt: number | undefined
  * open (a dialog answered no): taken back at the next main-loop turn's end, if still that exit's.
  */
 let exitLeft: { readonly state: string; readonly id: string; readonly leaving: ProcessRef } | undefined
+/** The conversation this process's own in-place switch wrote a ticket for: only this process may take it. */
+let ownTicket: string | undefined
+/** When this process's plugin first came up: a ticket of a move that placed a new process is for a process started after it. */
+let startedAt: number | undefined
 /** Whether the log has said this tab's claude wrapper is an older one: once per process. */
 let toldOldWrapper = false
 /** Whether the log has said what is wrong with placement.json: once per process. */
@@ -282,12 +289,6 @@ function text(raw: unknown): string | undefined {
 function why(err: unknown): string {
   const said = (err instanceof Error ? err.message : String(err)).trim()
   return said === '' ? 'no reason given' : said
-}
-
-/** One line, at most 300 characters: a process's output can run over many. */
-const brief = (said: string): string => {
-  const line = said.replace(/\s*\n\s*/g, ' ').trim()
-  return line.length > 300 ? `${line.slice(0, 299)}\u2026` : line
 }
 
 const isRecord = (value: unknown): value is Record<string, unknown> => typeof value === 'object' && value !== null && !Array.isArray(value)
@@ -806,7 +807,7 @@ async function probe($: EngineInterface, ctx: Context, to: string): Promise<Prob
     const script = probeScript({ ids: [ctx.own, to], take: to, configDirs: ctx.configDirs, stateDir: ctx.state, left: true, ...(ctx.heavySlotRoot === undefined ? {} : { heavySlotRoot: ctx.heavySlotRoot }), ...(ctx.placement === null ? {} : { slots: true, heavySlotRoot: ctx.heavySlotRoot ?? null }) })
     const call = powershellCall(ctx.powershell, script)
     const run = await $.process.run(call.argv, { stdin: call.stdin, cwd: ctx.folder, timeoutMs: PROBE_MS })
-    if (run.exitCode !== 0) return { failure: `it exited ${run.exitCode}${brief(run.stderr) === '' ? '' : `: ${brief(run.stderr)}`}` }
+    if (run.exitCode !== 0) return { failure: `it exited ${run.exitCode}${plainOutput(run.stderr) === '' ? '' : `: ${plainOutput(run.stderr)}`}` }
     const parsed = parseProbe(run.stdout)
     return 'error' in parsed ? { failure: parsed.error } : parsed
   } catch (err) {
@@ -837,7 +838,7 @@ async function placeLaunch(
     const run = await $.process.run(call.argv, { stdin: call.stdin, cwd, timeoutMs: LAUNCH_RUN_MS })
     const answer = parseLaunch(run.stdout)
     if (run.exitCode === 0 && 'launched' in answer) return { placed: answer.launched.transport, label: answer.launched.label, ...(answer.fallback === undefined ? {} : { fallback: answer.fallback }) }
-    const said = 'refused' in answer ? answer.refused.why : brief(`${run.stdout} ${run.stderr}`)
+    const said = 'refused' in answer ? answer.refused.why : plainOutput(`${run.stdout} ${run.stderr}`)
     return { said: `${run.exitCode !== 0 ? `the launcher exited ${run.exitCode}` : 'the launcher refused'}${said === '' ? '' : `: ${said}`}`, unclean: run.exitCode !== 0 || !('refused' in answer), ...('refused' in answer ? { code: answer.refused.code } : {}) }
   } catch (err) {
     return { said: `the launcher didn't run: ${why(err)}`, unclean: true }
@@ -848,7 +849,10 @@ async function placeLaunch(
  * Writes the left record of conversation `id` (leftScript, \u00a73.4): this process left it, in place (from
  * the SessionStart of the conversation it arrived at, LEFT_SETTLE_MS after) or by exiting (right
  * before its own /exit). Only this plugin's own moves, never on a model's word; a record that isn't
- * written leaves the 10-minute rule. Never throws: it says in the log what went wrong.
+ * written leaves the 10-minute rule. A record of the same move already there (the coordinator's go
+ * writes one too, whichever gets there first) counts as written. What a person reads, when one really
+ * isn't written, is a plain sentence; the script's own words go to the debug log, never a raw error.
+ * Never throws.
  */
 async function writeLeft($: EngineInterface, id: string, how: 'in-place' | 'exit', leaving?: ProcessRef): Promise<void> {
   try {
@@ -856,18 +860,24 @@ async function writeLeft($: EngineInterface, id: string, how: 'in-place' | 'exit
     if ('refusal' in found) return
     const dirs = await configDirsOf($)
     if ('refusal' in dirs) {
-      $.ui.log(`the left record for ${id} wasn't written (${dirs.refusal}); it reads live for 10 minutes, as before.`)
+      notWritten($, id, dirs.refusal)
       return
     }
     const call = powershellCall(found.powershell, leftScript({ stateDir: found.state, id, how, configDirs: dirs.configDirs, by: 'self-switch', ...(leaving === undefined ? {} : { process: leaving }) }))
     const run = await $.process.run(call.argv, { stdin: call.stdin, timeoutMs: RELEASE_MS })
     if (run.exitCode !== 0 || LEFT_WRITTEN.exec(run.stdout)?.[1] !== id) {
-      const said = brief(`${run.stdout} ${run.stderr}`)
-      $.ui.log(`the left record for ${id} wasn't written (exit ${run.exitCode}${said === '' ? '' : `: ${said}`}); it reads live for 10 minutes, as before.`)
+      const refused = LEFT_REFUSED.exec(run.stdout)?.[1]
+      notWritten($, id, refused ?? `the script that writes it ended without saying so (exit ${run.exitCode}${plainOutput(run.stderr) === '' ? '' : `: ${plainOutput(run.stderr)}`})`)
     }
   } catch (err) {
-    $.ui.log(`the left record for ${id} wasn't written (${why(err)}); it reads live for 10 minutes, as before.`)
+    notWritten($, id, why(err))
   }
+}
+
+/** Says a left record wasn't written: one plain sentence for the person, the reason in the debug log. */
+function notWritten($: EngineInterface, id: string, reason: string): void {
+  $.ui.log(`self-switch couldn't record that this session left conversation ${id.slice(0, 8)}, so for about 10 minutes a switch back to it is refused as if it were still open.`)
+  $.ui.log(`the left record for ${id} wasn't written: ${oneLine(reason, 400)}`, { to: 'debug' })
 }
 
 /**
@@ -904,6 +914,17 @@ async function sendResume($: EngineInterface, text: string): Promise<void> {
   }
 }
 
+/**
+ * Whether this process is the one a ticket for `id` is for: for an in-place move, the very process that wrote it
+ * (a module variable: no other process has it); for a move that placed another process (the slot, the tab, a
+ * window), one that started after the ticket was written, so a session already running that resumes `id` by hand
+ * leaves it for the process it is for.
+ */
+function isForThisProcess(ticket: Ticket, id: string): boolean {
+  if (ticket.transport === 'in-place') return ownTicket === id
+  return startedAt !== undefined && startedAt >= ticket.at
+}
+
 /** In the process that now holds `id`: the switch's arrival, once, if a ticket waits for it. */
 async function arrive($: EngineInterface, id: string): Promise<void> {
   if (arriving.has(id)) return
@@ -912,6 +933,9 @@ async function arrive($: EngineInterface, id: string): Promise<void> {
     const stored = await $.store.get(SWITCHES)
     if (!isRecord(stored) || !(id in stored)) return
     const found = ticketOf(stored[id])
+    // Not for this process: left where it is, for the process it is for, or to run out in 15 minutes.
+    // A hand-typed /resume of `to` mid-switch never takes another session's message (M27d).
+    if (found !== undefined && !isForThisProcess(found, id)) return
     await keepTicket($, id, null)
     if (found === undefined) return
     const now = await $.clock.now()
@@ -1131,8 +1155,17 @@ async function switchNow($: EngineInterface, value: Queued): Promise<void> {
     ...(value.resume === undefined ? {} : { resume: value.resume }),
     ...(fallback === undefined ? {} : { fallback }),
   }
-  await tellModel($, leaving(ctx.own, value, at, fallback))
-  await keepTicket($, to, ticket)
+  /**
+   * The leaving row and the ticket, written right before the final command, past every check that can refuse:
+   * a switch refused at the last look says nothing was switched and leaves no ticket for a process
+   * that resumes `to` by hand to take (M27d). The ticket is bound to the process it is for (arrive): this
+   * very process for an in-place move; for a move that places another process, one started after the ticket.
+   */
+  const commit = async (): Promise<void> => {
+    await tellModel($, leaving(ctx.own, value, at, fallback))
+    ownTicket = pick.transport === 'in-place' ? to : undefined
+    await keepTicket($, to, ticket)
+  }
   /**
    * The ticket or the slot's record written over as withdrawn, only while it is this switch's: a ticket
    * naming this launch's claim, a slot's record resuming `to`. One a newer launch wrote is kept.
@@ -1180,6 +1213,7 @@ async function switchNow($: EngineInterface, value: Queued): Promise<void> {
     // Taken back right before the command, after the last wait: a turn that starts up to here stops it.
     if (armed !== value) return undo('a new turn started')
     armed = undefined
+    await commit()
     await goRun($, go, {
       command: 'resume',
       args: to,
@@ -1286,6 +1320,7 @@ async function switchNow($: EngineInterface, value: Queued): Promise<void> {
   // Taken back right before the command, after the last wait: a turn that starts up to here stops it.
   if (armed !== value) return undo('a new turn started', record)
   armed = undefined
+  await commit()
   $.ui.log(`Switching to ${to}: ${value.reason}`)
   if (fallback !== undefined) $.ui.log(`this pane's slot runner isn't used: ${fallback}. A new window resumes ${to}.`)
   if (placedFallback !== undefined) $.ui.log(`the placed window isn't used: ${oneLine(placedFallback, 300)}.`)
@@ -1310,12 +1345,12 @@ async function switchNow($: EngineInterface, value: Queued): Promise<void> {
       $.clock.after(CHECK_MS, () => {
         const waits =
           pick.transport === 'slot'
-            ? 'The slot honours its record for 2 minutes'
+            ? 'The slot honours its record for 2 minutes, then gives up'
             : pick.transport === 'pane'
-              ? "This tab's claude wrapper honours its ticket for 2 minutes"
-              : `The new window waits up to ${WAIT_SECONDS / 60} minutes for this session to exit`
+              ? "This tab's claude wrapper honours its ticket for 2 minutes, then gives up"
+              : 'The new window keeps waiting for this session to exit, and resumes the conversation there when it does; closing that window gives up'
         $.ui.toast(`The exit ran, but the session is still open. ${waits}.`)
-        void tellModel($, `The switch's exit ran, but this session is still open (a dialog may have been answered no). ${waits}, then gives up; the claim on ${to} is released when its ticket runs out, 15 minutes after the switch.`)
+        void tellModel($, `The switch's exit ran, but this session is still open (a dialog may have been answered no). ${waits}. The claim on ${to} is released when its ticket runs out, 15 minutes after the switch.`)
       })
     },
   })
@@ -1350,6 +1385,7 @@ export const register: Register = (on, options) => {
   on('session.start', async ($, e, next) => {
     const started = await next(e)
     isTerminal = e.isInteractive && e.surface === 'terminal'
+    startedAt = await $.clock.now()
     // The first start's folder only: a reload starts the plugin again from wherever the session is now.
     const { value: first } = await $.state.get(folderKey)
     if (typeof first !== 'string' || first === '') await $.state.set(folderKey, e.cwd)

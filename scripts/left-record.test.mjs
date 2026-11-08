@@ -13,7 +13,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { after, before, describe, test } from 'node:test'
 import { pathToFileURL } from 'node:url'
-import { compileStub, underStub } from './stub.mjs'
+import { compileStub, underStub, stubWork } from './stub.mjs'
 import { ROOT } from './sync-shared.mjs'
 
 const machine = await import(pathToFileURL(join(ROOT, 'shared', 'hooks', 'machine.ts')).href)
@@ -25,7 +25,7 @@ let stub
 
 before(() => {
   if (!isWindows) return
-  work = mkdtempSync(join(tmpdir(), 'left-record-test-'))
+  work = stubWork('left-record-test-')
   stub = compileStub(work)
 })
 
@@ -177,5 +177,63 @@ describe('the left record, written and read for real', { skip: !isWindows && 'Wi
     assert.match(written.stdout, /refused key the left key \(.+left\.key\) can not be read as 32 bytes: .+delete it, and the next record makes a new one/)
     assert.equal(readFileSync(join(dirs.state, 'left.key')).length, 16)
     assert.ok(!existsSync(join(dirs.state, 'left', `${dirs.id}.json`)))
+  })
+})
+
+describe('#81: two writers of one move, the coordinator and self-switch', { skip: !isWindows && 'Windows only', concurrency: false }, () => {
+  /** Both scripts run one after the other, or at once, each in its own Windows PowerShell under the one stub claude.exe: one process left the conversation. */
+  async function both(dirs, first, second, together) {
+    const a = join(dirs.root, 'first.ps1')
+    const b = join(dirs.root, 'second.ps1')
+    writeFileSync(a, first)
+    writeFileSync(b, second)
+    const ps = POWERSHELL
+    const start = file => `Start-Ps '${file}'`
+    const begin = [
+      "$ProgressPreference = 'SilentlyContinue'",
+      `function Start-Ps($file) { $i = New-Object Diagnostics.ProcessStartInfo('${ps}', ('-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "' + $file + '"')); $i.UseShellExecute = $false; $i.CreateNoWindow = $true; $i.RedirectStandardOutput = $true; $i.RedirectStandardError = $true; return [Diagnostics.Process]::Start($i) }`,
+    ]
+    const script = together
+      ? [...begin, `$pa = ${start(a)}`, `$pb = ${start(b)}`, '$oa = $pa.StandardOutput.ReadToEnd(); $ea = $pa.StandardError.ReadToEnd(); $pa.WaitForExit()', '$ob = $pb.StandardOutput.ReadToEnd(); $eb = $pb.StandardError.ReadToEnd(); $pb.WaitForExit()', '"A:" + $pa.ExitCode + ":" + $oa.Trim() + ":" + ([regex]::Matches($ea, "S=.Error.")).Count', '"B:" + $pb.ExitCode + ":" + $ob.Trim() + ":" + ([regex]::Matches($eb, "S=.Error.")).Count'].join('\r\n')
+      : [...begin, `$pa = ${start(a)}`, '$oa = $pa.StandardOutput.ReadToEnd(); $ea = $pa.StandardError.ReadToEnd(); $pa.WaitForExit()', `$pb = ${start(b)}`, '$ob = $pb.StandardOutput.ReadToEnd(); $eb = $pb.StandardError.ReadToEnd(); $pb.WaitForExit()', '"A:" + $pa.ExitCode + ":" + $oa.Trim() + ":" + ([regex]::Matches($ea, "S=.Error.")).Count', '"B:" + $pb.ExitCode + ":" + $ob.Trim() + ":" + ([regex]::Matches($eb, "S=.Error.")).Count'].join('\r\n')
+    const ran = await write(script)
+    const line = tag => ran.stdout.split(/\r?\n/).find(l => l.startsWith(`${tag}:`)) ?? ''
+    return { a: line('A'), b: line('B'), all: ran.stdout + ran.stderr }
+  }
+  const GO = 'wu_abc123'
+
+  test("the coordinator's record first, then self-switch's for the same move: both say written, and the coordinator's stands, its go kept", async () => {
+    const dirs = lab()
+    const coordinator = machine.leftScript({ stateDir: dirs.state, id: dirs.id, how: 'in-place', configDirs: [dirs.config], by: 'coordinator', go: GO })
+    const selfSwitch = machine.leftScript({ stateDir: dirs.state, id: dirs.id, how: 'in-place', configDirs: [dirs.config], by: 'self-switch' })
+    const ran = await both(dirs, coordinator, selfSwitch, false)
+    assert.equal(ran.a, `A:0:left ${dirs.id}:0`, ran.all)
+    assert.equal(ran.b, `B:0:left ${dirs.id}:0`, ran.all)
+    const record = JSON.parse(readFileSync(join(dirs.state, 'left', `${dirs.id}.json`), 'utf8'))
+    assert.equal(record.by, 'coordinator')
+    assert.equal(record.go, GO)
+  })
+
+  test('both at once: each says written, with nothing on its error stream, and one whole record stands that reads back with its MAC', async () => {
+    const dirs = lab()
+    const coordinator = machine.leftScript({ stateDir: dirs.state, id: dirs.id, how: 'in-place', configDirs: [dirs.config], by: 'coordinator', go: GO })
+    const selfSwitch = machine.leftScript({ stateDir: dirs.state, id: dirs.id, how: 'in-place', configDirs: [dirs.config], by: 'self-switch' })
+    const ran = await both(dirs, coordinator, selfSwitch, true)
+    assert.equal(ran.a, `A:0:left ${dirs.id}:0`, ran.all)
+    assert.equal(ran.b, `B:0:left ${dirs.id}:0`, ran.all)
+    const read = await run(machine.leftReadScript({ stateDir: dirs.state, ids: [dirs.id], configDirs: [dirs.config] }))
+    const parsed = machine.parseLeftRead(read.stdout)
+    assert.ok(!('error' in parsed) && parsed.left.length === 1 && parsed.left[0].ok === true && parsed.left[0].macOk === true, read.stdout)
+  })
+
+  test('a record of another move (how exit, then in place) is replaced, as it always was', async () => {
+    const dirs = lab()
+    const exit = machine.leftScript({ stateDir: dirs.state, id: dirs.id, how: 'exit', configDirs: [dirs.config], by: 'self-switch' })
+    const inPlace = machine.leftScript({ stateDir: dirs.state, id: dirs.id, how: 'in-place', configDirs: [dirs.config], by: 'coordinator', go: GO })
+    const ran = await both(dirs, exit, inPlace, false)
+    assert.equal(ran.b, `B:0:left ${dirs.id}:0`, ran.all)
+    const record = JSON.parse(readFileSync(join(dirs.state, 'left', `${dirs.id}.json`), 'utf8'))
+    assert.equal(record.how, 'in-place')
+    assert.equal(record.by, 'coordinator')
   })
 })

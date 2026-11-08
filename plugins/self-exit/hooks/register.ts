@@ -44,6 +44,7 @@ const DESCRIPTION = [
   '`reason` (required) says why; it is recorded in the transcript. `note` is for whoever resumes this session: what was left, and where its notes are. Write your notes down first.',
   "It refuses while anything would make /exit stop at its confirmation or cut work off, naming each with how to stop it: a session cron (delete it with CronDelete), a background Bash, PowerShell or Monitor job (stop it with TaskStop), a subagent still running, a wake-up from wake_after still pending (cancel it with cancel_wake); and while any of that can't be read. Stop them, then call again.",
   'What still ends with the session: Remote Control (the phone and browser lose the session).',
+  "It can run only when the session is idle: Claude Code queues a plugin's command behind anything already waiting (a message typed during this turn, a background task's notification) and has no slot between turns ahead of them. A turn that starts first cancels the exit, and you are told, so nothing waiting is lost or carried into another conversation; under a nonstop stream of work and notifications it may not run for a long time, so call it again when the stream pauses.",
   'End the turn after calling it; the exit runs once your answer is shown.',
 ].join(' ')
 
@@ -130,9 +131,12 @@ async function mark($: EngineInterface, kind: PendingKind | null): Promise<void>
   if (failed !== undefined) $.ui.log(`the pending marker wasn't written (${failed}); the coordinator ignores an old one after 15 minutes.`)
 }
 
-/** The row the model reads when the session is resumed: why it ended, and the note. */
+/**
+ * The row the model reads when the session is resumed: why it asked to end, and the note. Never that it ended: in
+ * a background session (/background) /exit leaves the session running, and the row is read there too.
+ */
 const record = ({ reason, note }: Queued): string =>
-  `This session ended at its own request (exit_after_turn). Reason: ${reason}${note === undefined ? '' : ` Note for whoever resumes it: ${note}`}`
+  `This session asked to end here (exit_after_turn), and /exit ran. Reason: ${reason}${note === undefined ? '' : ` Note for whoever resumes it: ${note}`}`
 
 /** Logs the reason, then runs the exit; says so when it didn't run, or the session is still here after it. */
 async function exitNow($: EngineInterface, value: Queued): Promise<void> {

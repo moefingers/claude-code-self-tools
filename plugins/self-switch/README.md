@@ -100,6 +100,10 @@ What the slot does:
 
 ## Known limits
 
+- **A refused switch, recorded.** A window or a slot runner that won't resume the conversation writes why to `%LOCALAPPDATA%\claude-self-tools\refused\<conversation>.json`, besides saying so on its own screen. Until the coordinator reads these, look there by hand: `Get-ChildItem "$env:LOCALAPPDATA\claude-self-tools\refused" | Get-Content`.
+- **Two writers of one left record.** The coordinator's go and this plugin both write the left record of an in-place move; whichever comes second finds the first one's record of the same move (same conversation, how, process and transcript) and counts it as written, so neither says it failed.
+- **Test stubs and Claude Code's own `/fork` daemon and pty host** (a `claude.exe` with no session registry entry) no longer hold every switch on the machine: a probe sets them aside (a stub only by its folder, `%TEMP%\claude-self-tools-test-stubs`). Any other `claude.exe` the registry doesn't account for still reads as possibly holding the conversation.
+
 - **A fork's baseline** (to confirm by run). Claude Code's hook types give `fork` as the SessionStart source of a `--fork-session` start, and the plugin takes no baseline then, so a fork's start-folder changes hold as *dirty, no baseline*. A Claude Code that reported a fork as `startup` would give it a fresh baseline, with the parent conversation's uncommitted changes in it.
 - **A baseline's timing** (to confirm by run). A startup's fingerprint is taken half a second after its SessionStart. An edit to the start folder a first turn makes within that time (a launch with a first prompt) would count as the folder's state at the start.
 

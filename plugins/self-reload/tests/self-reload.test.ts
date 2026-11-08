@@ -16,7 +16,7 @@ function engine(on: On, { reload = 'returns' }: { reload?: 'returns' | 'hangs' |
   const clock = mock.clock(on)
   const session = mock.session(on)
   on('session.start', (_, e) => ({ cwd: e.cwd }))
-  on('tool.register', () => ({ value: { tool: TOOL } }))
+  on('tool.register', (_, e) => (registeredDescriptions.push(String(e.description)), { value: { tool: TOOL } }))
   on('ui.status', () => ({ value: undefined }))
   on('ui.toast', (_, e) => {
     toasts.push(String(e.text))
@@ -43,6 +43,9 @@ function engine(on: On, { reload = 'returns' }: { reload?: 'returns' | 'hangs' |
 
 const start = { cwd: '/', surface: 'terminal', isInteractive: true } as const
 const answered = { answer: 'done', durationMs: 1, turnId: 't1', isAborted: false, reason: 'answer' } as const
+
+/** Every description the plugin registered its tool with. */
+const registeredDescriptions: string[] = []
 
 test('the reload runs once the turn ends, and the resume is sent once', async ($, on) => {
   const { commands, prompts, clock } = engine(on)
@@ -171,4 +174,11 @@ test('a resume left pending too long is dropped, not sent', async ($, on) => {
   expect(toasts.some(t => /dropped/.test(t))).toBe(true)
   await clock.advance(HOUR)
   expect(prompts).toEqual([])
+})
+
+test("the owner's design: the description says the tool runs only when the session is idle, why, and warns of the distant future", async ($, on) => {
+  engine(on)
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  const said = registeredDescriptions.at(-1) ?? ''
+  expect(said).toContain("It runs when the session is idle: Claude Code queues a plugin's command behind anything already waiting (a message typed during this turn, a background task's notification) and has no slot between turns ahead of them, so under a nonstop stream of work and notifications it may run in the distant future. Nothing waiting is lost.")
 })

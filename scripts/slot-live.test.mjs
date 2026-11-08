@@ -15,7 +15,7 @@ import { freemem, tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { after, before, describe, test } from 'node:test'
 import { pathToFileURL } from 'node:url'
-import { compileStub, fence, holder, noWindow, underStub, WINDOWS_POWERSHELL } from './stub.mjs'
+import { compileStub, fence, holder, noWindow, underStub, WINDOWS_POWERSHELL, stubWork } from './stub.mjs'
 import { ROOT } from './sync-shared.mjs'
 
 const machine = await import(pathToFileURL(join(ROOT, 'shared', 'hooks', 'machine.ts')).href)
@@ -27,7 +27,7 @@ let stub
 
 before(() => {
   if (!isWindows) return
-  work = mkdtempSync(join(tmpdir(), 'slot-live-'))
+  work = stubWork('slot-live-')
   stub = compileStub(work)
 })
 after(() => {

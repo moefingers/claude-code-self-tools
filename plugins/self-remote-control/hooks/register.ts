@@ -59,6 +59,7 @@ const DESCRIPTION = [
   'Call `status` when the user asks whether they can reach this session remotely, and `connect` when they ask to be able to, such as before stepping away, with a `name` unless the session already has a title.',
   "It never disconnects, and never runs /remote-control while connected; disconnecting is the user's to do from its panel.",
   '`resume` is the message that starts your next turn once the action has run, after what happened: what to do next. Leave it out when the next step waits on someone else (the user, another session, a check).',
+  "`connect` and `rename` run when the session is idle: Claude Code queues a plugin's command behind anything already waiting (a message typed during this turn, a background task's notification) and has no slot between turns ahead of them, so under a nonstop stream of work and notifications they may run in the distant future. Nothing waiting is lost.",
   'After `connect` or `rename`, end the turn; it runs once your answer is shown.',
 ].join(' ')
 

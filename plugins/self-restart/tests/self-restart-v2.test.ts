@@ -181,7 +181,7 @@ test("the launch for this session's own id: the claim, the re-check after the wa
   // The process it waits for is this session's own claude.exe, by its id and its start.
   expect(script).toContain("if ([long]$session.ProcessId -ne 100 -or [math]::Abs([long](Get-Created $session) - [long]'134062345688901240') -gt 10000) { Refuse 'wait'")
   // The window re-reads the registry and the process table after the wait, and checks the claim, before claude.
-  const wait = script.indexOf('Wait-Process -Id 100')
+  const wait = script.indexOf('$gone = Wait-Gone 100 ')
   const claude = script.indexOf('& $launchPath -Resume $id -Dir $folder')
   expect(wait).toBeGreaterThan(0)
   for (const line of RECHECK) {
@@ -319,7 +319,7 @@ for (const [name, machine, said] of [
   [
     'a background Bash job under the session',
     { probe: probeOf([BASH]) },
-    /the background shell bash\.exe 505 runs under this session \(a background job of the Bash, PowerShell or Monitor tool\): stop it with TaskStop/,
+    /the shell bash\.exe 505 runs under this session \(a background job of the Bash, PowerShell or Monitor tool, or a tool call still finishing\): stop it with TaskStop/,
   ],
   ['a session cron', { crons: [CRON] }, /cron 7f3a9c21 \(Every 5 minutes: \u00abcheck the deploy\u00bb\) is set to wake this session: delete it with CronDelete \(id 7f3a9c21\)/],
   ['a git process under the session', { probe: probeOf([{ pid: 501, ppid: 100, created: '134062355678901240', name: 'git.exe', cls: 'git' }]) }, /S2: git\.exe 501 runs under this session/],
@@ -348,7 +348,7 @@ for (const [name, machine, said] of [
   [
     'a background Bash job under the session',
     { probe: probeOf([BASH]) },
-    'Not queued: the background shell bash.exe 505 runs under this session (a background job of the Bash, PowerShell or Monitor tool): stop it with TaskStop (the task id its Bash, PowerShell or Monitor call gave), or let it finish. Each would make the restart\'s exit stop at its confirmation, or end with this process: stop them, then call again.',
+    'Not queued: the shell bash.exe 505 runs under this session (a background job of the Bash, PowerShell or Monitor tool, or a tool call still finishing): stop it with TaskStop (the task id its Bash, PowerShell or Monitor call gave), or let it finish; if you started no background job, it is a tool call still finishing (self-check\'s check at a resume runs one): call again in a moment. Each would make the restart\'s exit stop at its confirmation, or end with this process: stop them, then call again.',
   ],
   [
     'a session cron',

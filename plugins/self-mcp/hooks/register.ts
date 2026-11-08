@@ -22,6 +22,7 @@ const DESCRIPTION = [
   'Not for a server that needs sign-in, or one turned off: /mcp is the person\'s for those.',
   '`resume` is the message that starts your next turn once the reconnect has run, with what the reconnect said: what to try again.',
   'Give it whenever you have a next step of your own; leave it out only when the next step waits on someone else (the user, another session, a check).',
+  "It runs when the session is idle: Claude Code queues a plugin's command behind anything already waiting (a message typed during this turn, a background task's notification) and has no slot between turns ahead of them, so under a nonstop stream of work and notifications it may run in the distant future. Nothing waiting is lost.",
   'End the turn after calling it; the reconnect runs once your answer is shown.',
 ].join(' ')
 

@@ -73,9 +73,9 @@
 import type { EngineInterface, Register } from 'claude-code'
 import type { Queued, Restart } from '../types'
 import { go } from './go'
-import { launch as buildLaunch, parseLaunch, powershellPath, RELEASED, releaseScript, SESSION_ID, stateFolder, SYSTEM_ROOT, WAIT_SECONDS } from './launcher'
+import { launch as buildLaunch, parseLaunch, powershellPath, RELEASED, releaseScript, SESSION_ID, stateFolder, SYSTEM_ROOT } from './launcher'
 import type { AgentLike, LaunchInput, LaunchWhere, PendingKind, Placement, Probe } from './machine'
-import { goAnswer, goRun, agentsHeld, agentsWayOut, blockersText, claimOf, exitBlockers, isBusyAgent, isSafeFolder, isWindowName, LAUNCH_DEADLINE_MS, LAUNCH_RETRY_MS, LAUNCH_RUN_MS, launchFolderFault, launchFolderSaid, loadPlacement, markPending, oneLine, paneFallback, paneTicketPath, pickLaunchTransport, powershellCall, quoted, readExit, readGit, readPane, resumeTitle, runProbe, safePoint, SLOT_SCRIPT_SHA256, idPathOrNone, TAB_LABEL } from './machine'
+import { goAnswer, goRun, agentsHeld, agentsWayOut, blockersText, claimOf, exitBlockers, isBusyAgent, isSafeFolder, isWindowName, LAUNCH_DEADLINE_MS, LAUNCH_RETRY_MS, LAUNCH_RUN_MS, launchFolderFault, launchFolderSaid, loadPlacement, markPending, oneLine, paneFallback, paneTicketPath, pickLaunchTransport, plainOutput, powershellCall, quoted, readExit, readGit, readPane, resumeTitle, runProbe, safePoint, SLOT_SCRIPT_SHA256, idPathOrNone, TAB_LABEL } from './machine'
 import { configureUpdateCheck, loadUpdateCheck, withUpdateNotice } from './update-check'
 
 const queued = { plugin: 'self-restart', key: 'queued' } as const
@@ -98,7 +98,7 @@ const CHECK_MS = 5000
 const RELEASE_MS = 15_000
 /** How long a slot honours the record the launcher left it, in seconds. */
 const SLOT_SECONDS = 120
-/** A restart's first prompt older than this is dropped, not sent: the window waits 10 minutes at most. */
+/** A restart's first prompt older than this is dropped, not sent: a window that waited this long for the old process, the session resumed later by hand. */
 const STALE_MS = 15 * 60 * 1000
 /** The most restarts under way the store keeps. */
 const MAX_KEPT = 50
@@ -111,6 +111,7 @@ const DESCRIPTION = [
   'Windows only, in a session run in a terminal.',
   '`reason` (required) says why; it is recorded in the transcript. `resume` is the message that starts your first turn in the restarted session: what to check or do next. Give it whenever you have a next step of your own; leave it out only when the next step waits on someone else.',
   'It refuses unless the session is at a safe point: while a session cron is set (delete it with CronDelete), while subagents you started are still running, while a wake-up from wake_after is pending (cancel it with cancel_wake), while anything runs under this session (a background Bash, PowerShell or Monitor job, git, a build, test or lint, a dev server or Playwright, a heavy-slot job), while a git operation is in flight in the repo, and while any of that can\'t be read; each is named with how to stop it. It refuses a second restart within 2 minutes of the last. What still ends with this process: Remote Control (with Remote Control on for all sessions, the resumed session connects again).',
+  "It can run only when the session is idle: Claude Code queues a plugin's command behind anything already waiting (a message typed during this turn, a background task's notification) and has no slot between turns ahead of them. A turn that starts first cancels the restart, and you are told, so nothing waiting is lost or carried into another conversation; under a nonstop stream of work and notifications it may not run for a long time, so call it again when the stream pauses.",
   'End the turn after calling it; the restart starts once your answer is shown.',
 ].join(' ')
 
@@ -148,12 +149,6 @@ function text(raw: unknown): string | undefined {
 function why(err: unknown): string {
   const said = (err instanceof Error ? err.message : String(err)).trim()
   return said === '' ? 'no reason given' : said
-}
-
-/** One line, at most 300 characters: a process's output can run over many. */
-const brief = (said: string): string => {
-  const line = said.replace(/\s*\n\s*/g, ' ').trim()
-  return line.length > 300 ? `${line.slice(0, 299)}…` : line
 }
 
 /** What is queued: `resume` only when there is one, since stored state holds no undefined. */
@@ -560,7 +555,7 @@ async function restartNow($: EngineInterface, value: Queued): Promise<void> {
         if (run.exitCode !== 0 || !('launched' in answer)) {
           unclean = run.exitCode !== 0 || !('refused' in answer)
           refusedFor = 'refused' in answer ? answer.refused.code : undefined
-          const said = 'refused' in answer ? answer.refused.why : brief(`${run.stdout} ${run.stderr}`)
+          const said = 'refused' in answer ? answer.refused.why : plainOutput(`${run.stdout} ${run.stderr}`)
           const nothing = pane !== undefined && 'token' in pane ? "the ticket for this tab wasn't written" : "the launcher didn't place the restart"
           opened = `${nothing} (${run.exitCode !== 0 ? `exit ${run.exitCode}` : 'refused'}${said === '' ? '' : `: ${said}`})`
         } else {
@@ -634,7 +629,6 @@ async function restartNow($: EngineInterface, value: Queued): Promise<void> {
     // time, and holds the claim meanwhile: the record stays, with the claim, so that whichever process
     // resumes it releases it. Not the first prompt: the session went on, and it may be out of date.
     await keep($, launch.id, claimed === undefined ? null : { at: kept.at, reason: kept.reason, claim: claimed })
-    const minutes = WAIT_SECONDS / 60
     if (spot !== undefined) {
       await refuse(
         $,
@@ -645,8 +639,8 @@ async function restartNow($: EngineInterface, value: Queued): Promise<void> {
     }
     await refuse(
       $,
-      `Restart stopped before the exit: ${late ?? 'a new turn started'}. Its window waits up to ${minutes} minutes for this session to exit, then gives up; close it, or exit (/exit) to resume there.`,
-      `The restart's window opened, but this session didn't exit: ${late ?? 'a new turn started'}. The session goes on. The window waits up to ${minutes} minutes for this process to exit, then resumes the session there, or gives up and says so; the person can close it.`,
+      `Restart stopped before the exit: ${late ?? 'a new turn started'}. Its window keeps waiting for this session to exit, and resumes it there when it does: exit (/exit) to resume there, or close the window to give up.`,
+      `The restart's window opened, but this session didn't exit: ${late ?? 'a new turn started'}. The session goes on. The window keeps waiting for this process to exit, and resumes the session there when it does; the person can close it to give up.`,
     )
     return
   }
@@ -688,16 +682,15 @@ async function restartNow($: EngineInterface, value: Queued): Promise<void> {
       await refuse($, `Restart stood down: ${said}.`, `The restart stood down when its exit came up: ${said}. What it had placed was taken back. The session goes on.`)
     },
     failed: async err => {
-      const minutes = WAIT_SECONDS / 60
       if (spot !== undefined) {
         $.ui.toast(`Exit didn't run: ${why(err)}. ${spot.Name} resumes the session if it exits (/exit) within ${SLOT_SECONDS / 60} minutes.`)
         await tellModel($, `The restart ${spot.left}, but the exit didn't run: ${why(err)}. If this process exits within ${SLOT_SECONDS / 60} minutes, ${spot.session}; after that this session goes on as it is.`)
         return
       }
-      $.ui.toast(`Exit didn't run: ${why(err)}. The new window waits ${minutes} minutes for this session to exit (/exit), then gives up.`)
+      $.ui.toast(`Exit didn't run: ${why(err)}. The new window keeps waiting for this session to exit (/exit), and resumes it there when it does; close the window to give up.`)
       await tellModel(
         $,
-        `The restart's new window opened, but the exit didn't run: ${why(err)}. The window waits up to ${minutes} minutes for this process to exit and then resumes the session there; the person can exit (/exit) for that. After that it gives up and says so, and this session goes on.`,
+        `The restart's new window opened, but the exit didn't run: ${why(err)}. The window keeps waiting for this process to exit, and then resumes the session there; the person can exit (/exit) for that, or close the window to give up. Until then this session goes on.`,
       )
     },
     after: async () => {
@@ -708,7 +701,7 @@ async function restartNow($: EngineInterface, value: Queued): Promise<void> {
           void tellModel($, `The restart's exit ran, but the session is still open (a dialog may have been answered no). If it exits within ${SLOT_SECONDS / 60} minutes, the wrapper resumes it in this tab; after that the ticket is ignored.`)
           return
         }
-        $.ui.toast(`The exit ran, but the session is still open. The new window waits up to ${WAIT_SECONDS / 60} minutes for it to exit.`)
+        $.ui.toast('The exit ran, but the session is still open. The new window keeps waiting for it to exit, and resumes it there when it does.')
         void tellModel($, 'The restart\'s exit ran, but the session is still open (a dialog may have been answered no). The new window waits for it to exit, then resumes it there.')
       })
     },

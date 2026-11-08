@@ -6,10 +6,11 @@ const TOOL = 'mcp__self-compact__compact_after_turn'
 /** The engine beneath the plugin: what it answers, and the compactions and prompts it was asked for. */
 function engine(on: On, { skip }: { skip?: string } = {}) {
   const compactions: (string | undefined)[] = []
+  const described: string[] = []
   const prompts: string[] = []
   const toasts: string[] = []
   on('session.start', (_, e) => ({ cwd: e.cwd }))
-  on('tool.register', () => ({ value: { tool: TOOL } }))
+  on('tool.register', (_, e) => (described.push(String(e.description)), { value: { tool: TOOL } }))
   on('ui.status', () => ({ value: undefined }))
   on('ui.toast', (_, e) => {
     toasts.push(String(e.text))
@@ -24,7 +25,7 @@ function engine(on: On, { skip }: { skip?: string } = {}) {
     return { text: e.text }
   })
   on('turn.complete', () => ({ text: 'done' }))
-  return { compactions, prompts, toasts, clock: mock.clock(on) }
+  return { compactions, prompts, toasts, described, clock: mock.clock(on) }
 }
 
 const ended = { answer: 'done', durationMs: 1, turnId: 't1' } as const
@@ -38,7 +39,9 @@ test('a queued compaction runs once the turn ends, keeping what the call said', 
   expect(compactions).toEqual([])
 
   await $.turn.complete({ ...ended, isAborted: false, reason: 'answer' })
-  expect(compactions).toEqual([])
+  await clock.advance(0)
+  // Between turns, the default: from the turn's end itself, with no beat for a queued message to take the session.
+  expect(compactions).toEqual(['the PR queue'])
   await clock.advance(1000)
   expect(compactions).toEqual(['the PR queue'])
   // No resume asked for: the session waits for the next message.
@@ -108,6 +111,31 @@ test('a call with nothing to keep is refused, and nothing is queued', async ($, 
 
   const refused = await $.tool.call({ tool: TOOL, keep: '   ' })
   expect(refused.deny).toMatch(/keep/)
+  await $.turn.complete({ ...ended, isAborted: false, reason: 'answer' })
+  await clock.advance(1000)
+  expect(compactions).toEqual([])
+})
+
+test("the owner's design: 'idle' waits a beat, so anything queued goes first; between turns doesn't", async ($, on) => {
+  const { compactions, clock } = engine(on)
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  const queued = await $.tool.call({ tool: TOOL, keep: 'the PR queue', when: 'idle' })
+  expect(queued.result).toContain('compacts once the session is idle after this turn')
+  await $.turn.complete({ ...ended, isAborted: false, reason: 'answer' })
+  await clock.advance(0)
+  expect(compactions).toEqual([])
+  await clock.advance(1000)
+  expect(compactions).toEqual(['the PR queue'])
+})
+
+test("the owner's design: `when` is between turns or idle, nothing else; the description says both, and warns of the distant future", async ($, on) => {
+  const { described, compactions, clock } = engine(on)
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  const said = described.join(' ')
+  expect(said).toContain("'between-turns' (the default) compacts right as this turn ends, ahead of anything queued meanwhile")
+  expect(said).toContain('under a nonstop stream of work and notifications that may be the distant future')
+  const refused = await $.tool.call({ tool: TOOL, keep: 'the PR queue', when: 'soon' })
+  expect(refused.deny).toBe("`when` is 'between-turns' (the default) or 'idle'.")
   await $.turn.complete({ ...ended, isAborted: false, reason: 'answer' })
   await clock.advance(1000)
   expect(compactions).toEqual([])
