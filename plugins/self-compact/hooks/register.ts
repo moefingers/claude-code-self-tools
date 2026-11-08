@@ -28,7 +28,7 @@ const DESCRIPTION = [
   'Give it whenever you have a next piece of your own, so the work goes on without a halt; leave it out only when the next step waits on someone else (the user, another session, a check).',
   "`when` chooses when it runs. 'between-turns' (the default) compacts right as this turn ends, ahead of anything queued meanwhile (a message typed during this turn, a background task's notification), which then runs on the compacted conversation: nothing is lost. If a turn queued during this one has started by then, it compacts at that turn's end instead.",
   "'idle' compacts half a second after a turn ends, and only if no turn has started by then, so anything queued goes first: under a nonstop stream of work and notifications that may be the distant future.",
-  'End the turn after calling it; the compaction starts once your answer is shown.',
+  'After calling it, end your turn and do nothing more until it has run; then carry on.',
 ].join(' ')
 
 /** When a compaction runs: as the turn ends (the default), or once the session is idle. */

@@ -421,3 +421,13 @@ test('an interrupted turn cancels the resume with what it queued', async ($, on)
   expect(commands).toEqual([])
   expect(prompts).toEqual([])
 })
+
+test("the owner's A: a rename starts the moment the turn's end returns, with no half-second beat", async ($, on) => {
+  const { commands, clock } = engine(on)
+  await $.session.start(start)
+  await $.tool.call({ tool: TOOL, action: 'rename', name: 'billing export' })
+  await $.turn.complete({ ...answered, turnId: 't1' })
+  expect(commands).toEqual([])
+  await clock.advance(1)
+  expect(commands).toHaveLength(1)
+})

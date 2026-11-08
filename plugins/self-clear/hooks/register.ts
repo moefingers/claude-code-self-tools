@@ -28,8 +28,13 @@ import { configureUpdateCheck, loadUpdateCheck, withUpdateNotice } from './updat
 
 const queued = { plugin: 'self-clear', key: 'queued' } as const
 
-/** A beat after the turn's end, so the turn is no longer running when the clear starts. */
-const SETTLE_MS = 500
+/**
+ * When the step starts after the turn's end: at once, the moment the turn's end returns, so its command is queued
+ * ahead of anything that arrives after (the owner's A). The 500 ms beat once copied here from self-compact (where
+ * compacting rejects while a turn still runs) guarded nothing for a command: $.command.run queues it either way,
+ * and a turn that starts before it runs takes it back (turn.start), as before.
+ */
+const TURN_END_MS = 0
 
 /**
  * An agent in one of these has ended. Every other status is still to report: `pending`, `running`,
@@ -62,7 +67,7 @@ const DESCRIPTION = [
   'Irreversible: nothing of this conversation is kept but `handoff` and what you wrote down. Before calling it, write what the next piece needs where your notes live (memory, files, the PR), and say where in `handoff`. Never mid-task.',
   'It refuses while subagents you started are still running. Background tasks you started report into the cleared conversation, which no longer knows why it asked: let them finish first.',
   "It can run only when the session is idle: Claude Code queues a plugin's command behind anything already waiting (a message typed during this turn, a background task's notification) and has no slot between turns ahead of them. A turn that starts first cancels the clear, and you are told, so nothing waiting is lost or carried into another conversation; under a nonstop stream of work and notifications it may not run for a long time, so call it again when the stream pauses.",
-  'End the turn after calling it; the clear runs once your answer is shown.',
+  'After calling it, end your turn and do nothing more until it has run; then carry on.',
 ].join(' ')
 
 const SUBAGENT =
@@ -248,7 +253,7 @@ export const register: Register = (on, options) => {
       return done
     }
     armed = value
-    $.clock.after(SETTLE_MS, () => void clearNow($, value))
+    $.clock.after(TURN_END_MS, () => void clearNow($, value))
     return done
   })
 

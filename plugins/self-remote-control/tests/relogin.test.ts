@@ -42,7 +42,9 @@ type Options = {
  * the account-switch tool does; Remote Control then stops `stopsAfterMs` later, as Claude Code's
  * own owner check does. `refresh` rewrites the login alone, as a token refresh does.
  */
-function machine(on: On, { description = CONNECTED, remoteControl = 'false', stopsAfterMs = 12_000, record, runTakesMs = 0 }: Options = {}) {
+function machine(on: On, { description = CONNECTED, remoteControl = 'false', stopsAfterMs = 12_000, record, runTakesMs = 0, chrome = false }: Options & { chrome?: boolean } = {}) {
+  // The session's tools: Claude in Chrome's, when asked for.
+  on('tool.list', () => ({ value: chrome ? [{ name: 'mcp__claude-in-chrome__navigate', description: 'Opens a page.', mcp: true }] : [] }))
   const clock = mock.clock(on, { now: 100 * HOUR })
   mock.env(on, { USERPROFILE: HOME, LOCALAPPDATA: LOCAL, SystemRoot: 'C:\\Windows' })
   const commands: string[] = []
@@ -897,4 +899,28 @@ test('a resume says which error its turn ended on, and how long ago, in the toas
   expect(w.prompts).toEqual([RESUME])
   expect(w.toasts[0]).toMatch(/resumed: the turn ended on rate_limit \d+ (?:s|min) ago\.$/)
   expect(debug.some(line => /self-remote-control: resumed: the turn ended on rate_limit \d+ (?:s|min) ago/.test(line))).toBe(true)
+})
+
+test('the owner\'s item 5: in a session with Claude in Chrome, a login change reconnects it after Remote Control and before the resume, and says its tab group starts over', async ($, on) => {
+  const w = machine(on, { chrome: true })
+  await begin($, w)
+  await cutOff($, w)
+  w.switchTo('account-b')
+  await w.clock.advance(SETTLE)
+  expect(w.commands[0]).toBe(`remote-control ${TITLE}`)
+  expect(w.prompts).toEqual([])
+  await w.clock.advance(DELAY + 15_000)
+  expect(w.commands).toEqual([`remote-control ${TITLE}`, 'mcp reconnect claude-in-chrome'])
+  expect(w.prompts).toEqual([RESUME])
+  expect(noAgo(w.toasts)).toEqual([`Login changed; Remote Control reconnected as "${TITLE}"; Claude in Chrome reconnected, so its tab group starts over; resumed: the turn ended on KIND AGO ago.`])
+})
+
+test('reconnectChromeOnLoginChange off: Claude in Chrome is left as it was', { options: { reconnectChromeOnLoginChange: false } }, async ($, on) => {
+  const w = machine(on, { chrome: true })
+  await begin($, w)
+  await cutOff($, w)
+  w.switchTo('account-b')
+  await w.clock.advance(SETTLE + DELAY + 15_000)
+  expect(w.commands).toEqual([`remote-control ${TITLE}`])
+  expect(w.prompts).toEqual([RESUME])
 })

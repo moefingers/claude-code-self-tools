@@ -1,12 +1,20 @@
 {
   "name": "self-remote-control",
-  "version": "0.3.2",
+  "version": "0.4.0",
   "description": "Lets a session report on its own Remote Control, turn it on under a title, and rename itself. After a login change it reconnects Remote Control and resumes a turn the change cut off. It runs /remote-control only when the session reads as not connected, so it never opens the Remote Control panel or disconnects.",
-  "author": { "name": "moefingers", "url": "https://github.com/moefingers" },
+  "author": {
+    "name": "moefingers",
+    "url": "https://github.com/moefingers"
+  },
   "homepage": "https://github.com/moefingers/claude-code-self-tools/tree/main/plugins/self-remote-control#readme",
   "repository": "https://github.com/moefingers/claude-code-self-tools",
   "license": "MIT",
-  "keywords": ["remote-control", "mobile", "rename", "mod"],
+  "keywords": [
+    "remote-control",
+    "mobile",
+    "rename",
+    "mod"
+  ],
   "types": "./types/index.d.ts",
   "userConfig": {
     "reconnectOnLoginChange": {
@@ -26,7 +34,16 @@
       "title": "Update check",
       "description": "on: when a tool of this plugin is called and the last check is 30 minutes old, fetch this plugin's published plugin.json from GitHub (a plain GET of a public file) and say when a newer version is out. off: never check.",
       "default": "on",
-      "options": ["on", "off"]
+      "options": [
+        "on",
+        "off"
+      ]
+    },
+    "reconnectChromeOnLoginChange": {
+      "type": "boolean",
+      "title": "Reconnect Claude in Chrome after a login change",
+      "description": "When the account changes, run /mcp reconnect claude-in-chrome after Remote Control reconnects and before the resume, in a session that has Claude in Chrome: its cloud bridge routes by claude.ai account, and a session keeps its old connection until it reconnects. The reconnect starts the session's Chrome tab group over.",
+      "default": true
     }
   }
 }

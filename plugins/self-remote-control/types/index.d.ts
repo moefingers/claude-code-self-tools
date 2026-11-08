@@ -60,6 +60,8 @@ export type Pending = {
   at: number
   /** Whether Remote Control read connected when the new account was first seen. */
   wasConnected: boolean
+  /** Claude in Chrome's reconnect, after Remote Control's and before the resume: run, not there, or failed. */
+  chrome?: 'ran' | 'none' | 'failed'
   /** Whether the /config setting for all sessions (`remoteControl`) was true then. */
   settingOn: boolean
   /** The first moment no turn was running after the change: the reconnect's wait counts from here. */

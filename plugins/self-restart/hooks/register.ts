@@ -92,6 +92,13 @@ const RECENT = 'recentRestarts'
 
 /** A beat after the turn's end, so the turn is no longer running when the restart starts. */
 const SETTLE_MS = 500
+/**
+ * When the step starts after the turn's end: at once, the moment the turn's end returns, so its command is queued
+ * ahead of anything that arrives after (the owner's A). The 500 ms beat once copied here from self-compact (where
+ * compacting rejects while a turn still runs) guarded nothing for a command: $.command.run queues it either way,
+ * and a turn that starts before it runs takes it back (turn.start), as before.
+ */
+const TURN_END_MS = 0
 /** How long after the exit command to look whether the session is still here. */
 const CHECK_MS = 5000
 /** How long releasing the claim lock may take. */
@@ -112,7 +119,7 @@ const DESCRIPTION = [
   '`reason` (required) says why; it is recorded in the transcript. `resume` is the message that starts your first turn in the restarted session: what to check or do next. Give it whenever you have a next step of your own; leave it out only when the next step waits on someone else.',
   'It refuses unless the session is at a safe point: while a session cron is set (delete it with CronDelete), while subagents you started are still running, while a wake-up from wake_after is pending (cancel it with cancel_wake), while anything runs under this session (a background Bash, PowerShell or Monitor job, git, a build, test or lint, a dev server or Playwright, a heavy-slot job), while a git operation is in flight in the repo, and while any of that can\'t be read; each is named with how to stop it. It refuses a second restart within 2 minutes of the last. What still ends with this process: Remote Control (with Remote Control on for all sessions, the resumed session connects again).',
   "It can run only when the session is idle: Claude Code queues a plugin's command behind anything already waiting (a message typed during this turn, a background task's notification) and has no slot between turns ahead of them. A turn that starts first cancels the restart, and you are told, so nothing waiting is lost or carried into another conversation; under a nonstop stream of work and notifications it may not run for a long time, so call it again when the stream pauses.",
-  'End the turn after calling it; the restart starts once your answer is shown.',
+  'After calling it, end your turn and do nothing more until it has run; then carry on.',
 ].join(' ')
 
 const SUBAGENT =
@@ -871,7 +878,7 @@ export const register: Register = (on, options) => {
     }
     armed = value
     await mark($, 'restart')
-    $.clock.after(SETTLE_MS, () => void restartNow($, value))
+    $.clock.after(TURN_END_MS, () => void restartNow($, value))
     return done
   })
 

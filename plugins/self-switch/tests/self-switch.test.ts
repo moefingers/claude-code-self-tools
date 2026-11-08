@@ -45,7 +45,7 @@ const launchOf = (where: LaunchInput['where'], folder: string, claim: string = L
   waitForExit: { pid: 100, created: ft(2) },
   tool: 'self-switch',
   // The run starts half a second after the turn's end: its deadline LAUNCH_DEADLINE_MS after that.
-  deadline: NOW + 500 + 20_000,
+  deadline: NOW + 20_000,
   ...extra,
 })
 
@@ -676,7 +676,7 @@ describe("the claude wrapper's tab", () => {
     const written = runs.find(r => r.kind === 'pane')
     // The ticket: this tab's token, the conversation switched to, the claim the probe took (which the
     // wrapper finds the lock still names), its own folder, now. No claim of the script's own.
-    expect(written?.script).toBe(launchScriptText(launchOf({ pane: { token: TOKEN } }, ELSEWHERE, LAUNCH, { now: NOW + 500 })))
+    expect(written?.script).toBe(launchScriptText(launchOf({ pane: { token: TOKEN } }, ELSEWHERE, LAUNCH, { now: NOW })))
     // The claim is the probe's, taken again in the launch's own run (the same session's: idempotent).
     expect(written?.script).toContain(`$by = '${LAUNCH}'`)
     expect(written?.script).toContain('if (-not $taken) { $taken = Set-Claim $claimPath $claimText }')
@@ -1779,7 +1779,7 @@ describe('the heartbeat', () => {
     expect(world.id).toBe(T)
     // T's heartbeat at once, from the resume's SessionStart, with the folder: not 2 minutes later. W's,
     // the conversation that left, isn't refreshed, though $.session.id() still read W then.
-    expect(held.get(`alive:${T}`)).toEqual({ at: NOW + 500, folder: REPO, project: PROJECT })
+    expect(held.get(`alive:${T}`)).toEqual({ at: NOW, folder: REPO, project: PROJECT })
     expect(held.get(`alive:${W}`)).toEqual({ at: NOW, folder: REPO, project: PROJECT })
     await clock.advance(1000)
     expect(texts(session).at(-1)).toContain(DROPPED_THERE)
@@ -1793,7 +1793,7 @@ describe('the heartbeat', () => {
     })
     await clock.advance(3 * MINUTE)
     // The 2-minute tick beats T now, with the process's start folder, which T's $.state never held.
-    expect((held.get(`alive:${T}`) as { at: number }).at).toBeGreaterThan(NOW + 2 * MINUTE)
+    expect((held.get(`alive:${T}`) as { at: number }).at).toBeGreaterThanOrEqual(NOW + 2 * MINUTE)
     expect((held.get(`alive:${W}`) as { at: number }).at).toBe(NOW)
     await switchNow($, clock, { to: X })
     expect(rows(session)).not.toMatch(/the folder this session started in isn't known/)
@@ -2262,7 +2262,7 @@ describe('a run the switch gave up on can leave nothing behind (the coordinator\
     await $.session.start(start)
     await switchNow($, clock)
     const script = runs.find(r => r.kind === 'pane')?.script ?? ''
-    expect(script).toContain(`if ([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() -gt ${NOW + 500 + 20_000}) { Refuse 'late'`)
+    expect(script).toContain(`if ([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() -gt ${NOW + 20_000}) { Refuse 'late'`)
     expect(runs.find(r => r.kind === 'pane')?.init?.timeoutMs).toBe(30_000)
   })
 

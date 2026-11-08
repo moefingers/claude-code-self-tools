@@ -20,7 +20,7 @@ const REPO = 'C:\\work\\repo'
 const SHELL_STARTED = '134062345678901240'
 const PANE = JSON.stringify({ v: 2, pid: 20, started: SHELL_STARTED })
 /** The time the restart runs at: the clock's start, and the half second after the turn's end. */
-const AT = 1_000_500
+const AT = 1_000_000
 
 /** A probe's answer: claude.exe 100 under PowerShell 20 in a tab, the probe under it, and `under`, what else runs under the session. */
 const probeOf = (under: Record<string, unknown>[] = []) =>
@@ -384,7 +384,7 @@ for (const [where, options, toast] of [
     // The claim the ticket, the slot's record or the window holds.
     const claim = where === "this pane's slot" ? `slot:${SLOT}` : claimOf(scripts[0])
     // Kept, with the claim, but not the first prompt: the session went on.
-    expect((held.get('restarts') as Record<string, unknown>)[ID]).toEqual({ at: 1_000_500, reason: 'Switched accounts.', claim })
+    expect((held.get('restarts') as Record<string, unknown>)[ID]).toEqual({ at: 1_000_000, reason: 'Switched accounts.', claim })
 
     // The person exits within 2 minutes, and the tab, the slot or the window resumes the session: its
     // copy of the plugin releases that claim, once, and sends no first prompt.

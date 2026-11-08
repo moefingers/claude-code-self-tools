@@ -26,9 +26,9 @@ const restartInput = (claim: string): LaunchInput => ({
   stateDir: 'C:\\Users\\u\\AppData\\Local\\claude-self-tools',
   where: 'auto',
   waitForExit: { pid: 100, created: '134062345688901240' },
-  now: 1_000_500,
+  now: 1_000_000,
   tool: 'self-restart',
-  deadline: 1_000_500 + 20_000,
+  deadline: 1_000_000 + 20_000,
 })
 
 /** The launch script for one claim, as self-restart builds it. */
@@ -206,7 +206,7 @@ test('the window opens only once the turn has ended, by the fixed path with noth
   // The shared launcher's script for this session: its id, its folder, its own claude.exe, a fresh claim.
   expect(claimOf(script)).not.toBe('none')
   // The run comes half a second after the turn's end, a minute in: its deadline LAUNCH_DEADLINE_MS after that.
-  expect(script).toBe(launchScriptText({ ...restartInput(claimOf(script)), now: 1_060_500, deadline: 1_060_500 + 20_000 }))
+  expect(script).toBe(launchScriptText({ ...restartInput(claimOf(script)), now: 1_060_000, deadline: 1_060_000 + 20_000 }))
   expect(script).toContain(`$id = '${ID}'`)
   for (const part of ['evil', 'Remove-Item', 'Switched accounts', 'deploy check']) expect(JSON.stringify(run)).not.toContain(part)
   for (const part of ['evil', 'Remove-Item']) expect(script).not.toContain(part)
@@ -240,7 +240,7 @@ test('a second restart within 2 minutes of the first is refused: no restart loop
   await $.turn.complete(answered)
   await clock.advance(1000)
   expect(runs).toHaveLength(1)
-  expect((held.get('recentRestarts') as Record<string, number>)[ID]).toBe(1_000_000 + 500)
+  expect((held.get('recentRestarts') as Record<string, number>)[ID]).toBe(1_000_000)
 
   // The resumed session, a minute later, asks again: refused at the call.
   await clock.advance(60_000)
@@ -510,7 +510,7 @@ test('a message that starts a turn while the window opens stops the exit, and th
   // The first prompt is taken back: the window may still resume the session if the person exits, and
   // the record keeps only the claim the window holds, for the process that resumes it to release.
   const LAUNCH = claimOf(String(runs[0]?.init?.stdin))
-  expect(held.get('restarts')).toEqual({ [ID]: { at: 1_000_500, reason: 'Switched accounts.', claim: LAUNCH } })
+  expect(held.get('restarts')).toEqual({ [ID]: { at: 1_000_000, reason: 'Switched accounts.', claim: LAUNCH } })
 })
 
 test('a subagent that starts while the window opens stops the exit', async ($, on) => {

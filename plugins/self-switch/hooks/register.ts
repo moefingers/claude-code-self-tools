@@ -183,6 +183,13 @@ const BASELINE = 'baseline:'
 const RETRY_MS = [2500, 3500, 4000] as const
 /** A beat after the turn's end, so the turn is no longer running when the switch starts. */
 const SETTLE_MS = 500
+/**
+ * When the step starts after the turn's end: at once, the moment the turn's end returns, so its command is queued
+ * ahead of anything that arrives after (the owner's A). The 500 ms beat once copied here from self-compact (where
+ * compacting rejects while a turn still runs) guarded nothing for a command: $.command.run queues it either way,
+ * and a turn that starts before it runs takes it back (turn.start), as before.
+ */
+const TURN_END_MS = 0
 /** How long after the exit command to look whether the session is still here. */
 const CHECK_MS = 5000
 /** How long the probe may take. */
@@ -214,7 +221,7 @@ const DESCRIPTION = [
   'Before anything runs it checks, and refuses saying why: when `to` is open, or may be open, anywhere on this machine; when anything still runs under this session (subagents, background Bash or Monitor jobs, git, builds, dev servers, a heavy slot); when an in-place switch would leave changes made since this conversation started uncommitted in the checkout both share; when a worktree named in `trees`, or the one this session works in, has uncommitted changes; within 2 minutes of a switch. Windows only, in a terminal.',
   '`trees` (optional): the git worktrees you worked in, absolute paths, each a worktree of the repository this session started in; each must be clean.',
   "It can run only when the session is idle: Claude Code queues a plugin's command behind anything already waiting (a message typed during this turn, a background task's notification) and has no slot between turns ahead of them. A turn that starts first cancels the switch, and you are told, so nothing waiting is lost or carried into another conversation; under a nonstop stream of work and notifications it may not run for a long time, so call it again when the stream pauses.",
-  'End the turn after calling it; the switch starts once your answer is shown.',
+  'After calling it, end your turn and do nothing more until it has run; then carry on.',
 ].join(' ')
 
 const SUBAGENT =
@@ -1595,7 +1602,7 @@ export const register: Register = (on, options) => {
       return done
     }
     armed = value
-    $.clock.after(SETTLE_MS, () => void runSwitch($, value))
+    $.clock.after(TURN_END_MS, () => void runSwitch($, value))
     return done
   })
 

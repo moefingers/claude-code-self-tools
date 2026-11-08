@@ -13,8 +13,13 @@ import { configureUpdateCheck, loadUpdateCheck, withUpdateNotice } from './updat
 
 const queued = { plugin: 'self-mcp', key: 'queued' } as const
 
-/** A beat after the turn's end, so the turn is no longer running when the command starts. */
-const SETTLE_MS = 500
+/**
+ * When the step starts after the turn's end: at once, the moment the turn's end returns, so its command is queued
+ * ahead of anything that arrives after (the owner's A). The 500 ms beat once copied here from self-compact (where
+ * compacting rejects while a turn still runs) guarded nothing for a command: $.command.run queues it either way,
+ * and a turn that starts before it runs takes it back (turn.start), as before.
+ */
+const TURN_END_MS = 0
 
 const DESCRIPTION = [
   'Reconnects one of this session\'s MCP servers once the current turn ends, as /mcp reconnect does: for a server whose tools stopped answering (a browser extension that dropped, a server that crashed or timed out), where reconnecting is all it needs.',
@@ -23,7 +28,7 @@ const DESCRIPTION = [
   '`resume` is the message that starts your next turn once the reconnect has run, with what the reconnect said: what to try again.',
   'Give it whenever you have a next step of your own; leave it out only when the next step waits on someone else (the user, another session, a check).',
   "It runs when the session is idle: Claude Code queues a plugin's command behind anything already waiting (a message typed during this turn, a background task's notification) and has no slot between turns ahead of them, so under a nonstop stream of work and notifications it may run in the distant future. Nothing waiting is lost.",
-  'End the turn after calling it; the reconnect runs once your answer is shown.',
+  'After calling it, end your turn and do nothing more until it has run; then carry on.',
 ].join(' ')
 
 /** Trimmed text, or undefined when it is not a string or is blank. */
@@ -145,7 +150,7 @@ export const register: Register = (on, options) => {
       $.ui.toast("MCP reconnect cancelled: the turn didn't finish.")
       return done
     }
-    $.clock.after(SETTLE_MS, () => void reconnectNow($, value))
+    $.clock.after(TURN_END_MS, () => void reconnectNow($, value))
     return done
   })
 }

@@ -16,8 +16,13 @@ import { configureUpdateCheck, loadUpdateCheck, withUpdateNotice } from './updat
 const queued = { plugin: 'self-reload', key: 'queued' } as const
 const pending = { plugin: 'self-reload', key: 'pending' } as const
 
-/** A beat after the turn's end, so the turn is no longer running when the reload starts. */
-const SETTLE_MS = 500
+/**
+ * When the step starts after the turn's end: at once, the moment the turn's end returns, so its command is queued
+ * ahead of anything that arrives after (the owner's A). The 500 ms beat once copied here from self-compact (where
+ * compacting rejects while a turn still runs) guarded nothing for a command: $.command.run queues it either way,
+ * and a turn that starts before it runs takes it back (turn.start), as before.
+ */
+const TURN_END_MS = 0
 
 /** A pending resume older than this is dropped, not sent: the turn that asked for it is long gone. */
 const STALE_MS = 10 * 60 * 1000
@@ -35,7 +40,7 @@ const DESCRIPTION = [
   '`resume` is the message that starts your next turn once the plugins have reloaded: what to check or do next.',
   'Give it whenever you have a next step of your own; leave it out only when the next step waits on someone else (the user, another session, a check).',
   "It runs when the session is idle: Claude Code queues a plugin's command behind anything already waiting (a message typed during this turn, a background task's notification) and has no slot between turns ahead of them, so under a nonstop stream of work and notifications it may run in the distant future. Nothing waiting is lost.",
-  'End the turn after calling it; the reload runs once your answer is shown.',
+  'After calling it, end your turn and do nothing more until it has run; then carry on.',
 ].join(' ')
 
 /** What is queued: `resume` only when there is one, since stored state holds no undefined. */
@@ -177,7 +182,7 @@ export const register: Register = (on, options) => {
     }
     // Written before the reload replaces this module, so the module it starts finds it.
     await $.state.set(pending, { ...value, at: await $.clock.now() })
-    $.clock.after(SETTLE_MS, () => void reloadNow($))
+    $.clock.after(TURN_END_MS, () => void reloadNow($))
     return done
   })
 }

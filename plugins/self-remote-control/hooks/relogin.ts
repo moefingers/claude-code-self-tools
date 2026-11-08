@@ -101,9 +101,15 @@ const RESUMABLE = new Set(['rate_limit', 'authentication_failed', 'billing_error
 /** Where the watch looks: the login file (stat only) and the config file holding the account record. */
 type Paths = { login: string; claim: string }
 
-type Settings = { reconnect: boolean; resume: boolean }
+type Settings = { reconnect: boolean; resume: boolean; chrome: boolean }
 
-let settings: Settings = { reconnect: true, resume: true }
+let settings: Settings = { reconnect: true, resume: true, chrome: true }
+
+/**
+ * Claude in Chrome's MCP server: its cloud bridge routes by claude.ai account, and a session keeps the connection it
+ * made under the old account until it reconnects. A reconnect starts the session's Chrome tab group over.
+ */
+const CHROME = 'claude-in-chrome'
 /** Undefined until looked for; null when they can't be worked out (no home folder), and nothing is watched. */
 let paths: Paths | null | undefined
 /** The login file's size and modification time at the last look; 'none' when there was none. */
@@ -128,7 +134,7 @@ let tickTimer: Timer | undefined
 
 /** Reads this load's settings and starts over; at register. */
 export function configureRelogin(options: PluginOptions): void {
-  settings = { reconnect: options.reconnectOnLoginChange !== false, resume: options.resumeAfterLoginChange !== false }
+  settings = { reconnect: options.reconnectOnLoginChange !== false, resume: options.resumeAfterLoginChange !== false, chrome: options.reconnectChromeOnLoginChange !== false }
   paths = undefined
   loginKey = undefined
   claimKey = undefined
@@ -578,6 +584,28 @@ const isLoginRunning = (now: number): boolean => logins.some(at => now - at < LO
  * check, the session's own delay, then the resume and the toast. A lock held past LOCK_HOLD_MS is
  * given back whatever else waits. Never throws.
  */
+/**
+ * /mcp reconnect for Claude in Chrome, when this session lists its tools: 'ran' once the command returned, 'none'
+ * when the session has no such server, 'failed' when it can't be listed or the command didn't return in time.
+ */
+async function reconnectChrome($: EngineInterface): Promise<'ran' | 'none' | 'failed'> {
+  try {
+    const tools = await $.tool.list()
+    if (!tools.some(tool => tool.name.startsWith(`mcp__${CHROME}__`))) return 'none'
+    const ran = await within($, $.command.run({ command: 'mcp', args: `reconnect ${CHROME}` }), RUN_WAIT_MS)
+    return ran === 'late' ? 'failed' : 'ran'
+  } catch {
+    return 'failed'
+  }
+}
+
+/** What the toast says of Claude in Chrome: nothing when this session has none. */
+function chromeSaid(p: Pending): string {
+  if (p.chrome === 'ran') return '; Claude in Chrome reconnected, so its tab group starts over'
+  if (p.chrome === 'failed') return `; Claude in Chrome didn't reconnect: run /mcp reconnect ${CHROME}`
+  return ''
+}
+
 export async function move($: EngineInterface): Promise<void> {
   if (busy) return
   busy = true
@@ -609,7 +637,8 @@ export async function move($: EngineInterface): Promise<void> {
     if (p.rc === undefined) ({ p, held } = await reconnect($, held, p, now))
     else if (p.rc === 'ran') p = await check($, p, now)
     if (p.rc === undefined || p.rc === 'ran') return await save(p, held)
-    // The reconnect has settled: the session's own delay, then the resume.
+    // The reconnect has settled: Claude in Chrome, once, when this session has it; then the session's own delay, and the resume.
+    if (settings.chrome && p.chrome === undefined) p = { ...p, chrome: await reconnectChrome($) }
     if (p.resumeAt === undefined && (await isResumeDue($, p, now))) {
       p = { ...p, resumeAt: now + (await jitter($)) }
     }
@@ -627,7 +656,7 @@ export async function move($: EngineInterface): Promise<void> {
     }
     await $.state.set(loginRef, settled)
     if (isCapToldAlready && !resumed.startsWith('resumed:')) return
-    $.ui.toast(`Login changed; ${rcSaid(p)}; ${resumed}.`)
+    $.ui.toast(`Login changed; ${rcSaid(p)}${chromeSaid(p)}; ${resumed}.`)
   } catch {
     // The next tick tries again.
   } finally {

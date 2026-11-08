@@ -57,6 +57,7 @@ Nothing runs while a turn is running. To turn either part off, use the plugin's 
 
 - `reconnectOnLoginChange`: reconnect Remote Control after a login change.
 - `resumeAfterLoginChange`: resume a cut-off turn after a login change.
+- `reconnectChromeOnLoginChange` (on by default): after a login change, once Remote Control has reconnected and before the resume, run `/mcp reconnect claude-in-chrome` in a session that has Claude in Chrome. Its cloud bridge routes by claude.ai account, and a session keeps its old connection until it reconnects. The reconnect starts the session's Chrome tab group over.
 
 Or set them from your shell:
 

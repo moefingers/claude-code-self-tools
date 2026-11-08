@@ -25,9 +25,9 @@ const restartInput = (claim: string): LaunchInput => ({
   stateDir: 'C:\\Users\\u\\AppData\\Local\\claude-self-tools',
   where: 'auto',
   waitForExit: { pid: 100, created: '134062345688901240' },
-  now: 1_000_500,
+  now: 1_000_000,
   tool: 'self-restart',
-  deadline: 1_000_500 + 20_000,
+  deadline: 1_000_000 + 20_000,
 })
 
 /** What the launch answers, by what it placed: a window, or this pane's slot (the claim then the slot's own). */
