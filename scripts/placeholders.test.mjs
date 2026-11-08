@@ -6,6 +6,7 @@ import assert from 'node:assert/strict'
 import { readdirSync, readFileSync, statSync } from 'node:fs'
 import { join, relative } from 'node:path'
 import { test } from 'node:test'
+import { pathToFileURL } from 'node:url'
 import { ROOT } from './sync-shared.mjs'
 
 /** Each file under `dir`, but tests and dot folders. */
@@ -40,4 +41,28 @@ test('no shipped file names a person, a machine folder, a user profile or an ema
     }
   }
   assert.deepEqual(found, [])
+})
+
+/** The generic names the shipped presets use for lanes and spare tabs: what a person renames to their own. */
+const GENERIC = /^(lane-[a-z]|spare-\d+|overflow-\d+)$/
+/** The hyphenated words a sentence that describes the presets may name besides them: the windows. */
+const WINDOW = /^claude-\d+$/
+/** Its hyphenated words, paths left out (plugins/self-switch/slot/... names a folder, not a lane). */
+const names = text => text.replace(/[\w.-]*\/[\w./-]*/g, ' ').match(/\b[a-z][a-z0-9]*(?:-[a-z0-9]+)+\b/g) ?? []
+
+test('the shipped presets name generic lanes only, and what describes them names only those', async () => {
+  const example = JSON.parse(readFileSync(join(ROOT, 'plugins', 'self-switch', 'slot', 'placement.example.json'), 'utf8'))
+  const tabs = example.layout.flatMap(w => w.tabs ?? [])
+  assert.ok(tabs.length > 0)
+  assert.deepEqual(tabs.filter(t => !GENERIC.test(t)), [], 'placement.example.json: a tab that is no generic lane')
+  const seed = await import(pathToFileURL(join(ROOT, 'tools', 'lanes-seed', 'lanes-seed.mjs')).href)
+  assert.deepEqual(Object.keys(seed.HOMES).filter(name => !GENERIC.test(name)), [], "lanes-seed's homes: a lane that is no generic one")
+  const known = new Set(tabs)
+  const readme = readFileSync(join(ROOT, 'README.md'), 'utf8').split('\n').find(line => line.includes('placement.example.json') && line.includes('presets')) ?? ''
+  const layout = readFileSync(join(ROOT, 'plugins', 'self-switch', 'slot', 'claude-layout.ps1'), 'utf8')
+  const header = layout.slice(layout.indexOf('presets ship as'), layout.indexOf('\n#\n', layout.indexOf('presets ship as')))
+  for (const [where, text] of [['README.md', readme.slice(readme.indexOf('presets'))], ['claude-layout.ps1', header]]) {
+    assert.ok(text.length > 0, `${where}: the presets are described`)
+    assert.deepEqual(names(text).filter(n => !known.has(n) && !WINDOW.test(n)), [], `${where}: names a lane the presets don't`)
+  }
 })

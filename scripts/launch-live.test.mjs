@@ -358,10 +358,12 @@ describe("the window's own script, run as the window runs it (hidden, here)", { 
 
 describe('S3: the window waits for the old process by its handle, keeps waiting, and records a refusal', { skip: !isWindows && 'Windows only', concurrency: 2 }, () => {
   /** The window's first wait, shortened from 10 minutes to 2 seconds for the test: nothing else changes. */
+  /** The window's looks, shortened from 30 s to 1 s, and its 10-minute line to 2 s, for the test: nothing else changes. */
   const shortWait = (inner, waitFor) => {
-    const line = `$gone = Wait-Gone ${waitFor.pid} '${waitFor.created}' ${machine.WAIT_SECONDS}`
-    assert.ok(inner.includes(line), 'the wait line as the window has it')
-    return inner.split(line).join(`$gone = Wait-Gone ${waitFor.pid} '${waitFor.created}' 2`)
+    const look = `$gone = Wait-Gone ${waitFor.pid} '${waitFor.created}' ${machine.WAIT_POLL_SECONDS}`
+    const long = `$waitClock.Elapsed.TotalSeconds -ge ${machine.WAIT_SECONDS}`
+    assert.ok(inner.includes(look) && inner.includes(long), 'the wait lines as the window has them')
+    return inner.split(look).join(`$gone = Wait-Gone ${waitFor.pid} '${waitFor.created}' 1`).split(long).join('$waitClock.Elapsed.TotalSeconds -ge 2')
   }
 
   test('a process that outlasts the first wait is waited for until it goes, and then the session resumes (no refusal, no giving up)', async () => {
@@ -371,7 +373,7 @@ describe('S3: the window waits for the old process by its handle, keeps waiting,
       const { inner, input } = windowLab({ waitForExit: { pid: old.pid, created: old.created }, checks: {} })
       void dirs
       const ran = await runWindow(shortWait(inner, { pid: old.pid, created: old.created }), windowLabDirs(input))
-      assert.match(ran.out, /It has not exited after 10 minutes\. This window keeps waiting, and resumes the session when it goes\./)
+      assert.match(ran.out, /It has not exited after 10 minutes\. This window keeps waiting while the move that opened it stands, and resumes the session when it goes\./)
       assert.doesNotMatch(ran.out, /still running/)
       assert.equal(ran.runs.length, 1, ran.out)
       assert.deepEqual(ran.runs[0].args, ['--resume', input.id])
@@ -393,6 +395,27 @@ describe('S3: the window waits for the old process by its handle, keeps waiting,
       assert.ok(Date.now() - started < 60_000, 'no wait for the pid')
     } finally {
       other.stop()
+    }
+  })
+
+  test('R4: a move taken back while the window waits (its claim released) ends the wait at once: refused, said and recorded', async () => {
+    const dirs = lab()
+    const old = await holder({ stub, work, env: envOf(dirs), ms: 60_000 })
+    try {
+      const waitFor = { pid: old.pid, created: old.created }
+      const waiting = windowLab({ waitForExit: waitFor, checks: {} })
+      const running = runWindow(shortWait(waiting.inner, waitFor), waiting.dirs)
+      // A few looks in, the switch is taken back: its claim released.
+      await new Promise(resolve => setTimeout(resolve, 5000))
+      rmSync(machine.claimPath(waiting.dirs.state, waiting.input.id), { force: true })
+      const taken = Date.now()
+      const ran = await running
+      assert.ok(Date.now() - taken < 20_000, `the wait ended at once, not when the old process went\n${ran.out}`)
+      assert.equal(ran.runs.length, 0, ran.out)
+      assert.match(ran.out, /the claim on it no longer names this window/)
+      assert.match(machine.readRefused(readFileSync(machine.refusedPath(waiting.dirs.state, waiting.input.id), 'utf8'))?.why ?? '', /no longer names this window/)
+    } finally {
+      old.stop()
     }
   })
 

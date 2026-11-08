@@ -27,8 +27,8 @@
 // environment (Claude Code's markers and NO_COLOR removed: CLAUDE_CODE_CHILD_SESSION among them makes
 // a claude nested, and a nested session saves no transcript; transcripts forced on; the REAP setting
 // kept on; WT_SESSION and WT_PROFILE_ID untouched) and runs `claude --resume <id>` in the folder the
-// session started in, with no other flag: no permission flag of any kind. If the old process is still
-// there after 10 minutes, the window says so and resumes nothing.
+// session started in, with no other flag: no permission flag of any kind. The window waits for the old
+// process as long as the restart's claim holds (read at every look), and resumes only once nothing else holds it.
 //
 // When Claude Code ends with an error, or within seconds (the resume didn't take), the window shows
 // the command to resume by hand and waits for Enter, rather than closing on the message; a resume

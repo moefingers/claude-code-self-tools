@@ -8,9 +8,9 @@
 #   powershell.exe -NoProfile -ExecutionPolicy RemoteSigned -File "%LOCALAPPDATA%\claude-self-tools\claude-layout.ps1" -Apply   runs them
 #
 # -Placement <file> reads another file than %LOCALAPPDATA%\claude-self-tools\placement.json. The file's
-# presets ship as plugins/self-switch/slot/placement.example.json, this machine's four windows:
-#   claude-1: agent-coordinator-3000, system-overhaul   claude-2: video-lab
-#   claude-3: olivia-work, ui-general, package-bumper   claude-4: overflow
+# presets ship as plugins/self-switch/slot/placement.example.json, four windows of generic lanes to rename:
+#   claude-1: lane-a, lane-b   claude-2: lane-c
+#   claude-3: lane-d, lane-e, lane-f   claude-4: overflow
 #
 # What it does:
 # - It checks the file by the rules of readPlacement in the plugins' machine code (one shared list of good
@@ -40,7 +40,7 @@ $ProgressPreference = 'SilentlyContinue'
 $env:PSModulePath = @([Environment]::GetFolderPath("MyDocuments") + "\WindowsPowerShell\Modules", [Environment]::GetFolderPath("ProgramFiles") + "\WindowsPowerShell\Modules", [Environment]::GetFolderPath("System") + "\WindowsPowerShell\v1.0\Modules") -join ";"
 
 # The slot runner this release ships.
-$SlotSha = 'd68c8f0e0957a26678d3a225f71039dbfdae5e2457629ee180fa50a2b1440b59'
+$SlotSha = '97f84fba8aeef8bad0d7ba1a0dd3cff085aca955a992391894c47a511a2c9335'
 # Set by Claude Code in the processes it starts, and NO_COLOR: LAUNCH_ENV_CLEAR in the plugins' machine code.
 $Clear = 'CLAUDE_CODE_CHILD_SESSION', 'CLAUDECODE', 'CLAUDE_CODE_SESSION_ID', 'CLAUDE_PID', 'CLAUDE_EFFORT', 'CLAUDE_CODE_BRIDGE_SESSION_ID', 'CLAUDE_CODE_MESSAGING_SOCKET', 'CLAUDE_CODE_MESSAGING_TOKEN', 'CLAUDE_CODE_REMOTE', 'CLAUDE_CODE_REMOTE_SESSION_ID', 'CLAUDE_JOB_DIR', 'AI_AGENT', 'CLAUDE_CODE_ENTRYPOINT', 'CLAUDE_CODE_EXECPATH', 'CLAUDE_CODE_SESSION_ATTENDED', 'CLAUDE_CODE_SSE_PORT', 'NO_COLOR'
 foreach ($n in $Clear) { [Environment]::SetEnvironmentVariable($n, [NullString]::Value, [EnvironmentVariableTarget]::Process) }

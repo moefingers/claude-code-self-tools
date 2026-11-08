@@ -256,9 +256,9 @@ describe('the checks, the claim and the place, in one run, in that order', () =>
   test('a launch that waits takes its last look after the wait: in the window, RECHECK and the folder and the claim, then claude-launch.ps1', () => {
     const inner = innerOf(SCRIPTS[0]?.[1] ?? '')
     // F1: waited for by its handle, then looked at again until it goes (S3): no refusal for one still running.
-    const wait = inner.search(/\$gone = Wait-Gone 100 '\d+' 600\r\n/)
+    const wait = inner.search(/ {2}\$gone = Wait-Gone 100 '\d+' 30\r\n/)
     expect(wait).toBeGreaterThan(0)
-    expect(inner.indexOf('while (-not $gone) { $gone = Wait-Gone 100 ')).toBeGreaterThan(wait)
+    expect(inner.indexOf('  if ($null -eq $held -or $held.by -cne $by) { $refusal = ', wait)).toBeGreaterThan(wait)
     expect(inner).not.toContain('The old process is still running')
     // Read from the wait on: RECHECK has lines as plain as a closing brace, which the functions above it hold too.
     for (const line of RECHECK) expect(inner.indexOf(`    ${line}`, wait)).toBeGreaterThan(wait)

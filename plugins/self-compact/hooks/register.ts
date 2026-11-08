@@ -43,13 +43,18 @@ function text(raw: unknown): string | undefined {
   return trimmed === '' ? undefined : trimmed
 }
 
-async function compactNow($: EngineInterface, { keep, resume, when }: Queued): Promise<void> {
+async function compactNow($: EngineInterface, { keep, resume, when }: Queued, retried = false): Promise<void> {
   $.ui.status(undefined)
   let skipped: string | undefined
   try {
     const done = await $.session.compact({ instructions: keep })
     skipped = done.skip
   } catch {
+    // Between turns, the engine may still count the turn as running: once more, a beat later, as 'idle' would.
+    if (when !== 'idle' && !retried) {
+      $.clock.after(SETTLE_MS, () => void compactNow($, entry(keep, resume, when), true))
+      return
+    }
     // A turn started first (a queued message): run it when that turn ends.
     await $.state.set(queued, entry(keep, resume, when))
     $.ui.status('compaction queued for when this turn ends')

@@ -2435,10 +2435,11 @@ describe('S3: the words a person reads, and a ticket only for the process it is 
     expect(lefts()).toHaveLength(1)
     expect(logs.join('\n')).toContain("couldn't record")
     const said = screen.filter(line => /couldn't record|left record/.test(line))
-    expect(said).toEqual([`self-switch couldn't record that this session left conversation ${W.slice(0, 8)}, so for about 10 minutes a switch back to it is refused as if it were still open.`])
+    expect(said).toEqual([`self-switch couldn't record that this session left conversation ${W.slice(0, 8)}, so for about 10 minutes after it leaves, a switch back to it is refused as if it were still open.`])
     expect(screen.some(line => /CLIXML|<Objs|Exception calling|exit 1/.test(line))).toBe(false)
     expect(logs.some(line => line.startsWith(`the left record for ${W} wasn't written: `))).toBe(true)
-    expect(logs.some(line => /CLIXML|<Objs/.test(line))).toBe(false)
+    // The raw error output kept for the debug log alone: never a line a person reads.
+    expect(logs.some(line => line.startsWith("the left record script's error output for "))).toBe(true)
   })
 
   test("#81: a record the script says stands (the same move's, written first by the coordinator) is written: nothing is said", async ($, on) => {
@@ -2481,6 +2482,56 @@ describe('S3: the words a person reads, and a ticket only for the process it is 
     await clock.advance(1000)
     expect(prompts).toEqual([])
     expect(texts(session).some(text => text.includes('self-switch: a message from session'))).toBe(false)
+    expect(tickets()[T]).toBeDefined()
+  })
+})
+
+describe('S3 review', () => {
+  const sayLeft = async ($: TestDollar, on: On, stdout: string) => {
+    const made = engine(on, { leftOut: { stdout, stderr: '', exitCode: 0 } })
+    await $.session.start(start)
+    await $.classic.SessionStart({ source: 'startup', session_id: W })
+    await $.classic.SessionStart({ source: 'resume', session_id: T })
+    await made.clock.advance(5000)
+    expect(made.lefts()).toHaveLength(1)
+    return made
+  }
+
+  test('R7: no transcript of the conversation left yet (a /resume before its first message): nothing is said, as nothing reads it live', async ($, on) => {
+    const { screen, logs } = await sayLeft($, on, 'refused transcript 0 transcripts of it are on this machine, not one\r\n')
+    expect(screen.filter(line => /record|10 minutes/.test(line))).toEqual([])
+    expect(logs.some(line => line.includes('0 transcripts of it are on this machine'))).toBe(true)
+  })
+
+  test('R7: its transcript in two project folders: the real reason, never the 10-minute sentence', async ($, on) => {
+    const { screen } = await sayLeft($, on, 'refused transcript 2 transcripts of it are on this machine, not one\r\n')
+    expect(screen.filter(line => /record|10 minutes/.test(line))).toEqual([
+      `self-switch didn't record that this session left conversation ${W.slice(0, 8)}: its transcript is in 2 project folders on this machine, and a switch back to it is refused until only one is left.`,
+    ])
+  })
+
+  test('R2: an arrival whose classic SessionStart comes before session.start still takes its ticket, and sends its resume', async ($, on) => {
+    const ticket = { at: NOW - 1000, from: OTHER, by: LAUNCH, transport: 'window', reason: 'Billing is next.', notes: 'notes/billing.md', resume: 'Run the invoice tests.' }
+    const { prompts, tickets, clock } = engine(on, { id: T, store: { switches: { [T]: ticket } } })
+    await $.classic.SessionStart({ source: 'resume', session_id: T })
+    await clock.advance(1000)
+    expect(prompts).toHaveLength(1)
+    expect(tickets()).toEqual({})
+  })
+
+  test("R11: once this process's own in-place ticket is taken, a later one for the same conversation is not this process's", async ($, on) => {
+    const { prompts, tickets, held, world, clock } = engine(on)
+    await $.session.start(start)
+    await switchNow($, clock, { resume: 'Go on.' })
+    world.id = T
+    await $.classic.SessionStart({ source: 'resume', session_id: T })
+    await clock.advance(1000)
+    expect(prompts).toHaveLength(1)
+    // Another process's in-place ticket for T, written now: this one never wrote it.
+    held.set('switches', { [T]: { at: NOW + 2000, from: OTHER, by: LAUNCH, transport: 'in-place', reason: 'Billing is next.', notes: 'notes/billing.md', resume: 'Run it again.' } })
+    await $.classic.SessionStart({ source: 'resume', session_id: T })
+    await clock.advance(1000)
+    expect(prompts).toHaveLength(1)
     expect(tickets()[T]).toBeDefined()
   })
 })

@@ -37,8 +37,8 @@
 # - With -Resume <uuid> -Claim launch:<uuid> -Launcher <sha256> (a tab a launch opened): the same claim and input; this folder must be that conversation's
 #   own (its project holds its transcript); no running Claude Code holds it (read right then), and, given
 #   a left record's stat (-LeftSize and -LeftMtime, or -LeftExitAt), its transcript is unchanged since; its
-#   floor and cap; then claude --resume <uuid> here. -WaitFor <pid>-<created> first waits up to 10 minutes
-#   for that process to exit. -ConfigDirs "<folder>|<folder>" names other config folders the look reads.
+#   floor and cap; then claude --resume <uuid> here. -WaitFor <pid>-<created> first waits for that process to
+#   exit, as long as this tab's claim holds (read at every look). -ConfigDirs "<folder>|<folder>" names other config folders the look reads.
 # - When Claude Code exits, it looks for the record a switch, a restart or a launch left for this pane:
 #   slots\<pid>-<created>.next.json, where <pid> is this script's process id and <created> its creation
 #   time (a FILETIME), so a record names one run of one pane. It deletes the record before anything else,
@@ -113,13 +113,13 @@ function Get-Sha256($path) {
 # is signaled and dropped from the table, so Wait-Process alone can return with it still listed.
 function Test-Gone($processId, $created) {
   $h = $null
-  try { $h = [Diagnostics.Process]::GetProcessById([int]$processId); if ($created -and [math]::Abs($h.StartTime.ToFileTimeUtc() - [long]$created) -gt 10000) { return $true }; return $h.HasExited }
+  try { $h = [Diagnostics.Process]::GetProcessById([int]$processId); $other = $false; if ($created -and "$created" -ne "0") { try { $other = [math]::Abs($h.StartTime.ToFileTimeUtc() - [long]$created) -gt 10000 } catch { $other = $false } }; if ($other) { return $true }; return $h.HasExited }
   catch { return ($_.Exception -is [ArgumentException] -or $_.Exception.InnerException -is [ArgumentException]) }
   finally { if ($null -ne $h) { $h.Dispose() } }
 }
 function Wait-Gone($processId, $created, $seconds) {
   $h = $null
-  try { $h = [Diagnostics.Process]::GetProcessById([int]$processId); if (-not $created -or [math]::Abs($h.StartTime.ToFileTimeUtc() - [long]$created) -le 10000) { [void]$h.WaitForExit([int]$seconds * 1000) } } catch { } finally { if ($null -ne $h) { $h.Dispose() } }
+  try { $h = [Diagnostics.Process]::GetProcessById([int]$processId); $same = $true; if ($created -and "$created" -ne "0") { try { $same = [math]::Abs($h.StartTime.ToFileTimeUtc() - [long]$created) -le 10000 } catch { $same = $true } }; if ($same) { [void]$h.WaitForExit([int]$seconds * 1000) } } catch { } finally { if ($null -ne $h) { $h.Dispose() } }
   return (Test-Gone $processId $created)
 }
 
@@ -500,11 +500,19 @@ function Get-Asked {
     else {
       $parts = $WaitFor.Split('-')
       $old = Get-CimInstance -ClassName Win32_Process -Filter "ProcessId = $([long]$parts[0])" -Property ProcessId, CreationDate
-      if ($null -ne $old -and [math]::Abs($old.CreationDate.ToFileTimeUtc() - [long]$parts[1]) -le 10000) {
+      if ($null -ne $old -and ($parts[1] -eq '0' -or [math]::Abs($old.CreationDate.ToFileTimeUtc() - [long]$parts[1]) -le 10000)) {
         Write-Host ('Waiting for the old Claude Code process (' + $parts[0] + ') to exit, then resuming here.')
-        $gone = Wait-Gone $parts[0] $parts[1] $WaitSeconds
-        if (-not $gone) { Write-Host ('It has not exited after ' + [int]($WaitSeconds / 60) + ' minutes. This tab keeps waiting, and resumes the session when it goes. Close this tab to give up.') }
-        while (-not $gone) { $gone = Wait-Gone $parts[0] $parts[1] 30; if (-not $gone) { Start-Sleep -Seconds 2 } }
+        $waitClock = [Diagnostics.Stopwatch]::StartNew()
+        $toldLong = $false
+        $gone = $false
+        while (-not $gone) {
+          $gone = Wait-Gone $parts[0] $parts[1] 30
+          if ($gone) { break }
+          # The claim at every look: a launch taken back (its claim released, or taken over) ends the wait at once.
+          if (-not (Test-Claim $id $Claim)) { $why = 'the claim lock on that conversation no longer names this tab''s launch: the move that opened it was taken back, or its time ran out'; break }
+          if (-not $toldLong -and $waitClock.Elapsed.TotalSeconds -ge $WaitSeconds) { $toldLong = $true; Write-Host ('It has not exited after ' + [int]($WaitSeconds / 60) + ' minutes. This tab keeps waiting while the move that opened it stands, and resumes the session when it goes. Close this tab to give up.') }
+          Start-Sleep -Seconds 1
+        }
       }
     }
   }
@@ -575,7 +583,7 @@ function Start-Claude($run) {
   $actual = $null
   try { $actual = Get-Sha256 $launcherPath } catch { $actual = $null }
   if ($actual -cne $sha) {
-    if ($run.ContainsKey('Resume')) { Give-Back $run.Resume $held } elseif ($run.ContainsKey('Start')) { Give-Back $run.Start $held }
+    if ($run.ContainsKey('Resume')) { Give-Back $run.Resume $held } elseif ($run.ContainsKey('Start')) { Give-Back $run.Start $held }; if ($run.ContainsKey('Resume') -or $run.ContainsKey('Start')) { Write-Refused $(if ($run.ContainsKey('Start')) { $run.Start } else { $run.Resume }) $held $(if ($run.ContainsKey('Start')) { 'start' } else { 'resume' }) $run.Dir ('claude-launch.ps1 is missing at ' + $launcherPath + ', or does not have the SHA-256 ' + $sha) }
     Write-Host ('Nothing started: ' + $launcherPath + ' does not have the SHA-256 ' + $sha + '. It is missing, or it changed after a launch put it there. Launch it again: a launch puts it back.')
     if ($run.ContainsKey('Resume')) { Say-ByHand $run.Resume $null $run.Dir } elseif ($run.ContainsKey('Start')) { Say-ByHand $run.Start $run.Name $run.Dir }
     return
@@ -583,7 +591,7 @@ function Start-Claude($run) {
   Write-Beacon 'running'
   $policy = [Environment]::GetEnvironmentVariable('PSExecutionPolicyPreference', [EnvironmentVariableTarget]::Process)
   $global:LASTEXITCODE = 0 # this run's exit code below, not one an earlier run here left
-  $threw = $null
+  $threw = $null; $ranFrom = Get-Date
   try { & $launcherPath @run }
   catch { $threw = $_.Exception.Message }
   finally { [Environment]::SetEnvironmentVariable('PSExecutionPolicyPreference', $policy, [EnvironmentVariableTarget]::Process) }
@@ -593,7 +601,7 @@ function Start-Claude($run) {
   $heldId = if ($run.ContainsKey('Resume')) { $run.Resume } elseif ($run.ContainsKey('Start')) { $run.Start } else { $null }
   $gaveBack = $null -ne $heldId -and ($null -ne $threw -or ($held -cmatch $LaunchClaim -and $code -ne 0))
   if ($gaveBack) { Give-Back $heldId $held }
-  if ($null -ne $heldId -and ($null -ne $threw -or $code -eq 2)) { Write-Refused $heldId $held $(if ($run.ContainsKey('Start')) { 'start' } else { 'resume' }) $run.Dir $(if ($null -ne $threw) { 'claude-launch.ps1 stopped on an error: ' + $threw } else { 'the launcher refused it: its last look found the conversation open elsewhere, or could not tell' }) }
+  if ($null -ne $heldId -and ($null -ne $threw -or ($code -eq 2 -and ((Get-Date) - $ranFrom).TotalSeconds -lt 10))) { Write-Refused $heldId $held $(if ($run.ContainsKey('Start')) { 'start' } else { 'resume' }) $run.Dir $(if ($null -ne $threw) { 'claude-launch.ps1 stopped on an error: ' + $threw } else { 'claude-launch.ps1 ended at once with exit code 2: its last look refused the conversation (open elsewhere, or no way to tell), or Claude Code could not start' }) }
   if ($null -ne $threw) { Write-Host ('claude-launch.ps1 stopped on an error, so Claude Code may not have started here: ' + $threw) }
   if ($gaveBack) { Say-ByHand $heldId $(if ($run.ContainsKey('Start')) { $run.Name } else { $null }) $run.Dir }
   Write-Beacon 'idle'

@@ -3,6 +3,7 @@
 // text. No script runs here.
 import { describe, expect, test } from 'claude-code/testing'
 import {
+  plainOutput,
   type Baseline,
   countStatus,
   ID_LAG_MS,
@@ -214,6 +215,10 @@ describe('liveness', () => {
       p.procs.push({ pid: 720, ppid: 21, created: ft(90), name: 'claude.exe', aside: true }, { pid: 721, ppid: 21, created: ft(91), name: 'claude.exe', aside: true })
     }
     expect(live(set)).toEqual({ verdict: 'not-live', evidence: [] })
+    // R1: never inherited: a claude.exe under one (the background session a pty host runs) is a session of its own.
+    expect(live(p => (set(p), p.procs.push({ pid: 724, ppid: 721, created: ft(94), name: 'claude.exe' }))).evidence).toEqual([
+      "unknown: claude.exe 724 isn't in any registry this plugin knows (another config folder, or a version without one)",
+    ])
     expect(live(p => (set(p), p.procs.push({ pid: 722, ppid: 21, created: ft(92), name: 'claude.exe' }))).evidence).toEqual([
       "unknown: claude.exe 722 isn't in any registry this plugin knows (another config folder, or a version without one)",
     ])
@@ -1001,7 +1006,7 @@ describe('the scripts, as text', () => {
     for (const script of [restart, window]) {
       const wait = script.indexOf('$gone = Wait-Gone 100 ')
       const recheck = script.indexOf(RECHECK[2] ?? '', wait)
-      const claimCheck = script.indexOf('the claim on it no longer names this window')
+      const claimCheck = script.indexOf('the claim on it no longer names this window', recheck)
       const folder = script.indexOf('-not (Test-Path -LiteralPath $folder -PathType Container)', claimCheck)
       const hash = script.indexOf("(Get-Sha256 $launchPath) -cne '", folder)
       const claude = script.indexOf('& $launchPath -Resume $id -Dir $folder')
@@ -1167,4 +1172,11 @@ describe('the scripts, as text', () => {
     expect(() => claimCheckScript({ stateDir: STATE, id: T, by: LAUNCH, configDirs: ["C:\\o'brien"] })).toThrow(/not an absolute folder/)
     expect(() => claimCheckScript({ stateDir: STATE, id: T, by: LAUNCH, configDirs: [] })).toThrow(/1 to 8/)
   })
+})
+
+test("R10: a script's raw error record is never shown, and its own message is", () => {
+  const raw = '#< CLIXML\r\n<Objs Version="1.1.0.1" xmlns="http://schemas.microsoft.com/powershell/2004/04"><S S="Error">Exception calling "Move" with "2" argument(s): "Cannot create a file when that file already exists."_x000D__x000A_</S><S S="Error">At line:12 char:5_x000D__x000A_</S><S S="Error">+     [IO.File]::Move($temp, $final)_x000D__x000A_</S></Objs>'
+  expect(plainOutput(raw)).toBe('Exception calling "Move" with "2" argument(s): "Cannot create a file when that file already exists."')
+  expect(plainOutput(`left 1\r\n${raw}`)).toBe('left 1 Exception calling "Move" with "2" argument(s): "Cannot create a file when that file already exists."')
+  expect(plainOutput('plain words')).toBe('plain words')
 })

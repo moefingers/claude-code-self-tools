@@ -555,6 +555,7 @@ async function restartNow($: EngineInterface, value: Queued): Promise<void> {
         if (run.exitCode !== 0 || !('launched' in answer)) {
           unclean = run.exitCode !== 0 || !('refused' in answer)
           refusedFor = 'refused' in answer ? answer.refused.code : undefined
+          if (run.stderr.trim() !== '') $.ui.log(`the launcher's error output: ${oneLine(run.stderr, 2000)}`, { to: 'debug' })
           const said = 'refused' in answer ? answer.refused.why : plainOutput(`${run.stdout} ${run.stderr}`)
           const nothing = pane !== undefined && 'token' in pane ? "the ticket for this tab wasn't written" : "the launcher didn't place the restart"
           opened = `${nothing} (${run.exitCode !== 0 ? `exit ${run.exitCode}` : 'refused'}${said === '' ? '' : `: ${said}`})`

@@ -4,7 +4,7 @@ import type { On } from 'claude-code'
 const TOOL = 'mcp__self-compact__compact_after_turn'
 
 /** The engine beneath the plugin: what it answers, and the compactions and prompts it was asked for. */
-function engine(on: On, { skip }: { skip?: string } = {}) {
+function engine(on: On, { skip, rejectFirst = false }: { skip?: string; rejectFirst?: boolean } = {}) {
   const compactions: (string | undefined)[] = []
   const described: string[] = []
   const prompts: string[] = []
@@ -16,7 +16,13 @@ function engine(on: On, { skip }: { skip?: string } = {}) {
     toasts.push(String(e.text))
     return { value: undefined }
   })
+  let rejected = !rejectFirst
   on('session.compact', (_, e) => {
+    // As the engine does while it still counts a turn as running.
+    if (!rejected) {
+      rejected = true
+      throw new Error('a turn is running; the conversation compacts between turns')
+    }
     compactions.push(e.instructions)
     return skip === undefined ? { messages: [{ role: 'user', text: 'The summary.', toolUses: [] }] } : { skip }
   })
@@ -139,4 +145,15 @@ test("the owner's design: `when` is between turns or idle, nothing else; the des
   await $.turn.complete({ ...ended, isAborted: false, reason: 'answer' })
   await clock.advance(1000)
   expect(compactions).toEqual([])
+})
+
+test('R3: between turns, a compaction the engine rejects (the turn still counted as running) tries once more half a second later, with no turn to wait for', async ($, on) => {
+  const { compactions, clock } = engine(on, { rejectFirst: true })
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  await $.tool.call({ tool: TOOL, keep: 'the PR queue' })
+  await $.turn.complete({ ...ended, isAborted: false, reason: 'answer' })
+  await clock.advance(0)
+  expect(compactions).toEqual([])
+  await clock.advance(1000)
+  expect(compactions).toEqual(['the PR queue'])
 })

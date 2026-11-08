@@ -102,9 +102,16 @@ describe('the wait for an old process, by its handle (F1)', { skip: !isWindows &
     assert.deepEqual(shipped, [true, true, true])
   })
 
-  test('the line it replaced, Wait-Process, returns in the gap: the reason for the fix, shown on this machine', () => {
+  test('a control, reported and never failed: how often the line it replaced, Wait-Process, returns in the gap on this machine', t => {
     const before = waited('Wait-Process -Id $id -Timeout 30 -ErrorAction SilentlyContinue', 3)
-    assert.ok(before.includes(false), `Wait-Process returned with the process signaled every time (${before}): this machine shows no gap, so the test above can't tell the two apart`)
+    t.diagnostic(`Wait-Process returned with the process not yet signaled in ${before.filter(signaled => !signaled).length} of ${before.length}`)
+  })
+
+  test('R9: an unread start time ("0") waits by the pid alone: a process still running is not gone, and is waited for', () => {
+    const out = ps([...machine.TEST_GONE, '$self = [Diagnostics.Process]::GetCurrentProcess()', '$clock = [Diagnostics.Stopwatch]::StartNew()', '"gone=" + (Wait-Gone $self.Id "0" 2)', '"waited=" + ($clock.Elapsed.TotalSeconds -ge 1.5)', '"test=" + (Test-Gone $self.Id "0")'].join('\r\n'))
+    assert.match(out, /gone=False/)
+    assert.match(out, /waited=True/)
+    assert.match(out, /test=False/)
   })
 
   test('a process id another process holds now (its start time not the one waited for) reads as gone at once', () => {

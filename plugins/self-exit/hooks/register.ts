@@ -132,11 +132,12 @@ async function mark($: EngineInterface, kind: PendingKind | null): Promise<void>
 }
 
 /**
- * The row the model reads when the session is resumed: why it asked to end, and the note. Never that it ended: in
- * a background session (/background) /exit leaves the session running, and the row is read there too.
+ * The row the model reads when the session is resumed: why it asked to end, and the note. Written before /exit
+ * runs, so it says what was asked, never that it ended: in a background session (/background) /exit leaves the
+ * session running, and the row is read there too.
  */
 const record = ({ reason, note }: Queued): string =>
-  `This session asked to end here (exit_after_turn), and /exit ran. Reason: ${reason}${note === undefined ? '' : ` Note for whoever resumes it: ${note}`}`
+  `This session asked to end here (exit_after_turn). Reason: ${reason}${note === undefined ? '' : ` Note for whoever resumes it: ${note}`}`
 
 /** Logs the reason, then runs the exit; says so when it didn't run, or the session is still here after it. */
 async function exitNow($: EngineInterface, value: Queued): Promise<void> {

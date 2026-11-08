@@ -1,9 +1,9 @@
 {
   "v": 1,
   "layout": [
-    { "window": "claude-1", "pos": [0, 0], "size": [160, 42], "tabs": ["agent-coordinator-3000", "system-overhaul", "spare-1"], "folder": "C:\\path\\to\\work" },
-    { "window": "claude-2", "pos": [960, 0], "size": [160, 42], "tabs": ["video-lab", "spare-2", "spare-3"], "folder": "C:\\path\\to\\work" },
-    { "window": "claude-3", "pos": [0, 540], "size": [160, 42], "tabs": ["olivia-work", "ui-general", "package-bumper"], "folder": "C:\\path\\to\\work" },
+    { "window": "claude-1", "pos": [0, 0], "size": [160, 42], "tabs": ["lane-a", "lane-b", "spare-1"], "folder": "C:\\path\\to\\work" },
+    { "window": "claude-2", "pos": [960, 0], "size": [160, 42], "tabs": ["lane-c", "spare-2", "spare-3"], "folder": "C:\\path\\to\\work" },
+    { "window": "claude-3", "pos": [0, 540], "size": [160, 42], "tabs": ["lane-d", "lane-e", "lane-f"], "folder": "C:\\path\\to\\work" },
     { "window": "claude-4", "pos": [960, 540], "size": [160, 42], "tabs": ["overflow-1", "overflow-2", "overflow-3"], "folder": "C:\\path\\to\\work" }
   ],
   "launch": { "prefer": ["slot", "tab", "window"], "tab": { "window": "claude-4", "maxTabs": 2 }, "window": { "name": "claude-overflow", "pos": [1920, 0], "size": [140, 60] } },

@@ -205,7 +205,7 @@ Copy the slot runner to `%LOCALAPPDATA%\claude-self-tools\claude-slot.ps1`; a pa
 
 ### Placement and the layout
 
-`%LOCALAPPDATA%\claude-self-tools\placement.json` says which windows and tabs there are, and where a launch or a restart goes. [`placement.example.json`](plugins/self-switch/slot/placement.example.json) holds this machine's presets: `claude-1` agent-coordinator-3000 and system-overhaul, `claude-2` video-lab, `claude-3` olivia-work, ui-general and package-bumper, `claude-4` overflow; a session without a home goes anywhere.
+`%LOCALAPPDATA%\claude-self-tools\placement.json` says which windows and tabs there are, and where a launch or a restart goes. [`placement.example.json`](plugins/self-switch/slot/placement.example.json) holds presets for four windows, with generic lanes to rename as your own: `claude-1` lane-a and lane-b, `claude-2` lane-c, `claude-3` lane-d, lane-e and lane-f, `claude-4` overflow; a session without a home goes anywhere.
 
 - **The file** is checked by `readPlacement` (`{ placement }` or `{ errors }`; a bad file means no placement: the log says what is wrong, and a move goes to a slot, then today's window). Window names of letters, digits, `_` and `-`, never `0`, `last`, `new`, `_quake`, `-1` or all digits, which Windows Terminal reads as special; tab labels; folders absolute, with no quote, `;` or `%` (Windows Terminal expands one); `pos` within 32768, `size` 20-400 columns and 5-200 rows; `prefer` from `slot`, `tab`, `window`; `workspaces` window names to workspace ids; `limits.minFreeGb` 1-64 and `limits.maxSessions` 1-40; `afterBoot.fltFix` an absolute `.ps1`; unknown keys refused, naming them. `scripts/placement-fixture.json` holds it and the layout script's validator equal.
 - **self-restart** follows `restart.prefer`: this pane's slot, then a tab in `restart.tab.window` (`same`: this tab's own stamp, read from its environment; a hand-started tab has none, and falls through), then the placement's window, then today's. **self-switch** follows `launch.prefer` for what isn't in place or in this pane's slot. A place refused for want of Windows Terminal or the slot runner gives way to the next.
@@ -216,7 +216,7 @@ Copy the slot runner to `%LOCALAPPDATA%\claude-self-tools\claude-slot.ps1`; a pa
   4. Give a Windows Terminal profile the line under [Slots v2](#slots-v2), if you want new tabs to be slots too.
   5. Your choice: `firstWindowPreference: "persistedWindowLayout"` keeps the names, places and tabs across a restart of Windows Terminal; without it, run the script again.
 
-  Compare what you copied: LAYOUT_SCRIPT_SHA256: `d112702a2dcff0322e581667942de2567599c915559deb4bd15dc505c47d0d3c`. Nothing checks that at run time.
+  Compare what you copied: LAYOUT_SCRIPT_SHA256: `069451ed8337c24a810d291c4dc38e2538574283686b7f1c2228d6da193041ed`. Nothing checks that at run time.
 
 ### The trampoline
 

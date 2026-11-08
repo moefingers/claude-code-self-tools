@@ -367,15 +367,28 @@ export function oneLine(text: string, max = QUOTED_MAX): string {
  * quotes, escapes included; an escape is never cut in half.
  */
 /**
- * What a script's output says, fit to show a person: one line, at most 300 characters, and nothing of a raw
- * PowerShell error record (the `#< CLIXML` and `<Objs ...>` text Windows PowerShell writes to a redirected error
- * stream), which says nothing a person can use. Empty when nothing is left.
+ * What a script's output says, fit to show a person: one line, at most 300 characters. Of a PowerShell error record
+ * (the `#< CLIXML` and `<Objs ...>` text Windows PowerShell writes to a redirected error stream, from its first
+ * byte) only its message lines are kept, decoded; the record itself never. Empty when nothing is left.
  */
 export function plainOutput(text: string): string {
   const cut = text.indexOf('#< CLIXML')
   const kept = (cut === -1 ? text : text.slice(0, cut)).replace(/<Objs\b[\s\S]*$/, '')
-  return oneLine(kept, 300)
+  // The error records' own words, where there are any: their message lines, never where in the script it stood.
+  const said = cut === -1 ? [] : [...text.slice(cut).matchAll(/<S S="Error">([\s\S]*?)<\/S>/g)].map(m => clixmlText(m[1] ?? ''))
+  const reasons = said.join('\n').split(/\r?\n/).filter(line => line.trim() !== '' && !/^\s*(\+|At line:|At char:|~+\s*$)/.test(line))
+  return oneLine([kept, ...reasons].filter(part => part.trim() !== '').join(' '), 300)
 }
+
+/** A CLIXML string's text: its `_xHHHH_` escapes and XML entities undone. */
+const clixmlText = (text: string): string =>
+  text
+    .replace(/_x([0-9A-Fa-f]{4})_/g, (_, hex: string) => String.fromCharCode(parseInt(hex, 16)))
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&apos;/g, "'")
+    .replace(/&amp;/g, '&')
 
 export function quoted(text: string): string {
   let inside = oneLine(text, Number.MAX_SAFE_INTEGER).replace(/[\\\u00ab\u00bb]/g, c => `\\${c}`)
@@ -522,13 +535,13 @@ export const REGISTRY_VERSION_MARKERS = ['v', 'schema', 'schemaVersion', 'format
 export const LAUNCH_LINE_TRUSTED_AFTER_MS = 60_000
 
 /** The SHA-256 of plugins/self-switch/slot/claude-slot.ps1, as it is committed. */
-export const SLOT_SCRIPT_SHA256 = 'd68c8f0e0957a26678d3a225f71039dbfdae5e2457629ee180fa50a2b1440b59'
+export const SLOT_SCRIPT_SHA256 = '97f84fba8aeef8bad0d7ba1a0dd3cff085aca955a992391894c47a511a2c9335'
 
 /**
  * The SHA-256 of plugins/self-switch/slot/claude-layout.ps1, as it is committed: a release pin, tested and
  * printed in the README for the person to compare. Nothing runs that script but the person, by hand.
  */
-export const LAYOUT_SCRIPT_SHA256 = 'd112702a2dcff0322e581667942de2567599c915559deb4bd15dc505c47d0d3c'
+export const LAYOUT_SCRIPT_SHA256 = '069451ed8337c24a810d291c4dc38e2538574283686b7f1c2228d6da193041ed'
 
 /** Input idle for this long before any launch of another process (PM2): a null reading is not idle. */
 export const INPUT_IDLE_MS = 60_000
@@ -2225,7 +2238,9 @@ function underCli(table: Map<number, ProcessEntry>, p: ProcessEntry): boolean {
   let at: ProcessEntry | undefined = p
   for (let i = 0; i < 8 && at !== undefined && isClaude(at); i += 1) {
     // A Claude Code command, or Claude Code's own /fork and /background machinery, or a test stub (Get-Aside).
-    if (at.cli === true || at.aside === true) return true
+    // A Claude Code command, and what it starts, are accounted. An aside process (Claude Code's own /fork daemon and
+    // pty host, a test stub) only itself: a claude.exe under one is a session of its own, held to the rule.
+    if (at.cli === true || (at === p && at.aside === true)) return true
     at = parentOf(table, at)
   }
   return false
@@ -3419,18 +3434,19 @@ const READ_WT_VERSION = [
  * at the exit code (Wait-Process) can return with the process still listed, and a look at the table then would find
  * it and refuse the launch for nothing. WaitForExit waits on the handle being signaled, past that gap. `$created` is
  * the process's start time (FILETIME as a string): a process id the system gave to another process reads as gone,
- * since it isn't the one waited for. Anything but "no such process" that can't be read counts as still there.
+ * since it isn't the one waited for. A start time of "0" (one the probe couldn't read), or one this process can't
+ * read, is waited for by the pid alone. Anything but "no such process" that can't be read counts as still there.
  */
 export const TEST_GONE = [
   'function Test-Gone($processId, $created) {',
   '  $h = $null',
-  '  try { $h = [Diagnostics.Process]::GetProcessById([int]$processId); if ($created -and [math]::Abs($h.StartTime.ToFileTimeUtc() - [long]$created) -gt 10000) { return $true }; return $h.HasExited }',
+  '  try { $h = [Diagnostics.Process]::GetProcessById([int]$processId); $other = $false; if ($created -and "$created" -ne "0") { try { $other = [math]::Abs($h.StartTime.ToFileTimeUtc() - [long]$created) -gt 10000 } catch { $other = $false } }; if ($other) { return $true }; return $h.HasExited }',
   '  catch { return ($_.Exception -is [ArgumentException] -or $_.Exception.InnerException -is [ArgumentException]) }',
   '  finally { if ($null -ne $h) { $h.Dispose() } }',
   '}',
   'function Wait-Gone($processId, $created, $seconds) {',
   '  $h = $null',
-  '  try { $h = [Diagnostics.Process]::GetProcessById([int]$processId); if (-not $created -or [math]::Abs($h.StartTime.ToFileTimeUtc() - [long]$created) -le 10000) { [void]$h.WaitForExit([int]$seconds * 1000) } } catch { } finally { if ($null -ne $h) { $h.Dispose() } }',
+  '  try { $h = [Diagnostics.Process]::GetProcessById([int]$processId); $same = $true; if ($created -and "$created" -ne "0") { try { $same = [math]::Abs($h.StartTime.ToFileTimeUtc() - [long]$created) -le 10000 } catch { $same = $true } }; if ($same) { [void]$h.WaitForExit([int]$seconds * 1000) } } catch { } finally { if ($null -ne $h) { $h.Dispose() } }',
   '  return (Test-Gone $processId $created)',
   '}',
 ]
@@ -3494,17 +3510,27 @@ function windowScript(v: { id: string; kind: 'resume' | 'start'; name?: string; 
     `$refusedPath = ${refusedAt}`,
     `$refusedKind = '${resume ? 'resume' : 'start'}'`,
     ...WRITE_REFUSED,
+    '$refusal = $null',
     ...(v.waitFor === undefined
       ? []
       : [
           ...TEST_GONE,
           `Write-Host ("Waiting for the old Claude Code process (${v.waitFor.pid}) to exit, then ${resume ? 'resuming' : 'starting'} session " + $id + " here.")`,
-          `$gone = Wait-Gone ${v.waitFor.pid} '${v.waitFor.created}' ${WAIT_SECONDS}`,
-          `if (-not $gone) { Write-Host "It has not exited after ${WAIT_SECONDS / 60} minutes. This window keeps waiting, and ${resume ? 'resumes' : 'starts'} the session when it goes. Close this window to give up." }`,
-          // A process that outlasts the first wait: looked at again until it goes (the claim and the last look below still decide).
-          `while (-not $gone) { $gone = Wait-Gone ${v.waitFor.pid} '${v.waitFor.created}' ${WAIT_POLL_SECONDS}; if (-not $gone) { Start-Sleep -Seconds 2 } }`,
+          // Looked at every WAIT_POLL_SECONDS until it goes, however long that takes; the claim read at each look, so a
+          // move taken back (its claim released, or taken over) ends the wait at once. The last look below still decides.
+          '$waitClock = [Diagnostics.Stopwatch]::StartNew()',
+          '$toldLong = $false',
+          '$gone = $false',
+          'while (-not $gone) {',
+          `  $gone = Wait-Gone ${v.waitFor.pid} '${v.waitFor.created}' ${WAIT_POLL_SECONDS}`,
+          '  if ($gone) { break }',
+          '  $held = $null',
+          '  try { $held = Get-Content -LiteralPath $claimPath -Raw -Encoding UTF8 | ConvertFrom-Json } catch { $held = $null }',
+          '  if ($null -eq $held -or $held.by -cne $by) { $refusal = "The session is not resumed here: the claim on it no longer names this window (the move that opened it was taken back, or its time ran out)."; break }',
+          `  if (-not $toldLong -and $waitClock.Elapsed.TotalSeconds -ge ${WAIT_SECONDS}) { $toldLong = $true; Write-Host "It has not exited after ${WAIT_SECONDS / 60} minutes. This window keeps waiting while the move that opened it stands, and ${resume ? 'resumes' : 'starts'} the session when it goes. Close this window to give up." }`,
+          '  Start-Sleep -Seconds 1',
+          '}',
         ]),
-    '$refusal = $null',
     // Right before claude: whether anything holds the conversation now (L1, L2), and the left record's stat.
     'if ($null -eq $refusal) {',
     '  $live = $null',
@@ -3554,7 +3580,7 @@ function windowScript(v: { id: string; kind: 'resume' | 'start'; name?: string; 
     // An error, or an end within seconds: the resume didn't take. Say how to resume by hand, and wait.
     `if ($code -ne 0 -or ((Get-Date) - $started).TotalSeconds -lt ${SHORT_RUN_SECONDS}) {`,
     // The launcher refused (its exit 2: its last look found the conversation open elsewhere, or no claude.exe): recorded.
-    '  if ($code -eq 2) { Write-Refused "the launcher refused it: its last look found the conversation open elsewhere, or could not tell" }',
+    `  if ($code -eq 2 -and ((Get-Date) - $started).TotalSeconds -lt ${SHORT_RUN_SECONDS}) { Write-Refused "claude-launch.ps1 ended at once with exit code 2: its last look refused the conversation (open elsewhere, or no way to tell), or Claude Code could not start" }`,
     '  Write-Host "Claude Code ended (exit code $code)."',
     `  Write-Host ("If the session did not ${resume ? 'resume' : 'start'} here, do it yourself: " + ${byHand})`,
     // The launcher refused (its exit 2: nothing ran), or what ran has ended: this launch's own claim, so no one else's.
@@ -3806,7 +3832,7 @@ export function launchScriptText(input: LaunchInput): string {
           'try { $lockNow = [IO.File]::ReadAllText($claimPath) | ConvertFrom-Json } catch { $lockNow = $null }',
           `if ([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() -gt ${v.deadline} -or $null -eq $lockNow -or $lockNow.by -cne $by) {`,
           '  if ($null -ne $final -and $transport -ne "window") { try { [IO.File]::WriteAllText($final, \'{"v":1,"cancelled":true}\') } catch { } }',
-          // A window placed already: it would only sit saying it waits, for up to 10 minutes, for a launch
+          // A window placed already: it would only sit saying it waits, as long as its claim holds, for a launch
           // no one wants. A tab's wt.exe has handed its tab over by now: the released claim turns the tab away.
           '  if ($transport -eq "window" -and $null -ne $window) { try { $window.Kill() } catch { } }',
           "  Refuse 'late' ($tool + ': the launch was placed past its deadline, or its claim was taken back meanwhile, so it is withdrawn')",
@@ -5191,6 +5217,7 @@ export function leftScript(input: LeftInput): string {
     `$leftPath = ${literal(leftPath(state, id))}`,
     `$leftKeyPath = ${literal(leftKeyPath(state))}`,
     ...LEFT_FIELDS,
+    ...GET_LEFT_FIELDS,
     '$table = @{}',
     'foreach ($p in (Get-CimInstance -ClassName Win32_Process -Property ProcessId, ParentProcessId, Name, CreationDate)) { $table[[int]$p.ProcessId] = $p }',
     ...GET_PARENT,
@@ -5241,17 +5268,40 @@ export function leftScript(input: LeftInput): string {
     '$final = $leftPath',
     '$text = $record | ConvertTo-Json -Compress -Depth 4',
     // The same move's record already there (the coordinator's go and this plugin each write one for an in-place go,
-    // whichever gets here first): it stands, and this one counts as written. The same move: the same id and how, by
-    // this very process, within LEFT_SAME_MOVE_MS, over the same transcript size and time, and naming the go this
-    // write names, if any. Any other record is replaced, as it always is; one that appears between the look and the
+    // whichever gets here first): it stands, and this one counts as written. The same move: a record of its shape
+    // under its MAC, by the other writer, of the same id and how, by this very process, over the same transcript size
+    // and time, written within LEFT_SAME_MOVE_MS either side of this one; and when this write names a go, that go.
+    // So a write without a go never replaces a record of the same move that has one, and a write with one replaces a
+    // record without it. Any other record is replaced, as it always is; one that appears between the look and the
     // move (the move then fails: the file exists) is looked at again, and replaced when it isn't the same move.
-    `function Test-SameLeft { $e = $null; try { $e = Get-Content -LiteralPath $leftPath -Raw -Encoding UTF8 | ConvertFrom-Json } catch { return $false }; if ($null -eq $e -or $null -eq $e.transcript -or $e.id -cne $id -or $e.how -cne $how -or "$($e.pid)" -cne $f.pid -or "$($e.created)" -cne $f.created -or "$($e.transcript.size)" -cne $f.size -or "$($e.transcript.mtime)" -cne $f.mtime -or ($go -ne '' -and "$($e.go)" -cne $go)) { return $false }; $apart = $null; try { $apart = [long]$f.at - [long]"$($e.at)" } catch { return $false }; return ($apart -ge 0 -and $apart -le ${LEFT_SAME_MOVE_MS}) }`,
-    'if (Test-SameLeft) { "left " + $id; exit 0 }',
-    'try {',
-    ...WRITE_WHOLE.map(line => `  ${line}`),
-    '} catch {',
+    'function Test-SameLeft {',
+    '  $e = $null',
+    '  try { $e = Get-Content -LiteralPath $leftPath -Raw -Encoding UTF8 | ConvertFrom-Json } catch { return $false }',
+    '  $ef = Get-LeftFields $e',
+    '  if ($null -eq $ef -or $e.mac -isnot [string]) { return $false }',
+    '  if ($ef.id -cne $id -or $ef.how -cne $how -or $ef.pid -cne $f.pid -or $ef.created -cne $f.created -or $ef.size -cne $f.size -or $ef.mtime -cne $f.mtime -or $ef.by -ceq $by) { return $false }',
+    '  if ($go -ne "" -and $ef.go -cne $go) { return $false }',
+    '  $apart = $null',
+    '  try { $apart = [math]::Abs([long]$f.at - [long]$ef.at) } catch { return $false }',
+    `  if ($apart -gt ${LEFT_SAME_MOVE_MS}) { return $false }`,
+    '  $sameKey = $null',
+    '  try { $sameKey = [IO.File]::ReadAllBytes($leftKeyPath) } catch { return $false }',
+    '  try { return ((Get-LeftMac $sameKey (Get-LeftText $ef)) -ceq $e.mac) } finally { $sameKey = $null }',
+    '}',
+    // Whole, by a temporary file and a move or a replace; the same move looked for at each try and again right before a
+    // replace, so a record the other writer made a moment ago is never replaced unread. A move that fails (the other's
+    // file appeared) is tried again, up to three times.
+    '[void][IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($final))',
+    '$written = $false',
+    'for ($try = 0; $try -lt 3 -and -not $written; $try++) {',
+    '  if ($try -gt 0) { Start-Sleep -Milliseconds 100 }',
     '  if (Test-SameLeft) { "left " + $id; exit 0 }',
-    ...WRITE_WHOLE.map(line => `  ${line}`),
+    '  $temp = $final + "." + [guid]::NewGuid().ToString() + ".tmp"',
+    '  [IO.File]::WriteAllText($temp, $text)',
+    '  try {',
+    '    if ([IO.File]::Exists($final)) { if (Test-SameLeft) { [IO.File]::Delete($temp); "left " + $id; exit 0 }; [IO.File]::Replace($temp, $final, [NullString]::Value) } else { [IO.File]::Move($temp, $final) }',
+    '    $written = $true',
+    '  } catch { try { [IO.File]::Delete($temp) } catch { }; if ($try -ge 2) { throw } }',
     '}',
     '"left " + $id',
   ].join('\r\n')

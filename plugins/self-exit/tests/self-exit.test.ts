@@ -166,7 +166,9 @@ test('the exit runs only once the turn has ended, after the reason and note are 
 
   const rows = JSON.stringify(session.appended())
   expect(rows).not.toMatch(/This session ended/)
-  expect(rows).toMatch(/This session asked to end here \(exit_after_turn\), and \/exit ran\. Reason: The brief is done and the PR is open\. Note for whoever resumes it: Review comments on PR 12\./)
+  // Written before /exit runs: what was asked, never that it ran.
+  expect(rows).not.toMatch(/\/exit ran/)
+  expect(rows).toMatch(/This session asked to end here \(exit_after_turn\)\. Reason: The brief is done and the PR is open\. Note for whoever resumes it: Review comments on PR 12\./)
   expect(logs.some(l => /The brief is done/.test(l))).toBe(true)
   expect(toasts.some(t => /Exiting/.test(t))).toBe(true)
   // An exit sends no prompt, and an exit that took never comes back to say it didn't.
