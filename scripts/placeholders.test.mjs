@@ -3,6 +3,7 @@
 // Examples use placeholders (C:\path\to\work, "the owner"). The CHANGELOG is history and is left as it was written;
 // tests are fixtures. Run with `node --test "scripts/*.test.mjs"`.
 import assert from 'node:assert/strict'
+import { spawnSync } from 'node:child_process'
 import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs'
 import { join, relative } from 'node:path'
 import { test } from 'node:test'
@@ -118,6 +119,31 @@ test("a plugin's own tests name no real lane, no email, and no user profile's pa
     }
     // A profile path names a placeholder user (u, tester, user), never a real one.
     for (const m of text.matchAll(/\b[A-Za-z]:\\{1,2}Users\\{1,2}([A-Za-z0-9._-]+)/g)) if (!PLACEHOLDER_USERS.has((m[1] ?? '').toLowerCase())) found.push(`${where}: a user profile's path (${m[0]})`)
+  }
+  assert.deepEqual(found, [])
+})
+
+test('no tracked file names a real lane, in any spelling: the CHANGELOG checked from its newest entry only, its history left as written', t => {
+  const names = existsSync(NAMES_FILE) ? readFileSync(NAMES_FILE, 'utf8').split(/\r?\n/).map(squash).filter(n => n.length >= 4) : []
+  if (names.length === 0) {
+    t.diagnostic(`no ${relative(ROOT, NAMES_FILE)}: this scan is skipped`)
+    return
+  }
+  const listed = spawnSync('git', ['-C', ROOT, 'ls-files', '-z'], { encoding: 'utf8' })
+  assert.equal(listed.status, 0, listed.stderr)
+  const files = listed.stdout.split('\0').filter(Boolean)
+  assert.ok(files.length > 100, `the tracked files were listed (${files.length})`)
+  const found = []
+  for (const file of files) {
+    let text = readFileSync(join(ROOT, file), 'utf8')
+    if (text.includes('\0')) continue
+    if (file === 'CHANGELOG.md') {
+      const first = text.indexOf('\n## ')
+      const next = text.indexOf('\n## ', first + 1)
+      text = text.slice(first, next === -1 ? undefined : next)
+    }
+    const flat = squash(text)
+    for (const name of names) if (flat.includes(name)) found.push(`${file}: a real lane's name`)
   }
   assert.deepEqual(found, [])
 })

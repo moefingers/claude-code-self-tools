@@ -312,7 +312,7 @@ describe('claude-launch.ps1, run for real against the stub', { skip: !isWindows 
         const lanes = { v: 1, at: Date.now(), lanes: { 'lane-x': { session: id, folder: dirs.work, ws: 'default', at: Date.now() }, broken: { session: 'not-a-uuid', folder: dirs.work, ws: 'default', at: 1 } } }
         writeFileSync(join(dirs.config, 'lanes.json'), JSON.stringify(lanes))
         assert.deepEqual(launched(await run(shell, dirs, ['-Lane', 'lane-x']), ['--resume', id], dirs.work), [])
-        for (const args of [['-Lane', 'nobody'], ['-Lane', 'broken'], ['-Lane', 'lane-x', '-Dir', dirs.work], ['-Lane', 'Dealer Wrap']]) {
+        for (const args of [['-Lane', 'nobody'], ['-Lane', 'broken'], ['-Lane', 'lane-x', '-Dir', dirs.work], ['-Lane', 'Lane X']]) {
           const other = lab()
           writeFileSync(join(other.config, 'lanes.json'), JSON.stringify(lanes))
           const result = await run(shell, other, args)
