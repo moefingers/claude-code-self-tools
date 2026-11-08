@@ -1,6 +1,6 @@
 {
   "name": "self-remote-control",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "description": "Lets a session report on its own Remote Control, turn it on under a title, and rename itself. After a login change it reconnects Remote Control and resumes a turn the change cut off. It runs /remote-control only when the session reads as not connected, so it never opens the Remote Control panel or disconnects.",
   "author": { "name": "moefingers", "url": "https://github.com/moefingers" },
   "homepage": "https://github.com/moefingers/claude-code-self-tools/tree/main/plugins/self-remote-control#readme",

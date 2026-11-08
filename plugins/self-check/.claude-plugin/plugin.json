@@ -1,6 +1,6 @@
 {
   "name": "self-check",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "description": "Lets a session check that its own tools answer: a nonce echoed through the Bash and PowerShell tools as the model calls them, each within 10 seconds, how much room the session env leaves a Bash command on Windows, and the MCP servers listed (exercised only through probes you name). Quietly again when the session is resumed, saying only what failed. Dedupes Bash's session env after each session start, against Git Bash's 8,186-character cut.",
   "author": { "name": "moefingers", "url": "https://github.com/moefingers" },
   "homepage": "https://github.com/moefingers/claude-code-self-tools/tree/main/plugins/self-check#readme",
