@@ -36,17 +36,17 @@ import type { EngineInterface, Register } from 'claude-code'
 import type { Held, Queued } from '../types'
 import { read, readNow, runRemoteControl, sessionTitle, why, type Reading } from './connection'
 import { LOCK_HOLD_MS, releaseLock, takeLock } from './rc-lock'
-import { aroundLogin, configureRelogin, forgetTurn, noteFailure, notePersonPrompt, noteTurnEnd, noteTurnStart, startWatch } from './relogin'
+import { aroundLogin, configureRelogin, forgetTurn, noteFailure, notePersonPrompt, noteServers, noteTurnEnd, noteTurnStart, startWatch } from './relogin'
 import { configureUpdateCheck, loadUpdateCheck, withUpdateNotice } from './update-check'
 
 const queued = { plugin: 'self-remote-control', key: 'queued' } as const
 const title = { plugin: 'self-remote-control', key: 'title' } as const
 
 /**
- * When the step starts after the turn's end: at once, the moment the turn's end returns, so its command is queued
- * ahead of anything that arrives after (the owner's A). The 500 ms beat once copied here from self-compact (where
- * compacting rejects while a turn still runs) guarded nothing for a command: $.command.run queues it either way,
- * and a turn that starts before it runs takes it back (turn.start), as before.
+ * When the connect or rename starts after the turn's end: at once, the moment the turn's end returns (the owner's A). Input
+ * already waiting when the turn ended still runs first, since Claude Code queues a plugin's command behind it; the
+ * connect or rename then runs after that input's turn, which does no harm. (self-clear, self-exit, self-restart and self-switch
+ * wait half a second instead, so that their step stands down when something is waiting.)
  */
 const TURN_END_MS = 0
 /** How long after a connect to look again, for whether it took. */
@@ -345,6 +345,7 @@ export const register: Register = (on, options) => {
     })
     loadUpdateCheck($)
     startWatch($)
+    void noteServers($)
     return started
   })
 
@@ -359,7 +360,7 @@ export const register: Register = (on, options) => {
   // The main conversation's turns, for whether a login change cut one off.
   on('turn.start', async ($, e, next) => {
     const started = await next(e)
-    if (e.agentId === undefined) await noteTurnStart($, e.text)
+    if (e.agentId === undefined) await noteTurnStart($, e.text, e.turnId)
     return started
   })
 
@@ -408,7 +409,8 @@ export const register: Register = (on, options) => {
   on('turn.complete', async ($, e, next) => {
     const done = await next(e)
     if (e.agentId !== undefined) return done
-    await noteTurnEnd($, { reason: e.reason, durationMs: e.durationMs, ...(e.usage === undefined ? {} : { usage: e.usage }) })
+    await noteTurnEnd($, { reason: e.reason, durationMs: e.durationMs, turnId: e.turnId, ...(e.usage === undefined ? {} : { usage: e.usage }) })
+    void noteServers($)
     const { value } = await $.state.get(queued)
     if (!value) return done
     await $.state.set(queued, null)

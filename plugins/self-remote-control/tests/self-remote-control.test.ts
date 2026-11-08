@@ -29,12 +29,13 @@ function engine(on: On, { description = NOT_CONNECTED, remoteControl = 'false', 
   const commands: string[] = []
   const prompts: string[] = []
   const toasts: string[] = []
+  const described: string[] = []
   const rc: { description: string | null; title?: string } = { description }
   const local: { title?: string } = {}
   const clock = mock.clock(on)
   const session = mock.session(on)
   on('session.start', (_, e) => ({ cwd: e.cwd }))
-  on('tool.register', () => ({ value: { tool: TOOL } }))
+  on('tool.register', (_, e) => (described.push(String(e.description)), { value: { tool: TOOL } }))
   on('ui.status', () => ({ value: undefined }))
   on('ui.toast', (_, e) => {
     toasts.push(String(e.text))
@@ -78,7 +79,7 @@ function engine(on: On, { description = NOT_CONNECTED, remoteControl = 'false', 
     }
     return { text: '' }
   })
-  return { commands, prompts, toasts, rc, local, clock, session }
+  return { commands, prompts, toasts, described, rc, local, clock, session }
 }
 
 const start = { cwd: '/', surface: 'terminal', isInteractive: true } as const
@@ -430,4 +431,10 @@ test("the owner's A: a rename starts the moment the turn's end returns, with no 
   expect(commands).toEqual([])
   await clock.advance(1)
   expect(commands).toHaveLength(1)
+})
+
+test("the owner's note: the description says, after connect or rename, to end the turn and do nothing more until it has run, then carry on", async ($, on) => {
+  const { described } = engine(on)
+  await $.session.start(start)
+  expect(described.join(' ')).toContain('After `connect` or `rename`, end your turn and do nothing more until it has run; then carry on.')
 })

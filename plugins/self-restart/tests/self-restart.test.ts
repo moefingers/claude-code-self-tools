@@ -26,9 +26,9 @@ const restartInput = (claim: string): LaunchInput => ({
   stateDir: 'C:\\Users\\u\\AppData\\Local\\claude-self-tools',
   where: 'auto',
   waitForExit: { pid: 100, created: '134062345688901240' },
-  now: 1_000_000,
+  now: 1_000_500,
   tool: 'self-restart',
-  deadline: 1_000_000 + 20_000,
+  deadline: 1_000_500 + 20_000,
 })
 
 /** The launch script for one claim, as self-restart builds it. */
@@ -94,6 +94,7 @@ function engine(on: On, { env = WINDOWS, id = ID, launcher = 'opens', exit = 'ex
   const commands: string[] = []
   const prompts: string[] = []
   const toasts: string[] = []
+  const described: string[] = []
   const logs: string[] = []
   const world = { id, agents }
   const held = new Map<string, unknown>(Object.entries(store))
@@ -118,7 +119,7 @@ function engine(on: On, { env = WINDOWS, id = ID, launcher = 'opens', exit = 'ex
   on('fs.exists', () => ({ value: false }))
   on('command.register', (_, e) => ({ value: { command: e.name } }))
   on('session.cwd', () => ({ value: 'C:\\work\\repo' }))
-  on('tool.register', () => ({ value: { tool: TOOL } }))
+  on('tool.register', (_, e) => (described.push(String(e.description)), { value: { tool: TOOL } }))
   on('ui.status', () => ({ value: undefined }))
   on('ui.toast', (_, e) => {
     toasts.push(String(e.text))
@@ -160,7 +161,7 @@ function engine(on: On, { env = WINDOWS, id = ID, launcher = 'opens', exit = 'ex
     if (exit === 'exits') await clock.sleep(HOUR)
     return {}
   })
-  return { runs, commands, prompts, toasts, logs, clock, session, world, held }
+  return { runs, commands, prompts, toasts, logs, described, clock, session, world, held }
 }
 
 const start = { cwd: 'C:\\work\\repo', surface: 'terminal', isInteractive: true } as const
@@ -206,7 +207,7 @@ test('the window opens only once the turn has ended, by the fixed path with noth
   // The shared launcher's script for this session: its id, its folder, its own claude.exe, a fresh claim.
   expect(claimOf(script)).not.toBe('none')
   // The run comes half a second after the turn's end, a minute in: its deadline LAUNCH_DEADLINE_MS after that.
-  expect(script).toBe(launchScriptText({ ...restartInput(claimOf(script)), now: 1_060_000, deadline: 1_060_000 + 20_000 }))
+  expect(script).toBe(launchScriptText({ ...restartInput(claimOf(script)), now: 1_060_500, deadline: 1_060_500 + 20_000 }))
   expect(script).toContain(`$id = '${ID}'`)
   for (const part of ['evil', 'Remove-Item', 'Switched accounts', 'deploy check']) expect(JSON.stringify(run)).not.toContain(part)
   for (const part of ['evil', 'Remove-Item']) expect(script).not.toContain(part)
@@ -240,7 +241,7 @@ test('a second restart within 2 minutes of the first is refused: no restart loop
   await $.turn.complete(answered)
   await clock.advance(1000)
   expect(runs).toHaveLength(1)
-  expect((held.get('recentRestarts') as Record<string, number>)[ID]).toBe(1_000_000)
+  expect((held.get('recentRestarts') as Record<string, number>)[ID]).toBe(1_000_000 + 500)
 
   // The resumed session, a minute later, asks again: refused at the call.
   await clock.advance(60_000)
@@ -492,6 +493,29 @@ test('a message that starts a turn before the restart has begun cancels it, and 
   expect(held.get('restarts')).toBeUndefined()
 })
 
+test('input already waiting at the turn\'s end: its turn starts after a step at once would have begun, and the restart stands down, saying so, rather than run a turn late', async ($, on) => {
+  const { runs, commands, toasts, session, held, clock } = engine(on)
+  await $.session.start(start)
+
+  await $.tool.call({ tool: TOOL, reason: 'Switched accounts.', resume: 'Go on.' })
+  await $.turn.complete(answered)
+  // A message typed during the turn was waiting: Claude Code runs it first, and its turn starts a moment later.
+  await clock.advance(50)
+  await $.turn.start({ text: 'one more thing', turnId: 't2' })
+  await clock.advance(60_000)
+  expect(runs).toEqual([])
+  expect(commands).toEqual([])
+  expect(toasts.some(t => /Restart cancelled: a new turn started/.test(t))).toBe(true)
+  expect(JSON.stringify(session.appended())).toMatch(/restart you queued didn't go ahead: a new turn started/)
+  expect(held.get('restarts')).toBeUndefined()
+})
+
+test("the owner's note: the description says to end the turn and do nothing more until it has run, then carry on", async ($, on) => {
+  const { described } = engine(on)
+  await $.session.start(start)
+  expect(described.join(' ')).toContain('After calling it, end your turn and do nothing more until it has run; then carry on.')
+})
+
 test('a message that starts a turn while the window opens stops the exit, and the window is said to wait', async ($, on) => {
   const { runs, commands, toasts, session, held, clock } = engine(on, { launchMs: 2000 })
   await $.session.start(start)
@@ -510,7 +534,7 @@ test('a message that starts a turn while the window opens stops the exit, and th
   // The first prompt is taken back: the window may still resume the session if the person exits, and
   // the record keeps only the claim the window holds, for the process that resumes it to release.
   const LAUNCH = claimOf(String(runs[0]?.init?.stdin))
-  expect(held.get('restarts')).toEqual({ [ID]: { at: 1_000_000, reason: 'Switched accounts.', claim: LAUNCH } })
+  expect(held.get('restarts')).toEqual({ [ID]: { at: 1_000_500, reason: 'Switched accounts.', claim: LAUNCH } })
 })
 
 test('a subagent that starts while the window opens stops the exit', async ($, on) => {

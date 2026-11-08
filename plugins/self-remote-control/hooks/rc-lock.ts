@@ -148,11 +148,11 @@ export const RELEASE_SHA256 = 'caeb549b91af66bebe634710889da5600d263c43b9bc77c36
 /** What taking the lock came to: held, or why not. */
 export type Taken = { held: Held } | { busy: string }
 
-const SESSION_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
+export const SESSION_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
 const UNSAFE = /["'‘’‚‛“”„<>|?*\u0000-\u001f\u007f]/
 
 /** A drive-absolute Windows folder with nothing in it a script could misread. */
-function isSafeFolder(path: unknown): path is string {
+export function isSafeFolder(path: unknown): path is string {
   if (typeof path !== 'string' || path.length < 3 || path.length > 240) return false
   if (!/^[A-Za-z]:\\/.test(path) || UNSAFE.test(path) || path.indexOf(':', 2) !== -1 || path.includes('/')) return false
   return path
@@ -170,7 +170,7 @@ export const lockText = (at: number): string => JSON.stringify({ v: 1, by: BY, a
 const BASE64 = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/'
 
 /** `script` as PowerShell's -EncodedCommand takes it: UTF-16LE, then base64 (as the shared machine code does). */
-function encodeCommand(script: string): string {
+export function encodeCommand(script: string): string {
   const bytes: number[] = []
   for (let i = 0; i < script.length; i += 1) {
     const unit = script.charCodeAt(i)
@@ -204,15 +204,20 @@ async function machine($: EngineInterface): Promise<{ path: string; powershell: 
   }
 }
 
-/** Runs one canonical script for `path` and `text`; its one line of output. */
-async function runScript($: EngineInterface, powershell: string, script: string, path: string, text: string): Promise<string> {
+/** Runs one canonical script with `env`, in one Windows PowerShell process: its one line of output. The resume claim's scripts run this way too. */
+export async function runCanonical($: EngineInterface, powershell: string, script: string, env: Record<string, string>): Promise<string> {
   const run = await $.process.run([powershell, '-NoProfile', '-NonInteractive', '-EncodedCommand', encodeCommand(STDIN_BOOTSTRAP)], {
     stdin: script,
-    env: { RC_LOCK_PATH: path, RC_LOCK_TEXT: text },
+    env,
     timeoutMs: PS_TIMEOUT_MS,
   })
   if (run.exitCode !== 0) throw new Error(`PowerShell exited ${run.exitCode}`)
   return run.stdout.trim()
+}
+
+/** Runs one lock script for `path` and `text`; its one line of output. A plain function: the engine loads a hooks module only when `$` goes to one. */
+function runScript($: EngineInterface, powershell: string, script: string, path: string, text: string): Promise<string> {
+  return runCanonical($, powershell, script, { RC_LOCK_PATH: path, RC_LOCK_TEXT: text })
 }
 
 /** Why the lock is held, as a clause, from TAKE's `held|<by>|<age ms>`. */

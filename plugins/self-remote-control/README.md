@@ -45,19 +45,24 @@ What the plugin adds, in each session:
    - **The old link.** Right after a change, the old link can still read as connected until it stops. So the plugin waits up to a minute for it to read as not connected. If it never does, nothing runs. The command doesn't depend on whether the change actually stopped Remote Control: whichever happened, the plugin ends up doing the right thing.
    - **A flapping login.** At most 3 reconnects in 10 minutes per session. Past that, one toast says the cap holds, and it waits for the login to settle.
    - **`/login` in this session.** It reads Remote Control before `/login` runs, because closing the login dialog turns it off. If it was connected then, it counts as connected before the change. It also waits until the dialog has closed before reconnecting.
-3. **It resumes the turn the change cut off.** If the session's last turn ended on an error a new login can clear, within the last 6 hours, and no turn has started since, the plugin sends exactly *There was a small interruption. Please resume from your last turn normally.*
+3. **It reconnects Claude in Chrome**, once the Remote Control step settles, whatever its outcome, and before the resume. It runs `/mcp reconnect claude-in-chrome` in a session that lists Claude in Chrome's tools, or listed them before (a server the change dropped lists none). Claude in Chrome's cloud bridge routes by claude.ai account, and a session keeps the old account's connection until it reconnects. The reconnect starts the session's Chrome tab group over.
+   - **Not where the coordinator plugin runs.** A session that lists the coordinator's tools (`mcp__coordinator__*`) has the coordinator reconnect Claude in Chrome after its own switch, so this plugin leaves it alone there. A coordinator that is off for the session's repo registers no tools, so a session there is reconnected here.
+   - **Three looks.** A coordinator that is reloading lists no tools for a moment. So the plugin looks for its tools at once, 10 seconds after and 30 seconds after, and reconnects only when none of the three finds them. Coordinator tools listed earlier in the session and missing at all three looks, or a tool list that fails, leave Claude in Chrome alone, and the toast says so: never two reconnects.
+   - **What the toast says**: that `/mcp reconnect` ran, which starts the tab group over (Claude Code's own line says whether it reconnected), that it is queued when it hadn't run within 15 seconds, or that it was refused, with the command to run by hand.
+4. **It resumes the turn the change cut off.** If the session's last turn ended on an error a new login can clear, within the last 6 hours, and no turn has started since, the plugin sends exactly *There was a small interruption. Please resume from your last turn normally.*
    - **Errors a new login can clear**: the usage limit, a failed or refused sign-in, billing, and an outage. It doesn't resume after an invalid request, a too-long output, an unknown model, an error Claude Code classes as unknown, or one with no kind given, because those would likely fail the same way again.
-   - **When it goes**: once per change, only after the reconnect has finished or failed, so your phone sees the resumed turn. Then it waits the session's own delay, from 0 to 60 seconds, taken from the session's id. That way the sessions of one switch don't all start on the new account in the same second.
+   - **When it goes**: once per change, only after the reconnect has finished or failed, so your phone sees the resumed turn, and after Claude in Chrome's step. Then it waits the session's own delay, from 0 to 60 seconds, taken from the session's id. That way the sessions of one switch don't all start on the new account in the same second.
    - **A turn still running at the change**: the plugin waits for it. If that turn then ends on such an error, it gets resumed.
    - **A session at a finished break gets nothing.** A rewind past the cut-off turn isn't seen: the plugin API gives no cheap mark of the newest message, and listing the conversation copies up to 4096 messages in every session at once. The 6-hour limit bounds it.
+   - **One resume per stop.** The coordinator plugin's auto-resume, or the owner's Resume on its page, may resume the same stop. Whoever takes the resume claim (below) first sends; the other sends nothing and says who resumed.
    - **The loop-breaker.** If the turn the resume started ends on an error at once (no usage, or in under 30 seconds), that conversation isn't resumed again until you type a prompt, at the terminal or from the app. A prompt you type while that turn runs counts too. A resumed turn that did real work before it hit the limit stays resumable.
-4. **It shows one toast per change**, saying what happened. For example: *Login changed; Remote Control reconnected as "auth-refactor"; resumed: the turn ended on rate_limit 12 s ago.* The resume names the error kind its turn ended on and how long ago, in the toast and in a debug line, so a resume can be checked after the fact.
+5. **It shows one toast per change**, saying what happened. For example: *Login changed; Remote Control reconnected as "auth-refactor"; Claude in Chrome: /mcp reconnect ran, so its tab group starts over (Claude Code's own line says whether it reconnected); resumed: the turn ended on rate_limit 12 s ago.* The resume names the error kind its turn ended on and how long ago, in the toast and in a debug line, so a resume can be checked after the fact.
 
-Nothing runs while a turn is running. To turn either part off, use the plugin's settings in `/config`, both on by default:
+Nothing runs while a turn is running. To turn any part off, use the plugin's settings in `/config`, all three on by default:
 
 - `reconnectOnLoginChange`: reconnect Remote Control after a login change.
 - `resumeAfterLoginChange`: resume a cut-off turn after a login change.
-- `reconnectChromeOnLoginChange` (on by default): after a login change, once Remote Control has reconnected and before the resume, run `/mcp reconnect claude-in-chrome` in a session that has Claude in Chrome. Its cloud bridge routes by claude.ai account, and a session keeps its old connection until it reconnects. The reconnect starts the session's Chrome tab group over.
+- `reconnectChromeOnLoginChange`: reconnect Claude in Chrome after a login change, once the Remote Control step settles and before the resume, in a session with Claude in Chrome and no coordinator.
 
 Or set them from your shell:
 
@@ -65,7 +70,21 @@ Or set them from your shell:
 echo '{"reconnectOnLoginChange":false}' | claude plugin configure self-remote-control@claude-code-self-tools --values-stdin
 ```
 
-With both off, the plugin doesn't watch anything.
+With `reconnectOnLoginChange` and `resumeAfterLoginChange` both off, the plugin doesn't watch the login at all, so `reconnectChromeOnLoginChange` does nothing either.
+
+## The resume claim
+
+Two things can resume a session a usage limit stopped: this plugin's resume after a login change, and the coordinator plugin's auto-resume or the owner's Resume on its page. Each checks that no turn has run since the stop and then acts, so both could pass. The claim lets exactly one act. The protocol, the same in both plugins:
+
+- **The file**: `%LOCALAPPDATA%\claude-self-tools\resumed\<session id>.<turn id>.json`. `<session id>` is `$.session.id()`. `<turn id>` is the `turnId` of the main-loop `turn.complete` whose `reason` was `error`: one per turn, the same in every plugin's hook. Both must be UUIDs.
+- **What it holds**: `{"v":1,"by":"<name>","at":<ms>}` in UTF-8 with no BOM. `by` is `self-remote-control`, `coordinator` (its auto-resume) or `coordinator:owner` (the page's Resume).
+- **Taking it**: only through the canonical CLAIM script (`CLAIM_SCRIPT` in `hooks/claim-script.ts`, SHA-256 `CLAIM_SHA256`, checked by `scripts/resume-claim.test.mjs`; the coordinator plugin pins the same), run the way the lock's scripts are, with `RESUME_CLAIM_PATH` and `RESUME_CLAIM_TEXT`. Right before the resume, it prints:
+  - `claimed`: it created the file, so this one resumes;
+  - `taken|<by>|<at>`: the file was there, so this one sends nothing and says who resumed;
+  - `error|<why>`: no file could be made, so this one sends nothing.
+- **It never overwrites or deletes a claim** of the stop it was given. A winner whose resume the engine refused or dropped gives the claim back with the lock's RELEASE script and its own text, so a later resume can claim it.
+- **Clean-up**: each CLAIM deletes other claims untouched for 7 days.
+- **Off Windows**, where no coordinator runs, the claim is kept in the session's own state, and the plugin resumes each stop at most once.
 
 ## The Remote Control lock
 

@@ -29,12 +29,14 @@ import { configureUpdateCheck, loadUpdateCheck, withUpdateNotice } from './updat
 const queued = { plugin: 'self-clear', key: 'queued' } as const
 
 /**
- * When the step starts after the turn's end: at once, the moment the turn's end returns, so its command is queued
- * ahead of anything that arrives after (the owner's A). The 500 ms beat once copied here from self-compact (where
- * compacting rejects while a turn still runs) guarded nothing for a command: $.command.run queues it either way,
- * and a turn that starts before it runs takes it back (turn.start), as before.
+ * How long after the turn's end the clear waits before it starts: half a second. Claude Code queues a plugin's
+ * command behind input already waiting when the turn ended (a message typed during it, a task notification), so a
+ * command queued at once would run a turn late, after that input's turn. In the half second that input's turn
+ * starts, and its turn.start takes the clear back, with a note to the model. A check when the command leaves the
+ * queue can't stand in for it in 2.1.319: its re-entry rule leaves a plugin's own command.run hooks out of a
+ * command the plugin raised outside a hook (`hooks module ... skipped: re-entry (the plugin's own code raised it)`).
  */
-const TURN_END_MS = 0
+const SETTLE_MS = 500
 
 /**
  * An agent in one of these has ended. Every other status is still to report: `pending`, `running`,
@@ -253,7 +255,7 @@ export const register: Register = (on, options) => {
       return done
     }
     armed = value
-    $.clock.after(TURN_END_MS, () => void clearNow($, value))
+    $.clock.after(SETTLE_MS, () => void clearNow($, value))
     return done
   })
 

@@ -54,14 +54,36 @@ export type RcOutcome =
   | 'capped'
   | 'busy'
 
+/**
+ * Claude in Chrome's step after a login change. `ran`: /mcp reconnect ran (its own line says whether it reconnected).
+ * `queued`: the command was queued and hadn't run within RUN_WAIT_MS; it runs once the session is idle. `failed`: the
+ * command was refused. `none`: this session has no Claude in Chrome, now or before. `coordinator`: the coordinator
+ * plugin runs in this session and reconnects it itself. `unread`: the session's tools couldn't be listed, so it was
+ * left alone. `unsure`: the coordinator's tools were listed before and not at three looks (a reload, or turned off),
+ * so it was left alone rather than reconnected twice.
+ */
+export type ChromeOutcome = 'ran' | 'queued' | 'failed' | 'none' | 'coordinator' | 'unread' | 'unsure'
+
+/** The MCP servers this session has listed tools of, at any look: one the login change dropped lists none. */
+export type Servers = { chrome?: true; coordinator?: true }
+
 /** A login change being handled, from when it was confirmed until its toast. */
 export type Pending = {
   /** When the change was confirmed (ms). */
   at: number
   /** Whether Remote Control read connected when the new account was first seen. */
   wasConnected: boolean
-  /** Claude in Chrome's reconnect, after Remote Control's and before the resume: run, not there, or failed. */
-  chrome?: 'ran' | 'none' | 'failed'
+  /**
+   * Claude in Chrome's step, once the Remote Control step has settled and before the resume (relogin.ts says each):
+   * absent until it is decided.
+   */
+  chrome?: ChromeOutcome
+  /** How many looks for the coordinator's tools found none so far, before Claude in Chrome's reconnect. */
+  chromeLooks?: number
+  /** When the first of those looks was (ms). */
+  chromeFirstAt?: number
+  /** When the next look is due (ms). */
+  chromeAt?: number
   /** Whether the /config setting for all sessions (`remoteControl`) was true then. */
   settingOn: boolean
   /** The first moment no turn was running after the change: the reconnect's wait counts from here. */
@@ -121,6 +143,8 @@ export type Turn = {
   error?: string
   /** The turn the resume message started. */
   fromResume?: true
+  /** Its id, as turn.start and turn.complete carried it: the resume claim's key for a turn that ended on an error. */
+  turnId?: string
 }
 
 /** The resume's own record, across changes. */
@@ -142,6 +166,8 @@ declare module 'claude-code' {
       turn: Turn | null
       resumes: Resumes | null
       rcLock: MemoryLock | null
+      servers: Servers | null
+      resumeClaims: string[] | null
     }
   }
 }

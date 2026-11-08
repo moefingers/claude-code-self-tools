@@ -181,15 +181,16 @@ const BASELINE = 'baseline:'
  * exiting, or a Claude Code command run from a shell (alive 5 to 7 s), reads that way for a moment.
  */
 const RETRY_MS = [2500, 3500, 4000] as const
-/** A beat after the turn's end, so the turn is no longer running when the switch starts. */
-const SETTLE_MS = 500
 /**
- * When the step starts after the turn's end: at once, the moment the turn's end returns, so its command is queued
- * ahead of anything that arrives after (the owner's A). The 500 ms beat once copied here from self-compact (where
- * compacting rejects while a turn still runs) guarded nothing for a command: $.command.run queues it either way,
- * and a turn that starts before it runs takes it back (turn.start), as before.
+ * How long after the turn's end the switch waits before it starts: half a second. Claude Code queues a plugin's
+ * command behind input already waiting when the turn ended (a message typed during it, a task notification), so a
+ * command queued at once would run a turn late, after that input's turn. In the half second that input's turn
+ * starts, and its turn.start takes the switch back, with a note to the model. A check when the command leaves the
+ * queue can't stand in for it in 2.1.319: its re-entry rule leaves a plugin's own command.run hooks out of a
+ * command the plugin raised outside a hook (`hooks module ... skipped: re-entry (the plugin's own code raised it)`).
+ * The same half second goes before an arrival's work, a baseline, and a resumed conversation's first prompt.
  */
-const TURN_END_MS = 0
+const SETTLE_MS = 500
 /** How long after the exit command to look whether the session is still here. */
 const CHECK_MS = 5000
 /** How long the probe may take. */
@@ -1602,7 +1603,7 @@ export const register: Register = (on, options) => {
       return done
     }
     armed = value
-    $.clock.after(TURN_END_MS, () => void runSwitch($, value))
+    $.clock.after(SETTLE_MS, () => void runSwitch($, value))
     return done
   })
 

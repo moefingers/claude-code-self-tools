@@ -157,3 +157,9 @@ test('R3: between turns, a compaction the engine rejects (the turn still counted
   await clock.advance(1000)
   expect(compactions).toEqual(['the PR queue'])
 })
+
+test("the owner's note: the description says to end the turn and do nothing more until it has run, then carry on", async ($, on) => {
+  const { described } = engine(on)
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  expect(described.join(' ')).toContain('After calling it, end your turn and do nothing more until it has run; then carry on.')
+})

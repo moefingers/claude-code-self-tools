@@ -282,14 +282,30 @@ test("the owner's design: the description says a clear runs only when the sessio
   expect(said).toContain('under a nonstop stream of work and notifications it may not run for a long time')
 })
 
-test("the owner's A: the step starts the moment the turn's end returns, with no half-second beat", async ($, on) => {
+test('input already waiting at the turn\'s end: its turn starts after a step at once would have been queued, and the clear stands down, saying so, rather than run a turn late', async ($, on) => {
+  const { commands, prompts, toasts, session, clock } = engine(on)
+  await $.session.start(start)
+  await $.tool.call({ tool: TOOL, why: 'complete', handoff: 'Next: the docs, notes in notes.md.' })
+  await $.turn.complete(answered)
+  // A message typed during the turn was waiting: Claude Code runs it first, and its turn starts a moment later.
+  await clock.advance(50)
+  await $.turn.start({ text: 'one more thing', turnId: 't2' })
+  await clock.advance(60_000)
+  expect(commands).toEqual([])
+  expect(prompts).toEqual([])
+  expect(toasts.some(t => /Clear cancelled: a new turn started/.test(t))).toBe(true)
+  expect(JSON.stringify(session.appended())).toMatch(/clear you queued didn't run: a new turn started/)
+})
+
+test('with nothing waiting, the clear starts half a second after the turn\'s end', async ($, on) => {
   const { commands, clock } = engine(on)
   await $.session.start(start)
   await $.tool.call({ tool: TOOL, why: 'complete', handoff: 'Next: the docs, notes in notes.md.' })
   await $.turn.complete(answered)
+  await clock.advance(499)
   expect(commands).toEqual([])
   await clock.advance(1)
-  expect(commands).toHaveLength(1)
+  expect(commands).toEqual(['clear'])
 })
 
 test("the owner's note: the description says to end the turn and do nothing more until it has run", async ($, on) => {

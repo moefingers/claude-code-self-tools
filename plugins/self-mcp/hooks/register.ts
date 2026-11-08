@@ -14,10 +14,10 @@ import { configureUpdateCheck, loadUpdateCheck, withUpdateNotice } from './updat
 const queued = { plugin: 'self-mcp', key: 'queued' } as const
 
 /**
- * When the step starts after the turn's end: at once, the moment the turn's end returns, so its command is queued
- * ahead of anything that arrives after (the owner's A). The 500 ms beat once copied here from self-compact (where
- * compacting rejects while a turn still runs) guarded nothing for a command: $.command.run queues it either way,
- * and a turn that starts before it runs takes it back (turn.start), as before.
+ * When the reconnect starts after the turn's end: at once, the moment the turn's end returns (the owner's A). Input
+ * already waiting when the turn ended still runs first, since Claude Code queues a plugin's command behind it; the
+ * reconnect then runs after that input's turn, which does no harm. (self-clear, self-exit, self-restart and self-switch
+ * wait half a second instead, so that their step stands down when something is waiting.)
  */
 const TURN_END_MS = 0
 
