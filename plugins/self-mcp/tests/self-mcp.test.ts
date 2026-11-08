@@ -24,6 +24,7 @@ function engine(on: On, { reconnect = 'silent' }: { reconnect?: 'silent' | 'repo
     prompts.push(e.text)
     return { text: e.text }
   })
+  on('turn.start', (_, e) => ({ turnId: e.turnId }))
   on('turn.complete', () => ({ text: 'done' }))
   on('command.run', async (_, e, next) => {
     commands.push(`${e.command} ${e.args}`)
@@ -139,4 +140,27 @@ test("the owner's note: the description says to end the turn and do nothing more
   engine(on)
   await $.session.start(start)
   expect(registeredDescriptions.at(-1) ?? '').toContain("After calling it, end your turn and do nothing more until it has run; then carry on.")
+})
+
+test('a turn that starts after the reconnect was queued, before it ran: the reconnect runs, and its resume goes to the model as a note, never as a turn', async ($, on) => {
+  const { commands, prompts, toasts, session, clock } = engine(on)
+  await $.session.start(start)
+  await $.tool.call({ tool: TOOL, server: 'claude-in-chrome', resume: 'Carry on with X.' })
+  await $.turn.complete(answered)
+  await $.turn.start({ text: "stop, don't do X", turnId: 't2' })
+  await $.turn.complete({ ...answered, turnId: 't2' })
+  await clock.advance(1000)
+  expect(commands).toEqual(['mcp reconnect claude-in-chrome'])
+  expect(prompts).toEqual([])
+  expect(toasts).toContain('Resume not sent: a turn started after the reconnect was queued, so the model has it as a note.')
+  expect(JSON.stringify(session.appended())).toContain("A turn started after the reconnect was queued, so its resume wasn't sent as a new message. It was: Carry on with X.")
+})
+
+test('no turn after the arm: the resume is sent as before', async ($, on) => {
+  const { prompts, clock } = engine(on)
+  await $.session.start(start)
+  await $.tool.call({ tool: TOOL, server: 'claude-in-chrome', resume: 'Carry on with X.' })
+  await $.turn.complete(answered)
+  await clock.advance(1000)
+  expect(prompts).toHaveLength(1)
 })

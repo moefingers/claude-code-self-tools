@@ -15,11 +15,17 @@ const queued = { plugin: 'self-mcp', key: 'queued' } as const
 
 /**
  * When the reconnect starts after the turn's end: at once, the moment the turn's end returns (the owner's A). Input
- * already waiting when the turn ended still runs first, since Claude Code queues a plugin's command behind it; the
- * reconnect then runs after that input's turn, which does no harm. (self-clear, self-exit, self-restart and self-switch
- * wait half a second instead, so that their step stands down when something is waiting.)
+ * already waiting when the turn ended still runs first, since Claude Code queues a plugin's command behind it, and the
+ * reconnect then runs after that input's turn. The reconnect itself does no harm late, but its resume would: a person who
+ * typed "stop" meanwhile would be answered by the old "go on". So a main-loop turn that starts after the arm is noted,
+ * and the resume goes to the model as a note instead of starting a turn. (self-clear, self-exit, self-restart and
+ * self-switch wait half a second instead, so that their step stands down when something is waiting.)
  */
 const TURN_END_MS = 0
+
+/** Whether a reconnect is armed and hasn't run yet, and whether a main-loop turn started since it was. */
+let armed = false
+let turnSince = false
 
 const DESCRIPTION = [
   'Reconnects one of this session\'s MCP servers once the current turn ends, as /mcp reconnect does: for a server whose tools stopped answering (a browser extension that dropped, a server that crashed or timed out), where reconnecting is all it needs.',
@@ -83,8 +89,16 @@ async function reconnectNow($: EngineInterface, value: Queued): Promise<void> {
     said = `MCP reconnect of ${value.server} didn't run: ${why(err)}.`
   }
   $.ui.toast(said)
-  if (value.resume !== undefined) await sendResume($, said, value.resume)
-  else await tellModel($, said)
+  // A main-loop turn after the arm: its input came after the model asked to resume, and is answered first.
+  const isStale = turnSince
+  armed = false
+  turnSince = false
+  if (value.resume === undefined) await tellModel($, said)
+  else if (!isStale) await sendResume($, said, value.resume)
+  else {
+    $.ui.toast('Resume not sent: a turn started after the reconnect was queued, so the model has it as a note.')
+    await tellModel($, `${said} A turn started after the reconnect was queued, so its resume wasn't sent as a new message. It was: ${value.resume}`)
+  }
 }
 
 export const register: Register = (on, options) => {
@@ -150,7 +164,15 @@ export const register: Register = (on, options) => {
       $.ui.toast("MCP reconnect cancelled: the turn didn't finish.")
       return done
     }
+    armed = true
+    turnSince = false
     $.clock.after(TURN_END_MS, () => void reconnectNow($, value))
     return done
+  })
+
+  on('turn.start', async ($, e, next) => {
+    const started = await next(e)
+    if (e.agentId === undefined && armed) turnSince = true
+    return started
   })
 }

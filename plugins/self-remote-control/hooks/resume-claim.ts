@@ -45,11 +45,14 @@ const ago = (ms: number): string => {
   return seconds < 120 ? `${seconds} s` : `${Math.round(seconds / 60)} min`
 }
 
-/** The state's own claim, off Windows: one per stop, in this session. */
+/** The state's own claim, off Windows: one per stop, in this session, taken with a compare-and-set on its version. */
 async function claimMemory($: EngineInterface, key: string): Promise<Claim> {
-  const held = (await $.state.get(memoryRef)).value ?? []
-  if (held.includes(key)) return { lost: 'no resume: another run of this plugin already resumed the interrupted turn' }
-  await $.state.set(memoryRef, [...held, key].slice(-MEMORY_KEEP))
+  const got = await $.state.get(memoryRef)
+  const held = got.value ?? []
+  const lost = { lost: 'no resume: another run of this plugin claimed the resume of the interrupted turn' }
+  if (held.includes(key)) return lost
+  const taken = await $.state.set(memoryRef, [...held, key].slice(-MEMORY_KEEP), { ifVersion: got.version })
+  if (!taken.isSet) return lost
   return {
     won: true,
     giveBack: async () => {
@@ -93,7 +96,7 @@ export async function claimResume($: EngineInterface, turnId: string | undefined
     if (line.startsWith('taken|')) {
       const [, by = 'unknown', at = '0'] = line.split('|')
       const when = Number(at) > 0 ? ` ${ago(now - Number(at))} ago` : ''
-      return { lost: `no resume: ${whoOf(by)} already resumed the interrupted turn${when}` }
+      return { lost: `no resume: ${whoOf(by)} claimed the resume of the interrupted turn${when}` }
     }
     const why = line.startsWith('error|') ? line.slice('error|'.length).trim() : "an answer this plugin doesn't know"
     return { lost: `no resume: the resume claim couldn't be taken (${why === '' ? 'no reason given' : why})` }

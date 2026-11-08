@@ -528,7 +528,7 @@ test('with nothing waiting, the exit starts half a second after the turn\'s end'
   await $.turn.complete(answered)
   await clock.advance(499)
   expect(commands).toEqual([])
-  await clock.advance(1000)
+  await clock.advance(1)
   expect(commands).toEqual(['exit'])
 })
 

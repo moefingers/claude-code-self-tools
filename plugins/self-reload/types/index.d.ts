@@ -8,7 +8,11 @@ export type Queued = { resume?: string }
  * A reload under way, written before the command runs so that the module the reload starts finds
  * it: what to resume with, and `at`, when it was written, in `$.clock.now()` milliseconds.
  */
-export type Pending = Queued & { at: number }
+export type Pending = Queued & {
+  at: number
+  /** A main-loop turn started after the reload was queued: its resume goes to the model as a note, never as a turn. */
+  turnSince?: true
+}
 
 declare module 'claude-code' {
   interface PluginState {

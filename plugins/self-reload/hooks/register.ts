@@ -18,9 +18,11 @@ const pending = { plugin: 'self-reload', key: 'pending' } as const
 
 /**
  * When the reload starts after the turn's end: at once, the moment the turn's end returns (the owner's A). Input
- * already waiting when the turn ended still runs first, since Claude Code queues a plugin's command behind it; the
- * reload then runs after that input's turn, which does no harm. (self-clear, self-exit, self-restart and self-switch
- * wait half a second instead, so that their step stands down when something is waiting.)
+ * already waiting when the turn ended still runs first, since Claude Code queues a plugin's command behind it, and the
+ * reload then runs after that input's turn. The reload itself does no harm late, but its resume would: a person who
+ * typed "stop" meanwhile would be answered by the old "go on". So a main-loop turn that starts after the arm is marked on the pending resume (in $.state, which the reload keeps),
+ * and the resume goes to the model as a note instead of starting a turn. (self-clear, self-exit, self-restart and
+ * self-switch wait half a second instead, so that their step stands down when something is waiting.)
  */
 const TURN_END_MS = 0
 
@@ -84,6 +86,17 @@ async function sendResume($: EngineInterface, said: string, resume: string): Pro
   }
 }
 
+/**
+ * Sends the resume, or, when a main-loop turn started after the reload was queued, hands it to the model as a note:
+ * that turn's input came after the model asked to resume, and is answered first.
+ */
+async function resumeOrNote($: EngineInterface, said: string, value: Pending): Promise<void> {
+  if (value.resume === undefined) return
+  if (value.turnSince !== true) return await sendResume($, said, value.resume)
+  $.ui.toast('Resume not sent: a turn started after the reload was queued, so the model has it as a note.')
+  await tellModel($, `${said} A turn started after the reload was queued, so its resume wasn't sent as a new message. It was: ${value.resume}`)
+}
+
 /** Runs the reload; then, if this module is still the one running, sends what is pending. */
 async function reloadNow($: EngineInterface): Promise<void> {
   $.ui.status(undefined)
@@ -98,18 +111,18 @@ async function reloadNow($: EngineInterface): Promise<void> {
   if (value === undefined) return
   if (failed !== undefined) {
     $.ui.toast(`Plugin reload didn't run: ${failed}`)
-    if (value.resume !== undefined) await sendResume($, `Plugin reload didn't run (${failed}).`, value.resume)
+    if (value.resume !== undefined) await resumeOrNote($, `Plugin reload didn't run (${failed}).`, value)
     else await tellModel($, `The plugin reload you queued didn't run: ${failed}`)
     return
   }
   if (output !== undefined && SKIPPED.test(output)) {
     $.ui.toast(`Plugin reload skipped: ${output}`)
-    if (value.resume !== undefined) await sendResume($, `Plugin reload was skipped (${output}).`, value.resume)
+    if (value.resume !== undefined) await resumeOrNote($, `Plugin reload was skipped (${output}).`, value)
     else await tellModel($, `The plugin reload you queued was skipped: ${output}`)
     return
   }
   $.ui.toast(output === undefined ? 'Plugins reloaded.' : `Plugins reloaded. ${output}`)
-  if (value.resume !== undefined) await sendResume($, 'Plugins reloaded.', value.resume)
+  await resumeOrNote($, 'Plugins reloaded.', value)
 }
 
 /** At a module's start: after a reload this session asked for, send its resume, once. */
@@ -123,7 +136,7 @@ async function resumeAfterReload($: EngineInterface): Promise<void> {
   }
   $.ui.toast('Plugins reloaded.')
   // Not awaited: a submitted prompt starts its turn only once this start has finished.
-  if (value.resume !== undefined) void sendResume($, 'Plugins reloaded.', value.resume)
+  void resumeOrNote($, 'Plugins reloaded.', value)
 }
 
 export const register: Register = (on, options) => {
@@ -168,6 +181,15 @@ export const register: Register = (on, options) => {
     const then = resume === undefined ? 'then waits for the next message' : `then resumes with: ${resume}`
     return { result: `Queued. Plugins reload once this turn ends, and the session ${then}` }
   }).catch(($, e, next) => (next.called ? next(e) : { deny: 'self-reload: queuing the reload failed; nothing is queued.' }))
+
+  // A main-loop turn after the reload was queued, before it ran: its resume goes to the model as a note.
+  on('turn.start', async ($, e, next) => {
+    const started = await next(e)
+    if (e.agentId !== undefined) return started
+    const held = await $.state.get(pending)
+    if (held.value && held.value.turnSince !== true) await $.state.set(pending, { ...held.value, turnSince: true }, { ifVersion: held.version })
+    return started
+  }).catch(($, e, next) => next(e))
 
   on('turn.complete', async ($, e, next) => {
     const done = await next(e)

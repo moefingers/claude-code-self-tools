@@ -26,6 +26,7 @@ function engine(on: On, { reload = 'returns' }: { reload?: 'returns' | 'hangs' |
     prompts.push(e.text)
     return { text: e.text }
   })
+  on('turn.start', (_, e) => ({ turnId: e.turnId }))
   on('turn.complete', () => ({ text: 'done' }))
   on('command.run', async (_, e, next) => {
     commands.push(e.command)
@@ -197,4 +198,19 @@ test("the owner's note: the description says to end the turn and do nothing more
   engine(on)
   await $.session.start(start)
   expect(registeredDescriptions.at(-1) ?? '').toContain("After calling it, end your turn and do nothing more until it has run; then carry on.")
+})
+
+test('a turn that starts after the reload was queued, before it ran: the reload runs, and its resume goes to the model as a note, never as a turn', async ($, on) => {
+  const { commands, prompts, toasts, session, clock } = engine(on)
+  await $.session.start(start)
+  await $.tool.call({ tool: TOOL, resume: 'Carry on with X.' })
+  await $.turn.complete(answered)
+  // A message typed during the turn ("stop, don't do X") was waiting: its turn runs first.
+  await $.turn.start({ text: "stop, don't do X", turnId: 't2' })
+  await $.turn.complete({ ...answered, turnId: 't2' })
+  await clock.advance(1000)
+  expect(commands).toEqual(['reload-plugins'])
+  expect(prompts).toEqual([])
+  expect(toasts).toContain('Resume not sent: a turn started after the reload was queued, so the model has it as a note.')
+  expect(JSON.stringify(session.appended())).toContain("A turn started after the reload was queued, so its resume wasn't sent as a new message. It was: Carry on with X.")
 })

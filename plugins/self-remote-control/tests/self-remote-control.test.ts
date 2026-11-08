@@ -46,6 +46,7 @@ function engine(on: On, { description = NOT_CONNECTED, remoteControl = 'false', 
     prompts.push(e.text)
     return { text: e.text }
   })
+  on('turn.start', (_, e) => ({ turnId: e.turnId }))
   on('turn.complete', () => ({ text: 'done' }))
   on('classic.SessionStart', () => ({}))
   on('classic.UserPromptSubmit', () => ({}))
@@ -437,4 +438,18 @@ test("the owner's note: the description says, after connect or rename, to end th
   const { described } = engine(on)
   await $.session.start(start)
   expect(described.join(' ')).toContain('After `connect` or `rename`, end your turn and do nothing more until it has run; then carry on.')
+})
+
+test('a turn that starts after a rename was queued, before it ran: the rename runs, and its resume goes to the model as a note, never as a turn', async ($, on) => {
+  const { commands, prompts, toasts, session, clock } = engine(on)
+  await $.session.start(start)
+  await $.tool.call({ tool: TOOL, action: 'rename', name: 'billing export', resume: 'Carry on with X.' })
+  await $.turn.complete({ ...answered, turnId: 't1' })
+  await $.turn.start({ text: "stop, don't do X", turnId: 't2' })
+  await $.turn.complete({ ...answered, turnId: 't2' })
+  await clock.advance(1000)
+  expect(commands).toEqual(['rename billing export'])
+  expect(prompts).toEqual([])
+  expect(toasts).toContain('Resume not sent: a turn started after the Remote Control action was queued, so the model has it as a note.')
+  expect(JSON.stringify(session.appended())).toContain("A turn started after the Remote Control action was queued, so its resume wasn't sent as a new message. It was: Carry on with X.")
 })

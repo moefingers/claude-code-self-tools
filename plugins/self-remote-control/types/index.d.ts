@@ -60,9 +60,10 @@ export type RcOutcome =
  * command was refused. `none`: this session has no Claude in Chrome, now or before. `coordinator`: the coordinator
  * plugin runs in this session and reconnects it itself. `unread`: the session's tools couldn't be listed, so it was
  * left alone. `unsure`: the coordinator's tools were listed before and not at three looks (a reload, or turned off),
- * so it was left alone rather than reconnected twice.
+ * so it was left alone rather than reconnected twice. `capped`: it was reconnected RECONNECT_CAP times in the window
+ * already, so a flapping login doesn't start its tab group over each time.
  */
-export type ChromeOutcome = 'ran' | 'queued' | 'failed' | 'none' | 'coordinator' | 'unread' | 'unsure'
+export type ChromeOutcome = 'ran' | 'queued' | 'failed' | 'none' | 'coordinator' | 'unread' | 'unsure' | 'capped'
 
 /** The MCP servers this session has listed tools of, at any look: one the login change dropped lists none. */
 export type Servers = { chrome?: true; coordinator?: true }
@@ -84,6 +85,8 @@ export type Pending = {
   chromeFirstAt?: number
   /** When the next look is due (ms). */
   chromeAt?: number
+  /** When /mcp reconnect was started (ms), saved before it runs: a reload while it runs doesn't run it twice. */
+  chromeRanAt?: number
   /** Whether the /config setting for all sessions (`remoteControl`) was true then. */
   settingOn: boolean
   /** The first moment no turn was running after the change: the reconnect's wait counts from here. */
@@ -129,6 +132,8 @@ export type Login = {
   runs?: number[]
   /** When the cap's toast was shown (ms): once while the cap holds. */
   cappedAt?: number
+  /** When Claude in Chrome's reconnect ran, within the last RECONNECT_WINDOW_MS (ms): the same cap as Remote Control's. */
+  chromeRuns?: number[]
 }
 
 /** The main conversation's latest turn, as turn.start, turn.complete and StopFailure told it. */

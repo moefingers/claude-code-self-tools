@@ -4,7 +4,7 @@
 /** The name this plugin claims under. */
 export const CLAIM_BY = 'self-remote-control'
 
-// BEGIN canonical script (scratchpad s3\resume-claim\claim.ps1, byte for byte)
+// BEGIN canonical script, byte for byte the same in the coordinator plugin (the README's "The resume claim")
 export const CLAIM_SCRIPT = `# claude-self-tools resume-claim, v1: the canonical script, run byte for byte by every plugin that resumes a stopped turn.
 # In: RESUME_CLAIM_PATH, <state>\\resumed\\<session id>.<turn id>.json; RESUME_CLAIM_TEXT, this claimant's {"v":1,"by":"<name>","at":<ms>}.
 # Out, one line: "claimed" (this run created the file: resume), "taken|<by>|<at>" (the file was there

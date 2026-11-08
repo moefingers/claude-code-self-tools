@@ -44,11 +44,17 @@ const title = { plugin: 'self-remote-control', key: 'title' } as const
 
 /**
  * When the connect or rename starts after the turn's end: at once, the moment the turn's end returns (the owner's A). Input
- * already waiting when the turn ended still runs first, since Claude Code queues a plugin's command behind it; the
- * connect or rename then runs after that input's turn, which does no harm. (self-clear, self-exit, self-restart and self-switch
- * wait half a second instead, so that their step stands down when something is waiting.)
+ * already waiting when the turn ended still runs first, since Claude Code queues a plugin's command behind it, and the
+ * connect or rename then runs after that input's turn. The connect or rename itself does no harm late, but its resume would: a person who
+ * typed "stop" meanwhile would be answered by the old "go on". So a main-loop turn that starts after the arm is noted,
+ * and the resume goes to the model as a note instead of starting a turn. (self-clear, self-exit, self-restart and
+ * self-switch wait half a second instead, so that their step stands down when something is waiting.)
  */
 const TURN_END_MS = 0
+
+/** Whether a connect or rename is armed and hasn't reported yet, and whether a main-loop turn started since it was. */
+let actionArmed = false
+let turnSinceArm = false
 /** How long after a connect to look again, for whether it took. */
 const CHECK_MS = 3000
 /** While a connect that hasn't read connected holds the lock: how often to look again. */
@@ -117,6 +123,15 @@ async function sendResume($: EngineInterface, said: string, resume: string): Pro
  */
 async function report($: EngineInterface, { toast, note }: Outcome, resume: string | undefined): Promise<void> {
   $.ui.toast(toast)
+  // A main-loop turn after the arm: its input came after the model asked to resume, and is answered first.
+  const isStale = turnSinceArm
+  actionArmed = false
+  turnSinceArm = false
+  if (resume !== undefined && isStale) {
+    $.ui.toast('Resume not sent: a turn started after the Remote Control action was queued, so the model has it as a note.')
+    await tellModel($, `${note ?? toast} A turn started after the Remote Control action was queued, so its resume wasn't sent as a new message. It was: ${resume}`)
+    return
+  }
   if (resume !== undefined && (await sendResume($, note ?? toast, resume))) return
   if (note !== undefined) await tellModel($, note)
 }
@@ -360,6 +375,7 @@ export const register: Register = (on, options) => {
   // The main conversation's turns, for whether a login change cut one off.
   on('turn.start', async ($, e, next) => {
     const started = await next(e)
+    if (e.agentId === undefined && actionArmed) turnSinceArm = true
     if (e.agentId === undefined) await noteTurnStart($, e.text, e.turnId)
     return started
   })
@@ -419,6 +435,8 @@ export const register: Register = (on, options) => {
       $.ui.toast(`Remote Control ${value.rename ? 'rename' : 'connect'} cancelled: the turn didn't finish.`)
       return done
     }
+    actionArmed = true
+    turnSinceArm = false
     $.clock.after(TURN_END_MS, () => void runQueued($, value))
     return done
   })
