@@ -1,32 +1,37 @@
 // Claude Code empties a plugin's `$.state` at an in-process /clear or /resume, and no session.start follows
 // (claude-code-self-tools#24). self-switch's start folder outlives it in the module: it goes back to
-// `$.state` at the move's SessionStart and at the heartbeat that finds it empty, and a session.start that
-// finds none kept anywhere takes its own folder only when that holds the conversation's transcript, or the
-// conversation has no prompt yet. Nothing here touches a real file: the transcript is the test's answer.
+// `$.state` at the move's SessionStart and at the heartbeat that finds it empty. A session.start that finds
+// none kept anywhere holds its own folder provisional, taken only once known: this process's own startup
+// named the conversation, or the folder holds its transcript. The heartbeat goes on meanwhile, without a
+// folder. Nothing here touches a real file: the transcript is the test's answer.
 import { expect, mock, test } from 'claude-code/testing'
 import type { On } from 'claude-code'
 
 const TOOL = 'mcp__self-switch__switch_after_turn'
-const ID = '5d2b8e14-7a3c-4f9e-b6d1-0c4e8a2f7b39'
+const ID = '00000000-0000-0000-0000-00000000000a'
 const REPO = 'C:\\work\\repo'
 const WORKTREE = 'C:\\work\\repo\\.claude\\worktrees\\feature'
 const CONFIG = 'C:\\Users\\u\\.claude'
-const TRANSCRIPT = `${CONFIG}\\projects\\C--work-repo\\${ID}.jsonl`
+const PROJECTS = `${CONFIG}\\projects`
+const TRANSCRIPT = `${PROJECTS}\\C--work-repo\\${ID}.jsonl`
 const WINDOWS = { OS: 'Windows_NT', SystemRoot: 'C:\\Windows', LOCALAPPDATA: 'C:\\Users\\u\\AppData\\Local', USERPROFILE: 'C:\\Users\\u' }
 const FOLDER = 'self-switch/folder'
 const NOW = Date.UTC(2026, 10, 9, 12, 0, 0)
 
 type Options = {
-  /** How many prompts the conversation has had: none at a first start. */
+  /** How many prompts the conversation has had: none at a first start, nor after a /clear. */
   turns?: number
-  /** Whether the transcript is on disk under the repo's project folder. */
+  /** Whether the transcript is on disk under the repo's project folder at the start. */
   onDisk?: boolean
+  /** `$.fs.exists` refuses: the check can't run. */
+  existsFails?: boolean
 }
 
 /** The engine beneath the plugin, its `$.state` the test's own, so a test can empty it as Claude Code does. */
-function engine(on: On, { turns = 3, onDisk = true }: Options = {}) {
+function engine(on: On, { turns = 3, onDisk = true, existsFails = false }: Options = {}) {
   const state = new Map<string, { value: unknown; version: number }>()
   const held = new Map<string, unknown>()
+  const disk = new Set(onDisk ? [TRANSCRIPT] : [])
   const logs: string[] = []
   const clock = mock.clock(on, { now: NOW })
   mock.env(on, WINDOWS)
@@ -47,7 +52,8 @@ function engine(on: On, { turns = 3, onDisk = true }: Options = {}) {
     return { value: undefined }
   })
   on('store.keys', () => ({ value: [...held.keys()] }))
-  on('fs.exists', (_, e) => ({ value: onDisk && e.path === TRANSCRIPT }))
+  on('fs.exists', (_, e) => (existsFails ? { deny: 'EACCES: permission denied' } : { value: disk.has(e.path) }))
+  on('fs.list', (_, e) => (e.path === PROJECTS ? { value: ['C--work-other', 'C--work-repo'].map(name => ({ name, kind: 'dir' as const, size: 0, mtimeMs: 0, isLink: false })) } : { deny: `ENOENT: ${e.path}` }))
   on('fs.read', (_, e) => ({ deny: `ENOENT: ${e.path}` }))
   on('fs.write', () => ({ value: undefined }))
   on('session.start', (_, e) => ({ cwd: e.cwd }))
@@ -70,12 +76,12 @@ function engine(on: On, { turns = 3, onDisk = true }: Options = {}) {
   on('process.run', () => ({ deny: 'no machine in this test' }))
   /** Claude Code at an in-process /clear or /resume: every value of the plugin's `$.state` gone, and no session.start. */
   const wipe = () => state.clear()
-  return { state, held, logs, clock, wipe }
+  return { state, held, disk, logs, clock, wipe }
 }
 
 const start = (cwd = REPO) => ({ cwd, surface: 'terminal', isInteractive: true }) as const
 /** The heartbeat this conversation keeps, as liveness reads it. */
-const beat = (held: Map<string, unknown>) => held.get(`alive:${ID}`) as { folder?: string; project?: string } | undefined
+const beat = (held: Map<string, unknown>) => held.get(`alive:${ID}`) as { at?: number; folder?: string; project?: string } | undefined
 
 test('a /resume empties $.state and no session.start follows: the start folder goes back at its SessionStart', async ($, on) => {
   const w = engine(on)
@@ -106,15 +112,22 @@ test('a wipe that lands after the SessionStart: the heartbeat that finds the sta
   expect(w.state.get(FOLDER)?.value).toBe(REPO)
 })
 
-test("a reload after the wipe starts the plugin in a worktree: with prompts in the conversation and its transcript elsewhere, the worktree isn't taken", async ($, on) => {
+test("a reload after the wipe starts the plugin in a worktree, its transcript elsewhere: the worktree isn't taken, the log says why and where the transcript is, and the heartbeat goes on without a folder", async ($, on) => {
   const w = engine(on, { turns: 3 })
   // No start folder kept anywhere (the module is new, `$.state` empty), and the session is in a worktree now.
   await $.session.start(start(WORKTREE))
   await w.clock.settle()
   expect(w.state.get(FOLDER)).toBeUndefined()
-  // No heartbeat names it either: liveness would read a folder the conversation isn't under.
-  expect(beat(w.held)).toBeUndefined()
-  expect(w.logs.some(line => line.includes(`${WORKTREE}, where the plugin starts again, doesn't hold this conversation's transcript`))).toBe(true)
+  expect(beat(w.held)).toMatchObject({ folder: '', project: '' })
+  expect(typeof beat(w.held)?.at).toBe('number')
+  expect(w.logs).toContain(
+    `self-switch: the folder this session started in isn't known (Claude Code empties plugin state at a /clear or /resume, and nothing kept it), and ${WORKTREE}, where the plugin started again, doesn't hold this conversation's transcript; Claude Code keeps it in ${PROJECTS}\\C--work-repo. It isn't taken as the start folder, and a switch here refuses until the session restarts.`,
+  )
+  // Said once, however many heartbeats look again.
+  await $.turn.start({ text: 'go on', turnId: 't1' })
+  await w.clock.advance(5 * 60 * 1000)
+  expect(w.logs.filter(line => line.startsWith('self-switch: the folder this session started in'))).toHaveLength(1)
+  expect(w.state.get(FOLDER)).toBeUndefined()
 })
 
 test('a reload after the wipe in the folder that holds the transcript: that folder is the start folder again', async ($, on) => {
@@ -125,8 +138,53 @@ test('a reload after the wipe in the folder that holds the transcript: that fold
   expect(beat(w.held)?.folder).toBe(REPO)
 })
 
-test('a first start, before any prompt: its own folder, though no transcript is written yet', async ($, on) => {
+test("a first start, before any prompt: this process's own startup names the conversation, so its folder is taken, the startup's SessionStart before session.start or after it", async ($, on) => {
   const w = engine(on, { turns: 0, onDisk: false })
   await $.session.start(start(WORKTREE))
+  expect(w.state.get(FOLDER)).toBeUndefined()
+  await $.classic.SessionStart({ source: 'startup', session_id: ID })
   expect(w.state.get(FOLDER)?.value).toBe(WORKTREE)
+})
+
+test('the startup SessionStart before session.start: taken at session.start', async ($, on) => {
+  const w = engine(on, { turns: 0, onDisk: false })
+  await $.classic.SessionStart({ source: 'startup', session_id: ID })
+  await $.session.start(start(WORKTREE))
+  expect(w.state.get(FOLDER)?.value).toBe(WORKTREE)
+})
+
+test("a reload after a /clear, before its first prompt: no prompt is no proof, so the folder waits, and isn't taken where the transcript then doesn't appear", async ($, on) => {
+  const w = engine(on, { turns: 0, onDisk: false })
+  // The /clear's conversation has no prompt, nor a transcript yet; this module saw no startup.
+  await $.session.start(start(WORKTREE))
+  await w.clock.settle()
+  expect(w.state.get(FOLDER)).toBeUndefined()
+  // Its first prompt writes the transcript under the folder the process really started in.
+  w.disk.add(TRANSCRIPT)
+  await $.turn.start({ text: 'go on', turnId: 't1' })
+  await w.clock.settle()
+  expect(w.state.get(FOLDER)).toBeUndefined()
+  expect(beat(w.held)?.folder).toBe('')
+})
+
+test('a folder held provisional is taken once the transcript appears under its project', async ($, on) => {
+  const w = engine(on, { turns: 0, onDisk: false })
+  await $.session.start(start(REPO))
+  expect(w.state.get(FOLDER)).toBeUndefined()
+  w.disk.add(TRANSCRIPT)
+  await $.turn.start({ text: 'go on', turnId: 't1' })
+  await w.clock.settle()
+  expect(w.state.get(FOLDER)?.value).toBe(REPO)
+  expect(beat(w.held)?.folder).toBe(REPO)
+})
+
+test("a check that can't run: the folder isn't taken, and the log says the check couldn't be made", async ($, on) => {
+  const w = engine(on, { turns: 3, existsFails: true })
+  await $.session.start(start(WORKTREE))
+  await w.clock.settle()
+  expect(w.state.get(FOLDER)).toBeUndefined()
+  const said = w.logs.find(line => line.startsWith(`self-switch: whether ${WORKTREE}, where the plugin started again, is the folder this session started in can't be checked: looking for `))
+  expect(said).toBeDefined()
+  expect(said).toContain('EACCES: permission denied')
+  expect(said?.endsWith("It isn't taken as the start folder until it can be, and a switch here refuses meanwhile.")).toBe(true)
 })

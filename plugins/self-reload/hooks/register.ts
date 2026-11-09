@@ -251,17 +251,24 @@ function withoutResume(value: Pending): Pending {
 /**
  * At a /clear's or a /resume's classic SessionStart, while a reload this module armed still waits: its resume
  * is dropped (the conversation it was for was left), from the module's copy and from $.state when the record
- * is still there (read fresh, so the compare-and-set's version is from after the move), and the person and
- * the model are told. The reload itself still runs. Nothing when the waiting reload has no resume.
+ * is still there (read fresh, so the compare-and-set's version is from after the move); when the wipe came
+ * first, the record goes back without it, so the reload's end still reports. The person and the model are
+ * told. The reload itself still runs. Nothing when the waiting reload has no resume.
  */
 function dropResume($: EngineInterface, source: 'clear' | 'resume'): Promise<void> {
   return serial(async () => {
     const mine = written
     if (mine === undefined || mine.resume === undefined) return
-    written = withoutResume(mine)
+    const kept = withoutResume(mine)
+    written = kept
     for (let tries = 0; tries < 3; tries += 1) {
       const held = await $.state.get(pending)
-      if (!held.value || held.value.at !== mine.at || held.value.resume === undefined) break
+      // The wipe came first: the record goes back without its resume, so the reload's end still says how it went.
+      if (!held.value) {
+        await $.state.set(pending, kept)
+        break
+      }
+      if (held.value.at !== mine.at || held.value.resume === undefined) break
       if ((await $.state.set(pending, withoutResume(held.value), { ifVersion: held.version })).isSet) break
     }
     const move = source === 'clear' ? '/clear' : '/resume'

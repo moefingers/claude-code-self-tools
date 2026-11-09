@@ -70,8 +70,12 @@ test('a /clear empties $.state before the queued reload runs: the reload runs, i
   expect(w.toasts).toEqual([DROPPED_TOAST])
   expect(JSON.stringify(w.session.appended())).toContain(DROPPED_NOTE)
 
+  // Back in $.state without its resume: the reload's end says how it went, as the toast promised.
+  expect((w.state.get(PENDING)?.value as { at?: number; resume?: string } | undefined)?.at).toBeDefined()
+  expect((w.state.get(PENDING)?.value as { resume?: string } | undefined)?.resume).toBeUndefined()
   await w.clock.advance(RELOAD_MS + 1000)
   expect(w.prompts).toEqual([])
+  expect(w.toasts).toEqual([DROPPED_TOAST, 'Plugins reloaded. Reloaded 3 plugins.'])
   expect(JSON.stringify(w.session.appended())).not.toContain('Try the edited tool.')
 })
 

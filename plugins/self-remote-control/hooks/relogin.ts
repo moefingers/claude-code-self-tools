@@ -63,10 +63,12 @@
 //
 // The login record and the servers seen are the machine's sign-in and the session's tools, not the
 // conversation's, so they outlive a move: Claude Code empties $.state at an in-process /clear or /resume,
-// with no session.start after, and the module keeps a mirror of each, set at every write. A read that finds
-// one empty while its mirror is set writes the mirror back and goes by it; and each goes back at every
-// main-loop classic SessionStart of a clear or a resume (restoreAfterMove), since the wipe may land before
-// that SessionStart or after it. The last turn and the resume's record are the conversation's, and are
+// with no session.start after, and a /resume may bring back what $.state held for that conversation
+// before. The module keeps a mirror of each, set at every write and loaded at its first read; once loaded,
+// the mirror stands: a read that finds $.state otherwise (empty, or stale) writes the mirror back and goes
+// by it. Each is read so at every main-loop classic SessionStart of a clear or a resume (restoreAfterMove),
+// written only when it differs; the wipe may land before that SessionStart or after it, and the next read
+// puts it right then. The last turn and the resume's record are the conversation's, and are
 // forgotten at a move (forgetTurn). A turn keeps the conversation it ran in (`session`), named by the last
 // main-loop SessionStart of a startup, a resume or a clear while `$.session.id()` lags it: the resume claim
 // is keyed by it, never by `$.session.id()` read when the claim is made.
@@ -173,9 +175,16 @@ let logins: number[] = []
 let connectedAtLogin: number | undefined
 let watchTimer: Timer | undefined
 let tickTimer: Timer | undefined
-/** The login record and the servers seen as this module last wrote or read them: the copies a /clear or a /resume doesn't empty. */
-let loginMirror: Login | undefined
-let serversMirror: Servers | undefined
+/**
+ * The login record and the servers seen as this module last wrote them, or first read them: undefined until
+ * loaded, null when known to be none. Once loaded, each stands over $.state: the copy a /clear or a /resume
+ * doesn't empty, nor a /resume bring back stale.
+ */
+let loginMirror: Login | null | undefined
+let serversMirror: Servers | null | undefined
+
+/** Whether two stored values are one, as $.state keeps them (JSON). */
+const sameValue = (a: unknown, b: unknown): boolean => JSON.stringify(a ?? null) === JSON.stringify(b ?? null)
 /** The conversation the last main-loop SessionStart of a startup, a resume or a clear named, and when. */
 let conversation: { readonly id: string; readonly at: number } | undefined
 
@@ -322,17 +331,16 @@ async function isSettingOn($: EngineInterface): Promise<boolean> {
 }
 
 /**
- * The login record: $.state's, which the mirror then follows; read empty while the mirror is set (Claude Code
- * emptied $.state at a /clear or a /resume), the mirror, written back.
+ * The login record: at the module's first read, $.state's, which loads the mirror; from then on the mirror,
+ * written back over a $.state that reads otherwise (emptied at a /clear or a /resume, or stale).
  */
 async function getLogin($: EngineInterface): Promise<Login | null> {
   const value = (await $.state.get(loginRef)).value ?? null
-  if (value !== null) {
+  if (loginMirror === undefined) {
     loginMirror = value
     return value
   }
-  if (loginMirror === undefined) return null
-  await $.state.set(loginRef, loginMirror)
+  if (!sameValue(value, loginMirror)) await $.state.set(loginRef, loginMirror)
   return loginMirror
 }
 
@@ -342,16 +350,15 @@ async function setLogin($: EngineInterface, value: Login): Promise<void> {
   await $.state.set(loginRef, value)
 }
 
-/** The servers seen, as getLogin reads the login: $.state's, else the mirror, written back; none when neither has any. Never throws. */
+/** The servers seen, as getLogin reads the login: loaded once, then the mirror, written back over a $.state that reads otherwise; none when none were seen. Never throws. */
 async function getServers($: EngineInterface): Promise<Servers> {
   const value = (await $.state.get(serversRef).catch(() => ({ value: null }))).value ?? null
-  if (value !== null) {
+  if (serversMirror === undefined) {
     serversMirror = value
-    return value
+    return value ?? {}
   }
-  if (serversMirror === undefined) return {}
-  await $.state.set(serversRef, serversMirror).catch(() => undefined)
-  return serversMirror
+  if (!sameValue(value, serversMirror)) await $.state.set(serversRef, serversMirror).catch(() => undefined)
+  return serversMirror ?? {}
 }
 
 /**
@@ -363,8 +370,9 @@ export async function restoreAfterMove($: EngineInterface, source: unknown, id: 
   try {
     if ((source === 'startup' || source === 'resume' || source === 'clear') && typeof id === 'string' && SESSION_ID.test(id)) conversation = { id, at: await $.clock.now() }
     if (source !== 'clear' && source !== 'resume') return
-    if (loginMirror !== undefined) await $.state.set(loginRef, loginMirror)
-    if (serversMirror !== undefined) await $.state.set(serversRef, serversMirror)
+    // Read, and written back only where $.state reads otherwise than the mirror.
+    if (loginMirror !== undefined) await getLogin($)
+    if (serversMirror !== undefined) await getServers($)
   } catch {
     // The next read that finds either empty puts it back.
   }
@@ -945,7 +953,9 @@ export async function move($: EngineInterface): Promise<void> {
     if ((await getTurn($))?.running === true) return await save(busyAgain(p), held)
     const resumed = await resume($, held, p, now)
     stopMoving()
-    const latest = (await getLogin($)) ?? held
+    // The record as this tick last wrote it (the mirror), never read back in the same dispatch: a read of
+    // one dispatch may still answer the moment before its own write.
+    const latest = loginMirror ?? held
     const runs = recentRuns(latest, now)
     const chromeRuns = recentChromeRuns(latest, now)
     // A retry after the cap has its own toast; after it, a cap is new again and is told.

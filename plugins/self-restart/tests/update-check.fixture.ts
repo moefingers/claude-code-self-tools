@@ -8,7 +8,8 @@ export const CALL = { tool: 'mcp__self-restart__restart_after_turn', reason: 'th
 
 /**
  * The call plans the launch at once, refusing it anywhere but Windows: what it reads of a Windows machine,
- * beneath each test's own environment. No %LOCALAPPDATA%, so no probe runs.
+ * beneath each test's own environment. No %LOCALAPPDATA%, so no wake-up marker is read; the probe runs, and
+ * `world` answers it.
  */
 export const ENV: Readonly<Record<string, string>> = { OS: 'Windows_NT', SystemRoot: 'C:\\Windows', USERPROFILE: 'C:\\Users\\u' }
 

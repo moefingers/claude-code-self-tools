@@ -261,7 +261,10 @@ function engine(
   // self-wake, when it is in this session: its tool listed, and its marker for this conversation read.
   on('tool.list', () => answer({ value: world.wake.present ? [{ name: 'mcp__self-wake__wake_after', description: 'Wakes this session later.', mcp: true }] : [] }))
   const MARKER = wakePath(STATE, W)
-  on('fs.exists', (_, e) => answer({ value: e.path === GATE ? world.gate !== undefined : e.path === MARKER ? world.wake.marker !== undefined : files.has(e.path) }))
+  // The conversation's transcript is under whichever project folder the start folder a test gives names, so
+  // a session.start's own folder, held provisional, is known at once to be where the session started.
+  const TRANSCRIPT = /\\projects\\[^\\]+\\[0-9a-f-]{36}\.jsonl$/
+  on('fs.exists', (_, e) => answer({ value: e.path === GATE ? world.gate !== undefined : e.path === MARKER ? world.wake.marker !== undefined : files.has(e.path) || TRANSCRIPT.test(e.path) }))
   on('fs.read', (_, e) =>
     answer(
       files.has(e.path)

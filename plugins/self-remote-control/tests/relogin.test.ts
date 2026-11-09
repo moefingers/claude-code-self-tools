@@ -1575,3 +1575,37 @@ test('a stop recorded with no conversation (a turn written before this version) 
   expect(w.claims).toEqual([])
   expect(w.toasts[0]).toContain("no resume: the conversation the interrupted turn ran in isn't known, so the resume can't be claimed")
 })
+
+test("a stale login record a /resume brings back doesn't replace the mirror: the change from the account this session saw is still seen", async ($, on) => {
+  const state = new Map<string, { value: unknown; version: number }>()
+  const w = machine(on, { state })
+  await begin($, w)
+  expect(state.get(LOGIN_KEY)?.value).toMatchObject({ account: fingerprint('account-a') })
+  // What $.state held for the conversation resumed, from before: the account the login is about to switch to.
+  state.set(LOGIN_KEY, { value: { account: fingerprint('account-b') }, version: 99 })
+  await $.classic.SessionStart({ source: 'resume', session_id: SESSION, session_title: TITLE })
+  expect(state.get(LOGIN_KEY)?.value).toMatchObject({ account: fingerprint('account-a') })
+
+  // Taken as the baseline, the stale record would make the switch to account-b no change at all.
+  w.switchTo('account-b')
+  await w.clock.advance(SETTLE)
+  expect(w.commands).toEqual([`remote-control ${TITLE}`])
+})
+
+test('a SessionStart that finds the login record and the servers seen as the mirrors have them writes nothing; emptied, it writes them back', async ($, on) => {
+  const state = new Map<string, { value: unknown; version: number }>()
+  const w = machine(on, { state, chrome: true })
+  await begin($, w)
+  const login = state.get(LOGIN_KEY)?.version
+  const servers = state.get(SERVERS_KEY)?.version
+  expect(login).toBeDefined()
+  expect(servers).toBeDefined()
+  await $.classic.SessionStart({ source: 'resume', session_id: SESSION, session_title: TITLE })
+  expect(state.get(LOGIN_KEY)?.version).toBe(login)
+  expect(state.get(SERVERS_KEY)?.version).toBe(servers)
+  state.clear()
+  await $.classic.SessionStart({ source: 'clear', session_id: SESSION, session_title: TITLE })
+  expect(state.get(LOGIN_KEY)?.value).toMatchObject({ account: fingerprint('account-a') })
+  expect(state.get(SERVERS_KEY)?.value).toEqual({ chrome: true })
+  void w
+})

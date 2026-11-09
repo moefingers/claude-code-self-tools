@@ -77,7 +77,7 @@ export async function claimResume($: EngineInterface, turnId: string | undefined
   try {
     if (turnId === undefined || !SESSION_ID.test(turnId)) return { lost: "no resume: the interrupted turn's id isn't known, so the resume can't be claimed" }
     if (session === undefined) return { lost: "no resume: the conversation the interrupted turn ran in isn't known, so the resume can't be claimed" }
-    if (!SESSION_ID.test(session)) return { lost: "no resume: this session's id isn't one, so the resume can't be claimed" }
+    if (!SESSION_ID.test(session)) return { lost: "no resume: the conversation the interrupted turn ran in isn't named by a session id, so the resume can't be claimed" }
     const [local, root] = await Promise.all([$.env.get('LOCALAPPDATA'), $.env.get('SystemRoot')])
     if (local === undefined && root === undefined) return await claimMemory($, `${session}.${turnId}`)
     if (!isSafeFolder(local) || typeof root !== 'string' || !/^[A-Za-z]:\\[^\\/:*?"<>|]+\\?$/.test(root)) return { lost: "no resume: the resume claim can't be placed (no usable %LOCALAPPDATA% or %SystemRoot%)" }
