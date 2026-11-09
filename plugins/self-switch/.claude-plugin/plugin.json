@@ -1,6 +1,6 @@
 {
   "name": "self-switch",
-  "version": "0.4.1",
+  "version": "0.4.2",
   "description": "Lets a session switch its terminal to another conversation on Windows once the current turn ends, for your own use: it checks the other conversation is open nowhere on this machine and nothing runs under this session, then resumes it in place, in the pane's slot, or in a new window. It refuses where the coordinator runs switches.",
   "author": { "name": "moefingers", "url": "https://github.com/moefingers" },
   "homepage": "https://github.com/moefingers/claude-code-self-tools/tree/main/plugins/self-switch#readme",
