@@ -1345,3 +1345,130 @@ test("off Windows, another writer that takes the session's own claim first: this
   expect(w.prompts).toEqual([])
   expect(w.toasts[0]).toContain('no resume: another run of this plugin claimed the resume of the interrupted turn')
 })
+
+/** The reconnect cap's line, in Remote Control's part of a toast. */
+const RC_CAPPED = 'Remote Control not reconnected: it already reconnected 3 times in 10 minutes'
+const CHROME_CAPPED = 'Claude in Chrome not reconnected: it already reconnected 3 times in 10 minutes'
+const runsOf = (w: World, command: string) => w.commands.filter(c => c.startsWith(command)).length
+
+test("a burst of five with the setting for all sessions off, the coordinator's session: Remote Control the cap left down stays owed, and reconnects once the window passes", async ($, on) => {
+  const w = machine(on, { chrome: true, coordinator: true })
+  await begin($, w)
+  for (const account of ['account-b', 'account-c', 'account-d', 'account-e', 'account-f']) {
+    w.switchTo(account)
+    await w.clock.advance(SETTLE + 10_000)
+  }
+  // Three reconnects; the fourth change is capped and leaves it down; the fifth reads it down, and still counts it owed.
+  expect(runsOf(w, 'remote-control')).toBe(3)
+  expect(w.rc.description).toBe(NOT_CONNECTED)
+  expect(w.toasts.filter(t => t.includes(RC_CAPPED))).toHaveLength(1)
+  expect(w.toasts.some(t => t.includes('Remote Control was off, and is left off'))).toBe(false)
+  expect(w.toasts).toHaveLength(4)
+  await w.clock.advance(10 * 60_000)
+  expect(runsOf(w, 'remote-control')).toBe(4)
+  expect(w.rc.description).toBe(CONNECTED)
+  expect(w.toasts.at(-1)).toBe(`Login settled after the reconnect cap; Remote Control reconnected as "${TITLE}".`)
+  // Owed no more: nothing after another window.
+  await w.clock.advance(15 * 60_000)
+  expect(runsOf(w, 'remote-control')).toBe(4)
+  expect(w.toasts).toHaveLength(5)
+})
+
+test("a login that flaps back to the last reconnect's account: Claude Code stopped Remote Control at the switch away, so it is still reconnected once the window passes", async ($, on) => {
+  const w = machine(on, { remoteControl: 'true' })
+  await begin($, w)
+  // account-d is the last reconnect's; account-e is capped and stops it; back to account-d, capped too.
+  for (const account of ['account-b', 'account-c', 'account-d', 'account-e', 'account-d']) {
+    w.switchTo(account)
+    await w.clock.advance(SETTLE + 10_000)
+  }
+  expect(runsOf(w, 'remote-control')).toBe(3)
+  expect(w.rc.description).toBe(NOT_CONNECTED)
+  await w.clock.advance(10 * 60_000)
+  expect(runsOf(w, 'remote-control')).toBe(4)
+  expect(w.rc.description).toBe(CONNECTED)
+  expect(w.toasts.at(-1)).toBe(`Login settled after the reconnect cap; Remote Control reconnected as "${TITLE}".`)
+})
+
+test('signed out when the window passes: no retry runs; signing in again is a change that counts Remote Control as owed', async ($, on) => {
+  const w = machine(on)
+  await begin($, w)
+  for (const account of ['account-b', 'account-c', 'account-d', 'account-e']) {
+    w.switchTo(account)
+    await w.clock.advance(SETTLE + 10_000)
+  }
+  expect(runsOf(w, 'remote-control')).toBe(3)
+  expect(w.toasts).toHaveLength(4)
+  w.switchTo(null)
+  await w.clock.advance(10 * 60_000)
+  expect(runsOf(w, 'remote-control')).toBe(3)
+  expect(w.toasts).toHaveLength(4)
+  // The setting for all sessions is off and Remote Control reads down: only the debt says to reconnect it.
+  w.switchTo('account-f')
+  await w.clock.advance(SETTLE + 10_000)
+  expect(runsOf(w, 'remote-control')).toBe(4)
+  expect(w.rc.description).toBe(CONNECTED)
+  expect(w.toasts.at(-1)).toBe(`Login changed; Remote Control reconnected as "${TITLE}"; no turn was cut off.`)
+})
+
+test("a real change folded into a retry reads the setting itself: with Remote Control for all sessions on, it reconnects, though the retry wasn't owed it", async ($, on) => {
+  const now = 100 * HOUR
+  const state = new Map<string, { value: unknown; version: number }>()
+  // A retry owed only Claude in Chrome's reconnect: its Remote Control placeholders are "was off" and "setting off".
+  state.set('self-remote-control/login', { version: 1, value: { account: fingerprint('account-a'), owedAt: now - 1000, chromeAccount: fingerprint('account-z') } })
+  const w = machine(on, { chrome: true, remoteControl: 'true', description: NOT_CONNECTED, state })
+  await begin($, w)
+  // The retry is looking for the coordinator's tools when another account comes: the change folds the retry in.
+  w.switchTo('account-b')
+  await w.clock.advance(CHROME_FLOW)
+  expect(w.commands).toContain(`remote-control ${TITLE}`)
+  expect(w.rc.description).toBe(CONNECTED)
+  expect(w.toasts.at(-1)).toBe(`Login changed; Remote Control reconnected as "${TITLE}"; ${CHROME_RAN}; no turn was cut off.`)
+})
+
+test("Claude in Chrome's cap is told once while it holds, though Remote Control isn't capped (it was off)", async ($, on) => {
+  const w = machine(on, { chrome: true, description: NOT_CONNECTED })
+  await begin($, w)
+  for (const account of ['account-b', 'account-c', 'account-d', 'account-e', 'account-f']) {
+    w.switchTo(account)
+    await w.clock.advance(SETTLE + CHROME_LOOK_MS[1] + 10_000)
+  }
+  expect(runsOf(w, 'mcp')).toBe(3)
+  expect(w.toasts.filter(t => t.includes(CHROME_CAPPED))).toHaveLength(1)
+  // Three reconnects, the cap's one toast, then nothing new for the fifth.
+  expect(w.toasts).toHaveLength(4)
+})
+
+test("Claude in Chrome left as it was (its tools can't be listed) is no news while Remote Control's cap holds", async ($, on) => {
+  const w = machine(on, { chrome: true, remoteControl: 'true' })
+  await begin($, w)
+  w.tools.fails = true
+  for (const account of ['account-b', 'account-c', 'account-d', 'account-e', 'account-f']) {
+    w.switchTo(account)
+    await w.clock.advance(SETTLE + 10_000)
+  }
+  expect(runsOf(w, 'remote-control')).toBe(3)
+  expect(w.toasts.filter(t => t.includes(RC_CAPPED))).toHaveLength(1)
+  expect(w.toasts).toHaveLength(4)
+})
+
+test('after a retry settles, a cap within the next minutes is told again', async ($, on) => {
+  const now = 100 * HOUR
+  const state = new Map<string, { value: unknown; version: number }>()
+  // A cap told a minute ago left Remote Control owed; two runs are still in the window, and the retry is due.
+  state.set('self-remote-control/login', {
+    version: 1,
+    value: { account: fingerprint('account-a'), runs: [now - 100_000, now - 90_000], cappedAt: now - 60_000, rcOwed: true, owedAt: now - 1000 },
+  })
+  const w = machine(on, { description: NOT_CONNECTED, state })
+  await begin($, w)
+  await w.clock.advance(SETTLE)
+  expect(w.commands).toEqual([`remote-control ${TITLE}`])
+  expect(w.toasts).toEqual([`Login settled after the reconnect cap; Remote Control reconnected as "${TITLE}".`])
+  // Three runs in the window now: the next change is capped, and that cap is new.
+  w.switchTo('account-b')
+  await w.clock.advance(SETTLE + 10_000)
+  expect(runsOf(w, 'remote-control')).toBe(1)
+  expect(w.toasts).toHaveLength(2)
+  expect(w.toasts[1]).toContain(RC_CAPPED)
+})

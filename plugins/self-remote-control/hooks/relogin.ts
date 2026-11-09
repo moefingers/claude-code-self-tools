@@ -32,6 +32,10 @@
 //      reading right after the change may be the old link not yet stopped, so it waits up to
 //      RC_WAIT_MS for it to read not connected, and runs nothing if it never does. At most
 //      RECONNECT_CAP runs in RECONNECT_WINDOW_MS, so a login that flaps doesn't fill the app's list.
+//      A change the cap holds back leaves Remote Control down (Claude Code stopped it at the switch),
+//      so it is owed (`rcOwed`): a change after it counts Remote Control as connected before, and
+//      once the oldest run leaves the window it is tried once more, whatever account the login
+//      settled on (owedRetry), unless signed out. It stays owed until it ran or reads connected.
 //   2. Claude in Chrome, when reconnectChromeOnLoginChange is on, once the Remote Control step settles, whatever its
 //      outcome: /mcp reconnect claude-in-chrome, in a session that lists Claude in Chrome's tools now or listed them
 //      before (a server the change dropped lists none), and none of the coordinator plugin's (`mcp__coordinator__*`).
@@ -52,9 +56,10 @@
 //      followed by another until a person types: the loop-breaker. A rewind past the cut-off turn
 //      isn't seen (the API gives no cheap mark of the newest message, and $.session.messages()
 //      copies up to 4096 of them): the 6-hour limit bounds it.
-//   4. One toast saying what happened (one only while the reconnect cap holds, unless there was a
-//      resume or Claude in Chrome's step did something). A resume names the error kind its turn ended on and how long ago,
-//      there and in a debug line, so it can be checked after.
+//   4. One toast saying what happened. A cap's line is told once while that cap holds: after it, its
+//      part is left out, and a toast with nothing else new (a resume, a step that did something) isn't
+//      shown. A resume names the error kind its turn ended on and how long ago, there and in a debug
+//      line, so it can be checked after.
 import type { EngineInterface, PluginOptions, Timer } from 'claude-code'
 import type { Login, Pending, Resumes, Servers, Turn } from '../types'
 import { readNow, runRemoteControl, sessionTitle, why } from './connection'
@@ -347,13 +352,33 @@ async function noteAccount($: EngineInterface, held: Login | null, account: stri
   // the reconnect starts over (this change may stop Remote Control again), the resume still goes at
   // most once, and a lock the first one holds is given back.
   let pending: Pending
+  // Remote Control a cap left down counts as connected before this change: Claude Code stopped it at the switch away.
+  const wasConnected = held.candidateRc === 'connected' || held.rcOwed === true
   if (held.pending === undefined) {
-    pending = { at: now, wasConnected: held.candidateRc === 'connected', settingOn: await isSettingOn($) }
+    pending = { at: now, wasConnected, settingOn: await isSettingOn($) }
   } else {
     if (held.pending.lock !== undefined) await releaseLock($, held.pending.lock)
-    // A retry after the cap that a real change folds into becomes that change: it may resume.
+    // A retry after the cap that a real change folds into becomes that change: it may resume. Whatever it folds into, the
+    // change counts its own reading of Remote Control, and the setting as it is now, over the first one's (or a retry's
+    // placeholders, `wasConnected` as owed and `settingOn` false).
     const folded = held.pending.retry === true ? without(held.pending, 'retry', 'resumed') : held.pending
-    pending = without({ ...folded, at: now }, 'idleAt', 'readAt', 'sawDown', 'rc', 'detail', 'name', 'ranAt', 'lock', 'resumeAt', 'chrome', 'chromeLooks', 'chromeFirstAt', 'chromeAt', 'chromeRanAt')
+    pending = without(
+      { ...folded, at: now, wasConnected: folded.wasConnected || wasConnected, settingOn: folded.settingOn || (await isSettingOn($)) },
+      'idleAt',
+      'readAt',
+      'sawDown',
+      'rc',
+      'detail',
+      'name',
+      'ranAt',
+      'lock',
+      'resumeAt',
+      'chrome',
+      'chromeLooks',
+      'chromeFirstAt',
+      'chromeAt',
+      'chromeRanAt',
+    )
   }
   return { ...without(held, 'candidate', 'candidateRc'), account, pending }
 }
@@ -415,15 +440,22 @@ export async function watch($: EngineInterface): Promise<void> {
 
 /**
  * Once the cap's window has passed after a burst of changes, the reconnects it held back, once, for the login as it
- * is now: Remote Control when it last reconnected under another account, Claude in Chrome likewise. Nothing is owed
- * when both last ran under this account.
+ * is now: Remote Control when a cap left it down (`rcOwed`), whatever account the login settled on, since Claude Code
+ * stopped it at the switch away even when the login came back to the last reconnect's account; Claude in Chrome when
+ * it last reconnected under another account (its connection isn't stopped by a switch). Nothing while signed out: the
+ * sign-in after it is a change of its own, which counts Remote Control as owed.
  */
 function owedRetry(held: Login, now: number): Login {
   const base = without(held, 'owedAt')
-  const rc = held.rcAccount !== undefined && held.rcAccount !== held.account
+  if (held.account === null) return base
+  const rc = held.rcOwed === true
   const chrome = held.chromeAccount !== undefined && held.chromeAccount !== held.account
   if (!rc && !chrome) return base
-  return { ...base, pending: { at: now, wasConnected: rc, settingOn: false, retry: true, resumed: true, ...(chrome ? {} : { chrome: 'none' as const }) } }
+  // Seen down already: a connected reading is Remote Control back, not the old link yet to stop.
+  return {
+    ...base,
+    pending: { at: now, wasConnected: rc, settingOn: false, retry: true, resumed: true, ...(rc ? { sawDown: true as const } : {}), ...(chrome ? {} : { chrome: 'none' as const }) },
+  }
 }
 
 /**
@@ -543,7 +575,7 @@ async function reconnect($: EngineInterface, held: Login, p: Pending, now: numbe
       }
       const after = await $.clock.now()
       const ran: Pending = { ...q, rc: 'ran', ranAt: after, readAt: after + CHECK_MS, lock: taken.held, ...(name === undefined ? {} : { name }) }
-      return { p: ran, held: { ...held, runs: [...runs, now], rcAccount: held.account } }
+      return { p: ran, held: { ...held, runs: [...runs, now] } }
     }
     await releaseLock($, taken.held)
     if (reading.state === 'unavailable') return { p: { ...q, rc: 'unavailable' }, held }
@@ -609,7 +641,8 @@ async function resume($: EngineInterface, held: Login, p: Pending, now: number):
   // The claim can take a while (one PowerShell run): a turn that started meanwhile, a person typing, means
   // nothing is cut off any more, and so does one that started and ended on the limit again (another stop, with
   // a claim of its own). Either way it is given back, and nothing is sent. A turn that starts between this look
-  // and the submit below can't be ruled out (the submit is queued behind it then); the window is one state read.
+  // and the submit below can't be ruled out (the submit is queued behind it then); the window is two state
+  // operations, the resume record's read and its write.
   const again = await getTurn($)
   if (!isCutOff(again, await $.clock.now()) || again?.turnId !== turn?.turnId || again?.at !== turn?.at) {
     await claim.giveBack()
@@ -729,8 +762,15 @@ async function chromeLook($: EngineInterface, p: Pending, now: number): Promise<
   return { p, chrome: 'reconnect' }
 }
 
-/** Claude in Chrome's outcomes that are told even while a reconnect cap's toast holds. */
-const CHROME_TELLS: ReadonlySet<string> = new Set(['ran', 'queued', 'reloaded', 'failed', 'unread', 'unsure'])
+/**
+ * Claude in Chrome's outcomes that did something (its reconnect ran, or was tried): news, told even while a cap's toast
+ * holds. One that left it as it was (none, coordinator, unread, unsure) says the same words at every flap.
+ */
+const CHROME_TELLS: ReadonlySet<string> = new Set(['ran', 'queued', 'reloaded', 'failed'])
+/** Remote Control's outcomes that did nothing: no news while a cap's toast holds. */
+const RC_QUIET: ReadonlySet<string> = new Set(['was-off', 'setting-off', 'unavailable', 'stayed'])
+/** Remote Control's outcomes after which it ran or reads connected: nothing more is owed it. */
+const RC_UP: ReadonlySet<string> = new Set(['reconnected', 'connected', 'stayed', 'not-taken'])
 
 /** What the toast says of Claude in Chrome: nothing when this session has none. */
 function chromeSaid(p: Pending): string {
@@ -813,29 +853,47 @@ export async function move($: EngineInterface): Promise<void> {
     const latest = (await getLogin($)) ?? held
     const runs = recentRuns(latest, now)
     const chromeRuns = recentChromeRuns(latest, now)
-    const isCapToldAlready = p.rc === 'capped' && latest.cappedAt !== undefined && now - latest.cappedAt < RECONNECT_WINDOW_MS
-    const isChromeCapToldAlready = p.chrome === 'capped' && latest.chromeCappedAt !== undefined && now - latest.chromeCappedAt < RECONNECT_WINDOW_MS
-    // A reconnect the cap held back is tried again, once, when the oldest run leaves the window (owedRetry).
-    const owed = [p.rc === 'capped' ? runs[0] : undefined, p.chrome === 'capped' ? chromeRuns[0] : undefined].filter((at): at is number => at !== undefined)
+    // A retry after the cap has its own toast; after it, a cap is new again and is told.
+    const told = p.retry === true ? without(latest, 'cappedAt', 'chromeCappedAt') : latest
+    const isCapToldAlready = p.rc === 'capped' && told.cappedAt !== undefined && now - told.cappedAt < RECONNECT_WINDOW_MS
+    const isChromeCapToldAlready = p.chrome === 'capped' && told.chromeCappedAt !== undefined && now - told.chromeCappedAt < RECONNECT_WINDOW_MS
+    // Remote Control a cap left down stays owed until it ran or reads connected; the retry is its one try.
+    const rcOwed = p.rc === 'capped' || (latest.rcOwed === true && p.retry !== true && !RC_UP.has(p.rc ?? ''))
+    // A reconnect the cap held back is tried again, once, when the oldest run leaves the window (owedRetry). One still
+    // owed keeps its time; one owed with none (its retry was folded into this change) is due when the cap allows.
+    const owed = [p.rc === 'capped' ? runs[0] : undefined, p.chrome === 'capped' ? chromeRuns[0] : undefined]
+      .filter((at): at is number => at !== undefined)
+      .map(at => at + RECONNECT_WINDOW_MS)
+    if (rcOwed && p.rc !== 'capped') {
+      if (latest.owedAt !== undefined) owed.push(latest.owedAt)
+      else owed.push(runs.length >= RECONNECT_CAP ? (runs[0] as number) + RECONNECT_WINDOW_MS : now)
+    }
     const settled: Login = {
-      ...without(latest, 'pending', 'runs', 'cappedAt', 'chromeRuns', 'chromeCappedAt', 'owedAt'),
+      ...without(latest, 'pending', 'runs', 'cappedAt', 'chromeRuns', 'chromeCappedAt', 'owedAt', 'rcOwed'),
       ...(runs.length === 0 ? {} : { runs }),
       ...(chromeRuns.length === 0 ? {} : { chromeRuns }),
-      ...(p.rc === 'capped' ? { cappedAt: isCapToldAlready ? (latest.cappedAt as number) : now } : latest.cappedAt === undefined ? {} : { cappedAt: latest.cappedAt }),
-      ...(p.chrome === 'capped' ? { chromeCappedAt: isChromeCapToldAlready ? (latest.chromeCappedAt as number) : now } : latest.chromeCappedAt === undefined ? {} : { chromeCappedAt: latest.chromeCappedAt }),
-      ...(owed.length === 0 ? {} : { owedAt: Math.max(...owed) + RECONNECT_WINDOW_MS }),
+      ...(p.rc === 'capped' ? { cappedAt: isCapToldAlready ? (told.cappedAt as number) : now } : told.cappedAt === undefined ? {} : { cappedAt: told.cappedAt }),
+      ...(p.chrome === 'capped' ? { chromeCappedAt: isChromeCapToldAlready ? (told.chromeCappedAt as number) : now } : told.chromeCappedAt === undefined ? {} : { chromeCappedAt: told.chromeCappedAt }),
+      ...(owed.length === 0 ? {} : { owedAt: Math.max(...owed) }),
+      ...(rcOwed ? { rcOwed: true as const } : {}),
     }
     await $.state.set(loginRef, settled)
+    // A cap's line is told once while that cap holds: after it, its part is left out.
+    const rcPart = isCapToldAlready ? '' : rcSaid(p)
+    const chromePart = isChromeCapToldAlready ? '' : chromeSaid(p).replace(/^; /, '')
     if (p.retry === true) {
       // Only what was owed: Remote Control when it was (wasConnected), Claude in Chrome when it was.
-      const parts = [p.wasConnected ? rcSaid(p) : '', chromeSaid(p).replace(/^; /, '')].filter(part => part !== '')
+      const parts = [p.wasConnected ? rcPart : '', chromePart].filter(part => part !== '')
       if (parts.length > 0) $.ui.toast(`Login settled after the reconnect cap; ${parts.join('; ')}.`)
       return
     }
-    // While the cap's toast holds, one only for a resume, or for what Claude in Chrome's step did that is news.
-    const isChromeNews = CHROME_TELLS.has(p.chrome ?? 'none') || (p.chrome === 'capped' && !isChromeCapToldAlready)
-    if (isCapToldAlready && !resumed.startsWith('resumed:') && !isChromeNews) return
-    $.ui.toast(`Login changed; ${rcSaid(p)}${chromeSaid(p)}; ${resumed}.`)
+    // While a cap's toast holds, one only when something else in it is new: a resume, or a step that did something.
+    if (isCapToldAlready || isChromeCapToldAlready) {
+      const isRcNews = rcPart !== '' && !RC_QUIET.has(p.rc ?? '')
+      const isChromeNews = CHROME_TELLS.has(p.chrome ?? 'none') || (p.chrome === 'capped' && chromePart !== '')
+      if (!isRcNews && !isChromeNews && !resumed.startsWith('resumed:')) return
+    }
+    $.ui.toast(`Login changed; ${[rcPart, chromePart, resumed].filter(part => part !== '').join('; ')}.`)
   } catch {
     // The next tick tries again.
   } finally {

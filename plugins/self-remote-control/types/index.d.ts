@@ -112,7 +112,7 @@ export type Pending = {
   resumed?: true
   /**
    * A reconnect the cap held back, tried again once the oldest run has left the window, for the login as it is
-   * now: no resume, and its own toast.
+   * now: no resume, and its own toast. A real change that comes meanwhile folds it in and becomes that change.
    */
   retry?: true
 }
@@ -136,15 +136,20 @@ export type Login = {
   pending?: Pending
   /** When the reconnect ran /remote-control, within the last RECONNECT_WINDOW_MS (ms). */
   runs?: number[]
-  /** When the cap's toast was shown (ms): once while the cap holds. */
+  /** When the cap's toast was shown (ms): once while the cap holds, and again after a retry. */
   cappedAt?: number
   /** When Claude in Chrome's reconnect ran, within the last RECONNECT_WINDOW_MS (ms): the same cap as Remote Control's. */
   chromeRuns?: number[]
-  /** When the Chrome cap's toast was shown (ms): once while that cap holds. */
+  /** When the Chrome cap's toast was shown (ms): once while that cap holds, and again after a retry. */
   chromeCappedAt?: number
-  /** The account (fingerprint) each reconnect last ran under: a retry after the cap runs only for another one. */
-  rcAccount?: string | null
+  /** The account (fingerprint) Claude in Chrome's reconnect last ran under: a retry after the cap runs it only for another one. */
   chromeAccount?: string | null
+  /**
+   * A change the cap held back left Remote Control down (Claude Code stopped it at the switch): a change after it counts
+   * it as connected before, and the retry after the cap runs it whatever account the login settled on. Kept until a
+   * change ran it or read it connected; the retry is its one try.
+   */
+  rcOwed?: true
   /** When a reconnect the cap held back may be tried again (ms): the oldest run's leaving the window. */
   owedAt?: number
 }

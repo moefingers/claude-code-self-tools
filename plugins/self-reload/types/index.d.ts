@@ -10,7 +10,10 @@ export type Queued = { resume?: string }
  */
 export type Pending = Queued & {
   at: number
-  /** A main-loop turn started after the reload was queued: its resume goes to the model as a note, never as a turn. */
+  /**
+   * The person's message came after the reload was queued: its resume goes to the model as a note, never as a turn.
+   * A mark alone: nothing of the message is kept.
+   */
   turnSince?: true
 }
 

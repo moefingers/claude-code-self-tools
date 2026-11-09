@@ -17,38 +17,84 @@ const queued = { plugin: 'self-mcp', key: 'queued' } as const
  * When the reconnect starts after the turn's end: at once, the moment the turn's end returns (the owner's A). Input
  * already waiting when the turn ended still runs first, since Claude Code queues a plugin's command behind it, and the
  * reconnect then runs after that input's turn. The reconnect itself does no harm late, but its resume would: a person who
- * typed "stop" meanwhile would be answered by the old "go on". So a turn the person's own prompt starts after the arm
- * (matched at prompt.submit, composer or bridge) is noted on that arm, and the resume goes to the model as a note instead of
- * starting a turn. Any other turn (a task's notification, a plugin's prompt) leaves the resume as it was. (self-clear,
- * self-exit, self-restart and self-switch wait half a second instead, so that their step stands down when something is
- * waiting.)
+ * typed "stop" meanwhile would be answered by the old "go on". So a message the person sent after the arm marks it, and
+ * the resume goes to the model as a note instead of starting a turn. Anything else first (a task's notification, a
+ * wake-up, another plugin's prompt) leaves the resume as it was. (self-clear, self-exit, self-restart and self-switch
+ * wait half a second instead, so that their step stands down when something is waiting.)
  */
 const TURN_END_MS = 0
 
-/** One reconnect armed at a turn's end: whether the person's turn started since. Each has its own. */
-type Arm = { stale: boolean }
-/** The reconnects armed and not yet run: a person's turn marks every one. */
-const openArms = new Set<Arm>()
-
 /**
- * The person's prompts not yet matched to a turn: their text, from prompt.submit (the composer, or the app's bridge).
- * A main-loop turn whose text holds one is the person's. Any other turn (a task's notification, a plugin's prompt, a
- * wake-up) is not, and leaves a queued resume alone: turning it into a note there would leave the session idle.
+ * The person's message, known by the turn it came in over, never by its words: no prompt text is held, hashed or
+ * logged. A prompt from the composer or the app's bridge (prompt.submit's origin) counts, from its prompt.submit until
+ * it settles:
+ * - one that comes while a reconnect is armed marks that arm;
+ * - one typed over a running main-loop turn (prompt.submit's `turnId`) marks the arm that turn's end makes, which comes
+ *   before the prompt's own `next(e)` resolves ("once the prompt entered the session and its turn started"). So the
+ *   marks are made before `next(e)`, and a prompt dropped beneath takes back its own, and only its own.
+ * A task's notification, a peer's message and a plugin's prompt (this one's resume included) have other origins, and a
+ * subagent's turn makes no arm. Known limit: a prompt the engine delivers into the running turn, which the model has
+ * read already, marks the arm too, so that resume goes as a note, while the person is there to see the toast.
  */
-let personTexts: string[] = []
+type Typed = { entered: boolean; arms: Set<Arm> }
+/** One reconnect armed at a turn's end: stale once a person's prompt that marked it entered, or while one in flight holds it. */
+type Arm = { sure: boolean; marks: Set<Typed> }
+/** The reconnects armed and not yet reported. */
+const openArms = new Set<Arm>()
+/** The main-loop turns a person's prompt was typed over, each with those prompts. Emptied at each main-loop turn's end, once its arm is made. */
+const typedOver = new Map<string, Set<Typed>>()
 
-/** Notes a person's prompt. */
-function notePerson(text: string): void {
-  const said = text.trim()
-  if (said !== '') personTexts = [...personTexts, said].slice(-20)
+const isStale = (arm: Arm): boolean => arm.sure || arm.marks.size > 0
+
+function mark(arm: Arm, typed: Typed): void {
+  if (typed.entered) arm.sure = true
+  else {
+    arm.marks.add(typed)
+    typed.arms.add(arm)
+  }
 }
 
-/** Whether the main-loop turn that starts with `text` is the person's: one of their prompts, matched once. */
-function isPersonTurn(text: string): boolean {
-  const at = personTexts.findIndex(said => text.includes(said))
-  if (at === -1) return false
-  personTexts = personTexts.slice(at + 1)
-  return true
+/** At a person's prompt, before it enters: every open arm marked, and the turn it was typed over noted. */
+function personTyped(turnId: string | undefined): Typed {
+  const typed: Typed = { entered: false, arms: new Set() }
+  for (const arm of openArms) mark(arm, typed)
+  if (turnId !== undefined) typedOver.set(turnId, (typedOver.get(turnId) ?? new Set<Typed>()).add(typed))
+  return typed
+}
+
+/** The prompt entered: what it marked stays marked. */
+function personEntered(typed: Typed): void {
+  typed.entered = true
+  for (const arm of typed.arms) {
+    arm.marks.delete(typed)
+    arm.sure = true
+  }
+  typed.arms.clear()
+}
+
+/** The prompt was dropped: its marks taken back, and its turn no longer held for it. */
+function personDropped(typed: Typed, turnId: string | undefined): void {
+  for (const arm of typed.arms) arm.marks.delete(typed)
+  typed.arms.clear()
+  if (turnId === undefined) return
+  const held = typedOver.get(turnId)
+  held?.delete(typed)
+  if (held?.size === 0) typedOver.delete(turnId)
+}
+
+/** At a main-loop turn's end: its arm, marked by the person's prompts typed over the turn. */
+function armAt(turnId: string): Arm {
+  const arm: Arm = { sure: false, marks: new Set() }
+  for (const typed of typedOver.get(turnId) ?? []) mark(arm, typed)
+  openArms.add(arm)
+  return arm
+}
+
+/** An arm whose reconnect has reported, or that queued nothing: it is marked no more. */
+function closeArm(arm: Arm): void {
+  openArms.delete(arm)
+  for (const typed of arm.marks) typed.arms.delete(arm)
+  arm.marks.clear()
 }
 
 const DESCRIPTION = [
@@ -97,30 +143,32 @@ async function sendResume($: EngineInterface, said: string, resume: string): Pro
   }
 }
 
-/** Runs the reconnect, then tells the person and the model what it said. */
+/** Runs the reconnect, then tells the person and the model what it said. Its arm is closed however it ends. */
 async function reconnectNow($: EngineInterface, value: Queued, arm: Arm): Promise<void> {
-  $.ui.status(undefined)
-  let said: string
   try {
-    const output = text((await $.command.run({ command: 'mcp', args: `reconnect ${value.server}` })).text)
-    // /mcp shows its outcome as its own transcript line, which the person and the model both read,
-    // and hands the caller no text; a version that hands one back has it passed on.
-    said =
-      output === undefined
-        ? `MCP reconnect of ${value.server} ran: Claude Code's own line above says whether it reconnected.`
-        : `MCP reconnect of ${value.server}: ${oneLine(output)}`
-  } catch (err) {
-    said = `MCP reconnect of ${value.server} didn't run: ${why(err)}.`
-  }
-  $.ui.toast(said)
-  // The person's turn after the arm: their input came after the model asked to resume, and is answered first.
-  const isStale = arm.stale
-  openArms.delete(arm)
-  if (value.resume === undefined) await tellModel($, said)
-  else if (!isStale) await sendResume($, said, value.resume)
-  else {
-    $.ui.toast('Resume not sent: a turn started after the reconnect was queued, so the model has it as a note.')
-    await tellModel($, `${said} A turn started after the reconnect was queued, so its resume wasn't sent as a new message. It was: ${value.resume}`)
+    $.ui.status(undefined)
+    let said: string
+    try {
+      const output = text((await $.command.run({ command: 'mcp', args: `reconnect ${value.server}` })).text)
+      // /mcp shows its outcome as its own transcript line, which the person and the model both read,
+      // and hands the caller no text; a version that hands one back has it passed on.
+      said =
+        output === undefined
+          ? `MCP reconnect of ${value.server} ran: Claude Code's own line above says whether it reconnected.`
+          : `MCP reconnect of ${value.server}: ${oneLine(output)}`
+    } catch (err) {
+      said = `MCP reconnect of ${value.server} didn't run: ${why(err)}.`
+    }
+    $.ui.toast(said)
+    // The person's message after the arm came after the model asked to resume, and is answered first.
+    if (value.resume === undefined) await tellModel($, said)
+    else if (!isStale(arm)) await sendResume($, said, value.resume)
+    else {
+      $.ui.toast('Resume not sent: your message came after the reconnect was queued, so the model has it as a note.')
+      await tellModel($, `${said} The person's message came after the reconnect was queued, so its resume wasn't sent as a new message. It was: ${value.resume}`)
+    }
+  } finally {
+    closeArm(arm)
   }
 }
 
@@ -177,32 +225,36 @@ export const register: Register = (on, options) => {
   }).catch(($, e, next) => (next.called ? next(e) : { deny: 'self-mcp: queuing the reconnect failed; nothing is queued.' }))
 
   on('turn.complete', async ($, e, next) => {
-    const done = await next(e)
-    if (e.agentId !== undefined) return done
-    const { value } = await $.state.get(queued)
-    if (!value) return done
-    await $.state.set(queued, null)
-    if (e.isAborted || e.reason !== 'answer') {
-      $.ui.status(undefined)
-      $.ui.toast("MCP reconnect cancelled: the turn didn't finish.")
+    if (e.agentId !== undefined) return next(e)
+    // This turn's arm, made at once, marked by the person's prompts typed over the turn; closed below if nothing is queued.
+    const arm = armAt(e.turnId)
+    typedOver.clear()
+    let isArmed = false
+    try {
+      const done = await next(e)
+      const { value } = await $.state.get(queued)
+      if (!value) return done
+      await $.state.set(queued, null)
+      if (e.isAborted || e.reason !== 'answer') {
+        $.ui.status(undefined)
+        $.ui.toast("MCP reconnect cancelled: the turn didn't finish.")
+        return done
+      }
+      isArmed = true
+      $.clock.after(TURN_END_MS, () => void reconnectNow($, value, arm))
       return done
+    } finally {
+      if (!isArmed) closeArm(arm)
     }
-    const arm: Arm = { stale: false }
-    openArms.add(arm)
-    $.clock.after(TURN_END_MS, () => void reconnectNow($, value, arm))
-    return done
   })
 
-  // A person's prompt, at the terminal or from the app: the turn it starts makes a queued resume a note.
+  // The person's message, at the terminal or from the app: it marks the arms it comes after (see Typed). No text is kept.
   on('prompt.submit', async ($, e, next) => {
+    if (e.origin.kind !== 'composer' && e.origin.kind !== 'bridge') return next(e)
+    const typed = personTyped(e.turnId)
     const done = await next(e)
-    if (done.drop === undefined && (e.origin.kind === 'composer' || e.origin.kind === 'bridge')) notePerson(done.text)
+    if (done.drop === undefined) personEntered(typed)
+    else personDropped(typed, e.turnId)
     return done
   }).catch(($, e, next) => next(e))
-
-  on('turn.start', async ($, e, next) => {
-    const started = await next(e)
-    if (e.agentId === undefined && isPersonTurn(e.text)) for (const arm of openArms) arm.stale = true
-    return started
-  })
 }
