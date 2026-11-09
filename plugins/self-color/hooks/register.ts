@@ -1,27 +1,41 @@
 // A session sets its own prompt bar color once the current turn ends, as `/color <color>` does, to mark
 // its role so the person can tell sessions apart at a glance. The model calls color_after_turn; a
 // command can't run while the turn the model is in waits on it, so the call is queued and /color runs
-// once the turn has ended with an answer. An interrupted turn cancels it. Only the main conversation
+// after the turn has ended with an answer. An interrupted turn cancels it. Only the main conversation
 // sets it this way, never a subagent.
 //
 // /color with an argument sets the color and prints one line, with no picker; with none it picks a
-// color at random, so the plugin always passes one, from the list the call checked. The color lasts
-// for the session, and `default` resets it. A change that runs late does no harm, and it has no resume
-// that a person's message could make stale, so it runs whatever came between. What is queued lives for
-// one turn: the turn's end takes it and clears it, and the run holds it in memory, so a /clear or a
-// /resume emptying the plugin's state never strands it.
+// color at random, so the plugin always passes one, from the list the call checked. `default` resets
+// it. A change that runs late does no harm in the same conversation, and it has no resume that a
+// person's message could make stale, so a person's turn in between only puts it off to that turn's
+// end. A move to another conversation is different: a /color that ran after a /resume or a /clear
+// would color the conversation moved to. So the change waits half a second after the turn's end, and
+// while a turn or a /resume or /clear runs; a SessionStart of a resume or a clear meanwhile drops it.
+//
+// In an interactive session /color is a panel command (local-jsx) that prints its line itself and hands
+// $.command.run no text, so the toast can't say whether it took: it says it ran, and points to
+// Claude Code's own line. A headless /color hands its line back, and only its exact success line
+// counts as set.
+//
+// What is queued lives in $.state for one turn: the turn's end takes it and clears it, and from then
+// the module holds it until it runs or is dropped, so nothing here needs to outlive a /clear or a /resume.
 import type { EngineInterface, Register } from 'claude-code'
 import type { Color, Queued } from '../types'
+import { oneLine, sentence, text, why } from './text'
 import { configureUpdateCheck, loadUpdateCheck, withUpdateNotice } from './update-check'
 
 const queued = { plugin: 'self-color', key: 'queued' } as const
 
 /**
- * When /color starts after the turn's end: at once, the moment the turn's end returns, as self-reload, self-mcp and
- * self-remote-control's rename do. Input already waiting when the turn ended still runs first, since Claude Code queues
- * a plugin's command behind it; the color then changes after that input's turn.
+ * How long after a turn's end the change waits before it goes to Claude Code: half a second, as self-clear's does.
+ * Input waiting when the turn ended runs then (a person's /resume or /clear typed during the turn among it), and a
+ * /color handed over at once could run after it, in the conversation it moved to. (Whether /color, an immediate
+ * command, would wait behind waiting input or go ahead of it isn't known; the plugin doesn't rely on either.) In
+ * the half second that input starts, and its command.run, which this plugin sees, holds the change until it ends.
+ * This plugin can't look at its own /color as it leaves the queue: 2.1.319's re-entry rule leaves a plugin's own
+ * command.run hooks out of a command it raised outside a hook.
  */
-const TURN_END_MS = 0
+const SETTLE_MS = 500
 
 /** The colors /color takes: Claude Code's own list (2.1.319), and `default`, which resets the prompt bar. */
 const COLORS: readonly Color[] = ['red', 'blue', 'green', 'yellow', 'purple', 'orange', 'pink', 'cyan', 'default']
@@ -31,32 +45,26 @@ const LISTED = `${COLORS.slice(0, -1).join(', ')}, or ${COLORS[COLORS.length - 1
 
 const DESCRIPTION = [
   "Sets this session's prompt bar color once the current turn ends, as /color does.",
-  'Use it to mark the session\'s role, so the person can tell sessions apart at a glance: for example, one color for a merger and another for a worker.',
+  "Use it to mark the session's role, so the person can tell sessions apart at a glance: for example, one color for a coordinating session, another for workers.",
   'The color lasts for the session; `default` resets it.',
-  "It runs once the session is idle, after anything already waiting; you don't need to end your turn for it.",
+  "It runs once the session is idle, after anything already waiting, and a /resume or /clear that runs first drops it; you don't need to end your turn for it.",
 ].join(' ')
 
 const SUBAGENT = "A subagent can't set the session's prompt bar color. Finish your piece and return its result; the main session can set it."
 
-/** How /color says it set the color, or reset it: anything else it hands back is its refusal. */
-const DID_SET = /^Session color /
+const DROPPED = 'Prompt bar color change dropped: this session moved to another conversation.'
+
+/** The change a turn's end took from $.state and that hasn't gone to Claude Code yet. */
+let waiting: Queued | undefined
+/** Whether a main-loop turn is running: a waiting change goes after it. */
+let isTurnRunning = false
+/** The /resume and /clear runs under way: a waiting change goes once each has ended without moving the session. */
+let moving = 0
 
 const isColor = (raw: unknown): raw is Color => typeof raw === 'string' && (COLORS as readonly string[]).includes(raw)
 
-/** Trimmed text, or undefined when it is not a string or is blank. */
-function text(raw: unknown): string | undefined {
-  const trimmed = typeof raw === 'string' ? raw.trim() : ''
-  return trimmed === '' ? undefined : trimmed
-}
-
-/** Why a call was refused, as one line. */
-function why(err: unknown): string {
-  const said = (err instanceof Error ? err.message : String(err)).trim()
-  return said === '' ? 'no reason given' : said
-}
-
-/** One line: the command's output can run over several. */
-const oneLine = (said: string) => said.replace(/\s*\n\s*/g, ' ')
+/** /color's own line when it set the color, or reset it (2.1.319): only this, exactly, counts as set. */
+const setLine = (color: Color) => (color === 'default' ? 'Session color reset to default' : `Session color set to: ${color}`)
 
 /** What the toast says once the color has changed. */
 const changed = (color: Color) => (color === 'default' ? 'Prompt bar color reset to default.' : `Prompt bar color set to ${color}.`)
@@ -70,7 +78,7 @@ async function tellModel($: EngineInterface, note: string): Promise<void> {
   }
 }
 
-/** Runs /color, then tells the person how it went, and the model when it didn't take. */
+/** Runs /color, then tells the person how it went, and the model when it didn't run or said something else. */
 async function colorNow($: EngineInterface, value: Queued): Promise<void> {
   $.ui.status(undefined)
   let said: string | undefined
@@ -78,16 +86,43 @@ async function colorNow($: EngineInterface, value: Queued): Promise<void> {
     said = text((await $.command.run({ command: 'color', args: value.color })).text)
   } catch (err) {
     $.ui.toast(`/color didn't run: ${why(err)}`)
-    await tellModel($, `The prompt bar color change to ${value.color} you queued didn't run: ${why(err)}.`)
+    await tellModel($, `The prompt bar color change to ${value.color} you queued didn't run: ${sentence(why(err))}`)
     return
   }
-  // /color prints its outcome as its own transcript line; a version that hands it back has it read here.
-  if (said !== undefined && !DID_SET.test(said)) {
-    $.ui.toast(`Prompt bar color not set: ${oneLine(said)}`)
-    await tellModel($, `The prompt bar color change to ${value.color} you queued didn't take: ${oneLine(said)}`)
+  // Interactive: /color prints its line itself and hands back none, so only Claude Code's line says whether it took.
+  if (said === undefined) {
+    $.ui.toast(`/color ${value.color} ran: Claude Code's line above says whether it took.`)
     return
   }
-  $.ui.toast(changed(value.color))
+  if (said === setLine(value.color)) {
+    $.ui.toast(changed(value.color))
+    return
+  }
+  // Anything else: its refusal (a teammate session), or the color set with a warning (a cloud session's).
+  $.ui.toast(`/color ${value.color} said: ${oneLine(said)}`)
+  await tellModel($, `The prompt bar color change to ${value.color} you queued ran, and /color said: ${oneLine(said)}`)
+}
+
+/** Hands the waiting change to Claude Code, unless a turn or a move runs: then it goes when that has ended. */
+function handOff($: EngineInterface): void {
+  const value = waiting
+  if (value === undefined || isTurnRunning || moving > 0) return
+  waiting = undefined
+  void colorNow($, value).catch(() => undefined)
+}
+
+/** Looks again half a second from now. */
+const settle = ($: EngineInterface) => void $.clock.after(SETTLE_MS, () => handOff($))
+
+/** Holds a waiting change while a /resume or /clear runs, and looks again once it has ended. */
+async function aroundMove<T>($: EngineInterface, run: () => Promise<T>): Promise<T> {
+  moving += 1
+  try {
+    return await run()
+  } finally {
+    moving -= 1
+    if (waiting !== undefined) settle($)
+  }
 }
 
 export const register: Register = (on, options) => {
@@ -130,22 +165,48 @@ export const register: Register = (on, options) => {
       result:
         color === 'default'
           ? 'Queued. The prompt bar goes back to its default color once this turn ends.'
-          : `Queued. The prompt bar turns ${color} once this turn ends, and stays ${color} for the session.`,
+          : `Queued. The prompt bar turns ${color} once this turn ends, and stays ${color} until it's changed.`,
     }
   }).catch(($, e, next) => (next.called ? next(e) : { deny: 'self-color: queuing the color change failed; nothing is queued.' }))
 
+  on('turn.start', async ($, e, next) => {
+    const started = await next(e)
+    if (e.agentId === undefined) isTurnRunning = true
+    return started
+  }).catch(($, e, next) => next(e))
+
   on('turn.complete', async ($, e, next) => {
     if (e.agentId !== undefined) return next(e)
-    const done = await next(e)
-    const { value } = await $.state.get(queued)
-    if (!value) return done
-    await $.state.set(queued, null)
-    if (e.isAborted || e.reason !== 'answer') {
-      $.ui.status(undefined)
-      $.ui.toast("Prompt bar color change cancelled: the turn didn't finish.")
+    isTurnRunning = false
+    try {
+      const done = await next(e)
+      const { value } = await $.state.get(queued)
+      if (!value) return done
+      await $.state.set(queued, null)
+      if (e.isAborted || e.reason !== 'answer') {
+        $.ui.status(undefined)
+        $.ui.toast("Prompt bar color change cancelled: the turn didn't finish.")
+        return done
+      }
+      waiting = value
       return done
+    } finally {
+      if (waiting !== undefined) settle($)
     }
-    $.clock.after(TURN_END_MS, () => void colorNow($, value).catch(() => undefined))
-    return done
   })
+
+  // A /resume or a /clear, the person's or another plugin's: a waiting change goes only once it has ended.
+  on('command.run', { command: 'resume' }, ($, e, next) => aroundMove($, () => next(e))).catch(($, e, next) => next(e))
+  on('command.run', { command: 'clear' }, ($, e, next) => aroundMove($, () => next(e))).catch(($, e, next) => next(e))
+
+  // The session moved to another conversation before the change ran: it was for the one left, so it is dropped.
+  on('classic.SessionStart', async ($, e, next) => {
+    const done = await next(e)
+    if (e.agent_id === undefined && (e.source === 'resume' || e.source === 'clear') && waiting !== undefined) {
+      waiting = undefined
+      $.ui.status(undefined)
+      $.ui.toast(DROPPED)
+    }
+    return done
+  }).catch(($, e, next) => next(e))
 }

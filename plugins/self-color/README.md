@@ -1,6 +1,6 @@
 # self-color
 
-Lets a session set its own prompt bar color once the current turn ends, as `/color <color>` does. A session uses it to mark its role, so you can tell sessions apart at a glance: one color for a merger, another for a worker. Part of [claude-code-self-tools](../../README.md).
+Lets a session set its own prompt bar color once the current turn ends, as `/color <color>` does. A session uses it to mark its role, so you can tell sessions apart at a glance: one color for a coordinating session, another for workers. Part of [claude-code-self-tools](../../README.md).
 
 ## Tool
 
@@ -10,13 +10,16 @@ Lets a session set its own prompt bar color once the current turn ends, as `/col
 
 ## How it behaves
 
-- **The color changes once the turn ends.** The call queues it; `/color <color>` runs once the turn ends with Claude's answer, and shows in the transcript as if you had typed it. With a color, `/color` sets it and prints one line, with no picker. Claude needn't end its turn for it.
-- **It lasts for the session.** `default` resets it.
-- **Your message first, and the color all the same.** Claude Code runs anything already waiting when the turn ends (a message you typed during it) before the change. The change does no harm late and has nothing to resume, so it runs whatever came between.
-- **A toast says how it went:** `Prompt bar color set to <color>.`, or `Prompt bar color reset to default.` If Claude Code refuses the command, the toast says `/color didn't run: <why>`, and Claude is told on its next turn. If `/color` itself refuses (in a teammate session of an agent team, whose colors the team leader assigns), the toast says `Prompt bar color not set:` with `/color`'s own words, and Claude is told too.
-- **An interrupted turn cancels it**, with a notice.
+- **The color changes after the turn ends.** The call queues it; half a second after the turn ends with Claude's answer, once no turn and no `/resume` or `/clear` is running, the plugin runs `/color <color>`, which shows in the transcript as if you had typed it. With a color, `/color` sets it and prints one line, with no picker. Claude needn't end its turn for it.
+- **It lasts until it's changed.** `default` resets it.
+- **A message of yours in between only puts it off.** The change has no resume, so nothing in it can go stale: if a turn of yours starts before it runs (a message you typed during Claude's turn, say), it goes once that turn has ended, and the color still changes.
+- **A move to another conversation drops it.** A `/resume` or a `/clear` that runs before the change (typed during the turn, or run by another plugin) would move the session first, and the color would land on the conversation moved to. So the change waits while one runs, and when the session's start says it moved, the change is dropped, with a toast: `Prompt bar color change dropped: this session moved to another conversation.` A `/resume` that ends without moving (its picker closed) lets the change go. The half second after the turn's end is there so that such a command has started when the change would go; once the change has gone to Claude Code, it can't be taken back.
+- **A toast says what ran.** In an interactive session `/color` prints its own line in the transcript and hands the plugin no text, so the toast can't tell whether it took: `/color <color> ran: Claude Code's line above says whether it took.` That line is `Session color set to: <color>` or `Session color reset to default` when it took, and `/color`'s own refusal when it didn't (in a teammate session of an agent team, whose colors the team leader assigns).
+- **Headless, the toast says how it went**, since `/color` hands its line back there: `Prompt bar color set to <color>.` or `Prompt bar color reset to default.` for its exact success line, and `/color <color> said: <its line>` for anything else (its refusal, or a cloud session's warning that the color is set on this screen only), which Claude is told too.
+- **If Claude Code refuses the command**, the toast says `/color didn't run: <why>`, and Claude is told on its next turn.
+- **An interrupted turn cancels it**, with a notice: one you stopped, or one that ended on an error.
 - **Subagents can't use it.** A subagent that calls the tool is told to finish its piece and return its result; the main session can set the color.
-- **It keeps nothing past the turn.** The queued color lives in the plugin's session state for that one turn, and the turn's end takes it.
+- **It keeps nothing past the change.** The queued color lives in the plugin's session state for the turn that queued it; the turn's end takes it, and the plugin holds it until it runs or is dropped.
 
 ## Update check
 
