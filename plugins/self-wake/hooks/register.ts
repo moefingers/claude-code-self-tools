@@ -18,11 +18,13 @@
 // A wake-up belongs to one conversation, and a move decides what becomes of it (follow), at the main
 // loop's SessionStart of a clear or a resume:
 //   - a /clear carries it on: it moves to the conversation the /clear started (the module's copy, its
-//     timer's hold and $.state), whose marker then says armed, and the one left's not;
-//   - a /resume, or a switch in place, to another conversation drops it, with a toast, and a note to the
-//     model in the conversation now held: it never fires into an unrelated task, nor waits hidden for a
-//     move back;
+//     timer's hold and $.state), whose marker then says armed, and the one left's not; so does a /branch,
+//     once `$.session.id()` reads the fork past the id's lag (its fork's SessionStart names nothing here);
+//   - a /resume, or a switch in place, to another conversation drops it, with a toast that names it, and
+//     a note to the model in the conversation now held that doesn't (the other's task stays there): it
+//     never fires into an unrelated task, nor waits hidden for a move back;
 //   - a /resume of the conversation it belongs to keeps it.
+// The module's copy decides, once loaded: a $.state that can't be read then doesn't keep a wake-up alive.
 // A timer that loses the take (a write landed between its read and its compare-and-set) looks again a
 // moment later, the wake-up still armed and pinned; one that sends nothing leaves the status line
 // pinned to a wake-up still armed, else clear.
@@ -43,7 +45,7 @@
 // switch may not see the wake-up.
 import type { EngineInterface, Register, Timer } from 'claude-code'
 import type { Wake } from '../types'
-import { idLag, isSafeFolder, movesConversation, powershellPath, removeWakeMarker, SESSION_ID, stateFolder, SYSTEM_ROOT, wakeMarker, wakePath } from './machine'
+import { ID_LAG_MS, idLag, isSafeFolder, movesConversation, powershellPath, removeWakeMarker, SESSION_ID, stateFolder, SYSTEM_ROOT, wakeMarker, wakePath } from './machine'
 import { configureUpdateCheck, loadUpdateCheck, withUpdateNotice } from './update-check'
 
 const queued = { plugin: 'self-wake', key: 'queued' } as const
@@ -118,8 +120,14 @@ async function conversation($: EngineInterface): Promise<string | undefined> {
   if (current === undefined) return own
   if (own === undefined) return current
   if (idLag(current, currentAt, own, await $.clock.now()) === 'stale') {
+    const left = current
     current = own
     currentAt = undefined
+    // A /branch: the foreground is the fork now, and the id says so. The wake-up goes with it, as at a /clear.
+    if (held !== undefined && held.conversation === left) {
+      const value = kept !== undefined ? kept : (await armedWake($)).value
+      if (value !== null && value.id === held.id) await carry($, left, own, value)
+    }
   }
   return current
 }
@@ -310,37 +318,44 @@ async function arm($: EngineInterface, wake: Wake, now: number, conversationOf: 
 const ownerOf = (wake: Wake, here: string | undefined): string | undefined => (typeof wake.conversation === 'string' && SESSION_ID.test(wake.conversation) ? wake.conversation : here)
 
 /**
+ * The armed wake-up carried on from conversation `owner` to `here`: re-keyed in the module's copy, the
+ * timer's hold and $.state, `here`'s marker armed (awaited, as arm's is) and the one it belonged to not.
+ */
+async function carry($: EngineInterface, owner: string | undefined, here: string, value: Wake): Promise<void> {
+  const moved: Wake = { ...value, conversation: here }
+  kept = moved
+  if (held !== undefined && held.id === value.id) held.conversation = here
+  await $.state.set(armed, moved)
+  await markArmed($, here)
+  if (owner !== undefined && owner !== here) void mark($, owner)
+}
+
+/**
  * What a move makes of the armed wake-up, at the main loop's SessionStart of a clear or a resume, from
- * `previous` (the conversation held until now) to `here`: $.state made the module's copy first. A /clear
- * carries it on, re-keyed to `here` (the module's copy, the timer's hold, $.state), with `here`'s marker
- * armed and the one it belonged to not. A /resume (a switch in place too) to another conversation drops it:
- * its timer stopped, $.state none, the status line cleared, a toast, and a note to the model in `here`.
- * A /resume of the conversation it belongs to keeps it.
+ * `previous` (the conversation held until now) to `here`, decided by the module's copy once loaded. A
+ * /clear carries it on (carry). A /resume (a switch in place too) to another conversation drops it: its
+ * timer stopped, $.state none, the status line cleared, a toast naming it, and a note to the model in
+ * `here` that doesn't, so the other conversation's task doesn't carry over. A /resume of the conversation it
+ * belongs to keeps it. Where nothing moves, $.state is made the module's copy.
  */
 async function follow($: EngineInterface, source: 'clear' | 'resume', previous: string | undefined, here: string): Promise<void> {
-  const { value } = await armedWake($)
-  if (value === null) return
-  const owner = ownerOf(value, previous)
-  if (owner === here) return
-  if (source === 'clear') {
-    const moved: Wake = { ...value, conversation: here }
-    kept = moved
-    if (held !== undefined && held.id === value.id) held.conversation = here
-    await $.state.set(armed, moved)
-    await markArmed($, here)
-    if (owner !== undefined) void mark($, owner)
+  const value = kept !== undefined ? kept : (await armedWake($)).value
+  const owner = value === null ? undefined : ownerOf(value, previous)
+  if (value === null || owner === here) {
+    await armedWake($)
     return
   }
+  if (source === 'clear') return await carry($, owner, here, value)
   timer?.cancel()
   timer = undefined
   if (held !== undefined && held.id === value.id) held = undefined
   kept = null
-  await $.state.set(armed, null)
   $.ui.status(undefined)
   const note = value.note.length > 60 ? `${value.note.slice(0, 59)}…` : value.note
   $.ui.toast(`Wake-up dropped: it was set in another conversation (due ${clockOf(value.dueAt)}: "${note}"), and this session moved.`)
-  await tellModel($, `self-wake: a wake-up set in another conversation (due ${clockOf(value.dueAt)}: ${value.note}) was dropped when this session moved here. Set it again here if it is still needed.`)
+  await tellModel($, 'self-wake: a wake-up from another conversation was dropped when this session moved here.')
   if (owner !== undefined) void mark($, owner)
+  await $.state.set(armed, null)
 }
 
 export const register: Register = (on, options) => {
@@ -402,6 +417,9 @@ export const register: Register = (on, options) => {
     if (e.agent_id !== undefined || typeof e.session_id !== 'string' || !SESSION_ID.test(e.session_id)) return done
     if (!movesConversation(e.source)) {
       void mark($, e.session_id)
+      // A fork's start: if it was a /branch, `$.session.id()` reads the fork once past its lag, and the
+      // wake-up goes with it (conversation). Looked at then, and at each main-loop turn's end.
+      if (e.source === 'fork' && held !== undefined) $.clock.after(ID_LAG_MS + 1000, () => void conversation($).catch(() => undefined))
       return done
     }
     const previous = current
@@ -472,6 +490,8 @@ export const register: Register = (on, options) => {
   on('turn.complete', async ($, e, next) => {
     const done = await next(e)
     if (e.agentId !== undefined) return done
+    // The conversation as the id now reads it: a /branch past its lag carries the wake-up to the fork.
+    if (held !== undefined) await conversation($).catch(() => undefined)
     const { value } = await $.state.get(queued)
     if (!value) return done
     await $.state.set(queued, null)

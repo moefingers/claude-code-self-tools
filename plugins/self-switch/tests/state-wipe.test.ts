@@ -25,12 +25,14 @@ type Options = {
   onDisk?: boolean
   /** `$.fs.exists` refuses: the check can't run. */
   existsFails?: boolean
+  /** What the plugin's store holds at the start. */
+  store?: Record<string, unknown>
 }
 
 /** The engine beneath the plugin, its `$.state` the test's own, so a test can empty it as Claude Code does. */
-function engine(on: On, { turns = 3, onDisk = true, existsFails = false }: Options = {}) {
+function engine(on: On, { turns = 3, onDisk = true, existsFails = false, store = {} }: Options = {}) {
   const state = new Map<string, { value: unknown; version: number }>()
-  const held = new Map<string, unknown>()
+  const held = new Map<string, unknown>(Object.entries(store))
   const disk = new Set(onDisk ? [TRANSCRIPT] : [])
   const logs: string[] = []
   const clock = mock.clock(on, { now: NOW })
@@ -187,4 +189,14 @@ test("a check that can't run: the folder isn't taken, and the log says the check
   expect(said).toBeDefined()
   expect(said).toContain('EACCES: permission denied')
   expect(said?.endsWith("It isn't taken as the start folder until it can be, and a switch here refuses meanwhile.")).toBe(true)
+})
+
+test("the heartbeat with the start folder unknown carries the last beat's folder forward: after a wipe and a reload in a worktree, the alive record keeps its folder", async ($, on) => {
+  const w = engine(on, { turns: 3, store: { [`alive:${ID}`]: { at: NOW - 60_000, folder: REPO, project: 'C--work-repo' } } })
+  await $.session.start(start(WORKTREE))
+  await w.clock.settle()
+  expect(w.state.get(FOLDER)).toBeUndefined()
+  expect(beat(w.held)).toEqual({ at: NOW, folder: REPO, project: 'C--work-repo' })
+  await w.clock.advance(2 * 60 * 1000)
+  expect(beat(w.held)).toEqual({ at: NOW + 2 * 60 * 1000, folder: REPO, project: 'C--work-repo' })
 })

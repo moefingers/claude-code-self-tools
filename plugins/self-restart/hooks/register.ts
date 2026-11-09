@@ -89,7 +89,7 @@ import { go } from './go'
 import { launch as buildLaunch, parseLaunch, powershellPath, RELEASED, releaseScript, SESSION_ID, stateFolder, SYSTEM_ROOT } from './launcher'
 import type { AgentLike, LaunchInput, LaunchWhere, PendingKind, Placement, Probe } from './machine'
 import { goAnswer, goRun, agentsHeld, agentsWayOut, blockersText, claimOf, exitBlockers, idLag, isBusyAgent, isSafeFolder, isWindowName, LAUNCH_DEADLINE_MS, LAUNCH_RETRY_MS, LAUNCH_RUN_MS, launchFolderFault, launchFolderSaid, loadPlacement, markPending, movesConversation, oneLine, paneFallback, paneTicketPath, pickLaunchTransport, plainOutput, powershellCall, quoted, readExit, readGit, readPane, resumeTitle, runProbe, safePoint, SLOT_SCRIPT_SHA256, idPathOrNone, TAB_LABEL } from './machine'
-import { checkTranscript, findTranscript, type Transcript, transcriptFolder } from './start-folder'
+import { checkTranscript, findTranscript, isProjectOf, type Transcript, transcriptFolder } from './start-folder'
 import { configureUpdateCheck, loadUpdateCheck, withUpdateNotice } from './update-check'
 
 const queued = { plugin: 'self-restart', key: 'queued' } as const
@@ -165,6 +165,16 @@ let currentAt: number | undefined
  * `$.state`. Read first (startFolderOf).
  */
 let startFolder: string | undefined
+/**
+ * Where the start folder came from: `$.state` (kept since an earlier start), this process's own startup
+ * (its SessionStart of a startup seen in this module), or `reset`: a session.start that found `$.state`
+ * empty and saw no startup, a reload after Claude Code emptied it, which sets it from wherever the session is.
+ */
+let startFolderFrom: 'state' | 'startup' | 'reset' | undefined
+/** Whether this module saw the main loop's SessionStart of a startup: this process's first start. */
+let sawStartup = false
+/** Whether this module saw the main loop's SessionStart of a clear or a resume: Claude Code emptied `$.state` then. */
+let sawMove = false
 
 /** The transcript the last main-loop classic SessionStart of a startup, a resume, a clear or a compact named: what the start folder is checked against. */
 let transcript: Transcript | undefined
@@ -371,8 +381,11 @@ async function configDirOf($: EngineInterface): Promise<{ readonly dir: string }
 async function startFolderOf($: EngineInterface): Promise<string | undefined> {
   const { value } = await $.state.get(folder)
   const kept = typeof value === 'string' && value !== '' ? value : undefined
-  if (startFolder === undefined) startFolder = kept
-  else if (kept === undefined) await $.state.set(folder, startFolder)
+  if (startFolder === undefined && kept !== undefined) {
+    startFolder = kept
+    startFolderFrom = 'state'
+  }
+  else if (kept === undefined && startFolder !== undefined) await $.state.set(folder, startFolder)
   return startFolder
 }
 
@@ -382,7 +395,25 @@ async function restoreFolder($: EngineInterface): Promise<void> {
 }
 
 /** A folder this session is known by, and what it is to the session. */
-type Known = { readonly role: 'the folder it started in' | 'its project root' | 'its folder'; readonly folder: string }
+type Known = { readonly role: 'the folder it started in' | 'where the plugin started again' | 'its project root' | 'its folder'; readonly folder: string }
+
+/** `folder`'s parent, or undefined at a drive's root. */
+function parentOf(folder: string): string | undefined {
+  const trimmed = folder.replace(/\\+$/, '')
+  const at = trimmed.lastIndexOf('\\')
+  if (at < 0 || /^[A-Za-z]:$/.test(trimmed)) return undefined
+  return at === 2 && /^[A-Za-z]:/.test(trimmed) ? `${trimmed.slice(0, 2)}\\` : trimmed.slice(0, at)
+}
+
+/** Of the known folders and their parents, the first whose project folder is named `name`; undefined when none is. */
+function folderNamed(known: readonly Known[], name: string): string | undefined {
+  for (const { folder } of known) {
+    for (let up: string | undefined = folder; up !== undefined; up = parentOf(up)) {
+      if (isProjectOf(name, up)) return up
+    }
+  }
+  return undefined
+}
 
 /** The known folders as one phrase, each named once with every role it has: "C:\a (the folder it started in, its project root)". */
 function knownText(known: readonly Known[]): string {
@@ -408,20 +439,24 @@ function knownText(known: readonly Known[]): string {
 async function resumeFolder($: EngineInterface, id: string): Promise<{ readonly folder: string } | { readonly refusal: string }> {
   const config = await configDirOf($)
   if ('refusal' in config) return config
-  const reads: readonly [Known['role'], () => Promise<string | undefined>][] = [
-    ['the folder it started in', () => startFolderOf($)],
-    ['its project root', () => $.session.root()],
-    ['its folder', () => $.session.cwd()],
+  // Why the start folder isn't known, when it isn't: a cause only when it is the known one.
+  let unread: string | undefined
+  const reads: readonly [() => Known['role'], () => Promise<string | undefined>][] = [
+    [() => (startFolderFrom === 'reset' ? 'where the plugin started again' : 'the folder it started in'), () => startFolderOf($)],
+    [() => 'its project root', () => $.session.root()],
+    [() => 'its folder', () => $.session.cwd()],
   ]
   const known: Known[] = []
   let unchecked: { readonly known: Known; readonly error: string } | undefined
-  for (const [role, read] of reads) {
+  for (const [n, [roleOf, read]] of reads.entries()) {
     let found: string | undefined
     try {
       found = await read()
-    } catch {
+    } catch (err) {
+      if (n === 0) unread = why(err)
       continue
     }
+    const role = roleOf()
     if (typeof found !== 'string' || found === '') continue
     known.push({ role, folder: found })
     const checked = await checkTranscript($, found, id, [config.dir], transcript)
@@ -434,11 +469,15 @@ async function resumeFolder($: EngineInterface, id: string): Promise<{ readonly 
   }
   const project = transcriptFolder(transcript, id) ?? (await findTranscript($, id, [config.dir]))
   const kept = project === undefined ? '' : `; Claude Code keeps its transcript in ${project}`
-  const where = project === undefined ? 'the folder the session started in' : 'the folder the session started in, the one that project folder is named for'
+  // The folder that project folder is named for, when a known folder or one of its parents is.
+  const name = project === undefined ? undefined : project.slice(Math.max(project.lastIndexOf('\\'), project.lastIndexOf('/')) + 1)
+  const named = name === undefined ? undefined : folderNamed(known, name)
+  const where = name === undefined ? 'the folder the session started in' : named === undefined ? `the folder ${name} is named for` : `${named} (the folder ${name} is named for)`
+  const cause = unread !== undefined ? `the plugin's session state can't be read (${unread})` : sawMove ? 'Claude Code emptied plugin state at a /clear or /resume' : "the plugin's session state holds none"
   if (known.length === 0) {
-    return { refusal: `no folder of this session is known, not even the one it started in: Claude Code emptied plugin state at a /clear or /resume, and the session's folders can't be read${kept}. ${byHand(where)}` }
+    return { refusal: `no folder of this session is known, not even the one it started in: ${cause}, and the session's folders can't be read${kept}. ${byHand(where)}` }
   }
-  const lost = known.some(k => k.role === 'the folder it started in') ? '' : "the folder it started in isn't known (Claude Code emptied plugin state at a /clear or /resume), and "
+  const lost = known.some(k => k.role === 'the folder it started in' || k.role === 'where the plugin started again') ? '' : `the folder it started in isn't known (${cause}), and `
   return { refusal: `${lost}none of this session's folders holds its transcript: not ${knownText(known)}${kept}. ${byHand(where)}` }
 }
 
@@ -468,8 +507,8 @@ async function plan($: EngineInterface): Promise<{ powershell: string; id: strin
   if (current !== undefined && current !== id) {
     const now = await $.clock.now()
     if (idLag(current, currentAt, id, now) === 'lags') {
-      const since = currentAt === undefined ? 0 : Math.max(0, Math.round((now - currentAt) / 1000))
-      return { refusal: `this session's id reads ${id}, but its last SessionStart named ${current} ${since} seconds ago: it is moving between conversations, so which one a restart would resume is unclear. Try again in a moment` }
+      const since = currentAt === undefined ? 1 : Math.max(1, Math.round((now - currentAt) / 1000))
+      return { refusal: `this session's id reads ${id}, but its last SessionStart named ${current} ${secondsText(since)} ago: it is moving between conversations, so which one a restart would resume is unclear. Try again in a moment` }
     }
     current = id
     currentAt = undefined
@@ -529,9 +568,12 @@ async function noteRestart($: EngineInterface, id: string): Promise<void> {
 }
 
 /** Why a restart this soon after the last is refused. */
+/** A count of seconds, as words: "1 second", "5 seconds". */
+const secondsText = (n: number): string => `${n} second${n === 1 ? '' : 's'}`
+
 async function loop($: EngineInterface, at: number): Promise<string> {
   const seconds = Math.max(1, Math.round(((await $.clock.now()) - at) / 1000))
-  return `this session restarted ${seconds} seconds ago, and a second restart within 2 minutes is refused, so that restarts can't loop unattended`
+  return `this session restarted ${secondsText(seconds)} ago, and a second restart within 2 minutes is refused, so that restarts can't loop unattended`
 }
 
 /** Says an armed restart didn't go ahead: the pending marker done, a toast for the person, a note for the model. */
@@ -912,7 +954,10 @@ export const register: Register = (on, options) => {
     // so it takes the one `$.state` kept. Kept in the module too: a /clear or a /resume empties `$.state`.
     const { value: first } = await $.state.get(folder)
     const kept = typeof first === 'string' && first !== '' ? first : undefined
-    startFolder ??= kept ?? e.cwd
+    if (startFolder === undefined) {
+      startFolder = kept ?? e.cwd
+      startFolderFrom = kept !== undefined ? 'state' : sawStartup ? 'startup' : 'reset'
+    }
     if (kept === undefined) await $.state.set(folder, startFolder)
     // The trampoline's command: registered whichever way GO_VIA says, so its hook answers a person's
     // typing or a stale entry, and validate sees it as a hook that answers its own command.
@@ -959,7 +1004,13 @@ export const register: Register = (on, options) => {
       transcript = { id: e.session_id, path: e.transcript_path }
     }
     // A /clear or a /resume empties `$.state`, now or a moment after: the start folder goes back in.
+    // This process's own startup: a start folder set from its session.start is where it started.
+    if (e.agent_id === undefined && e.source === 'startup') {
+      sawStartup = true
+      if (startFolderFrom === 'reset') startFolderFrom = 'startup'
+    }
     if (e.agent_id === undefined && (e.source === 'clear' || e.source === 'resume')) {
+      sawMove = true
       try {
         await restoreFolder($)
       } catch {

@@ -282,7 +282,7 @@ test("a conversation whose start named another id than $.session.id() reads: ref
   await $.session.start(start)
   await $.classic.SessionStart({ source: 'startup', session_id: OTHER })
   const refused = await $.tool.call({ tool: TOOL, reason: 'Switched accounts.' })
-  expect(refused.deny).toMatch(new RegExp(`^Not queued: this session's id reads ${ID}, but its last SessionStart named ${OTHER} \\d+ seconds ago: it is moving between conversations`))
+  expect(refused.deny).toMatch(new RegExp(`^Not queued: this session's id reads ${ID}, but its last SessionStart named ${OTHER} \\d+ seconds? ago: it is moving between conversations`))
   await clock.advance(16_000)
   expect((await $.tool.call({ tool: TOOL, reason: 'Switched accounts.' })).deny).toBeUndefined()
   await $.turn.complete(answered)

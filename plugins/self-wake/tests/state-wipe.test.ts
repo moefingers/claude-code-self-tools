@@ -17,6 +17,8 @@ const A = '00000000-0000-0000-0000-00000000000a'
 const B = '00000000-0000-0000-0000-00000000000b'
 const C = '00000000-0000-0000-0000-00000000000c'
 const D = '00000000-0000-0000-0000-00000000000d'
+/** The branch a /branch forks off A. */
+const F = '00000000-0000-0000-0000-00000000000f'
 const LOCAL = 'C:\\Users\\u\\AppData\\Local'
 const STATE = `${LOCAL}\\claude-self-tools`
 const ARMED = 'self-wake/armed'
@@ -29,7 +31,7 @@ type Options = {
 /** The engine beneath the plugin, its `$.state` the test's own, so a test can empty it as Claude Code does. */
 function engine(on: On, { conflicts = 0 }: Options = {}) {
   const state = new Map<string, { value: unknown; version: number }>()
-  const world = { id: A, conflicts }
+  const world = { id: A, conflicts, stateFails: false }
   const prompts: string[] = []
   const toasts: string[] = []
   const statuses: (string | undefined)[] = []
@@ -37,10 +39,11 @@ function engine(on: On, { conflicts = 0 }: Options = {}) {
   const clock = mock.clock(on)
   const session = mock.session(on)
   mock.env(on, { LOCALAPPDATA: LOCAL })
-  on('state.get', (_, e) => ({ value: state.get(`${e.plugin}/${e.key}`) ?? { value: undefined, version: 0 } }))
+  on('state.get', (_, e) => (world.stateFails ? { deny: 'the session state is being swapped' } : { value: state.get(`${e.plugin}/${e.key}`) ?? { value: undefined, version: 0 } }))
   on('state.set', (_, e) => {
     const key = `${e.plugin}/${e.key}`
     const held = state.get(key) ?? { value: undefined, version: 0 }
+    if (world.stateFails) return { deny: 'the session state is being swapped' }
     if (e.ifVersion !== undefined && world.conflicts > 0) {
       world.conflicts -= 1
       return { value: { isSet: false, version: held.version } }
@@ -84,7 +87,10 @@ function engine(on: On, { conflicts = 0 }: Options = {}) {
 const start = { cwd: '/', surface: 'terminal', isInteractive: true } as const
 const answered = { answer: 'done', durationMs: 1, isAborted: false, reason: 'answer' } as const
 const DROPPED_TOAST = /^Wake-up dropped: it was set in another conversation \(due \d\d:\d\d: "check the deploy"\), and this session moved\.$/
-const DROPPED_NOTE = /self-wake: a wake-up set in another conversation \(due \d\d:\d\d: check the deploy\) was dropped when this session moved here\. Set it again here if it is still needed\./
+/** The note the model in the conversation now held reads: the drop said, nothing of the other conversation's task. */
+const DROPPED_NOTE = 'self-wake: a wake-up from another conversation was dropped when this session moved here.'
+/** The rows the model was handed, as text. */
+const notes = (appended: unknown) => JSON.stringify(appended)
 
 /** A wake-up `minutes` after this turn, armed in conversation A. */
 async function armed($: Engine, minutes: number, note: string) {
@@ -130,7 +136,10 @@ test('a /resume to another conversation drops the wake-up: a toast, a note in th
   await w.clock.settle()
   expect(w.toasts).toHaveLength(1)
   expect(w.toasts[0]).toMatch(DROPPED_TOAST)
-  expect(JSON.stringify(w.session.appended())).toMatch(DROPPED_NOTE)
+  // B's model reads that a wake-up was dropped, and nothing of A's task: no note text, no invitation.
+  expect(notes(w.session.appended())).toContain(DROPPED_NOTE)
+  expect(notes(w.session.appended())).not.toContain('check the deploy')
+  expect(notes(w.session.appended())).not.toContain('Set it again')
   expect(w.stored()).toBeNull()
   expect(w.statuses.at(-1)).toBeUndefined()
   expect(w.markers(A).at(-1)?.armed).toBe(false)
@@ -152,7 +161,8 @@ test("an in-place switch to D (its SessionStart while $.session.id() still reads
   await $.classic.SessionStart({ source: 'resume', session_id: D })
   await w.clock.settle()
   expect(w.toasts[0]).toMatch(DROPPED_TOAST)
-  expect(JSON.stringify(w.session.appended())).toMatch(DROPPED_NOTE)
+  expect(notes(w.session.appended())).toContain(DROPPED_NOTE)
+  expect(notes(w.session.appended())).not.toContain('check the deploy')
   expect(w.stored()).toBeNull()
   expect(w.markers(A).at(-1)?.armed).toBe(false)
   expect(w.markers(D).at(-1)?.armed).toBe(false)
@@ -255,4 +265,44 @@ test('a SessionStart that finds $.state as the module has it writes nothing ther
   w.wipe()
   await $.classic.SessionStart({ source: 'resume', session_id: A })
   expect(w.stored()?.note).toBe('check the deploy')
+})
+
+test("a /branch carries the wake-up to the fork once $.session.id() reads it past its lag: F's marker armed and A's not, so a restart's pre-check in F holds, and it fires there", async ($, on) => {
+  const w = engine(on)
+  await armed($, 5, 'check the deploy')
+  await w.clock.settle()
+  expect(w.markers(A).at(-1)?.armed).toBe(true)
+  // The fork's SessionStart names F and moves nothing here; the id reads F from then on.
+  await $.classic.SessionStart({ source: 'fork', session_id: F })
+  w.world.id = F
+  await w.clock.advance(17_000)
+  expect(w.stored()?.conversation).toBe(F)
+  expect(w.markers(F).at(-1)?.armed).toBe(true)
+  expect(w.markers(A).at(-1)?.armed).toBe(false)
+  expect(preCheck(w.markers(F).at(-1)).map(b => b.kind)).toEqual(['wake'])
+  await w.clock.advance(5 * MINUTE)
+  expect(w.prompts).toEqual(['Wake-up: check the deploy'])
+})
+
+test("a /fork's background copy leaves the wake-up where it was: the id still reads A, and A's marker stays armed", async ($, on) => {
+  const w = engine(on)
+  await armed($, 5, 'check the deploy')
+  await $.classic.SessionStart({ source: 'fork', session_id: F })
+  await w.clock.advance(17_000)
+  expect(w.stored()?.conversation).toBe(A)
+  expect(w.markers(A).at(-1)?.armed).toBe(true)
+  expect(w.markers(F).at(-1)?.armed).toBe(false)
+})
+
+test("the drop is decided by the module's copy: a /resume to B whose $.state can't be read still drops the wake-up, and says so", async ($, on) => {
+  const w = engine(on)
+  await armed($, 5, 'check the deploy')
+  w.world.stateFails = true
+  await $.classic.SessionStart({ source: 'resume', session_id: B })
+  expect(w.toasts[0]).toMatch(DROPPED_TOAST)
+  expect(notes(w.session.appended())).toContain(DROPPED_NOTE)
+  w.world.stateFails = false
+  w.world.id = B
+  await w.clock.advance(60 * MINUTE)
+  expect(w.prompts).toEqual([])
 })

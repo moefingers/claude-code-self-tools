@@ -758,9 +758,12 @@ async function heartbeat($: EngineInterface, resumed?: string): Promise<void> {
     await restoreFolder($, false)
     const id = resumed ?? (await sessionId($))
     if (id === undefined || !SESSION_ID.test(id)) return
-    // With the start folder unknown, still a beat (liveness reads its time), its folder and project empty.
+    // With the start folder unknown, still a beat (liveness reads its time), its folder and project the last
+    // beat's for this conversation, carried forward (empty when there was none).
     const folder = await startFolderOf($)
-    const value: Heartbeat = { at: await $.clock.now(), folder: folder ?? '', project: folder === undefined ? '' : (projectName(folder) ?? '') }
+    const last = folder === undefined ? await readHeartbeat($, id) : undefined
+    const at = await $.clock.now()
+    const value: Heartbeat = folder !== undefined ? { at, folder, project: projectName(folder) ?? '' } : { at, folder: last?.folder ?? '', project: last?.project ?? '' }
     await $.store.set(`${ALIVE}${id}`, value)
     await touchBaseline($, id, value.at)
   } catch {

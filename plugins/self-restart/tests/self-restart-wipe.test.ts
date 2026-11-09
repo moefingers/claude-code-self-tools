@@ -66,10 +66,12 @@ type Options = {
   projects?: readonly string[]
   /** `$.fs.exists` refuses: the check can't run. */
   existsFails?: boolean
+  /** `$.state` can't be read. */
+  stateFails?: boolean
 }
 
 /** The engine beneath the plugin, its `$.state` the test's own, so a test can empty it as Claude Code does. */
-function engine(on: On, { root = REPO, cwd = REPO, disk = [TRANSCRIPT], projects = [], existsFails = false }: Options = {}) {
+function engine(on: On, { root = REPO, cwd = REPO, disk = [TRANSCRIPT], projects = [], existsFails = false, stateFails = false }: Options = {}) {
   const state = new Map<string, { value: unknown; version: number }>()
   const world = { id: ID }
   const files = new Set(disk)
@@ -79,7 +81,7 @@ function engine(on: On, { root = REPO, cwd = REPO, disk = [TRANSCRIPT], projects
   const clock = mock.clock(on, { now: 1_000_000 })
   const session = mock.session(on)
   mock.env(on, WINDOWS)
-  on('state.get', (_, e) => ({ value: state.get(`${e.plugin}/${e.key}`) ?? { value: undefined, version: 0 } }))
+  on('state.get', (_, e) => (stateFails ? { deny: 'the session state is being swapped' } : { value: state.get(`${e.plugin}/${e.key}`) ?? { value: undefined, version: 0 } }))
   on('state.set', (_, e) => {
     const key = `${e.plugin}/${e.key}`
     const version = (state.get(key)?.version ?? 0) + 1
@@ -213,14 +215,15 @@ test('then the session folder, when it alone holds the transcript', async ($, on
   expect(w.launched).toEqual([REPO])
 })
 
-test('folders known, none holding the transcript: refused at the call, each named once with what it is, and the project folder the transcript path names', async ($, on) => {
+test('a reload after the wipe set the start folder in a worktree: refused at the call, the worktree named as where the plugin started again, and the repo, whose name the project folder bears, named to run it in', async ($, on) => {
   const w = engine(on, { root: WORKTREE, cwd: WORKTREE, disk: [] })
+  // A session.start that finds $.state empty and saw no startup: a reload after the wipe, from the worktree.
   await $.session.start(start(WORKTREE))
   await $.classic.SessionStart({ source: 'resume', session_id: ID, transcript_path: TRANSCRIPT })
 
   const refused = await $.tool.call({ tool: TOOL, reason: 'Switched accounts.' })
   expect(refused.deny).toBe(
-    `Not queued: none of this session's folders holds its transcript: not ${WORKTREE} (the folder it started in, its project root, its folder); Claude Code keeps its transcript in ${PROJECT}. ${BY_HAND} the folder the session started in, the one that project folder is named for.`,
+    `Not queued: none of this session's folders holds its transcript: not ${WORKTREE} (where the plugin started again, its project root, its folder); Claude Code keeps its transcript in ${PROJECT}. ${BY_HAND} ${REPO} (the folder C--work-repo is named for).`,
   )
   await $.turn.complete(answered)
   await w.clock.advance(1000)
@@ -233,35 +236,55 @@ test('folders known, none holding it, no transcript path: the project folder fou
   const w = engine(on, { root: REPO, cwd: WORKTREE, disk: [`${PROJECTS}\\C--work-elsewhere\\${ID}.jsonl`], projects: ['C--work-other', 'C--work-elsewhere'] })
   await $.session.start(start(WORKTREE))
   const refused = await $.tool.call({ tool: TOOL, reason: 'Switched accounts.' })
+  // No known folder nor any of its parents is the one C--work-elsewhere is named for: the name alone.
   expect(refused.deny).toBe(
-    `Not queued: none of this session's folders holds its transcript: not ${WORKTREE} (the folder it started in, its folder), nor ${REPO} (its project root); Claude Code keeps its transcript in ${PROJECTS}\\C--work-elsewhere. ${BY_HAND} the folder the session started in, the one that project folder is named for.`,
+    `Not queued: none of this session's folders holds its transcript: not ${WORKTREE} (where the plugin started again, its folder), nor ${REPO} (its project root); Claude Code keeps its transcript in ${PROJECTS}\\C--work-elsewhere. ${BY_HAND} the folder C--work-elsewhere is named for.`,
   )
   w.files.clear()
   expect((await $.tool.call({ tool: TOOL, reason: 'Switched accounts.' })).deny).toBe(
-    `Not queued: none of this session's folders holds its transcript: not ${WORKTREE} (the folder it started in, its folder), nor ${REPO} (its project root). ${BY_HAND} the folder the session started in.`,
+    `Not queued: none of this session's folders holds its transcript: not ${WORKTREE} (where the plugin started again, its folder), nor ${REPO} (its project root). ${BY_HAND} the folder the session started in.`,
   )
 })
 
-test("no start folder known, the other folders known: the refusal says the state was emptied, and names them", async ($, on) => {
+test("no start folder known, the other folders known: the refusal names them, and blames no wipe it didn't see", async ($, on) => {
   // No session.start in this module (nothing kept the start folder), and $.state empty.
   engine(on, { root: WORKTREE, cwd: WORKTREE, disk: [] })
+  const refused = await $.tool.call({ tool: TOOL, reason: 'Switched accounts.' })
+  expect(refused.deny).toBe(
+    `Not queued: the folder it started in isn't known (the plugin's session state holds none), and none of this session's folders holds its transcript: not ${WORKTREE} (its project root, its folder). ${BY_HAND} the folder the session started in.`,
+  )
+})
+
+test('no start folder known after a /clear this module saw: the refusal names the wipe as the cause', async ($, on) => {
+  engine(on, { root: WORKTREE, cwd: WORKTREE, disk: [] })
+  await $.classic.SessionStart({ source: 'clear', session_id: ID })
   const refused = await $.tool.call({ tool: TOOL, reason: 'Switched accounts.' })
   expect(refused.deny).toBe(
     `Not queued: the folder it started in isn't known (Claude Code emptied plugin state at a /clear or /resume), and none of this session's folders holds its transcript: not ${WORKTREE} (its project root, its folder). ${BY_HAND} the folder the session started in.`,
   )
 })
 
+test("the start folder unread because $.state can't be read: the refusal says that, not a wipe", async ($, on) => {
+  engine(on, { root: WORKTREE, cwd: WORKTREE, disk: [], stateFails: true })
+  const refused = String((await $.tool.call({ tool: TOOL, reason: 'Switched accounts.' })).deny)
+  expect(refused.startsWith("Not queued: the folder it started in isn't known (the plugin's session state can't be read (")).toBe(true)
+  expect(refused).toContain('the session state is being swapped')
+  expect(refused).not.toContain('emptied')
+})
+
 test('nothing known at all: no start folder, and the session folders unreadable', async ($, on) => {
   engine(on, { root: null, cwd: null, disk: [] })
   const refused = await $.tool.call({ tool: TOOL, reason: 'Switched accounts.' })
   expect(refused.deny).toBe(
-    `Not queued: no folder of this session is known, not even the one it started in: Claude Code emptied plugin state at a /clear or /resume, and the session's folders can't be read. ${BY_HAND} the folder the session started in.`,
+    `Not queued: no folder of this session is known, not even the one it started in: the plugin's session state holds none, and the session's folders can't be read. ${BY_HAND} the folder the session started in.`,
   )
 })
 
 test("the check can't run (the look at the disk refused): the refusal says so, and names the folder to try", async ($, on) => {
   const w = engine(on, { existsFails: true })
   await $.session.start(start())
+  // This process's own startup: its folder is the one it started in.
+  await $.classic.SessionStart({ source: 'startup', session_id: ID })
   const refused = String((await $.tool.call({ tool: TOOL, reason: 'Switched accounts.' })).deny)
   // The engine's own words for the refused look go in the brackets.
   expect(refused.startsWith(`Not queued: whether ${REPO} (the folder it started in) holds this conversation's transcript can't be checked: looking for ${TRANSCRIPT} failed (`)).toBe(true)
@@ -346,11 +369,13 @@ test("right after a move, while $.session.id() still reads the conversation left
   await w.clock.advance(5000)
   // A /resume to OTHER: its SessionStart names it; $.session.id() still reads ID.
   await $.classic.SessionStart({ source: 'resume', session_id: OTHER })
-  await w.clock.advance(3000)
   const refused = await $.tool.call({ tool: TOOL, reason: 'Switched accounts.' })
+  // At once: 1 second, never 0 seconds, nor 1 seconds.
   expect(refused.deny).toBe(
-    `Not queued: this session's id reads ${ID}, but its last SessionStart named ${OTHER} 3 seconds ago: it is moving between conversations, so which one a restart would resume is unclear. Try again in a moment.`,
+    `Not queued: this session's id reads ${ID}, but its last SessionStart named ${OTHER} 1 second ago: it is moving between conversations, so which one a restart would resume is unclear. Try again in a moment.`,
   )
+  await w.clock.advance(3000)
+  expect((await $.tool.call({ tool: TOOL, reason: 'Switched accounts.' })).deny).toContain(`named ${OTHER} 3 seconds ago`)
   // The id catches up: the call is queued, for the conversation it reads.
   w.world.id = OTHER
   expect((await $.tool.call({ tool: TOOL, reason: 'Switched accounts.' })).deny).toBeUndefined()
