@@ -124,10 +124,11 @@ describe('exitBlockers', () => {
     expect(found[1]).toEqual({
       kind: 'shell',
       id: '505',
-      what: 'the background shell bash.exe 505 runs under this session (a background job of the Bash, PowerShell or Monitor tool)',
-      howToStop: 'stop it with TaskStop (the task id its Bash, PowerShell or Monitor call gave), or let it finish',
+      what: 'the shell bash.exe 505 runs under this session (a background job of the Bash, PowerShell or Monitor tool, or a tool call still finishing)',
+      // A shell under the session may be a tool call still finishing (self-check's check at a resume): the way out says so.
+      howToStop: "stop it with TaskStop (the task id its Bash, PowerShell or Monitor call gave), or let it finish; if you started no background job, it is a tool call still finishing (self-check's check at a resume runs one): call again in a moment",
     })
-    expect(found[2]?.what).toBe('the background shell powershell.exe 506 runs under this session (a background job of the Bash, PowerShell or Monitor tool)')
+    expect(found[2]?.what).toBe('the shell powershell.exe 506 runs under this session (a background job of the Bash, PowerShell or Monitor tool, or a tool call still finishing)')
     expect(found[3]).toEqual({ kind: 'subagent', id: 'a1', what: 'a subagent is still running (Run the e2e suite)', howToStop: 'wait for it to report, or stop it with TaskStop (a1)' })
     expect(found[4]).toEqual({ kind: 'wake', what: 'a wake-up is pending (\u00abcheck CI\u00bb)', howToStop: "cancel it with cancel_wake: it doesn't outlive this process" })
   })
@@ -135,7 +136,7 @@ describe('exitBlockers', () => {
   test('the refusal line: each blocker and how to stop it', () => {
     const found = exitBlockers({ crons: [CRON], busy: probeOf([BASH]), agents: [] })
     expect(blockersText(found)).toBe(
-      'cron 7f3a9c21 (Every 5 minutes: \u00abcheck the deploy\u00bb) is set to wake this session: delete it with CronDelete (id 7f3a9c21); the background shell bash.exe 505 runs under this session (a background job of the Bash, PowerShell or Monitor tool): stop it with TaskStop (the task id its Bash, PowerShell or Monitor call gave), or let it finish',
+      'cron 7f3a9c21 (Every 5 minutes: \u00abcheck the deploy\u00bb) is set to wake this session: delete it with CronDelete (id 7f3a9c21); the shell bash.exe 505 runs under this session (a background job of the Bash, PowerShell or Monitor tool, or a tool call still finishing): stop it with TaskStop (the task id its Bash, PowerShell or Monitor call gave), or let it finish; if you started no background job, it is a tool call still finishing (self-check\'s check at a resume runs one): call again in a moment',
     )
   })
 

@@ -85,14 +85,14 @@ test('an unknown key is refused by its name; a BOM is read past; not JSON says s
   assert.deepEqual(machine.readPlacement('{').errors, ['it is not JSON'])
 })
 
-test("the shipped presets are this machine's four windows, and read: claude-1 agent-coordinator-3000 and system-overhaul, claude-2 video-lab, claude-3 olivia-work, ui-general and package-bumper, claude-4 overflow", () => {
+test('the shipped presets are four windows of generic lanes, and read: claude-1 lane-a and lane-b, claude-2 lane-c, claude-3 lane-d, lane-e and lane-f, claude-4 overflow', () => {
   const read = machine.readPlacement(readFileSync(join(ROOT, 'plugins', 'self-switch', 'slot', 'placement.example.json'), 'utf8'))
   assert.ok('placement' in read, JSON.stringify(read.errors))
   const tabs = Object.fromEntries(read.placement.layout.map(w => [w.window, w.tabs]))
   assert.deepEqual(Object.keys(tabs), ['claude-1', 'claude-2', 'claude-3', 'claude-4'])
-  for (const name of ['agent-coordinator-3000', 'system-overhaul']) assert.ok(tabs['claude-1'].includes(name))
-  assert.ok(tabs['claude-2'].includes('video-lab'))
-  for (const name of ['olivia-work', 'ui-general', 'package-bumper']) assert.ok(tabs['claude-3'].includes(name))
+  for (const name of ['lane-a', 'lane-b']) assert.ok(tabs['claude-1'].includes(name))
+  assert.ok(tabs['claude-2'].includes('lane-c'))
+  for (const name of ['lane-d', 'lane-e', 'lane-f']) assert.ok(tabs['claude-3'].includes(name))
   assert.equal(read.placement.launch.tab.window, 'claude-4')
   assert.equal(read.placement.restart.tab.window, 'same')
 })

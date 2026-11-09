@@ -1,6 +1,6 @@
 {
   "name": "self-exit",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "description": "Lets a session end itself once the current turn ends, as /exit does, with a stated reason recorded in its transcript for whoever resumes it: a tool queues the exit, and it runs as the turn ends.",
   "author": { "name": "moefingers", "url": "https://github.com/moefingers" },
   "homepage": "https://github.com/moefingers/claude-code-self-tools/tree/main/plugins/self-exit#readme",

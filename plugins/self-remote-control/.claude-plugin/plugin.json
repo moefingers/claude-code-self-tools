@@ -1,6 +1,6 @@
 {
   "name": "self-remote-control",
-  "version": "0.3.1",
+  "version": "0.4.0",
   "description": "Lets a session report on its own Remote Control, turn it on under a title, and rename itself. After a login change it reconnects Remote Control and resumes a turn the change cut off. It runs /remote-control only when the session reads as not connected, so it never opens the Remote Control panel or disconnects.",
   "author": { "name": "moefingers", "url": "https://github.com/moefingers" },
   "homepage": "https://github.com/moefingers/claude-code-self-tools/tree/main/plugins/self-remote-control#readme",
@@ -19,6 +19,12 @@
       "type": "boolean",
       "title": "Resume after a login change",
       "description": "When the account changes and this session's last turn ended, within 6 hours, on an error a new login can clear (the usage limit, a failed sign-in), send it: There was a small interruption. Please resume from your last turn normally. Once per change, after the Remote Control reconnect and a delay of up to a minute, never to a session at a finished break, and not again after a resume that failed at once until you type.",
+      "default": true
+    },
+    "reconnectChromeOnLoginChange": {
+      "type": "boolean",
+      "title": "Reconnect Claude in Chrome after a login change",
+      "description": "When the account changes, run /mcp reconnect claude-in-chrome once the Remote Control step settles and before the resume, in a session that has Claude in Chrome and no coordinator plugin (a coordinator reconnects it itself after its switch): its cloud bridge routes by claude.ai account, and a session keeps its old connection until it reconnects. The reconnect starts the session's Chrome tab group over. It runs as part of the login watch, so it does nothing while the two settings above are both off.",
       "default": true
     },
     "updateCheck": {

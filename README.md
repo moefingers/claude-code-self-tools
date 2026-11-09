@@ -154,9 +154,9 @@ launch({ powershell, kind: 'resume', id: own, folder: startFolder, claim: `launc
 // A switch's window to another project's conversation, its left record checked at the last look.
 launch({ ..., id: to, folder: toFolder, claim: probeClaim, where: { window: true }, left: live.waived, waitForExit, deadline, tool: 'self-switch' })
 // A start in an idle slot elsewhere: its floor, the input idle and its id checked new, in the one run that writes the record.
-launch({ ..., kind: 'start', id, name: 'dealerwrap', claim: `slot:${slot}`, where: { slot }, checks: { fresh: true, floor: true, input: true }, maxSessions, heavySlotRoot })
+launch({ ..., kind: 'start', id, name: 'lane-x', claim: `slot:${slot}`, where: { slot }, checks: { fresh: true, floor: true, input: true }, maxSessions, heavySlotRoot })
 // A resume in a tab of a named window.
-launch({ ..., id: to, folder: toFolder, claim: `launch:${to}`, where: { tab: { window: 'claude-4', title: 'dealerwrap' } }, checks: { live: true, floor: true, input: true } })
+launch({ ..., id: to, folder: toFolder, claim: `launch:${to}`, where: { tab: { window: 'claude-4', title: 'lane-x' } }, checks: { live: true, floor: true, input: true } })
 ```
 
 ### The launch environment
@@ -164,7 +164,7 @@ launch({ ..., id: to, folder: toFolder, claim: `launch:${to}`, where: { tab: { w
 [`claude-launch.ps1`](plugins/self-switch/slot/claude-launch.ps1) is the one script that runs `claude` for a launch. After its checks, the module path, the folder and finding `claude`, it takes the last look a launch's window and the claude wrapper take, the same lines (`RECHECK`, and `LEFT_RECHECK` with a left record's stat), for `-Resume`, `-Lane` and `-Start`, by hand too: no running Claude Code holds the conversation, read from the session registry of its config folder and of each `-ConfigDir`, and every command line; held, or unreadable, it starts nothing and says why. Right before it runs `claude`, it:
 
 - removes `LAUNCH_ENV_CLEAR`: the variables Claude Code sets in the processes it starts (`CLAUDE_CODE_CHILD_SESSION` and the rest of `SESSION_MARKERS`; a `claude` that inherits them is nested, and saves no transcript), `NO_COLOR` among them (Claude Code sets it in its tool shells, so a tab launched from one draws no colour); and `LAUNCH_ENV_DROP`: `PSExecutionPolicyPreference`, and `CLAUDE_PANE_TOKEN` (the claude wrapper's token for the tab a session ran in; a session resumed in a window has no tab of its own);
-- sets `LAUNCH_ENV_SET`: `CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1` (transcripts on, whatever marker a later Claude Code adds) and `CLAUDE_CODE_DISABLE_BG_SHELL_PRESSURE_REAP=1` (Mo's choice: the page file carries the load rather than shells being reaped);
+- sets `LAUNCH_ENV_SET`: `CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1` (transcripts on, whatever marker a later Claude Code adds) and `CLAUDE_CODE_DISABLE_BG_SHELL_PRESSURE_REAP=1` (the owner's choice: the page file carries the load rather than shells being reaped);
 - never touches `WT_SESSION` or `WT_PROFILE_ID`: Claude Code reads `WT_SESSION` to draw its prompt and its links.
 
 `claude` is `%USERPROFILE%\.local\bin\claude.exe` when it is there, else the first `claude` application on `PATH`. It is also the hand tool:
@@ -205,7 +205,7 @@ Copy the slot runner to `%LOCALAPPDATA%\claude-self-tools\claude-slot.ps1`; a pa
 
 ### Placement and the layout
 
-`%LOCALAPPDATA%\claude-self-tools\placement.json` says which windows and tabs there are, and where a launch or a restart goes. [`placement.example.json`](plugins/self-switch/slot/placement.example.json) holds this machine's presets: `claude-1` agent-coordinator-3000 and system-overhaul, `claude-2` video-lab, `claude-3` olivia-work, ui-general and package-bumper, `claude-4` overflow; a session without a home goes anywhere.
+`%LOCALAPPDATA%\claude-self-tools\placement.json` says which windows and tabs there are, and where a launch or a restart goes. [`placement.example.json`](plugins/self-switch/slot/placement.example.json) holds presets for four windows, with generic lanes to rename as your own: `claude-1` lane-a and lane-b, `claude-2` lane-c, `claude-3` lane-d, lane-e and lane-f, `claude-4` overflow; a session without a home goes anywhere.
 
 - **The file** is checked by `readPlacement` (`{ placement }` or `{ errors }`; a bad file means no placement: the log says what is wrong, and a move goes to a slot, then today's window). Window names of letters, digits, `_` and `-`, never `0`, `last`, `new`, `_quake`, `-1` or all digits, which Windows Terminal reads as special; tab labels; folders absolute, with no quote, `;` or `%` (Windows Terminal expands one); `pos` within 32768, `size` 20-400 columns and 5-200 rows; `prefer` from `slot`, `tab`, `window`; `workspaces` window names to workspace ids; `limits.minFreeGb` 1-64 and `limits.maxSessions` 1-40; `afterBoot.fltFix` an absolute `.ps1`; unknown keys refused, naming them. `scripts/placement-fixture.json` holds it and the layout script's validator equal.
 - **self-restart** follows `restart.prefer`: this pane's slot, then a tab in `restart.tab.window` (`same`: this tab's own stamp, read from its environment; a hand-started tab has none, and falls through), then the placement's window, then today's. **self-switch** follows `launch.prefer` for what isn't in place or in this pane's slot. A place refused for want of Windows Terminal or the slot runner gives way to the next.
@@ -216,7 +216,7 @@ Copy the slot runner to `%LOCALAPPDATA%\claude-self-tools\claude-slot.ps1`; a pa
   4. Give a Windows Terminal profile the line under [Slots v2](#slots-v2), if you want new tabs to be slots too.
   5. Your choice: `firstWindowPreference: "persistedWindowLayout"` keeps the names, places and tabs across a restart of Windows Terminal; without it, run the script again.
 
-  Compare what you copied: LAYOUT_SCRIPT_SHA256: `8e02f0c59e8a5817eb581b8b6ff85c7551d3b1c4fa021849a17afa2e80ac2b39`. Nothing checks that at run time.
+  Compare what you copied: LAYOUT_SCRIPT_SHA256: `6582b11a3846175b2eb167673d2dfce47095660acba96c7a15e11b2aca33f543`. Nothing checks that at run time.
 
 ### The trampoline
 

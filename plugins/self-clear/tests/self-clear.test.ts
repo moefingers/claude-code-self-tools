@@ -273,3 +273,43 @@ test('a subagent that has not ended holds, whatever its status: an idle teammate
     expect((await $.tool.call({ tool: TOOL, why: 'complete', handoff: 'Go on.' })).deny).toBeUndefined()
   }
 })
+
+test("the owner's design: the description says a clear runs only when the session is idle, why, and what a turn that starts first does", async ($, on) => {
+  const { described } = engine(on)
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  const said = described.join(' ')
+  expect(said).toContain("It can run only when the session is idle: Claude Code queues a plugin's command behind anything already waiting (a message typed during this turn, a background task's notification) and has no slot between turns ahead of them. A turn that starts first cancels the clear")
+  expect(said).toContain('under a nonstop stream of work and notifications it may not run for a long time')
+})
+
+test('input already waiting at the turn\'s end: its turn starts after a step at once would have been queued, and the clear stands down, saying so, rather than run a turn late', async ($, on) => {
+  const { commands, prompts, toasts, session, clock } = engine(on)
+  await $.session.start(start)
+  await $.tool.call({ tool: TOOL, why: 'complete', handoff: 'Next: the docs, notes in notes.md.' })
+  await $.turn.complete(answered)
+  // A message typed during the turn was waiting: Claude Code runs it first, and its turn starts a moment later.
+  await clock.advance(50)
+  await $.turn.start({ text: 'one more thing', turnId: 't2' })
+  await clock.advance(60_000)
+  expect(commands).toEqual([])
+  expect(prompts).toEqual([])
+  expect(toasts.some(t => /Clear cancelled: a new turn started/.test(t))).toBe(true)
+  expect(JSON.stringify(session.appended())).toMatch(/clear you queued didn't run: a new turn started/)
+})
+
+test('with nothing waiting, the clear starts half a second after the turn\'s end', async ($, on) => {
+  const { commands, clock } = engine(on)
+  await $.session.start(start)
+  await $.tool.call({ tool: TOOL, why: 'complete', handoff: 'Next: the docs, notes in notes.md.' })
+  await $.turn.complete(answered)
+  await clock.advance(499)
+  expect(commands).toEqual([])
+  await clock.advance(1)
+  expect(commands).toEqual(['clear'])
+})
+
+test("the owner's note: the description says to end the turn and do nothing more until it has run", async ($, on) => {
+  const { described } = engine(on)
+  await $.session.start(start)
+  expect(described.join(' ')).toContain("After calling it, end your turn and do nothing more until it has run; then carry on.")
+})

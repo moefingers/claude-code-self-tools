@@ -16,7 +16,7 @@ import { tmpdir } from 'node:os'
 import { join, relative } from 'node:path'
 import { after, before, describe, test } from 'node:test'
 import { pathToFileURL } from 'node:url'
-import { compileStub, holder } from './stub.mjs'
+import { compileStub, holder, stubWork } from './stub.mjs'
 import { ROOT } from './sync-shared.mjs'
 
 const LAUNCH = join(ROOT, 'plugins', 'self-switch', 'slot', 'claude-launch.ps1')
@@ -197,7 +197,7 @@ let stub
 
 before(() => {
   if (!isWindows) return
-  work = mkdtempSync(join(tmpdir(), 'claude-launch-test-'))
+  work = stubWork('claude-launch-test-')
   stub = compileStub(work)
 })
 
@@ -298,7 +298,7 @@ describe('claude-launch.ps1, run for real against the stub', { skip: !isWindows 
       test('-Start <id> -Name <name>: claude --session-id <id> --name <name>', async () => {
         const dirs = lab()
         const id = randomUUID()
-        assert.deepEqual(launched(await run(shell, dirs, ['-Start', id, '-Name', 'dealerwrap', '-Dir', dirs.work]), ['--session-id', id, '--name', 'dealerwrap'], dirs.work), [])
+        assert.deepEqual(launched(await run(shell, dirs, ['-Start', id, '-Name', 'lane-x', '-Dir', dirs.work]), ['--session-id', id, '--name', 'lane-x'], dirs.work), [])
       })
 
       test('no arguments: plain claude, where it is run (a slot\'s Enter)', async () => {
@@ -309,10 +309,10 @@ describe('claude-launch.ps1, run for real against the stub', { skip: !isWindows 
       test('-Lane <name>: the entry\'s conversation in the entry\'s folder; an unknown name, a bad entry, or -Dir with it: nothing started', async () => {
         const dirs = lab()
         const id = randomUUID()
-        const lanes = { v: 1, at: Date.now(), lanes: { dealerwrap: { session: id, folder: dirs.work, ws: 'default', at: Date.now() }, broken: { session: 'not-a-uuid', folder: dirs.work, ws: 'default', at: 1 } } }
+        const lanes = { v: 1, at: Date.now(), lanes: { 'lane-x': { session: id, folder: dirs.work, ws: 'default', at: Date.now() }, broken: { session: 'not-a-uuid', folder: dirs.work, ws: 'default', at: 1 } } }
         writeFileSync(join(dirs.config, 'lanes.json'), JSON.stringify(lanes))
-        assert.deepEqual(launched(await run(shell, dirs, ['-Lane', 'dealerwrap']), ['--resume', id], dirs.work), [])
-        for (const args of [['-Lane', 'nobody'], ['-Lane', 'broken'], ['-Lane', 'dealerwrap', '-Dir', dirs.work], ['-Lane', 'Dealer Wrap']]) {
+        assert.deepEqual(launched(await run(shell, dirs, ['-Lane', 'lane-x']), ['--resume', id], dirs.work), [])
+        for (const args of [['-Lane', 'nobody'], ['-Lane', 'broken'], ['-Lane', 'lane-x', '-Dir', dirs.work], ['-Lane', 'Lane X']]) {
           const other = lab()
           writeFileSync(join(other.config, 'lanes.json'), JSON.stringify(lanes))
           const result = await run(shell, other, args)
@@ -366,7 +366,7 @@ describe('claude-launch.ps1, run for real against the stub', { skip: !isWindows 
         const id = randomUUID()
         const held = await holder({ stub, work, env: envOf(dirs), args: ['--resume', id] })
         try {
-          for (const args of [['-Resume', id], ['-Start', id, '-Name', 'dealerwrap']]) {
+          for (const args of [['-Resume', id], ['-Start', id, '-Name', 'lane-x']]) {
             const result = await run(shell, dirs, args)
             assert.equal(result.runs.length, 0, `${args.join(' ')}: ${result.stdout}`)
             assert.match(result.stdout, new RegExp(`it is open elsewhere: process ${held.pid} names it on its command line \\(L2\\)`))
@@ -421,15 +421,15 @@ describe('claude-launch.ps1, run for real against the stub', { skip: !isWindows 
       test('-Lane says the conversation the name resolved to, then takes the same last look: held, nothing starts (S1-3)', async () => {
         const dirs = lab()
         const id = randomUUID()
-        writeFileSync(join(dirs.config, 'lanes.json'), JSON.stringify({ v: 1, at: Date.now(), lanes: { 'system-overhaul': { session: id, folder: dirs.work, ws: 'default', at: Date.now() } } }))
-        const free = await run(shell, dirs, ['-Lane', 'system-overhaul'])
-        assert.ok(free.stdout.includes(`claude-launch: -Lane system-overhaul is conversation ${id}, in ${dirs.work}.`), free.stdout)
+        writeFileSync(join(dirs.config, 'lanes.json'), JSON.stringify({ v: 1, at: Date.now(), lanes: { 'lane-z': { session: id, folder: dirs.work, ws: 'default', at: Date.now() } } }))
+        const free = await run(shell, dirs, ['-Lane', 'lane-z'])
+        assert.ok(free.stdout.includes(`claude-launch: -Lane lane-z is conversation ${id}, in ${dirs.work}.`), free.stdout)
         assert.deepEqual(launched(free, ['--resume', id], dirs.work), [])
         const held = await holder({ stub, work, env: envOf(dirs), args: ['--resume', id] })
         try {
           const other = lab()
-          writeFileSync(join(other.config, 'lanes.json'), JSON.stringify({ v: 1, at: Date.now(), lanes: { 'system-overhaul': { session: id, folder: other.work, ws: 'default', at: Date.now() } } }))
-          const refused = await run(shell, other, ['-Lane', 'system-overhaul'])
+          writeFileSync(join(other.config, 'lanes.json'), JSON.stringify({ v: 1, at: Date.now(), lanes: { 'lane-z': { session: id, folder: other.work, ws: 'default', at: Date.now() } } }))
+          const refused = await run(shell, other, ['-Lane', 'lane-z'])
           assert.equal(refused.runs.length, 0, refused.stdout)
           assert.ok(refused.stdout.includes(`is conversation ${id}`))
           assert.match(refused.stdout, /\(L2\)\. Nothing was started\./)

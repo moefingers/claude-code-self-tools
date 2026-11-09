@@ -6,12 +6,12 @@ import { isWindowName, laneEntry, lanesPath, lanesUpdateScript, LANES_WRITTEN, r
 import { ELSEWHERE, NOW, REPO, T, W } from './fixtures'
 
 const CONFIG = 'C:\\Users\\u\\.claude'
-const ENTRY = { session: T, folder: ELSEWHERE, window: 'claude-1', tab: 'dealerwrap', ws: 'default', at: NOW }
+const ENTRY = { session: T, folder: ELSEWHERE, window: 'claude-1', tab: 'lane-x', ws: 'default', at: NOW }
 
 describe('readLanes: strict, a malformed entry dropped, the rest kept', () => {
   test('a well-formed file', () => {
-    const text = JSON.stringify({ v: 1, at: NOW, lanes: { dealerwrap: ENTRY, 'ui-general': { session: W, folder: REPO, ws: 'w_abcdef012345', at: NOW } } })
-    expect(readLanes(text)).toEqual({ at: NOW, lanes: { dealerwrap: ENTRY, 'ui-general': { session: W, folder: REPO, ws: 'w_abcdef012345', at: NOW } } })
+    const text = JSON.stringify({ v: 1, at: NOW, lanes: { 'lane-x': ENTRY, 'lane-y': { session: W, folder: REPO, ws: 'w_abcdef012345', at: NOW } } })
+    expect(readLanes(text)).toEqual({ at: NOW, lanes: { 'lane-x': ENTRY, 'lane-y': { session: W, folder: REPO, ws: 'w_abcdef012345', at: NOW } } })
     // A BOM is read past.
     expect(readLanes(`\uFEFF${text}`)).toEqual(readLanes(text))
   })
@@ -56,24 +56,24 @@ describe('readLanes: strict, a malformed entry dropped, the rest kept', () => {
 })
 
 describe('lanesUpdateScript: one entry merged under a lock, the file replaced whole', () => {
-  const script = lanesUpdateScript({ configDir: CONFIG, name: 'dealerwrap', entry: ENTRY })
+  const script = lanesUpdateScript({ configDir: CONFIG, name: 'lane-x', entry: ENTRY })
 
   test('the path, the name and the entry, each a literal of a checked value', () => {
     expect(lanesPath(CONFIG)).toBe(`${CONFIG}\\lanes.json`)
     expect(lanesPath(`${CONFIG}\\`)).toBe(`${CONFIG}\\lanes.json`)
     expect(script).toContain(`$path = '${CONFIG}\\lanes.json'`)
-    expect(script).toContain("$name = 'dealerwrap'")
-    expect(script).toContain(`$entryText = '${JSON.stringify(laneEntry('dealerwrap', ENTRY))}'`)
-    expect(LANES_WRITTEN.exec('lanes dealerwrap\r\n')?.[1]).toBe('dealerwrap')
+    expect(script).toContain("$name = 'lane-x'")
+    expect(script).toContain(`$entryText = '${JSON.stringify(laneEntry('lane-x', ENTRY))}'`)
+    expect(LANES_WRITTEN.exec('lanes lane-x\r\n')?.[1]).toBe('lane-x')
   })
 
   test('a bad name, id, folder, window, tab or workspace is refused before anything is written', () => {
-    expect(() => lanesUpdateScript({ configDir: CONFIG, name: 'Dealer Wrap', entry: ENTRY })).toThrow()
+    expect(() => lanesUpdateScript({ configDir: CONFIG, name: 'Lane X', entry: ENTRY })).toThrow()
     expect(() => lanesUpdateScript({ configDir: CONFIG, name: "x'; calc", entry: ENTRY })).toThrow()
     for (const change of [{ session: 'x' }, { folder: 'C:\\a;b' }, { folder: "C:\\o'brien" }, { window: 'last' }, { window: '0' }, { tab: "a'b" }, { ws: 'nope' }, { at: Number.NaN }]) {
-      expect(() => lanesUpdateScript({ configDir: CONFIG, name: 'dealerwrap', entry: { ...ENTRY, ...change } as never })).toThrow()
+      expect(() => lanesUpdateScript({ configDir: CONFIG, name: 'lane-x', entry: { ...ENTRY, ...change } as never })).toThrow()
     }
-    expect(() => lanesUpdateScript({ configDir: 'relative', name: 'dealerwrap', entry: ENTRY })).toThrow()
+    expect(() => lanesUpdateScript({ configDir: 'relative', name: 'lane-x', entry: ENTRY })).toThrow()
   })
 
   test('the lock: a handle no one else may open, held from before the read to after the write, gone with its process (DeleteOnClose)', () => {

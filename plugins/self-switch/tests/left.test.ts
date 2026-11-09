@@ -218,7 +218,11 @@ describe('the scripts that write and read it, as text', () => {
     expect(write).toMatch(/'refused key the left key \(' \+ \$leftKeyPath \+ '\) can not be read as 32 bytes: .+delete it, and the next record makes a new one/)
     expect(write).toContain('$rng = [Security.Cryptography.RandomNumberGenerator]::Create(); try { $rng.GetBytes($fresh) }')
     expect(write).toContain('$fresh = New-Object byte[] 32')
-    expect(write).not.toMatch(/FileMode\]::(Create|OpenOrCreate|Truncate)\b(?!New)/)
+    // The lock alone is opened or made (a leftover no one holds is just opened), sharing nothing, deleted on close.
+    const lockLine = write.split(/\r?\n/).filter(line => line.includes('$leftLock = [IO.FileStream]::new($leftLockPath'))
+    expect(lockLine).toHaveLength(1)
+    expect(lockLine[0]).toContain('[IO.FileMode]::OpenOrCreate, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None, 4096, [IO.FileOptions]::DeleteOnClose')
+    expect(write.split(/\r?\n/).filter(line => !line.includes('$leftLockPath')).join('\n')).not.toMatch(/FileMode\]::(Create|OpenOrCreate|Truncate)\b(?!New)/)
     expect(write).not.toMatch(/WriteAllBytes\(\$leftKeyPath/)
     // The reader never makes the key: every line that names it reads it, or asks whether it is there.
     const keyLines = read.split(/\r?\n/).filter(line => line.includes('$leftKeyPath'))

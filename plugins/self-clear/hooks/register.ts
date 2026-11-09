@@ -28,7 +28,14 @@ import { configureUpdateCheck, loadUpdateCheck, withUpdateNotice } from './updat
 
 const queued = { plugin: 'self-clear', key: 'queued' } as const
 
-/** A beat after the turn's end, so the turn is no longer running when the clear starts. */
+/**
+ * How long after the turn's end the clear waits before it starts: half a second. Claude Code queues a plugin's
+ * command behind input already waiting when the turn ended (a message typed during it, a task notification), so a
+ * command queued at once would run a turn late, after that input's turn. In the half second that input's turn
+ * starts, and its turn.start takes the clear back, with a note to the model. A check when the command leaves the
+ * queue can't stand in for it in 2.1.319: its re-entry rule leaves a plugin's own command.run hooks out of a
+ * command the plugin raised outside a hook (`hooks module ... skipped: re-entry (the plugin's own code raised it)`).
+ */
 const SETTLE_MS = 500
 
 /**
@@ -61,7 +68,8 @@ const DESCRIPTION = [
   "Only when `why` is 'complete' (the work is done, and its notes are written down) or 'contaminated' (what this context holds misleads the work); any other call is refused, and nothing is queued.",
   'Irreversible: nothing of this conversation is kept but `handoff` and what you wrote down. Before calling it, write what the next piece needs where your notes live (memory, files, the PR), and say where in `handoff`. Never mid-task.',
   'It refuses while subagents you started are still running. Background tasks you started report into the cleared conversation, which no longer knows why it asked: let them finish first.',
-  'End the turn after calling it; the clear runs once your answer is shown.',
+  "It can run only when the session is idle: Claude Code queues a plugin's command behind anything already waiting (a message typed during this turn, a background task's notification) and has no slot between turns ahead of them. A turn that starts first cancels the clear, and you are told, so nothing waiting is lost or carried into another conversation; under a nonstop stream of work and notifications it may not run for a long time, so call it again when the stream pauses.",
+  'After calling it, end your turn and do nothing more until it has run; then carry on.',
 ].join(' ')
 
 const SUBAGENT =

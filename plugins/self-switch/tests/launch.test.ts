@@ -75,7 +75,7 @@ function noWait(change: Partial<LaunchInput> = {}): LaunchInput {
 }
 
 /** A start's launch: a new id and name in a window, its id checked new, after nothing. */
-const START = noWait({ kind: 'start', name: 'dealerwrap', checks: { fresh: true, floor: true, input: true } })
+const START = noWait({ kind: 'start', name: 'lane-x', checks: { fresh: true, floor: true, input: true } })
 
 /** The checks a launch of another process must ask for. */
 const ANOTHER = { floor: true, input: true, live: true }
@@ -90,9 +90,9 @@ const SCRIPTS: [string, string][] = [
   ["this pane's slot", launchScriptText(input({ where: { slot: SLOT }, claim: `slot:${SLOT}` }))],
   ["'auto' (self-restart's)", launchScriptText(input({ id: W, folder: REPO, where: 'auto' }))],
   ['an idle slot elsewhere, a resume', launchScriptText(noWait({ where: { slot: SLOT }, claim: `slot:${SLOT}`, checks: ANOTHER, left: { size: 12, mtime: 34 } }))],
-  ['an idle slot elsewhere, a start', launchScriptText(noWait({ kind: 'start', name: 'dealerwrap', where: { slot: SLOT }, claim: `slot:${SLOT}`, checks: { fresh: true, floor: true, input: true }, heavySlotRoot: 'O:\\heavy' }))],
+  ['an idle slot elsewhere, a start', launchScriptText(noWait({ kind: 'start', name: 'lane-x', where: { slot: SLOT }, claim: `slot:${SLOT}`, checks: { fresh: true, floor: true, input: true }, heavySlotRoot: 'O:\\heavy' }))],
   ['a tab, a resume that waits', launchScriptText(input({ where: { tab: { window: 'claude-1', title: 'tab one' } }, claim: `launch:${T}`, left: { exitAt: NOW - 60_000 } }))],
-  ['a tab, a start', launchScriptText(noWait({ kind: 'start', name: 'dealerwrap', where: { tab: { window: 'claude-4', title: 'dealerwrap', pos: [960, 540], size: [160, 42] } }, claim: `launch:${T}`, checks: { fresh: true, floor: true, input: true } }))],
+  ['a tab, a start', launchScriptText(noWait({ kind: 'start', name: 'lane-x', where: { tab: { window: 'claude-4', title: 'lane-x', pos: [960, 540], size: [160, 42] } }, claim: `launch:${T}`, checks: { fresh: true, floor: true, input: true } }))],
   ['a named window', launchScriptText(noWait({ where: { window: { name: 'claude-overflow', pos: [1920, 0], size: [140, 60] } }, claim: `launch:${T}`, checks: ANOTHER }))],
 ]
 
@@ -137,7 +137,7 @@ describe('launch(): one powershellCall, the script on standard input', () => {
       releaseScript({ stateDir: STATE, id: T, by: LAUNCH }),
       claimCheckScript({ stateDir: STATE, id: T, by: LAUNCH, configDirs: [CONFIG] }),
       leftScript({ stateDir: STATE, id: T, how: 'exit', configDirs: [CONFIG], by: 'self-switch' }),
-      lanesUpdateScript({ configDir: CONFIG, name: 'dealerwrap', entry: { session: T, folder: ELSEWHERE, ws: 'default', at: NOW } }),
+      lanesUpdateScript({ configDir: CONFIG, name: 'lane-x', entry: { session: T, folder: ELSEWHERE, ws: 'default', at: NOW } }),
     ]
     for (const script of [...SCRIPTS.map(([, s]) => s), ...others]) {
       const lines = script.split('\r\n')
@@ -176,7 +176,7 @@ describe('launch(): one powershellCall, the script on standard input', () => {
     expect(inner.lastIndexOf('try {', run)).toBeGreaterThan(inner.indexOf('$started = Get-Date'))
     const caught = inner.indexOf('} catch {', run)
     expect(caught).toBeGreaterThan(run)
-    expect(inner.slice(caught)).toMatch(/^\} catch \{\r\n  Write-Host \("claude-launch\.ps1 stopped on an error, so the session may not have resumed here: " \+ \$_\.Exception\.Message\)\r\n  Write-Host \("Once it is safe, resume it yourself: " \+ "& '" \+ \$handPath \+ "' -Resume " \+ \$id \+ " -Dir '" \+ \$folder \+ "'"\)\r\n  Release-Claim\r\n  Read-Host "Press Enter to close this window" \| Out-Null\r\n  exit 1\r\n\}/)
+    expect(inner.slice(caught)).toMatch(/^\} catch \{\r\n  Write-Refused \("claude-launch\.ps1 stopped on an error: " \+ \$_\.Exception\.Message\)\r\n  Write-Host \("claude-launch\.ps1 stopped on an error, so the session may not have resumed here: " \+ \$_\.Exception\.Message\)\r\n  Write-Host \("Once it is safe, resume it yourself: " \+ "& '" \+ \$handPath \+ "' -Resume " \+ \$id \+ " -Dir '" \+ \$folder \+ "'"\)\r\n  Release-Claim\r\n  Read-Host "Press Enter to close this window" \| Out-Null\r\n  exit 1\r\n\}/)
   })
 
   test('no environment is changed but PSModulePath: the launch environment is claude-launch.ps1\'s alone', () => {
@@ -222,7 +222,7 @@ describe('launch(): one powershellCall, the script on standard input', () => {
       expect(INSTALL_LAUNCHER.join('\n')).not.toMatch(/WriteAllBytes\(\$path|WriteAllText\(\$path|Set-Content|Out-File/)
       const inner = innerOf(script)
       expect(inner.indexOf(`(Get-Sha256 $launchPath) -cne '${LAUNCH_SCRIPT_SHA256}'`)).toBeLessThan(inner.indexOf('& $launchPath'))
-      expect(inner.indexOf(`(Get-Sha256 $launchPath) -cne '${LAUNCH_SCRIPT_SHA256}'`)).toBeGreaterThan(inner.indexOf('Wait-Process'))
+      expect(inner.indexOf(`(Get-Sha256 $launchPath) -cne '${LAUNCH_SCRIPT_SHA256}'`)).toBeGreaterThan(inner.indexOf('$gone = Wait-Gone'))
       expect(script).toContain('[Security.Cryptography.SHA256]::Create()')
       expect(script).not.toContain('Get-FileHash')
     }
@@ -255,15 +255,17 @@ describe('the checks, the claim and the place, in one run, in that order', () =>
 
   test('a launch that waits takes its last look after the wait: in the window, RECHECK and the folder and the claim, then claude-launch.ps1', () => {
     const inner = innerOf(SCRIPTS[0]?.[1] ?? '')
-    const wait = inner.indexOf('Wait-Process -Id 100 -Timeout 600 -ErrorAction SilentlyContinue')
+    // F1: waited for by its handle, then looked at again until it goes (S3): no refusal for one still running.
+    const wait = inner.search(/ {2}\$gone = Wait-Gone 100 '\d+' 30\r\n/)
     expect(wait).toBeGreaterThan(0)
-    expect(inner.indexOf('if (-not (Test-Gone 100)) { $refusal = "The old process is still running')).toBeGreaterThan(wait)
+    expect(inner.indexOf('  if ($claimSays -eq "gone" -or $claimSays -eq "other") { $refusal = ', wait)).toBeGreaterThan(wait)
+    expect(inner).not.toContain('The old process is still running')
     // Read from the wait on: RECHECK has lines as plain as a closing brace, which the functions above it hold too.
     for (const line of RECHECK) expect(inner.indexOf(`    ${line}`, wait)).toBeGreaterThan(wait)
     expect(inner.indexOf('$lock.by -cne $by')).toBeGreaterThan(inner.indexOf(`    ${RECHECK[RECHECK.length - 1]}`, wait))
     expect(inner.indexOf('& $launchPath')).toBeGreaterThan(inner.indexOf('$lock.by -cne $by'))
     // waitForExit skipped: no wait, no last look after it. A test that plants it must fail here.
-    expect(innerOf(launchScriptText(noWait({ checks: ANOTHER })))).not.toContain('Wait-Process')
+    expect(innerOf(launchScriptText(noWait({ checks: ANOTHER })))).not.toContain('Wait-Gone ')
   })
 
   test('a launch that does not wait checks NOT LIVE now (and the left record), before the claim; one that waits is refused that check', () => {
@@ -286,8 +288,8 @@ describe('the checks, the claim and the place, in one run, in that order', () =>
     expect(script).toContain('$text.IndexOf($id, [StringComparison]::OrdinalIgnoreCase) -ge 0) { $fresh = "the registry file " + $f.Name + " names it" }')
     expect(script).toContain('"$($p.CommandLine)".IndexOf($id, [StringComparison]::OrdinalIgnoreCase) -ge 0) { $fresh = "process " + $p.ProcessId + " names it on its command line" }')
     expect(script).toContain("if ($null -ne $fresh) { Refuse 'fresh' $fresh }")
-    expect(script).toContain("$name = ''dealerwrap''")
-    for (const name of ['', 'Dealerwrap', 'deal wrap', "x'; calc", '-x', 'a'.repeat(41)]) expect(() => launchScriptText({ ...START, name })).toThrow()
+    expect(script).toContain("$name = ''lane-x''")
+    for (const name of ['', 'Lanex', 'lane x', "x'; calc", '-x', 'a'.repeat(41)]) expect(() => launchScriptText({ ...START, name })).toThrow()
     expect(() => launchScriptText({ ...START, checks: { floor: true, input: true } })).toThrow(/checks\.fresh/)
     expect(() => launchScriptText({ ...START, where: { pane: { token: TOKEN } }, now: NOW })).toThrow(/window/)
   })

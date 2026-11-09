@@ -5,8 +5,9 @@
 import { expect, mock, test } from 'claude-code/testing'
 import type { Engine } from 'claude-code/testing'
 import type { On } from 'claude-code'
+import { CLAIM_SCRIPT } from '../hooks/claim-script'
 import { RELEASE_SCRIPT, TAKE_SCRIPT } from '../hooks/rc-lock'
-import { fingerprintOf, isCutOff, jitterOf, RC_WAIT_MS, resumedSaid, RESUME } from '../hooks/relogin'
+import { CHROME_LOOK_MS, fingerprintOf, isCutOff, jitterOf, RC_WAIT_MS, resumedSaid, RESUME, RUN_WAIT_MS } from '../hooks/relogin'
 
 const CONNECTED = 'Disconnect Remote Control'
 const NOT_CONNECTED = 'Control this session from your phone or claude.ai/code'
@@ -21,6 +22,15 @@ const TITLE = 'auth-refactor'
 /** This session's own delay before a resume. */
 const DELAY = jitterOf(SESSION)
 const HOUR = 60 * 60_000
+/** Turn ids, made up, in the shape Claude Code gives one. */
+const T1 = '00000000-0000-4000-8000-0000000000a1'
+const T2 = '00000000-0000-4000-8000-0000000000a2'
+const T3 = '00000000-0000-4000-8000-0000000000a3'
+/** The resume claim of the stop turn T1 ended on. */
+const CLAIM_FILE = `${LOCAL}\\claude-self-tools\\resumed\\${SESSION}.${T1}.json`
+/** Claude in Chrome's tools, and the coordinator plugin's, as $.tool.list names them. */
+const CHROME_TOOL = { name: 'mcp__claude-in-chrome__navigate', description: 'Opens a page.', mcp: true }
+const COORDINATOR_TOOL = { name: 'mcp__coordinator__ask_owner', description: 'Posts a question.', mcp: true }
 
 type Options = {
   /** What the remote-control command's description reads at the start; null: no such command. */
@@ -33,6 +43,23 @@ type Options = {
   record?: Record<string, unknown>
   /** How long /remote-control takes to answer. */
   runTakesMs?: number
+  /** Whether Claude in Chrome's tools, and the coordinator's, are listed at the start. */
+  chrome?: boolean
+  coordinator?: boolean
+  /** What /mcp reconnect does: answers, is refused, or answers only after RUN_WAIT_MS. */
+  mcp?: 'answers' | 'refused' | 'slow'
+  /** Why the engine drops a prompt a plugin submits; left out, it enters. */
+  drops?: string
+  /** How long the claim script takes to answer. */
+  claimTakesMs?: number
+  /** A submit that answers only after this long (then with `drops`, if given), or one that throws. */
+  submitTakesMs?: number
+  submitThrows?: boolean
+  /** No %LOCALAPPDATA% and no %SystemRoot%: the claim and the lock are the session's own. */
+  offWindows?: boolean
+  /** The plugin's state, answered by the test: seeded before the start; a set with ifVersion on `conflictOn` loses. */
+  state?: Map<string, { value: unknown; version: number }>
+  conflictOn?: string
 }
 
 /**
@@ -42,9 +69,29 @@ type Options = {
  * the account-switch tool does; Remote Control then stops `stopsAfterMs` later, as Claude Code's
  * own owner check does. `refresh` rewrites the login alone, as a token refresh does.
  */
-function machine(on: On, { description = CONNECTED, remoteControl = 'false', stopsAfterMs = 12_000, record, runTakesMs = 0 }: Options = {}) {
+function machine(on: On, { description = CONNECTED, remoteControl = 'false', stopsAfterMs = 12_000, record, runTakesMs = 0, chrome = false, coordinator = false, mcp = 'answers', drops, claimTakesMs = 0, submitTakesMs = 0, submitThrows = false, offWindows = false, state, conflictOn }: Options = {}) {
+  if (state !== undefined) {
+    on('state.get', (_, e) => ({ value: state.get(`${e.plugin}/${e.key}`) ?? { value: undefined, version: 0 } }))
+    on('state.set', (_, e) => {
+      const key = `${e.plugin}/${e.key}`
+      const held = state.get(key) ?? { value: undefined, version: 0 }
+      // Another writer got there first.
+      if (e.key === conflictOn && e.ifVersion !== undefined) return { value: { isSet: false, version: held.version + 1 } }
+      if (e.ifVersion !== undefined && e.ifVersion !== held.version) return { value: { isSet: false, version: held.version } }
+      const next = { value: JSON.parse(JSON.stringify(e.value ?? null)), version: held.version + 1 }
+      state.set(key, next)
+      return { value: { isSet: true, version: next.version } }
+    })
+  }
+  /** The session's tools, as the test changes them: Claude in Chrome's, the coordinator's, or a list that fails. */
+  const tools = { chrome, coordinator, fails: false, looks: 0 }
+  on('tool.list', () => {
+    tools.looks += 1
+    if (tools.fails) return { deny: 'the tool list is being rebuilt' }
+    return { value: [...(tools.chrome ? [CHROME_TOOL] : []), ...(tools.coordinator ? [COORDINATOR_TOOL] : [])] }
+  })
   const clock = mock.clock(on, { now: 100 * HOUR })
-  mock.env(on, { USERPROFILE: HOME, LOCALAPPDATA: LOCAL, SystemRoot: 'C:\\Windows' })
+  mock.env(on, offWindows ? { USERPROFILE: HOME } : { USERPROFILE: HOME, LOCALAPPDATA: LOCAL, SystemRoot: 'C:\\Windows' })
   const commands: string[] = []
   const prompts: string[] = []
   const toasts: string[] = []
@@ -54,6 +101,10 @@ function machine(on: On, { description = CONNECTED, remoteControl = 'false', sto
   /** The lock files the PowerShell calls made, by path. */
   const files = new Map<string, { text: string; mtimeMs: number }>()
   const lockOps: string[] = []
+  /** The resume claims asked for, by path; who wins the race to one, when another does; and a claim that fails. */
+  const claims: string[] = []
+  let claimRace: string | undefined
+  let claimFails = false
   /** Each lock script's call: what ran, and the environment it was given. */
   const scriptCalls: { stdin: string; env: Record<string, string> }[] = []
   /** The link: what the command reads, its title, and the account it was made under (the owner check stops it when that isn't the current one). */
@@ -75,7 +126,10 @@ function machine(on: On, { description = CONNECTED, remoteControl = 'false', sto
     toasts.push(String(e.text))
     return { value: undefined }
   })
-  on('prompt.submit', (_, e) => {
+  on('prompt.submit', async (_, e) => {
+    if (submitThrows) throw new Error('the session is closing')
+    if (submitTakesMs > 0) await clock.sleep(submitTakesMs)
+    if (drops !== undefined) return { drop: drops }
     prompts.push(e.text)
     at.push({ what: 'prompt', at: clock.now() })
     return { text: e.text }
@@ -106,6 +160,8 @@ function machine(on: On, { description = CONNECTED, remoteControl = 'false', sto
     commands.push(e.args === '' ? e.command : `${e.command} ${e.args}`)
     at.push({ what: e.command, at: clock.now() })
     if (e.command === 'remote-control') lockAtRun.push(files.get(LOCK)?.text ?? 'none')
+    if (e.command === 'mcp' && mcp === 'refused') throw new Error('mcp: no such server')
+    if (e.command === 'mcp' && mcp === 'slow') await clock.sleep(RUN_WAIT_MS + 5000)
     // A slow command: it connects only once it answers.
     if (e.command === 'remote-control' && runTakesMs > 0) await clock.sleep(runTakesMs)
     if (e.command === 'remote-control' && rc.description === NOT_CONNECTED) {
@@ -117,11 +173,29 @@ function machine(on: On, { description = CONNECTED, remoteControl = 'false', sto
   })
   // The canonical scripts, as they behave: TAKE creates, or overwrites a stale lock in place (over
   // 90 s old or 90 s ahead, by its `at` else its time), never deleting; RELEASE deletes only its own text.
-  on('process.run', (_, e) => {
+  on('process.run', async (_, e) => {
     const script = e.init?.stdin ?? ''
-    const op = script === TAKE_SCRIPT ? 'take' : script === RELEASE_SCRIPT ? 'release' : undefined
+    const op = script === TAKE_SCRIPT ? 'take' : script === RELEASE_SCRIPT ? 'release' : script === CLAIM_SCRIPT ? 'claim' : undefined
     if (op === undefined || !/powershell\.exe$/i.test(e.argv[0] ?? '')) return { deny: 'not a canonical lock script' }
     scriptCalls.push({ stdin: script, env: { ...(e.init?.env ?? {}) } })
+    if (op === 'claim') {
+      // CLAIM, as it behaves: the file made exclusively, or there already (who claimed it, and when).
+      const path = e.init?.env?.RESUME_CLAIM_PATH ?? ''
+      const mine = e.init?.env?.RESUME_CLAIM_TEXT ?? ''
+      claims.push(path)
+      if (claimTakesMs > 0) await clock.sleep(claimTakesMs)
+      const ok = (stdout: string) => ({ value: { exitCode: 0, stdout: `${stdout}\r\n`, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } })
+      if (claimFails) return ok('error|the claim folder could not be made')
+      // Another claimant that gets there first, at the same moment (the coordinator's auto-resume).
+      if (claimRace !== undefined && !files.has(path)) files.set(path, { text: JSON.stringify({ v: 1, by: claimRace, at: clock.now() }), mtimeMs: clock.now() })
+      const there = files.get(path)
+      if (there === undefined) {
+        files.set(path, { text: mine, mtimeMs: clock.now() })
+        return ok('claimed')
+      }
+      const doc = JSON.parse(there.text) as { by: string; at: number }
+      return ok(`taken|${doc.by}|${doc.at}`)
+    }
     const path = e.init?.env?.RC_LOCK_PATH ?? ''
     const text = e.init?.env?.RC_LOCK_TEXT ?? ''
     lockOps.push(op)
@@ -178,6 +252,22 @@ function machine(on: On, { description = CONNECTED, remoteControl = 'false', sto
     files,
     lockOps,
     scriptCalls,
+    tools,
+    claims,
+    /** Another claimant (the coordinator's auto-resume, or the owner's Resume) claims the next stop first. */
+    raceClaim(by: string) {
+      claimRace = by
+    },
+    /** The claim script answers that no claim could be made. */
+    failClaim() {
+      claimFails = true
+    },
+    /** The coordinator's own claim of a stop, as its CLAIM run would: true when it wins and so resumes. */
+    coordinatorClaims(path: string): boolean {
+      if (files.has(path)) return false
+      files.set(path, { text: JSON.stringify({ v: 1, by: 'coordinator', at: clock.now() }), mtimeMs: clock.now() })
+      return true
+    },
     lockAtRun,
     listed,
     rc,
@@ -222,7 +312,7 @@ async function begin($: Engine, w: World) {
 }
 
 /** The main conversation's turn cut off by `error` (the usage limit unless said). */
-async function cutOff($: Engine, w: World, turnId = 't1', error: 'rate_limit' | 'authentication_failed' | 'invalid_request' | 'unknown' = 'rate_limit') {
+async function cutOff($: Engine, w: World, turnId = T1, error: 'rate_limit' | 'authentication_failed' | 'invalid_request' | 'unknown' = 'rate_limit') {
   await $.turn.start({ text: 'go on', turnId })
   await $.classic.StopFailure({ error })
   await $.turn.complete({ ...failed, turnId })
@@ -308,8 +398,8 @@ test('another account at one look only is no change', async ($, on) => {
 test('a session at a finished break gets no resume; its Remote Control still reconnects', async ($, on) => {
   const w = machine(on)
   await begin($, w)
-  await $.turn.start({ text: 'go on', turnId: 't1' })
-  await $.turn.complete({ ...answered, turnId: 't1' })
+  await $.turn.start({ text: 'go on', turnId: T1 })
+  await $.turn.complete({ ...answered, turnId: T1 })
   await w.clock.advance(5000)
 
   w.switchTo('account-b')
@@ -356,7 +446,7 @@ test('a session with no title reconnects bare', async ($, on) => {
 test('a turn running at the change is waited for, and resumed when the change cut it off', async ($, on) => {
   const w = machine(on)
   await begin($, w)
-  await $.turn.start({ text: 'go on', turnId: 't1' })
+  await $.turn.start({ text: 'go on', turnId: T1 })
 
   w.switchTo('account-b')
   await w.clock.advance(60_000)
@@ -364,7 +454,7 @@ test('a turn running at the change is waited for, and resumed when the change cu
   expect(w.commands).toEqual([])
   expect(w.toasts).toEqual([])
   await $.classic.StopFailure({ error: 'authentication_failed' })
-  await $.turn.complete({ ...failed, turnId: 't1' })
+  await $.turn.complete({ ...failed, turnId: T1 })
   await w.clock.advance(FLOW)
   expect(w.commands).toEqual([`remote-control ${TITLE}`])
   expect(w.prompts).toEqual([RESUME])
@@ -374,11 +464,11 @@ test('a turn running at the change is waited for, and resumed when the change cu
 test('a turn running at the change that finishes with an answer is not resumed', async ($, on) => {
   const w = machine(on)
   await begin($, w)
-  await $.turn.start({ text: 'go on', turnId: 't1' })
+  await $.turn.start({ text: 'go on', turnId: T1 })
 
   w.switchTo('account-b')
   await w.clock.advance(20_000)
-  await $.turn.complete({ ...answered, turnId: 't1' })
+  await $.turn.complete({ ...answered, turnId: T1 })
   await w.clock.advance(FLOW)
   expect(w.commands).toEqual([`remote-control ${TITLE}`])
   expect(w.prompts).toEqual([])
@@ -388,8 +478,8 @@ test('a turn the person started after the limit means nothing is cut off any mor
   const w = machine(on)
   await begin($, w)
   await cutOff($, w)
-  await $.turn.start({ text: 'try again', turnId: 't2' })
-  await $.turn.complete({ ...answered, turnId: 't2' })
+  await $.turn.start({ text: 'try again', turnId: T2 })
+  await $.turn.complete({ ...answered, turnId: T2 })
 
   w.switchTo('account-b')
   await w.clock.advance(FLOW)
@@ -399,18 +489,18 @@ test('a turn the person started after the limit means nothing is cut off any mor
 test('errors a new login does not clear are not resumed: an invalid request, an unknown kind, or none given', async ($, on) => {
   const w = machine(on)
   await begin($, w)
-  await cutOff($, w, 't1', 'invalid_request')
+  await cutOff($, w, T1, 'invalid_request')
   w.switchTo('account-b')
   await w.clock.advance(FLOW)
   expect(w.prompts).toEqual([])
 
-  await cutOff($, w, 't2', 'unknown')
+  await cutOff($, w, T2, 'unknown')
   w.switchTo('account-c')
   await w.clock.advance(FLOW)
   expect(w.prompts).toEqual([])
 
-  await $.turn.start({ text: 'go on', turnId: 't3' })
-  await $.turn.complete({ ...failed, turnId: 't3' })
+  await $.turn.start({ text: 'go on', turnId: T3 })
+  await $.turn.complete({ ...failed, turnId: T3 })
   w.switchTo('account-d')
   await w.clock.advance(FLOW)
   expect(w.prompts).toEqual([])
@@ -432,8 +522,8 @@ test('a turn cut off more than six hours ago is not resumed', async ($, on) => {
 test("a subagent's failed turn is not the session's", async ($, on) => {
   const w = machine(on)
   await begin($, w)
-  await $.turn.start({ text: 'go on', turnId: 't1' })
-  await $.turn.complete({ ...answered, turnId: 't1' })
+  await $.turn.start({ text: 'go on', turnId: T1 })
+  await $.turn.complete({ ...answered, turnId: T1 })
   await $.turn.start({ text: 'sub', turnId: 'a-t1', agentId: 'a1' })
   await $.classic.StopFailure({ error: 'rate_limit', agent_id: 'a1' })
   await $.turn.complete({ ...failed, turnId: 'a-t1', agentId: 'a1' })
@@ -474,11 +564,11 @@ test('a prompt the person queues while the resumed turn runs counts, though that
   w.switchTo('account-b')
   await w.clock.advance(FLOW)
   expect(w.prompts).toEqual([RESUME])
-  await $.turn.start({ text: RESUME, turnId: 't2' })
+  await $.turn.start({ text: RESUME, turnId: T2 })
   // Typed during the resumed turn, so queued behind it; then the turn hits the limit at once.
   await $.prompt.submit({ text: 'and then this', wait: false, origin: { kind: 'composer' } })
   await $.classic.StopFailure({ error: 'rate_limit' })
-  await $.turn.complete({ ...failed, durationMs: 2000, turnId: 't2' })
+  await $.turn.complete({ ...failed, durationMs: 2000, turnId: T2 })
   await w.clock.advance(5000)
 
   w.switchTo('account-c')
@@ -495,9 +585,9 @@ test("a continuation turn (no text) after the resume was sent is not the resume'
   await w.clock.advance(FLOW)
   expect(w.prompts).toEqual([RESUME])
   // A continuation starts first and dies at once: it must not block the next resume.
-  await $.turn.start({ text: '', turnId: 't2' })
+  await $.turn.start({ text: '', turnId: T2 })
   await $.classic.StopFailure({ error: 'rate_limit' })
-  await $.turn.complete({ ...failed, durationMs: 2000, turnId: 't2' })
+  await $.turn.complete({ ...failed, durationMs: 2000, turnId: T2 })
   await w.clock.advance(5000)
 
   w.switchTo('account-c')
@@ -514,9 +604,9 @@ test('a resume whose turn ends on an error at once is not followed by another un
   await w.clock.advance(FLOW)
   expect(w.prompts).toEqual([RESUME])
   // The resume's turn hits the limit again at once: no usage, two seconds.
-  await $.turn.start({ text: `The self-remote-control plugin sent a message: ${RESUME}`, turnId: 't2' })
+  await $.turn.start({ text: `The self-remote-control plugin sent a message: ${RESUME}`, turnId: T2 })
   await $.classic.StopFailure({ error: 'rate_limit' })
-  await $.turn.complete({ ...failed, durationMs: 2000, turnId: 't2' })
+  await $.turn.complete({ ...failed, durationMs: 2000, turnId: T2 })
   await w.clock.advance(5000)
 
   w.switchTo('account-c')
@@ -526,9 +616,9 @@ test('a resume whose turn ends on an error at once is not followed by another un
 
   // A person types; that turn hits the limit too; the next switch resumes again.
   await $.prompt.submit({ text: 'keep going', wait: false, origin: { kind: 'composer' } })
-  await $.turn.start({ text: 'keep going', turnId: 't3' })
+  await $.turn.start({ text: 'keep going', turnId: T3 })
   await $.classic.StopFailure({ error: 'rate_limit' })
-  await $.turn.complete({ ...failed, durationMs: 90_000, usage: { input_tokens: 10, output_tokens: 10, cache_read_input_tokens: 0, cache_creation_input_tokens: 0, model: 'm' }, turnId: 't3' })
+  await $.turn.complete({ ...failed, durationMs: 90_000, usage: { input_tokens: 10, output_tokens: 10, cache_read_input_tokens: 0, cache_creation_input_tokens: 0, model: 'm' }, turnId: T3 })
   await w.clock.advance(5000)
   w.switchTo('account-d')
   await w.clock.advance(FLOW)
@@ -542,9 +632,9 @@ test('a resume whose turn did real work before the limit stays resumable', async
 
   w.switchTo('account-b')
   await w.clock.advance(FLOW)
-  await $.turn.start({ text: RESUME, turnId: 't2' })
+  await $.turn.start({ text: RESUME, turnId: T2 })
   await $.classic.StopFailure({ error: 'rate_limit' })
-  await $.turn.complete({ ...failed, durationMs: 10 * 60_000, usage: { input_tokens: 10, output_tokens: 10, cache_read_input_tokens: 0, cache_creation_input_tokens: 0, model: 'm' }, turnId: 't2' })
+  await $.turn.complete({ ...failed, durationMs: 10 * 60_000, usage: { input_tokens: 10, output_tokens: 10, cache_read_input_tokens: 0, cache_creation_input_tokens: 0, model: 'm' }, turnId: T2 })
   await w.clock.advance(5000)
 
   w.switchTo('account-c')
@@ -721,7 +811,7 @@ test("a queued connect doesn't run while another plugin holds the lock", async (
   w.lockedBy('agent-coordinator')
 
   await $.tool.call({ tool: 'mcp__self-remote-control__remote_control', action: 'connect' })
-  await $.turn.complete({ ...answered, turnId: 't1' })
+  await $.turn.complete({ ...answered, turnId: T1 })
   await w.clock.advance(5000)
   expect(w.commands).toEqual([])
   expect(w.toasts.some(t => t.includes("agent-coordinator holds this session's Remote Control lock"))).toBe(true)
@@ -733,7 +823,7 @@ test('a queued connect takes the lock, and gives it back once connected', async 
   await begin($, w)
 
   await $.tool.call({ tool: 'mcp__self-remote-control__remote_control', action: 'connect' })
-  await $.turn.complete({ ...answered, turnId: 't1' })
+  await $.turn.complete({ ...answered, turnId: T1 })
   await w.clock.advance(5000)
   expect(w.commands).toEqual([`remote-control ${TITLE}`])
   expect(w.lockOps).toEqual(['take', 'release'])
@@ -745,7 +835,7 @@ test("a release never deletes another's lock: one taken over meanwhile is kept",
   await begin($, w)
 
   await $.tool.call({ tool: 'mcp__self-remote-control__remote_control', action: 'connect' })
-  await $.turn.complete({ ...answered, turnId: 't1' })
+  await $.turn.complete({ ...answered, turnId: T1 })
   await w.clock.advance(1000)
   // The command hangs past the lock's life (90 s); the coordinator takes the stale lock over
   // before this plugin's release runs.
@@ -897,4 +987,488 @@ test('a resume says which error its turn ended on, and how long ago, in the toas
   expect(w.prompts).toEqual([RESUME])
   expect(w.toasts[0]).toMatch(/resumed: the turn ended on rate_limit \d+ (?:s|min) ago\.$/)
   expect(debug.some(line => /self-remote-control: resumed: the turn ended on rate_limit \d+ (?:s|min) ago/.test(line))).toBe(true)
+})
+
+/** Long enough for a change with Claude in Chrome: its three looks for the coordinator, then the resume. */
+const CHROME_FLOW = FLOW + CHROME_LOOK_MS[1] + 5000
+const CHROME_RAN = "Claude in Chrome: /mcp reconnect ran, so its tab group starts over (Claude Code's own line says whether it reconnected)"
+
+test('in a session with Claude in Chrome and no coordinator, a login change reconnects it after Remote Control, after three looks for the coordinator, and before the resume', async ($, on) => {
+  const w = machine(on, { chrome: true })
+  await begin($, w)
+  await cutOff($, w)
+  const looked = w.tools.looks
+  w.switchTo('account-b')
+  await w.clock.advance(CHROME_FLOW)
+  // Three looks for the coordinator's tools, the last CHROME_LOOK_MS[1] after the first: then the reconnect.
+  expect(w.tools.looks - looked).toBe(3)
+  expect(w.commands).toEqual([`remote-control ${TITLE}`, 'mcp reconnect claude-in-chrome'])
+  const when = (what: string) => w.at.find(e => e.what === what)?.at ?? 0
+  expect(when('mcp') - when('remote-control')).toBeGreaterThanOrEqual(CHROME_LOOK_MS[1])
+  expect(w.prompts).toEqual([RESUME])
+  // In order: Remote Control, Claude in Chrome, then the resume.
+  expect(w.at.map(e => e.what)).toEqual(['remote-control', 'mcp', 'prompt'])
+  expect(noAgo(w.toasts)).toEqual([`Login changed; Remote Control reconnected as "${TITLE}"; ${CHROME_RAN}; resumed: the turn ended on KIND AGO ago.`])
+})
+
+test('in a session the coordinator runs in, Claude in Chrome is left to the coordinator: no reconnect, and the toast says so, with the command if it doesn\'t', async ($, on) => {
+  const w = machine(on, { chrome: true, coordinator: true })
+  await begin($, w)
+  await cutOff($, w)
+  w.switchTo('account-b')
+  await w.clock.advance(CHROME_FLOW)
+  expect(w.commands).toEqual([`remote-control ${TITLE}`])
+  expect(w.prompts).toEqual([RESUME])
+  expect(noAgo(w.toasts)).toEqual([`Login changed; Remote Control reconnected as "${TITLE}"; Claude in Chrome left to the coordinator (run /mcp reconnect claude-in-chrome if it doesn't reconnect); resumed: the turn ended on KIND AGO ago.`])
+})
+
+test("the coordinator's tools missing at the first look but listed at a later one (a reload): no reconnect", async ($, on) => {
+  const w = machine(on, { chrome: true })
+  await begin($, w)
+  await cutOff($, w)
+  const looked = w.tools.looks
+  w.switchTo('account-b')
+  // Until the first look for the coordinator's tools, which finds none.
+  for (let i = 0; i < 180 && w.tools.looks === looked; i += 1) await w.clock.advance(1000)
+  expect(w.tools.looks).toBe(looked + 1)
+  // The coordinator comes back between the first look and the second.
+  w.tools.coordinator = true
+  await w.clock.advance(CHROME_FLOW)
+  expect(w.tools.looks).toBe(looked + 2)
+  expect(w.commands).toEqual([`remote-control ${TITLE}`])
+  expect(w.prompts).toEqual([RESUME])
+})
+
+test("the coordinator's tools listed before, and missing at all three looks: Claude in Chrome is left alone, and the toast says why", async ($, on) => {
+  const w = machine(on, { chrome: true, coordinator: true })
+  await begin($, w)
+  // A turn's end notes the servers: the coordinator's is there.
+  await $.turn.start({ text: 'go on', turnId: T3 })
+  await $.turn.complete({ ...answered, turnId: T3 })
+  await w.clock.advance(1000)
+  w.tools.coordinator = false
+  await cutOff($, w)
+  w.switchTo('account-b')
+  await w.clock.advance(CHROME_FLOW)
+  expect(w.commands).toEqual([`remote-control ${TITLE}`])
+  expect(w.prompts).toEqual([RESUME])
+  expect(noAgo(w.toasts)[0]).toContain("Claude in Chrome left as it was: the coordinator's tools were here before and aren't now, and the coordinator may reconnect it (run /mcp reconnect claude-in-chrome if it doesn't)")
+})
+
+test('a tool list that fails: Claude in Chrome is left alone, said in the toast; the resume still goes', async ($, on) => {
+  const w = machine(on, { chrome: true })
+  await begin($, w)
+  await cutOff($, w)
+  w.tools.fails = true
+  w.switchTo('account-b')
+  await w.clock.advance(CHROME_FLOW)
+  expect(w.commands).toEqual([`remote-control ${TITLE}`])
+  expect(w.prompts).toEqual([RESUME])
+  expect(noAgo(w.toasts)[0]).toContain("Claude in Chrome left as it was: this session's tools can't be listed (run /mcp reconnect claude-in-chrome if it needs it)")
+})
+
+test("Claude in Chrome listed before but not at the change (its server dropped with the account): still reconnected", async ($, on) => {
+  const w = machine(on, { chrome: true })
+  await begin($, w)
+  await $.turn.start({ text: 'go on', turnId: T3 })
+  await $.turn.complete({ ...answered, turnId: T3 })
+  await w.clock.advance(1000)
+  w.tools.chrome = false
+  await cutOff($, w)
+  w.switchTo('account-b')
+  await w.clock.advance(CHROME_FLOW)
+  expect(w.commands).toEqual([`remote-control ${TITLE}`, 'mcp reconnect claude-in-chrome'])
+})
+
+test('/mcp reconnect refused: the toast says to run it by hand', async ($, on) => {
+  const w = machine(on, { chrome: true, mcp: 'refused' })
+  await begin($, w)
+  await cutOff($, w)
+  w.switchTo('account-b')
+  await w.clock.advance(CHROME_FLOW)
+  expect(w.prompts).toEqual([RESUME])
+  expect(noAgo(w.toasts)[0]).toContain("Claude in Chrome didn't reconnect: run /mcp reconnect claude-in-chrome")
+})
+
+test('/mcp reconnect still queued after RUN_WAIT_MS: said to be queued, never failed', async ($, on) => {
+  const w = machine(on, { chrome: true, mcp: 'slow' })
+  await begin($, w)
+  await cutOff($, w)
+  w.switchTo('account-b')
+  await w.clock.advance(CHROME_FLOW + RUN_WAIT_MS)
+  expect(w.prompts).toEqual([RESUME])
+  const said = noAgo(w.toasts)[0] ?? ''
+  expect(said).toContain("Claude in Chrome: /mcp reconnect hadn't finished within 15 s (queued or still running; its tab group starts over when it runs)")
+  expect(said).not.toContain("didn't reconnect")
+})
+
+test('a second change folded into the first reconnects Claude in Chrome again', async ($, on) => {
+  const w = machine(on, { chrome: true })
+  await begin($, w)
+  await cutOff($, w)
+  w.switchTo('account-b')
+  const reconnects = () => w.commands.filter(c => c.startsWith('mcp')).length
+  for (let i = 0; i < 180 && reconnects() === 0; i += 1) await w.clock.advance(1000)
+  expect(reconnects()).toBe(1)
+  // A turn the person starts holds the rest of the change back, and another switch comes meanwhile: folded in.
+  await $.turn.start({ text: 'one more thing', turnId: T2 })
+  w.switchTo('account-c')
+  await w.clock.advance(20_000)
+  await $.turn.complete({ ...answered, turnId: T2 })
+  await w.clock.advance(CHROME_FLOW)
+  expect(reconnects()).toBe(2)
+  expect(w.toasts).toHaveLength(1)
+})
+
+test('a login change with no turn cut off still reconnects Claude in Chrome, and sends no resume', async ($, on) => {
+  const w = machine(on, { chrome: true })
+  await begin($, w)
+  await $.turn.start({ text: 'go on', turnId: T1 })
+  await $.turn.complete({ ...answered, turnId: T1 })
+  await w.clock.advance(5000)
+  w.switchTo('account-b')
+  await w.clock.advance(CHROME_FLOW)
+  expect(w.commands).toEqual([`remote-control ${TITLE}`, 'mcp reconnect claude-in-chrome'])
+  expect(w.prompts).toEqual([])
+  expect(w.toasts).toEqual([`Login changed; Remote Control reconnected as "${TITLE}"; ${CHROME_RAN}; no turn was cut off.`])
+})
+
+test('the resume claim: taken right before the resume, under the stop\'s session and turn ids', async ($, on) => {
+  const w = machine(on)
+  await begin($, w)
+  await cutOff($, w)
+  w.switchTo('account-b')
+  await w.clock.advance(FLOW)
+  expect(w.prompts).toEqual([RESUME])
+  expect(w.claims).toEqual([CLAIM_FILE])
+  expect(JSON.parse(w.files.get(CLAIM_FILE)?.text ?? '{}')).toMatchObject({ v: 1, by: 'self-remote-control' })
+})
+
+test('the resume claim, both at once: the coordinator claims the same stop first, so this sends nothing and says who resumed', async ($, on) => {
+  const w = machine(on)
+  const debug: string[] = []
+  on('ui.log', (_, e) => {
+    debug.push(String(e.text))
+    return { value: undefined }
+  })
+  await begin($, w)
+  await cutOff($, w)
+  w.raceClaim('coordinator')
+  w.switchTo('account-b')
+  await w.clock.advance(FLOW)
+  // Exactly one resume: the coordinator's (it won the claim), none from here.
+  expect(w.prompts).toEqual([])
+  expect(w.toasts[0]).toMatch(/no resume: the coordinator's auto-resume claimed the resume of the interrupted turn \d+ s ago\.$/)
+  expect(debug.some(line => line.startsWith("self-remote-control: no resume: the coordinator's auto-resume claimed the resume"))).toBe(true)
+})
+
+test("the owner's Resume on the coordinator's page claimed the stop: no resume from here, and the toast says so", async ($, on) => {
+  const w = machine(on)
+  await begin($, w)
+  await cutOff($, w)
+  w.raceClaim('coordinator:owner')
+  w.switchTo('account-b')
+  await w.clock.advance(FLOW)
+  expect(w.prompts).toEqual([])
+  expect(w.toasts[0]).toMatch(/no resume: the owner \(from the coordinator's page\) claimed the resume of the interrupted turn \d+ s ago\.$/)
+})
+
+test('a claim that fails sends nothing: one resume or none, never two', async ($, on) => {
+  const w = machine(on)
+  await begin($, w)
+  await cutOff($, w)
+  w.failClaim()
+  w.switchTo('account-b')
+  await w.clock.advance(FLOW)
+  expect(w.prompts).toEqual([])
+  expect(w.toasts[0]).toContain("no resume: the resume claim couldn't be taken (the claim folder could not be made)")
+})
+
+test('a resume the engine drops gives its claim back, so a later resume of that stop can claim it', async ($, on) => {
+  const w = machine(on, { drops: "plugins' input is held" })
+  await begin($, w)
+  await cutOff($, w)
+  w.switchTo('account-b')
+  await w.clock.advance(FLOW)
+  expect(w.claims).toEqual([CLAIM_FILE])
+  expect(w.files.has(CLAIM_FILE)).toBe(false)
+  expect(w.coordinatorClaims(CLAIM_FILE)).toBe(true)
+})
+
+test('reconnectChromeOnLoginChange off: Claude in Chrome is left as it was', { options: { reconnectChromeOnLoginChange: false } }, async ($, on) => {
+  const w = machine(on, { chrome: true })
+  await begin($, w)
+  await cutOff($, w)
+  w.switchTo('account-b')
+  await w.clock.advance(SETTLE + DELAY + 15_000)
+  expect(w.commands).toEqual([`remote-control ${TITLE}`])
+  expect(w.prompts).toEqual([RESUME])
+})
+
+test('a turn that starts while the resume is being claimed: the claim is given back, and nothing is sent', async ($, on) => {
+  const w = machine(on, { claimTakesMs: 5000 })
+  await begin($, w)
+  await cutOff($, w)
+  w.switchTo('account-b')
+  for (let i = 0; i < 240 && w.claims.length === 0; i += 1) await w.clock.advance(1000)
+  expect(w.claims).toEqual([CLAIM_FILE])
+  // The person types while the claim script runs.
+  await $.turn.start({ text: 'one more thing', turnId: T2 })
+  await w.clock.advance(10_000)
+  expect(w.prompts).toEqual([])
+  expect(w.files.has(CLAIM_FILE)).toBe(false)
+  expect(w.toasts[0]).toContain('no resume: a turn started while the resume was being claimed')
+})
+
+test('a submit still waiting after SUBMIT_WAIT_MS, then dropped: said as a resume, queued, and the claim is given back when the drop comes', async ($, on) => {
+  const w = machine(on, { submitTakesMs: 45_000, drops: "plugins' input is held" })
+  await begin($, w)
+  await cutOff($, w)
+  w.switchTo('account-b')
+  for (let i = 0; i < 300 && w.toasts.length === 0; i += 1) await w.clock.advance(1000)
+  expect(noAgo(w.toasts)[0]).toMatch(/; resumed: the turn ended on KIND AGO ago \(queued, to run once the session is idle\)\.$/)
+  expect(w.files.has(CLAIM_FILE)).toBe(true)
+  await w.clock.advance(30_000)
+  expect(w.files.has(CLAIM_FILE)).toBe(false)
+})
+
+test('a submit that throws gives the claim back', async ($, on) => {
+  const w = machine(on, { submitThrows: true })
+  await begin($, w)
+  await cutOff($, w)
+  w.switchTo('account-b')
+  await w.clock.advance(FLOW)
+  expect(w.prompts).toEqual([])
+  expect(w.claims).toEqual([CLAIM_FILE])
+  expect(w.files.has(CLAIM_FILE)).toBe(false)
+  // The kit hands a hook's throw back as no answer at all: the submit is refused either way.
+  expect(w.toasts[0]).toMatch(/; resume not sent: .+\.$/)
+})
+
+test('off Windows the claim is the session\'s own: the resume goes once, and no claim script runs', async ($, on) => {
+  const w = machine(on, { offWindows: true })
+  await begin($, w)
+  await cutOff($, w)
+  w.switchTo('account-b')
+  await w.clock.advance(FLOW)
+  expect(w.prompts).toEqual([RESUME])
+  expect(w.claims).toEqual([])
+  expect(w.scriptCalls).toEqual([])
+})
+
+test("Claude in Chrome's reconnect has Remote Control's cap: a flapping login reconnects it at most three times in ten minutes, and the toast says why not", async ($, on) => {
+  const w = machine(on, { chrome: true })
+  await begin($, w)
+  for (const account of ['account-b', 'account-c', 'account-d', 'account-e']) {
+    w.switchTo(account)
+    await w.clock.advance(CHROME_FLOW)
+  }
+  expect(w.commands.filter(c => c.startsWith('mcp'))).toHaveLength(3)
+  expect(w.toasts.at(-1)).toContain("Claude in Chrome not reconnected: it already reconnected 3 times in 10 minutes, so it waits for the login to settle (run /mcp reconnect claude-in-chrome yourself to reconnect now)")
+})
+
+/** The account record's fingerprint for an account the machine names: what the login watch keeps. */
+const fingerprint = (account: string) => fingerprintOf({ oauthAccount: { accountUuid: account, organizationUuid: 'org-1' } }) ?? ''
+
+test('a turn that starts and ends on the limit again while the resume is being claimed: another stop, so the old claim is given back and nothing is sent', async ($, on) => {
+  const w = machine(on, { claimTakesMs: 5000 })
+  await begin($, w)
+  await cutOff($, w)
+  w.switchTo('account-b')
+  for (let i = 0; i < 240 && w.claims.length === 0; i += 1) await w.clock.advance(1000)
+  expect(w.claims).toEqual([CLAIM_FILE])
+  // The person types, and that turn too ends on the limit, while the claim script runs.
+  await $.turn.start({ text: 'one more thing', turnId: T2 })
+  await $.classic.StopFailure({ error: 'rate_limit' })
+  await $.turn.complete({ ...failed, turnId: T2 })
+  await w.clock.advance(10_000)
+  expect(w.prompts).toEqual([])
+  expect(w.files.has(CLAIM_FILE)).toBe(false)
+  expect(w.toasts[0]).toContain('no resume: a turn started while the resume was being claimed')
+})
+
+test("a flapping login in a session the coordinator runs in: one toast while the cap holds, though Claude in Chrome's part is never empty", async ($, on) => {
+  // Remote Control for all sessions: each change after the cap is capped again, not left off.
+  const w = machine(on, { chrome: true, coordinator: true, remoteControl: 'true' })
+  await begin($, w)
+  for (const account of ['account-b', 'account-c', 'account-d', 'account-e', 'account-f']) {
+    w.switchTo(account)
+    await w.clock.advance(FLOW)
+  }
+  // Three reconnects, then the cap's one toast, then nothing for the fifth.
+  expect(w.commands.filter(c => c.startsWith('remote-control'))).toHaveLength(3)
+  expect(w.toasts).toHaveLength(4)
+  expect(w.toasts[3]).toContain('it already reconnected 3 times in 10 minutes')
+})
+
+test('after a burst the cap held back, the last login is reconnected once the oldest run leaves the window', async ($, on) => {
+  const w = machine(on, { chrome: true })
+  await begin($, w)
+  for (const account of ['account-b', 'account-c', 'account-d', 'account-e']) {
+    w.switchTo(account)
+    await w.clock.advance(CHROME_FLOW)
+  }
+  expect(w.commands.filter(c => c.startsWith('remote-control'))).toHaveLength(3)
+  expect(w.commands.filter(c => c.startsWith('mcp'))).toHaveLength(3)
+  // The window passes: Remote Control and Claude in Chrome, once each, for account-e.
+  await w.clock.advance(10 * 60_000)
+  expect(w.commands.filter(c => c.startsWith('remote-control'))).toHaveLength(4)
+  expect(w.commands.filter(c => c.startsWith('mcp'))).toHaveLength(4)
+  expect(w.toasts.at(-1)).toBe(`Login settled after the reconnect cap; Remote Control reconnected as "${TITLE}"; ${CHROME_RAN}.`)
+  // Once: nothing more after another window.
+  await w.clock.advance(15 * 60_000)
+  expect(w.commands.filter(c => c.startsWith('remote-control'))).toHaveLength(4)
+})
+
+test('a reconnect started before this plugin reloaded is not run again, and the toast says so', async ($, on) => {
+  const now = 100 * HOUR
+  const state = new Map<string, { value: unknown; version: number }>()
+  state.set('self-remote-control/login', {
+    version: 1,
+    value: { account: fingerprint('account-a'), pending: { at: now - 30_000, wasConnected: false, settingOn: false, rc: 'was-off', idleAt: now - 20_000, chromeRanAt: now - 5000 } },
+  })
+  const w = machine(on, { chrome: true, state })
+  await begin($, w)
+  await w.clock.advance(10_000)
+  expect(w.commands.filter(c => c.startsWith('mcp'))).toEqual([])
+  expect(w.toasts).toEqual([
+    "Login changed; Remote Control was off, and is left off; Claude in Chrome: /mcp reconnect was started before this plugin reloaded, so it isn't run again (its tab group starts over if it ran); no turn was cut off.",
+  ])
+})
+
+test("off Windows, another writer that takes the session's own claim first: this one sends nothing", async ($, on) => {
+  const w = machine(on, { offWindows: true, state: new Map(), conflictOn: 'resumeClaims' })
+  await begin($, w)
+  await cutOff($, w)
+  w.switchTo('account-b')
+  await w.clock.advance(FLOW)
+  expect(w.prompts).toEqual([])
+  expect(w.toasts[0]).toContain('no resume: another run of this plugin claimed the resume of the interrupted turn')
+})
+
+/** The reconnect cap's line, in Remote Control's part of a toast. */
+const RC_CAPPED = 'Remote Control not reconnected: it already reconnected 3 times in 10 minutes'
+const CHROME_CAPPED = 'Claude in Chrome not reconnected: it already reconnected 3 times in 10 minutes'
+const runsOf = (w: World, command: string) => w.commands.filter(c => c.startsWith(command)).length
+
+test("a burst of five with the setting for all sessions off, the coordinator's session: Remote Control the cap left down stays owed, and reconnects once the window passes", async ($, on) => {
+  const w = machine(on, { chrome: true, coordinator: true })
+  await begin($, w)
+  for (const account of ['account-b', 'account-c', 'account-d', 'account-e', 'account-f']) {
+    w.switchTo(account)
+    await w.clock.advance(SETTLE + 10_000)
+  }
+  // Three reconnects; the fourth change is capped and leaves it down; the fifth reads it down, and still counts it owed.
+  expect(runsOf(w, 'remote-control')).toBe(3)
+  expect(w.rc.description).toBe(NOT_CONNECTED)
+  expect(w.toasts.filter(t => t.includes(RC_CAPPED))).toHaveLength(1)
+  expect(w.toasts.some(t => t.includes('Remote Control was off, and is left off'))).toBe(false)
+  expect(w.toasts).toHaveLength(4)
+  await w.clock.advance(10 * 60_000)
+  expect(runsOf(w, 'remote-control')).toBe(4)
+  expect(w.rc.description).toBe(CONNECTED)
+  expect(w.toasts.at(-1)).toBe(`Login settled after the reconnect cap; Remote Control reconnected as "${TITLE}".`)
+  // Owed no more: nothing after another window.
+  await w.clock.advance(15 * 60_000)
+  expect(runsOf(w, 'remote-control')).toBe(4)
+  expect(w.toasts).toHaveLength(5)
+})
+
+test("a login that flaps back to the last reconnect's account: Claude Code stopped Remote Control at the switch away, so it is still reconnected once the window passes", async ($, on) => {
+  const w = machine(on, { remoteControl: 'true' })
+  await begin($, w)
+  // account-d is the last reconnect's; account-e is capped and stops it; back to account-d, capped too.
+  for (const account of ['account-b', 'account-c', 'account-d', 'account-e', 'account-d']) {
+    w.switchTo(account)
+    await w.clock.advance(SETTLE + 10_000)
+  }
+  expect(runsOf(w, 'remote-control')).toBe(3)
+  expect(w.rc.description).toBe(NOT_CONNECTED)
+  await w.clock.advance(10 * 60_000)
+  expect(runsOf(w, 'remote-control')).toBe(4)
+  expect(w.rc.description).toBe(CONNECTED)
+  expect(w.toasts.at(-1)).toBe(`Login settled after the reconnect cap; Remote Control reconnected as "${TITLE}".`)
+})
+
+test('signed out when the window passes: no retry runs; signing in again is a change that counts Remote Control as owed', async ($, on) => {
+  const w = machine(on)
+  await begin($, w)
+  for (const account of ['account-b', 'account-c', 'account-d', 'account-e']) {
+    w.switchTo(account)
+    await w.clock.advance(SETTLE + 10_000)
+  }
+  expect(runsOf(w, 'remote-control')).toBe(3)
+  expect(w.toasts).toHaveLength(4)
+  w.switchTo(null)
+  await w.clock.advance(10 * 60_000)
+  expect(runsOf(w, 'remote-control')).toBe(3)
+  expect(w.toasts).toHaveLength(4)
+  // The setting for all sessions is off and Remote Control reads down: only the debt says to reconnect it.
+  w.switchTo('account-f')
+  await w.clock.advance(SETTLE + 10_000)
+  expect(runsOf(w, 'remote-control')).toBe(4)
+  expect(w.rc.description).toBe(CONNECTED)
+  expect(w.toasts.at(-1)).toBe(`Login changed; Remote Control reconnected as "${TITLE}"; no turn was cut off.`)
+})
+
+test("a real change folded into a retry reads the setting itself: with Remote Control for all sessions on, it reconnects, though the retry wasn't owed it", async ($, on) => {
+  const now = 100 * HOUR
+  const state = new Map<string, { value: unknown; version: number }>()
+  // A retry owed only Claude in Chrome's reconnect: its Remote Control placeholders are "was off" and "setting off".
+  state.set('self-remote-control/login', { version: 1, value: { account: fingerprint('account-a'), owedAt: now - 1000, chromeAccount: fingerprint('account-z') } })
+  const w = machine(on, { chrome: true, remoteControl: 'true', description: NOT_CONNECTED, state })
+  await begin($, w)
+  // The retry is looking for the coordinator's tools when another account comes: the change folds the retry in.
+  w.switchTo('account-b')
+  await w.clock.advance(CHROME_FLOW)
+  expect(w.commands).toContain(`remote-control ${TITLE}`)
+  expect(w.rc.description).toBe(CONNECTED)
+  expect(w.toasts.at(-1)).toBe(`Login changed; Remote Control reconnected as "${TITLE}"; ${CHROME_RAN}; no turn was cut off.`)
+})
+
+test("Claude in Chrome's cap is told once while it holds, though Remote Control isn't capped (it was off)", async ($, on) => {
+  const w = machine(on, { chrome: true, description: NOT_CONNECTED })
+  await begin($, w)
+  for (const account of ['account-b', 'account-c', 'account-d', 'account-e', 'account-f']) {
+    w.switchTo(account)
+    await w.clock.advance(SETTLE + CHROME_LOOK_MS[1] + 10_000)
+  }
+  expect(runsOf(w, 'mcp')).toBe(3)
+  expect(w.toasts.filter(t => t.includes(CHROME_CAPPED))).toHaveLength(1)
+  // Three reconnects, the cap's one toast, then nothing new for the fifth.
+  expect(w.toasts).toHaveLength(4)
+})
+
+test("Claude in Chrome left as it was (its tools can't be listed) is no news while Remote Control's cap holds", async ($, on) => {
+  const w = machine(on, { chrome: true, remoteControl: 'true' })
+  await begin($, w)
+  w.tools.fails = true
+  for (const account of ['account-b', 'account-c', 'account-d', 'account-e', 'account-f']) {
+    w.switchTo(account)
+    await w.clock.advance(SETTLE + 10_000)
+  }
+  expect(runsOf(w, 'remote-control')).toBe(3)
+  expect(w.toasts.filter(t => t.includes(RC_CAPPED))).toHaveLength(1)
+  expect(w.toasts).toHaveLength(4)
+})
+
+test('after a retry settles, a cap within the next minutes is told again', async ($, on) => {
+  const now = 100 * HOUR
+  const state = new Map<string, { value: unknown; version: number }>()
+  // A cap told a minute ago left Remote Control owed; two runs are still in the window, and the retry is due.
+  state.set('self-remote-control/login', {
+    version: 1,
+    value: { account: fingerprint('account-a'), runs: [now - 100_000, now - 90_000], cappedAt: now - 60_000, rcOwed: true, owedAt: now - 1000 },
+  })
+  const w = machine(on, { description: NOT_CONNECTED, state })
+  await begin($, w)
+  await w.clock.advance(SETTLE)
+  expect(w.commands).toEqual([`remote-control ${TITLE}`])
+  expect(w.toasts).toEqual([`Login settled after the reconnect cap; Remote Control reconnected as "${TITLE}".`])
+  // Three runs in the window now: the next change is capped, and that cap is new.
+  w.switchTo('account-b')
+  await w.clock.advance(SETTLE + 10_000)
+  expect(runsOf(w, 'remote-control')).toBe(1)
+  expect(w.toasts).toHaveLength(2)
+  expect(w.toasts[1]).toContain(RC_CAPPED)
 })

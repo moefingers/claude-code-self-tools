@@ -36,14 +36,96 @@ import type { EngineInterface, Register } from 'claude-code'
 import type { Held, Queued } from '../types'
 import { read, readNow, runRemoteControl, sessionTitle, why, type Reading } from './connection'
 import { LOCK_HOLD_MS, releaseLock, takeLock } from './rc-lock'
-import { aroundLogin, configureRelogin, forgetTurn, noteFailure, notePersonPrompt, noteTurnEnd, noteTurnStart, startWatch } from './relogin'
+import { aroundLogin, configureRelogin, forgetTurn, noteFailure, notePersonPrompt, noteServers, noteTurnEnd, noteTurnStart, startWatch } from './relogin'
 import { configureUpdateCheck, loadUpdateCheck, withUpdateNotice } from './update-check'
 
 const queued = { plugin: 'self-remote-control', key: 'queued' } as const
 const title = { plugin: 'self-remote-control', key: 'title' } as const
 
-/** A beat after the turn's end, so the turn is no longer running when the command starts. */
-const SETTLE_MS = 500
+/**
+ * When the connect or rename starts after the turn's end: at once, the moment the turn's end returns (the owner's A).
+ * Input already waiting when the turn ended still runs first, since Claude Code queues a plugin's command behind it, and
+ * the connect or rename then runs after that input's turn. The connect or rename itself does no harm late, but its
+ * resume would: a person who typed "stop" meanwhile would be answered by the old "go on". So a message the person sent
+ * after the arm marks it, and the resume goes to the model as a note instead of starting a turn. Anything else first (a
+ * task's notification, a wake-up, another plugin's prompt) leaves the resume as it was. (self-clear, self-exit,
+ * self-restart and self-switch wait half a second instead, so that their step stands down when something is waiting.)
+ */
+const TURN_END_MS = 0
+
+/**
+ * The person's message, known by the turn it came in over, never by its words: no prompt text is held, hashed or
+ * logged. A prompt from the composer or the app's bridge (prompt.submit's origin) counts, from its prompt.submit until
+ * it settles:
+ * - one that comes while a connect or rename is armed marks that arm;
+ * - one typed over a running main-loop turn (prompt.submit's `turnId`) marks the arm that turn's end makes, which comes
+ *   before the prompt's own `next(e)` resolves ("once the prompt entered the session and its turn started"). So the
+ *   marks are made before `next(e)`, and a prompt dropped beneath takes back its own, and only its own.
+ * A task's notification, a peer's message and a plugin's prompt (this one's resume included) have other origins, and a
+ * subagent's turn makes no arm. Known limit: a prompt the engine delivers into the running turn, which the model has
+ * read already, marks the arm too, so that resume goes as a note, while the person is there to see the toast.
+ */
+type Typed = { entered: boolean; arms: Set<Arm> }
+/** One connect or rename armed at a turn's end: stale once a person's prompt that marked it entered, or while one in flight holds it. */
+type Arm = { sure: boolean; marks: Set<Typed> }
+/** The actions armed and not yet reported. */
+const openArms = new Set<Arm>()
+/** The main-loop turns a person's prompt was typed over, each with those prompts. Emptied at each main-loop turn's end, once its arm is made. */
+const typedOver = new Map<string, Set<Typed>>()
+
+const isStale = (arm: Arm): boolean => arm.sure || arm.marks.size > 0
+
+function mark(arm: Arm, typed: Typed): void {
+  if (typed.entered) arm.sure = true
+  else {
+    arm.marks.add(typed)
+    typed.arms.add(arm)
+  }
+}
+
+/** At a person's prompt, before it enters: every open arm marked, and the turn it was typed over noted. */
+function personTyped(turnId: string | undefined): Typed {
+  const typed: Typed = { entered: false, arms: new Set() }
+  for (const arm of openArms) mark(arm, typed)
+  if (turnId !== undefined) typedOver.set(turnId, (typedOver.get(turnId) ?? new Set<Typed>()).add(typed))
+  return typed
+}
+
+/** The prompt entered: what it marked stays marked. */
+function personEntered(typed: Typed): void {
+  typed.entered = true
+  for (const arm of typed.arms) {
+    arm.marks.delete(typed)
+    arm.sure = true
+  }
+  typed.arms.clear()
+}
+
+/** The prompt was dropped: its marks taken back, and its turn no longer held for it. */
+function personDropped(typed: Typed, turnId: string | undefined): void {
+  for (const arm of typed.arms) arm.marks.delete(typed)
+  typed.arms.clear()
+  if (turnId === undefined) return
+  const held = typedOver.get(turnId)
+  held?.delete(typed)
+  if (held?.size === 0) typedOver.delete(turnId)
+}
+
+/** At a main-loop turn's end: its arm, marked by the person's prompts typed over the turn. */
+function armAt(turnId: string): Arm {
+  const arm: Arm = { sure: false, marks: new Set() }
+  for (const typed of typedOver.get(turnId) ?? []) mark(arm, typed)
+  openArms.add(arm)
+  return arm
+}
+
+/** An arm whose action has reported, or that queued nothing: it is marked no more. */
+function closeArm(arm: Arm): void {
+  openArms.delete(arm)
+  for (const typed of arm.marks) typed.arms.delete(arm)
+  arm.marks.clear()
+}
+
 /** How long after a connect to look again, for whether it took. */
 const CHECK_MS = 3000
 /** While a connect that hasn't read connected holds the lock: how often to look again. */
@@ -59,7 +141,8 @@ const DESCRIPTION = [
   'Call `status` when the user asks whether they can reach this session remotely, and `connect` when they ask to be able to, such as before stepping away, with a `name` unless the session already has a title.',
   "It never disconnects, and never runs /remote-control while connected; disconnecting is the user's to do from its panel.",
   '`resume` is the message that starts your next turn once the action has run, after what happened: what to do next. Leave it out when the next step waits on someone else (the user, another session, a check).',
-  'After `connect` or `rename`, end the turn; it runs once your answer is shown.',
+  "`connect` and `rename` run when the session is idle: Claude Code queues a plugin's command behind anything already waiting (a message typed during this turn, a background task's notification) and has no slot between turns ahead of them, so under a nonstop stream of work and notifications they may run in the distant future. Nothing waiting is lost.",
+  'After `connect` or `rename`, end your turn and do nothing more until it has run; then carry on.',
 ].join(' ')
 
 const SUBAGENT =
@@ -107,12 +190,23 @@ async function sendResume($: EngineInterface, said: string, resume: string): Pro
 
 /**
  * Says how an action ended: a toast, then the resume, led by the note (or the toast's words when it
- * took). Without a resume, or when it can't be sent, the model gets the note, if there is one.
+ * took). Without a resume, or when it can't be sent, the model gets the note, if there is one. The
+ * arm is closed however it ends.
  */
-async function report($: EngineInterface, { toast, note }: Outcome, resume: string | undefined): Promise<void> {
-  $.ui.toast(toast)
-  if (resume !== undefined && (await sendResume($, note ?? toast, resume))) return
-  if (note !== undefined) await tellModel($, note)
+async function report($: EngineInterface, { toast, note }: Outcome, resume: string | undefined, arm?: Arm): Promise<void> {
+  try {
+    $.ui.toast(toast)
+    // The person's message after the arm came after the model asked to resume, and is answered first.
+    if (resume !== undefined && arm !== undefined && isStale(arm)) {
+      $.ui.toast('Resume not sent: your message came after the Remote Control action was queued, so the model has it as a note.')
+      await tellModel($, `${note ?? toast} The person's message came after the Remote Control action was queued, so its resume wasn't sent as a new message. It was: ${resume}`)
+      return
+    }
+    if (resume !== undefined && (await sendResume($, note ?? toast, resume))) return
+    if (note !== undefined) await tellModel($, note)
+  } finally {
+    if (arm !== undefined) closeArm(arm)
+  }
 }
 
 /** Why `connect` won't run the command on this reading. */
@@ -209,7 +303,7 @@ async function queueRename($: EngineInterface, name: string, resume: string | un
 }
 
 /** At the turn's end: the rename, then the connect if one is queued, then the report. */
-async function runQueued($: EngineInterface, value: Queued): Promise<void> {
+async function runQueued($: EngineInterface, value: Queued, arm: Arm): Promise<void> {
   $.ui.status(undefined)
   if (value.rename) {
     try {
@@ -220,16 +314,17 @@ async function runQueued($: EngineInterface, value: Queued): Promise<void> {
         $,
         { toast: `Session not renamed: ${why(err)}`, note: `The rename to "${value.name}" you queued didn't run: ${why(err)}.${rest}` },
         value.resume,
+        arm,
       )
       return
     }
     if (!value.connect) {
-      await report($, { toast: `Session renamed "${value.name}".` }, value.resume)
+      await report($, { toast: `Session renamed "${value.name}".` }, value.resume, arm)
       return
     }
   }
   const lead = value.rename ? `Session renamed "${value.name}". ` : ''
-  await connectNow($, value.name ?? (await sessionTitle($)), value.resume, lead)
+  await connectNow($, value.name ?? (await sessionTitle($)), value.resume, lead, arm)
 }
 
 /**
@@ -237,17 +332,17 @@ async function runQueued($: EngineInterface, value: Queued): Promise<void> {
  * the lock is held, then says whether it took, after `lead`. The lock is held until the session
  * reads connected, or LOCK_HOLD_MS.
  */
-async function connectNow($: EngineInterface, name: string | undefined, resume: string | undefined, lead: string): Promise<void> {
+async function connectNow($: EngineInterface, name: string | undefined, resume: string | undefined, lead: string, arm?: Arm): Promise<void> {
   const taken = await takeLock($, await $.clock.now())
   if ('busy' in taken) {
     const busy = `${taken.busy}, so nothing ran; check with remote_control status.`
-    await report($, { toast: `${lead}Remote Control: ${busy}`, note: `${lead}The Remote Control connect you queued didn't run: ${busy}` }, resume)
+    await report($, { toast: `${lead}Remote Control: ${busy}`, note: `${lead}The Remote Control connect you queued didn't run: ${busy}` }, resume, arm)
     return
   }
   const reading = await readNow($)
   if (reading.state === 'connected') {
     await releaseLock($, taken.held)
-    await report($, { toast: `${lead}Remote Control was already connected; nothing ran.` }, resume)
+    await report($, { toast: `${lead}Remote Control was already connected; nothing ran.` }, resume, arm)
     return
   }
   if (reading.state !== 'not connected') {
@@ -256,6 +351,7 @@ async function connectNow($: EngineInterface, name: string | undefined, resume: 
       $,
       { toast: `${lead}Remote Control not connected: ${refusal(reading)}`, note: `${lead}The Remote Control connect you queued did not run. ${refusal(reading)}` },
       resume,
+      arm,
     )
     return
   }
@@ -267,10 +363,11 @@ async function connectNow($: EngineInterface, name: string | undefined, resume: 
       $,
       { toast: `${lead}Remote Control didn't connect: ${why(err)}`, note: `${lead}The Remote Control connect you queued didn't run: ${why(err)}` },
       resume,
+      arm,
     )
     return
   }
-  $.clock.after(CHECK_MS, () => void checkConnected($, name, resume, lead, taken.held))
+  $.clock.after(CHECK_MS, () => void checkConnected($, name, resume, lead, taken.held, arm).catch(() => (arm === undefined ? undefined : closeArm(arm))))
 }
 
 /** Gives the lock back once the session reads connected, or once it has been held LOCK_HOLD_MS. */
@@ -282,11 +379,11 @@ async function holdUntilConnected($: EngineInterface, held: Held): Promise<void>
   $.clock.after(HOLD_LOOK_MS, () => void holdUntilConnected($, held))
 }
 
-async function checkConnected($: EngineInterface, name: string | undefined, resume: string | undefined, lead: string, held: Held): Promise<void> {
+async function checkConnected($: EngineInterface, name: string | undefined, resume: string | undefined, lead: string, held: Held, arm?: Arm): Promise<void> {
   const reading = await readNow($)
   if (reading.state === 'connected') {
     await releaseLock($, held)
-    await report($, { toast: `${lead}Remote Control connected${titled(name)}.` }, resume)
+    await report($, { toast: `${lead}Remote Control connected${titled(name)}.` }, resume, arm)
     return
   }
   $.clock.after(HOLD_LOOK_MS, () => void holdUntilConnected($, held))
@@ -297,6 +394,7 @@ async function checkConnected($: EngineInterface, name: string | undefined, resu
       note: `${lead}The remote-control command ran, but this session did not read as connected a few seconds later; check with remote_control status.`,
     },
     resume,
+    arm,
   )
 }
 
@@ -339,6 +437,7 @@ export const register: Register = (on, options) => {
     })
     loadUpdateCheck($)
     startWatch($)
+    void noteServers($)
     return started
   })
 
@@ -353,7 +452,7 @@ export const register: Register = (on, options) => {
   // The main conversation's turns, for whether a login change cut one off.
   on('turn.start', async ($, e, next) => {
     const started = await next(e)
-    if (e.agentId === undefined) await noteTurnStart($, e.text)
+    if (e.agentId === undefined) await noteTurnStart($, e.text, e.turnId)
     return started
   })
 
@@ -363,10 +462,18 @@ export const register: Register = (on, options) => {
     return done
   })
 
-  // A prompt the person typed, at the terminal or from the app: a resume the loop-breaker held may go again.
+  // A prompt the person typed, at the terminal or from the app: it marks the arms it comes after (see Typed), and a
+  // resume the loop-breaker held may go again. No text is kept.
   on('prompt.submit', async ($, e, next) => {
+    if (e.origin.kind !== 'composer' && e.origin.kind !== 'bridge') return next(e)
+    const typed = personTyped(e.turnId)
     const done = await next(e)
-    if (done.drop === undefined && (e.origin.kind === 'composer' || e.origin.kind === 'bridge')) await notePersonPrompt($)
+    if (done.drop !== undefined) {
+      personDropped(typed, e.turnId)
+      return done
+    }
+    personEntered(typed)
+    await notePersonPrompt($)
     return done
   }).catch(($, e, next) => next(e))
 
@@ -400,18 +507,29 @@ export const register: Register = (on, options) => {
   }).catch(($, e, next) => (next.called ? next(e) : { deny: 'self-remote-control: the call failed; nothing is queued.' }))
 
   on('turn.complete', async ($, e, next) => {
-    const done = await next(e)
-    if (e.agentId !== undefined) return done
-    await noteTurnEnd($, { reason: e.reason, durationMs: e.durationMs, ...(e.usage === undefined ? {} : { usage: e.usage }) })
-    const { value } = await $.state.get(queued)
-    if (!value) return done
-    await $.state.set(queued, null)
-    if (e.isAborted || e.reason !== 'answer') {
-      $.ui.status(undefined)
-      $.ui.toast(`Remote Control ${value.rename ? 'rename' : 'connect'} cancelled: the turn didn't finish.`)
+    if (e.agentId !== undefined) return next(e)
+    // This turn's arm, made at once, marked by the person's prompts typed over the turn; closed below if nothing is queued.
+    const arm = armAt(e.turnId)
+    typedOver.clear()
+    let isArmed = false
+    try {
+      const done = await next(e)
+      await noteTurnEnd($, { reason: e.reason, durationMs: e.durationMs, turnId: e.turnId, ...(e.usage === undefined ? {} : { usage: e.usage }) })
+      void noteServers($)
+      const { value } = await $.state.get(queued)
+      if (!value) return done
+      await $.state.set(queued, null)
+      if (e.isAborted || e.reason !== 'answer') {
+        $.ui.status(undefined)
+        $.ui.toast(`Remote Control ${value.rename ? 'rename' : 'connect'} cancelled: the turn didn't finish.`)
+        return done
+      }
+      isArmed = true
+      // A step that throws before its report still closes its arm.
+      $.clock.after(TURN_END_MS, () => void runQueued($, value, arm).catch(() => closeArm(arm)))
       return done
+    } finally {
+      if (!isArmed) closeArm(arm)
     }
-    $.clock.after(SETTLE_MS, () => void runQueued($, value))
-    return done
   })
 }

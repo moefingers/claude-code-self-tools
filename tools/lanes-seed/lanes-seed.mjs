@@ -5,11 +5,11 @@
 //
 //   node tools/lanes-seed/lanes-seed.mjs --csv <inventory.csv> [--ws <workspace id>] [--home <name>=<window>]... [--at <ms>]
 //
-// The inventory is system-overhaul's (scratchpad sessions\inventory.csv): one row per conversation on
+// The inventory is a session inventory (a CSV, inventory.csv): one row per conversation on
 // disk, the canonical conversation of each session name marked in its `lane` column. Each marked row
 // becomes one entry, by that name: `session` its session_id, `folder` its folder, `ws` the workspace
-// (`default` unless --ws), `tab` its name, and `window` its home window when it has one. The homes (Mo,
-// 2026-11-06) are the defaults below; --home overrides or adds one, `--home name=` removes it. A name
+// (`default` unless --ws), `tab` its name, and `window` its home window when it has one. The homes (the
+// presets' generic lanes) are the defaults below; --home overrides or adds one, `--home name=` removes it. A name
 // without a home has no window: it goes anywhere. Every entry is checked by the machine code's
 // laneEntry, as readLanes reads it; a row that fails is left out and said on standard error, as is a
 // name marked twice (the first kept). It reads no transcript, and nothing but the CSV given.
@@ -20,14 +20,14 @@ import { fileURLToPath, pathToFileURL } from 'node:url'
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..', '..')
 const machine = await import(pathToFileURL(join(ROOT, 'shared', 'hooks', 'machine.ts')).href)
 
-/** Mo's four windows (2026-11-06): window 1 the coordinator's and the merger's; 2 video-lab; 3 three lanes; 4 overflow. */
+/** Four windows' homes, as placement.example.json's presets: generic lanes; --home gives your own. */
 export const HOMES = {
-  'agent-coordinator-3000': 'claude-1',
-  'system-overhaul': 'claude-1',
-  'video-lab': 'claude-2',
-  'olivia-work': 'claude-3',
-  'ui-general': 'claude-3',
-  'package-bumper': 'claude-3',
+  'lane-a': 'claude-1',
+  'lane-b': 'claude-1',
+  'lane-c': 'claude-2',
+  'lane-d': 'claude-3',
+  'lane-e': 'claude-3',
+  'lane-f': 'claude-3',
 }
 
 /** A CSV's rows (RFC 4180: quoted fields, doubled quotes, line breaks inside quotes), the first row the header. */

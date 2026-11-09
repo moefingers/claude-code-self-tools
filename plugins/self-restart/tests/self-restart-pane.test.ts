@@ -354,7 +354,7 @@ test('the full safe point holds first: a background job under the session, there
   await clock.advance(1000)
   expect(kinds).toEqual([])
   expect(commands).toEqual([])
-  expect(rows().at(-1)).toMatch(/the background shell bash\.exe 505 runs under this session/)
+  expect(rows().at(-1)).toMatch(/the shell bash\.exe 505 runs under this session/)
   expect(writes.map(w => w.text).at(-1)).toBe('{"v":1,"done":true}')
 })
 
@@ -371,7 +371,7 @@ test('the pre-check at the call: a session cron refuses it, and nothing is queue
 for (const [where, options, toast] of [
   ['the tab', {}, "This tab resumes the session if it exits (/exit) within 2 minutes."],
   ["this pane's slot", { token: '', launcher: 'slot' as const }, "This pane's slot resumes the session if it exits (/exit) within 2 minutes."],
-  ['a new window', { token: '' }, 'Its window waits up to 10 minutes for this session to exit, then gives up; close it, or exit (/exit) to resume there.'],
+  ['a new window', { token: '' }, 'Its window keeps waiting for this session to exit, and resumes it there when it does: exit (/exit) to resume there, or close the window to give up.'],
 ] as const) {
   test(`a restart stopped right before its exit, ${where} already holding the claim: the record keeps the claim, and the session resumed there releases it`, async ($, on) => {
     const { scripts, kinds, commands, toasts, held, prompts, clock } = engine(on, { ...options, agentDuring: true })

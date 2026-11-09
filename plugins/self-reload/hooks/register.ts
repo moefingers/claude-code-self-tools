@@ -16,8 +16,133 @@ import { configureUpdateCheck, loadUpdateCheck, withUpdateNotice } from './updat
 const queued = { plugin: 'self-reload', key: 'queued' } as const
 const pending = { plugin: 'self-reload', key: 'pending' } as const
 
-/** A beat after the turn's end, so the turn is no longer running when the reload starts. */
-const SETTLE_MS = 500
+/**
+ * When the reload starts after the turn's end: at once, the moment the turn's end returns (the owner's A). Input
+ * already waiting when the turn ended still runs first, since Claude Code queues a plugin's command behind it, and the
+ * reload then runs after that input's turn. The reload itself does no harm late, but its resume would: a person who
+ * typed "stop" meanwhile would be answered by the old "go on". So a message the person sent after the arm marks the
+ * pending resume (in $.state, which the reload keeps), and the resume goes to the model as a note instead of starting a
+ * turn. Anything else first (a task's notification, a wake-up, another plugin's prompt) leaves the resume as it was.
+ * (self-clear, self-exit, self-restart and self-switch wait half a second instead, so that their step stands down when
+ * something is waiting.)
+ */
+const TURN_END_MS = 0
+
+/**
+ * The person's message, known by the turn it came in over, never by its words: no prompt text is held, hashed, stored
+ * or logged. A prompt from the composer or the app's bridge (prompt.submit's origin) counts, from its prompt.submit
+ * until it settles:
+ * - one that comes while a reload is armed (its pending record written) marks that arm;
+ * - one typed over a running main-loop turn (prompt.submit's `turnId`) marks the arm that turn's end makes, which comes
+ *   before the prompt's own `next(e)` resolves ("once the prompt entered the session and its turn started"). So the
+ *   marks are made before `next(e)`, and a prompt dropped beneath takes back its own, and only its own.
+ * The mark the next module reads is the pending record's `turnSince`, written once a marking prompt has entered: one
+ * still in flight marks the arm in this module only, and the claim here counts it, so a drop has nothing in $.state to
+ * take back. The reload runs after the prompt has settled, since Claude Code queues the command behind it. The prompt's
+ * own hook writes it when it can see the record; one typed over the turn that wrote the record can't ("every `get` of
+ * one dispatch reads one moment", and its dispatch began before the record was there), so each main-loop turn.start
+ * writes what is marked, before that turn can end and the reload run. A task's notification, a peer's message
+ * and a plugin's prompt (this one's resume included) have other origins, and a subagent's turn makes no arm. Known
+ * limit: a prompt the engine delivers into the running turn, which the model has read already, marks the arm too, so
+ * that resume goes as a note, while the person is there to see the toast.
+ */
+type Typed = { entered: boolean; arms: Set<Arm> }
+/**
+ * The pending reload as this module marks it: its record's `at` (absent until written), stale once a person's prompt
+ * that marked it entered (or its record was marked by an earlier load of this module), or while one in flight holds it.
+ */
+type Arm = { at?: number; sure: boolean; marks: Set<Typed> }
+/** The reloads armed and not yet taken. */
+const openArms = new Set<Arm>()
+/** The main-loop turns a person's prompt was typed over, each with those prompts. Emptied at each main-loop turn's end, once its arm is made. */
+const typedOver = new Map<string, Set<Typed>>()
+
+const isStale = (arm: Arm): boolean => arm.sure || arm.marks.size > 0
+
+function mark(arm: Arm, typed: Typed): void {
+  if (typed.entered) arm.sure = true
+  else {
+    arm.marks.add(typed)
+    typed.arms.add(arm)
+  }
+}
+
+/** At a person's prompt, before it enters: every open arm marked, and the turn it was typed over noted. */
+function personTyped(turnId: string | undefined): Typed {
+  const typed: Typed = { entered: false, arms: new Set() }
+  for (const arm of openArms) mark(arm, typed)
+  if (turnId !== undefined) typedOver.set(turnId, (typedOver.get(turnId) ?? new Set<Typed>()).add(typed))
+  return typed
+}
+
+/** The prompt entered: what it marked stays marked. */
+function personEntered(typed: Typed): void {
+  typed.entered = true
+  for (const arm of typed.arms) {
+    arm.marks.delete(typed)
+    arm.sure = true
+  }
+  typed.arms.clear()
+}
+
+/** The prompt was dropped: its marks taken back, and its turn no longer held for it. */
+function personDropped(typed: Typed, turnId: string | undefined): void {
+  for (const arm of typed.arms) arm.marks.delete(typed)
+  typed.arms.clear()
+  if (turnId === undefined) return
+  const held = typedOver.get(turnId)
+  held?.delete(typed)
+  if (held?.size === 0) typedOver.delete(turnId)
+}
+
+/** At a main-loop turn's end: its arm, marked by the person's prompts typed over the turn. */
+function armAt(turnId: string): Arm {
+  const arm: Arm = { sure: false, marks: new Set() }
+  for (const typed of typedOver.get(turnId) ?? []) mark(arm, typed)
+  openArms.add(arm)
+  return arm
+}
+
+/** An arm whose record was taken or replaced, or that queued nothing: it is marked no more. */
+function closeArm(arm: Arm): void {
+  openArms.delete(arm)
+  for (const typed of arm.marks) typed.arms.delete(arm)
+  arm.marks.clear()
+}
+
+/** The state steps on the pending record, one at a time: its writing, a mark and the claim never interleave. */
+let chain: Promise<unknown> = Promise.resolve()
+function serial<T>(work: () => Promise<T>): Promise<T> {
+  const run = chain.then(work, work)
+  chain = run.catch(() => undefined)
+  return run
+}
+
+/**
+ * Writes the mark into the pending record (`turnSince: true`) once a prompt that marked its arm has entered. Only the
+ * record the arm was written as (its `at`); a write that lost to another reads it again.
+ */
+function syncMark($: EngineInterface, arm: Arm): Promise<void> {
+  return serial(async () => {
+    for (let tries = 0; tries < 3; tries += 1) {
+      if (arm.at === undefined || !arm.sure) return
+      const held = await $.state.get(pending)
+      if (!held.value || held.value.at !== arm.at || held.value.turnSince === true) return
+      if ((await $.state.set(pending, { ...held.value, turnSince: true }, { ifVersion: held.version })).isSet) return
+    }
+  })
+}
+
+/** A pending record no open arm stands for (an earlier load of this module wrote it): it gets an arm, and the prompt marks it too. */
+function adopt($: EngineInterface, typed: Typed): Promise<void> {
+  return serial(async () => {
+    const { value } = await $.state.get(pending)
+    if (!value || [...openArms].some(arm => arm.at === value.at)) return
+    const arm: Arm = { at: value.at, sure: value.turnSince === true, marks: new Set() }
+    openArms.add(arm)
+    mark(arm, typed)
+  })
+}
 
 /** A pending resume older than this is dropped, not sent: the turn that asked for it is long gone. */
 const STALE_MS = 10 * 60 * 1000
@@ -34,7 +159,8 @@ const DESCRIPTION = [
   'Not mid-edit: finish the change first. Not for a change that needs a new session anyway.',
   '`resume` is the message that starts your next turn once the plugins have reloaded: what to check or do next.',
   'Give it whenever you have a next step of your own; leave it out only when the next step waits on someone else (the user, another session, a check).',
-  'End the turn after calling it; the reload runs once your answer is shown.',
+  "It runs when the session is idle: Claude Code queues a plugin's command behind anything already waiting (a message typed during this turn, a background task's notification) and has no slot between turns ahead of them, so under a nonstop stream of work and notifications it may run in the distant future. Nothing waiting is lost.",
+  'After calling it, end your turn and do nothing more until it has run; then carry on.',
 ].join(' ')
 
 /** What is queued: `resume` only when there is one, since stored state holds no undefined. */
@@ -61,12 +187,25 @@ async function tellModel($: EngineInterface, note: string): Promise<void> {
   }
 }
 
-/** Takes the pending resume, if it is still there and no one took it first. */
-async function claim($: EngineInterface): Promise<Pending | undefined> {
-  const held = await $.state.get(pending)
-  if (!held.value) return undefined
-  const taken = await $.state.set(pending, null, { ifVersion: held.version })
-  return taken.isSet ? held.value : undefined
+/**
+ * Takes the pending resume, if it is still there and no one took it first, with this module's mark of it: a person's
+ * prompt still in flight counts. A take that lost to a mark written meanwhile (by another load of this module) reads
+ * the record again; one that lost to another take finds it gone.
+ */
+function claim($: EngineInterface): Promise<Pending | undefined> {
+  return serial(async () => {
+    for (let tries = 0; tries < 3; tries += 1) {
+      const held = await $.state.get(pending)
+      const value = held.value
+      if (!value) return undefined
+      if ((await $.state.set(pending, null, { ifVersion: held.version })).isSet) {
+        const isMarked = [...openArms].some(arm => arm.at === value.at && isStale(arm))
+        for (const arm of openArms) if (arm.at === value.at) closeArm(arm)
+        return isMarked && value.turnSince !== true ? { ...value, turnSince: true } : value
+      }
+    }
+    return undefined
+  })
 }
 
 async function sendResume($: EngineInterface, said: string, resume: string): Promise<void> {
@@ -76,6 +215,17 @@ async function sendResume($: EngineInterface, said: string, resume: string): Pro
   } catch {
     $.ui.toast('Resume not sent; the session waits for the next message.')
   }
+}
+
+/**
+ * Sends the resume, or, when the person's message came after the reload was queued, hands it to the model as a note:
+ * their message came after the model asked to resume, and is answered first.
+ */
+async function resumeOrNote($: EngineInterface, said: string, value: Pending): Promise<void> {
+  if (value.resume === undefined) return
+  if (value.turnSince !== true) return await sendResume($, said, value.resume)
+  $.ui.toast('Resume not sent: your message came after the reload was queued, so the model has it as a note.')
+  await tellModel($, `${said} The person's message came after the reload was queued, so its resume wasn't sent as a new message. It was: ${value.resume}`)
 }
 
 /** Runs the reload; then, if this module is still the one running, sends what is pending. */
@@ -92,18 +242,18 @@ async function reloadNow($: EngineInterface): Promise<void> {
   if (value === undefined) return
   if (failed !== undefined) {
     $.ui.toast(`Plugin reload didn't run: ${failed}`)
-    if (value.resume !== undefined) await sendResume($, `Plugin reload didn't run (${failed}).`, value.resume)
+    if (value.resume !== undefined) await resumeOrNote($, `Plugin reload didn't run (${failed}).`, value)
     else await tellModel($, `The plugin reload you queued didn't run: ${failed}`)
     return
   }
   if (output !== undefined && SKIPPED.test(output)) {
     $.ui.toast(`Plugin reload skipped: ${output}`)
-    if (value.resume !== undefined) await sendResume($, `Plugin reload was skipped (${output}).`, value.resume)
+    if (value.resume !== undefined) await resumeOrNote($, `Plugin reload was skipped (${output}).`, value)
     else await tellModel($, `The plugin reload you queued was skipped: ${output}`)
     return
   }
   $.ui.toast(output === undefined ? 'Plugins reloaded.' : `Plugins reloaded. ${output}`)
-  if (value.resume !== undefined) await sendResume($, 'Plugins reloaded.', value.resume)
+  await resumeOrNote($, 'Plugins reloaded.', value)
 }
 
 /** At a module's start: after a reload this session asked for, send its resume, once. */
@@ -117,7 +267,7 @@ async function resumeAfterReload($: EngineInterface): Promise<void> {
   }
   $.ui.toast('Plugins reloaded.')
   // Not awaited: a submitted prompt starts its turn only once this start has finished.
-  if (value.resume !== undefined) void sendResume($, 'Plugins reloaded.', value.resume)
+  void resumeOrNote($, 'Plugins reloaded.', value)
 }
 
 export const register: Register = (on, options) => {
@@ -164,19 +314,64 @@ export const register: Register = (on, options) => {
   }).catch(($, e, next) => (next.called ? next(e) : { deny: 'self-reload: queuing the reload failed; nothing is queued.' }))
 
   on('turn.complete', async ($, e, next) => {
+    if (e.agentId !== undefined) return next(e)
+    // This turn's arm, made at once, marked by the person's prompts typed over the turn; closed below if nothing is queued.
+    const arm = armAt(e.turnId)
+    typedOver.clear()
+    let isArmed = false
+    try {
+      const done = await next(e)
+      const { value } = await $.state.get(queued)
+      if (!value) return done
+      await $.state.set(queued, null)
+      if (e.isAborted || e.reason !== 'answer') {
+        $.ui.status(undefined)
+        $.ui.toast("Plugin reload cancelled: the turn didn't finish.")
+        return done
+      }
+      // Written before the reload replaces this module, so the module it starts finds it, marked when a person's
+      // prompt typed over this turn has entered already.
+      const at = await $.clock.now()
+      await serial(async () => {
+        arm.at = at
+        await $.state.set(pending, { ...value, at, ...(arm.sure ? { turnSince: true as const } : {}) })
+      })
+      isArmed = true
+      // An arm of a record this one replaced stands for nothing now.
+      for (const other of openArms) if (other !== arm) closeArm(other)
+      $.clock.after(TURN_END_MS, () => void reloadNow($))
+      return done
+    } finally {
+      if (!isArmed) closeArm(arm)
+    }
+  })
+
+  // A main-loop turn's start: a mark the prompt's own hook couldn't write into the record (see Typed) is written now,
+  // before the turn can end and the reload run. Only a mark; nothing of the turn's text is read.
+  on('turn.start', async ($, e, next) => {
+    const started = await next(e)
+    if (e.agentId === undefined) for (const arm of openArms) if (arm.sure) await syncMark($, arm).catch(() => undefined)
+    return started
+  }).catch(($, e, next) => next(e))
+
+  // The person's message, at the terminal or from the app: it marks the arms it comes after (see Typed), here before it
+  // enters, and in the pending record once it has; a drop takes back its own marks. No text is kept.
+  on('prompt.submit', async ($, e, next) => {
+    if (e.origin.kind !== 'composer' && e.origin.kind !== 'bridge') return next(e)
+    const typed = personTyped(e.turnId)
+    try {
+      await adopt($, typed)
+    } catch {
+      // A record an earlier load wrote goes unmarked by this prompt; this module's own arms are marked all the same.
+    }
     const done = await next(e)
-    if (e.agentId !== undefined) return done
-    const { value } = await $.state.get(queued)
-    if (!value) return done
-    await $.state.set(queued, null)
-    if (e.isAborted || e.reason !== 'answer') {
-      $.ui.status(undefined)
-      $.ui.toast("Plugin reload cancelled: the turn didn't finish.")
+    if (done.drop !== undefined) {
+      personDropped(typed, e.turnId)
       return done
     }
-    // Written before the reload replaces this module, so the module it starts finds it.
-    await $.state.set(pending, { ...value, at: await $.clock.now() })
-    $.clock.after(SETTLE_MS, () => void reloadNow($))
+    const marked = [...typed.arms]
+    personEntered(typed)
+    for (const arm of marked) await syncMark($, arm).catch(() => undefined)
     return done
-  })
+  }).catch(($, e, next) => next(e))
 }

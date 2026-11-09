@@ -33,7 +33,14 @@ import { configureUpdateCheck, loadUpdateCheck, withUpdateNotice } from './updat
 
 const queued = { plugin: 'self-exit', key: 'queued' } as const
 
-/** A beat after the turn's end, so the turn is no longer running when the exit starts. */
+/**
+ * How long after the turn's end the exit waits before it starts: half a second. Claude Code queues a plugin's
+ * command behind input already waiting when the turn ended (a message typed during it, a task notification), so a
+ * command queued at once would run a turn late, after that input's turn. In the half second that input's turn
+ * starts, and its turn.start takes the exit back, with a note to the model. A check when the command leaves the
+ * queue can't stand in for it in 2.1.319: its re-entry rule leaves a plugin's own command.run hooks out of a
+ * command the plugin raised outside a hook (`hooks module ... skipped: re-entry (the plugin's own code raised it)`).
+ */
 const SETTLE_MS = 500
 /** How long after the exit command to look whether the session is still here. */
 const CHECK_MS = 5000
@@ -44,7 +51,8 @@ const DESCRIPTION = [
   '`reason` (required) says why; it is recorded in the transcript. `note` is for whoever resumes this session: what was left, and where its notes are. Write your notes down first.',
   "It refuses while anything would make /exit stop at its confirmation or cut work off, naming each with how to stop it: a session cron (delete it with CronDelete), a background Bash, PowerShell or Monitor job (stop it with TaskStop), a subagent still running, a wake-up from wake_after still pending (cancel it with cancel_wake); and while any of that can't be read. Stop them, then call again.",
   'What still ends with the session: Remote Control (the phone and browser lose the session).',
-  'End the turn after calling it; the exit runs once your answer is shown.',
+  "It can run only when the session is idle: Claude Code queues a plugin's command behind anything already waiting (a message typed during this turn, a background task's notification) and has no slot between turns ahead of them. A turn that starts first cancels the exit, and you are told, so nothing waiting is lost or carried into another conversation; under a nonstop stream of work and notifications it may not run for a long time, so call it again when the stream pauses.",
+  'After calling it, end your turn and do nothing more until it has run.',
 ].join(' ')
 
 const SUBAGENT =
@@ -130,9 +138,13 @@ async function mark($: EngineInterface, kind: PendingKind | null): Promise<void>
   if (failed !== undefined) $.ui.log(`the pending marker wasn't written (${failed}); the coordinator ignores an old one after 15 minutes.`)
 }
 
-/** The row the model reads when the session is resumed: why it ended, and the note. */
+/**
+ * The row the model reads when the session is resumed: why it asked to end, and the note. Written before /exit
+ * runs, so it says what was asked, never that it ended: in a background session (/background) /exit leaves the
+ * session running, and the row is read there too.
+ */
 const record = ({ reason, note }: Queued): string =>
-  `This session ended at its own request (exit_after_turn). Reason: ${reason}${note === undefined ? '' : ` Note for whoever resumes it: ${note}`}`
+  `This session asked to end here (exit_after_turn). Reason: ${reason}${note === undefined ? '' : ` Note for whoever resumes it: ${note}`}`
 
 /** Logs the reason, then runs the exit; says so when it didn't run, or the session is still here after it. */
 async function exitNow($: EngineInterface, value: Queued): Promise<void> {

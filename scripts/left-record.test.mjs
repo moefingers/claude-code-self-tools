@@ -13,7 +13,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { after, before, describe, test } from 'node:test'
 import { pathToFileURL } from 'node:url'
-import { compileStub, underStub } from './stub.mjs'
+import { compileStub, underStub, stubWork } from './stub.mjs'
 import { ROOT } from './sync-shared.mjs'
 
 const machine = await import(pathToFileURL(join(ROOT, 'shared', 'hooks', 'machine.ts')).href)
@@ -25,7 +25,7 @@ let stub
 
 before(() => {
   if (!isWindows) return
-  work = mkdtempSync(join(tmpdir(), 'left-record-test-'))
+  work = stubWork('left-record-test-')
   stub = compileStub(work)
 })
 
@@ -177,5 +177,241 @@ describe('the left record, written and read for real', { skip: !isWindows && 'Wi
     assert.match(written.stdout, /refused key the left key \(.+left\.key\) can not be read as 32 bytes: .+delete it, and the next record makes a new one/)
     assert.equal(readFileSync(join(dirs.state, 'left.key')).length, 16)
     assert.ok(!existsSync(join(dirs.state, 'left', `${dirs.id}.json`)))
+  })
+})
+
+describe('#81: two writers of one move, the coordinator and self-switch', { skip: !isWindows && 'Windows only', concurrency: false }, () => {
+  /** Both scripts run one after the other, or at once, each in its own Windows PowerShell under the one stub claude.exe: one process left the conversation. */
+  async function both(dirs, first, second, together, between = '') {
+    const a = join(dirs.root, 'first.ps1')
+    const b = join(dirs.root, 'second.ps1')
+    writeFileSync(a, first)
+    writeFileSync(b, second)
+    const ps = POWERSHELL
+    const start = file => `Start-Ps '${file}'`
+    const begin = [
+      "$ProgressPreference = 'SilentlyContinue'",
+      `function Start-Ps($file) { $i = New-Object Diagnostics.ProcessStartInfo('${ps}', ('-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "' + $file + '"')); $i.UseShellExecute = $false; $i.CreateNoWindow = $true; $i.RedirectStandardOutput = $true; $i.RedirectStandardError = $true; return [Diagnostics.Process]::Start($i) }`,
+    ]
+    const script = together
+      ? [...begin, `$pa = ${start(a)}`, `$pb = ${start(b)}`, between, '$oa = $pa.StandardOutput.ReadToEnd(); $ea = $pa.StandardError.ReadToEnd(); $pa.WaitForExit()', '$ob = $pb.StandardOutput.ReadToEnd(); $eb = $pb.StandardError.ReadToEnd(); $pb.WaitForExit()', '"A:" + $pa.ExitCode + ":" + $oa.Trim() + ":" + ([regex]::Matches($ea, "S=.Error.")).Count', '"B:" + $pb.ExitCode + ":" + $ob.Trim() + ":" + ([regex]::Matches($eb, "S=.Error.")).Count'].join('\r\n')
+      : [...begin, `$pa = ${start(a)}`, '$oa = $pa.StandardOutput.ReadToEnd(); $ea = $pa.StandardError.ReadToEnd(); $pa.WaitForExit()', between, `$pb = ${start(b)}`, '$ob = $pb.StandardOutput.ReadToEnd(); $eb = $pb.StandardError.ReadToEnd(); $pb.WaitForExit()', '"A:" + $pa.ExitCode + ":" + $oa.Trim() + ":" + ([regex]::Matches($ea, "S=.Error.")).Count', '"B:" + $pb.ExitCode + ":" + $ob.Trim() + ":" + ([regex]::Matches($eb, "S=.Error.")).Count'].join('\r\n')
+    const ran = await write(script)
+    const line = tag => ran.stdout.split(/\r?\n/).find(l => l.startsWith(`${tag}:`)) ?? ''
+    return { a: line('A'), b: line('B'), all: ran.stdout + ran.stderr }
+  }
+  const GO = 'wu_abc123'
+
+  test("the coordinator's record first, then self-switch's for the same move: both say written, and the coordinator's stands, its go kept", async () => {
+    const dirs = lab()
+    const coordinator = machine.leftScript({ stateDir: dirs.state, id: dirs.id, how: 'in-place', configDirs: [dirs.config], by: 'coordinator', go: GO })
+    const selfSwitch = machine.leftScript({ stateDir: dirs.state, id: dirs.id, how: 'in-place', configDirs: [dirs.config], by: 'self-switch' })
+    const ran = await both(dirs, coordinator, selfSwitch, false)
+    assert.equal(ran.a, `A:0:left ${dirs.id}:0`, ran.all)
+    assert.equal(ran.b, `B:0:left ${dirs.id}:0`, ran.all)
+    const record = JSON.parse(readFileSync(join(dirs.state, 'left', `${dirs.id}.json`), 'utf8'))
+    assert.equal(record.by, 'coordinator')
+    assert.equal(record.go, GO)
+  })
+
+  /**
+   * Both scripts held at one gate right after their first look (no record there yet for either), then let go at once,
+   * so their writes really race: the move of one fails on the file the other just made.
+   */
+  const gated = (script, gate, ready) => {
+    const at = script.indexOf('\r\n$leftLockPath = ')
+    assert.ok(at > 0, 'before the lock: both race for it')
+    const hold = [`New-Item -ItemType File -Path '${ready}' -Force | Out-Null`, `$gate = New-Object Threading.EventWaitHandle($false, [Threading.EventResetMode]::ManualReset, '${gate}')`, '[void]$gate.WaitOne(60000)'].join('\r\n')
+    return `${script.slice(0, at)}\r\n${hold}${script.slice(at)}`
+  }
+
+  for (let rep = 1; rep <= 3; rep += 1) {
+    test(`R8: both at once, their writes racing (${rep} of 3): each says written, nothing on its error stream, and the coordinator's record stands, its go kept and its MAC good`, async () => {
+      const dirs = lab()
+      const gate = `left-race-${randomUUID()}`
+      const readyA = join(dirs.root, 'ready-a')
+      const readyB = join(dirs.root, 'ready-b')
+      const coordinator = gated(machine.leftScript({ stateDir: dirs.state, id: dirs.id, how: 'in-place', configDirs: [dirs.config], by: 'coordinator', go: GO }), gate, readyA)
+      const selfSwitch = gated(machine.leftScript({ stateDir: dirs.state, id: dirs.id, how: 'in-place', configDirs: [dirs.config], by: 'self-switch' }), gate, readyB)
+      const open = [`$gate = New-Object Threading.EventWaitHandle($false, [Threading.EventResetMode]::ManualReset, '${gate}')`, `$until = (Get-Date).AddSeconds(60); while (-not ((Test-Path '${readyA}') -and (Test-Path '${readyB}')) -and (Get-Date) -lt $until) { Start-Sleep -Milliseconds 20 }`, '[void]$gate.Set()'].join('\r\n')
+      const ran = await both(dirs, coordinator, selfSwitch, true, open)
+      assert.equal(ran.a, `A:0:left ${dirs.id}:0`, ran.all)
+      assert.equal(ran.b, `B:0:left ${dirs.id}:0`, ran.all)
+      const record = JSON.parse(readFileSync(join(dirs.state, 'left', `${dirs.id}.json`), 'utf8'))
+      assert.equal(record.by, 'coordinator', ran.all)
+      assert.equal(record.go, GO)
+      const read = await run(machine.leftReadScript({ stateDir: dirs.state, ids: [dirs.id], configDirs: [dirs.config] }))
+      const parsed = machine.parseLeftRead(read.stdout)
+      assert.ok(!('error' in parsed) && parsed.left.length === 1 && parsed.left[0].ok === true && parsed.left[0].macOk === true, read.stdout)
+    })
+  }
+
+  for (let rep = 1; rep <= 3; rep += 1) {
+    test(`R1 (delta): an earlier record already in place, both writers racing (${rep} of 3): one at a time, and the coordinator's go stands`, async () => {
+      const dirs = lab()
+      // The usual case: a record of an earlier move of this conversation, by another process.
+      const stale = await write(machine.leftScript({ stateDir: dirs.state, id: dirs.id, how: 'exit', configDirs: [dirs.config], by: 'self-switch' }))
+      assert.equal(machine.LEFT_WRITTEN.exec(stale.stdout)?.[1], dirs.id, stale.stdout + stale.stderr)
+      const gate = `left-race-${randomUUID()}`
+      const readyA = join(dirs.root, 'ready-a')
+      const readyB = join(dirs.root, 'ready-b')
+      const coordinator = gated(machine.leftScript({ stateDir: dirs.state, id: dirs.id, how: 'in-place', configDirs: [dirs.config], by: 'coordinator', go: GO }), gate, readyA)
+      const selfSwitch = gated(machine.leftScript({ stateDir: dirs.state, id: dirs.id, how: 'in-place', configDirs: [dirs.config], by: 'self-switch' }), gate, readyB)
+      const open = [`$gate = New-Object Threading.EventWaitHandle($false, [Threading.EventResetMode]::ManualReset, '${gate}')`, `$until = (Get-Date).AddSeconds(60); while (-not ((Test-Path '${readyA}') -and (Test-Path '${readyB}')) -and (Get-Date) -lt $until) { Start-Sleep -Milliseconds 20 }`, '[void]$gate.Set()'].join('\r\n')
+      const ran = await both(dirs, coordinator, selfSwitch, true, open)
+      assert.equal(ran.a, `A:0:left ${dirs.id}:0`, ran.all)
+      assert.equal(ran.b, `B:0:left ${dirs.id}:0`, ran.all)
+      const record = JSON.parse(readFileSync(join(dirs.state, 'left', `${dirs.id}.json`), 'utf8'))
+      assert.equal(record.how, 'in-place', ran.all)
+      assert.equal(record.by, 'coordinator', ran.all)
+      assert.equal(record.go, GO)
+      assert.ok(!existsSync(join(dirs.state, 'left', `${dirs.id}.lock`)), 'the lock is gone with its last holder')
+    })
+  }
+
+  test('R8: a record of the same move whose MAC is not good is no record of it: replaced', async () => {
+    const dirs = lab()
+    const coordinator = machine.leftScript({ stateDir: dirs.state, id: dirs.id, how: 'in-place', configDirs: [dirs.config], by: 'coordinator', go: GO })
+    const selfSwitch = machine.leftScript({ stateDir: dirs.state, id: dirs.id, how: 'in-place', configDirs: [dirs.config], by: 'self-switch' })
+    const path = join(dirs.state, 'left', `${dirs.id}.json`)
+    const spoil = `$r = Get-Content -LiteralPath '${path}' -Raw | ConvertFrom-Json; $r.mac = ('0' * 64); [IO.File]::WriteAllText('${path}', ($r | ConvertTo-Json -Compress -Depth 4))`
+    const ran = await both(dirs, coordinator, selfSwitch, false, spoil)
+    assert.equal(ran.b, `B:0:left ${dirs.id}:0`, ran.all)
+    assert.equal(JSON.parse(readFileSync(path, 'utf8')).by, 'self-switch')
+  })
+
+  test("R8: the same writer's record of the same move is replaced by its newer one, never taken as the other writer's", async () => {
+    const dirs = lab()
+    const first = machine.leftScript({ stateDir: dirs.state, id: dirs.id, how: 'in-place', configDirs: [dirs.config], by: 'self-switch' })
+    const path = join(dirs.state, 'left', `${dirs.id}.json`)
+    const keep = `Copy-Item -LiteralPath '${path}' -Destination '${join(dirs.root, 'after-a.json')}'`
+    const ran = await both(dirs, first, first, false, keep)
+    assert.equal(ran.b, `B:0:left ${dirs.id}:0`, ran.all)
+    const before = JSON.parse(readFileSync(join(dirs.root, 'after-a.json'), 'utf8'))
+    assert.notEqual(JSON.parse(readFileSync(path, 'utf8')).at, before.at, 'the second write replaced the first')
+  })
+
+  test('both at once, unheld: each says written, with nothing on its error stream, and one whole record stands that reads back with its MAC', async () => {
+    const dirs = lab()
+    const coordinator = machine.leftScript({ stateDir: dirs.state, id: dirs.id, how: 'in-place', configDirs: [dirs.config], by: 'coordinator', go: GO })
+    const selfSwitch = machine.leftScript({ stateDir: dirs.state, id: dirs.id, how: 'in-place', configDirs: [dirs.config], by: 'self-switch' })
+    const ran = await both(dirs, coordinator, selfSwitch, true)
+    assert.equal(ran.a, `A:0:left ${dirs.id}:0`, ran.all)
+    assert.equal(ran.b, `B:0:left ${dirs.id}:0`, ran.all)
+    const read = await run(machine.leftReadScript({ stateDir: dirs.state, ids: [dirs.id], configDirs: [dirs.config] }))
+    const parsed = machine.parseLeftRead(read.stdout)
+    assert.ok(!('error' in parsed) && parsed.left.length === 1 && parsed.left[0].ok === true && parsed.left[0].macOk === true, read.stdout)
+  })
+
+  test('a record of another move (how exit, then in place) is replaced, as it always was', async () => {
+    const dirs = lab()
+    const exit = machine.leftScript({ stateDir: dirs.state, id: dirs.id, how: 'exit', configDirs: [dirs.config], by: 'self-switch' })
+    const inPlace = machine.leftScript({ stateDir: dirs.state, id: dirs.id, how: 'in-place', configDirs: [dirs.config], by: 'coordinator', go: GO })
+    const ran = await both(dirs, exit, inPlace, false)
+    assert.equal(ran.b, `B:0:left ${dirs.id}:0`, ran.all)
+    const record = JSON.parse(readFileSync(join(dirs.state, 'left', `${dirs.id}.json`), 'utf8'))
+    assert.equal(record.how, 'in-place')
+    assert.equal(record.by, 'coordinator')
+  })
+})
+
+describe('the left record lock (S3 final)', { skip: !isWindows && 'Windows only', concurrency: false }, () => {
+  const GO = 'wu_abc123'
+  const lockOf = dirs => join(dirs.state, 'left', `${dirs.id}.lock`)
+  /** Holds writer A right after it has taken the lock, before it stats the transcript: a file says it holds it. */
+  const heldAfterLock = (script, gate, holding) => {
+    const line = "if ($null -eq $leftLock) { 'refused lock another writer held this record for 10 seconds'; exit 0 }"
+    const at = script.indexOf(line)
+    assert.ok(at > 0, 'the lock, taken')
+    const end = at + line.length
+    const hold = [`New-Item -ItemType File -Path '${holding}' -Force | Out-Null`, `$gate = New-Object Threading.EventWaitHandle($false, [Threading.EventResetMode]::ManualReset, '${gate}')`, '[void]$gate.WaitOne(60000)'].join('\r\n')
+    return `${script.slice(0, end)}\r\n${hold}${script.slice(end)}`
+  }
+
+  test("R2 (final): while writer A holds the lock, writer B waits, writing nothing: the earlier record stays; once A lets go, both say written and the coordinator's go stands", async () => {
+    const dirs = lab()
+    const stale = await write(machine.leftScript({ stateDir: dirs.state, id: dirs.id, how: 'exit', configDirs: [dirs.config], by: 'self-switch' }))
+    assert.equal(machine.LEFT_WRITTEN.exec(stale.stdout)?.[1], dirs.id, stale.stdout + stale.stderr)
+    const gate = `left-held-${randomUUID()}`
+    const holding = join(dirs.root, 'holding')
+    const a = join(dirs.root, 'a.ps1')
+    const b = join(dirs.root, 'b.ps1')
+    writeFileSync(a, heldAfterLock(machine.leftScript({ stateDir: dirs.state, id: dirs.id, how: 'in-place', configDirs: [dirs.config], by: 'self-switch' }), gate, holding))
+    writeFileSync(b, machine.leftScript({ stateDir: dirs.state, id: dirs.id, how: 'in-place', configDirs: [dirs.config], by: 'coordinator', go: GO }))
+    const record = join(dirs.state, 'left', `${dirs.id}.json`)
+    const script = [
+      "$ProgressPreference = 'SilentlyContinue'",
+      `function Start-Ps($file) { $i = New-Object Diagnostics.ProcessStartInfo('${POWERSHELL}', ('-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "' + $file + '"')); $i.UseShellExecute = $false; $i.CreateNoWindow = $true; $i.RedirectStandardOutput = $true; $i.RedirectStandardError = $true; return [Diagnostics.Process]::Start($i) }`,
+      `$gate = New-Object Threading.EventWaitHandle($false, [Threading.EventResetMode]::ManualReset, '${gate}')`,
+      `$pa = Start-Ps '${a}'`,
+      `$until = (Get-Date).AddSeconds(60); while (-not (Test-Path '${holding}') -and (Get-Date) -lt $until) { Start-Sleep -Milliseconds 20 }`,
+      `$pb = Start-Ps '${b}'`,
+      'Start-Sleep -Seconds 4',
+      '"B-WAITING:" + (-not $pb.HasExited)',
+      `"RECORD:" + (Get-Content -LiteralPath '${record}' -Raw | ConvertFrom-Json).how`,
+      '[void]$gate.Set()',
+      '$oa = $pa.StandardOutput.ReadToEnd(); $ea = $pa.StandardError.ReadToEnd(); $pa.WaitForExit()',
+      '$ob = $pb.StandardOutput.ReadToEnd(); $eb = $pb.StandardError.ReadToEnd(); $pb.WaitForExit()',
+      '"A:" + $pa.ExitCode + ":" + $oa.Trim() + ":" + ([regex]::Matches($ea, "S=.Error.")).Count',
+      '"B:" + $pb.ExitCode + ":" + $ob.Trim() + ":" + ([regex]::Matches($eb, "S=.Error.")).Count',
+    ].join('\r\n')
+    const ran = await write(script)
+    const all = ran.stdout + ran.stderr
+    assert.match(ran.stdout, /^B-WAITING:True\r?$/m, all)
+    assert.match(ran.stdout, /^RECORD:exit\r?$/m, all)
+    assert.match(ran.stdout, new RegExp(`^A:0:left ${dirs.id}:0\\r?$`, 'm'), all)
+    assert.match(ran.stdout, new RegExp(`^B:0:left ${dirs.id}:0\\r?$`, 'm'), all)
+    const final = JSON.parse(readFileSync(record, 'utf8'))
+    assert.equal(final.by, 'coordinator', all)
+    assert.equal(final.go, GO)
+    assert.ok(!existsSync(lockOf(dirs)), 'the lock is gone with its last holder')
+  })
+
+  /** Holds the lock from outside, sharing nothing, for `seconds`; resolves once it is held. */
+  async function hold(dirs, seconds) {
+    const held = join(dirs.root, `held-${randomUUID()}`)
+    mkdirSync(join(dirs.state, 'left'), { recursive: true })
+    const child = spawn(POWERSHELL, ['-NoProfile', '-NonInteractive', '-Command', `$s = [IO.FileStream]::new('${lockOf(dirs)}', 'OpenOrCreate', 'ReadWrite', 'None'); New-Item -ItemType File -Path '${held}' -Force | Out-Null; Start-Sleep -Seconds ${seconds}; $s.Dispose()`], { windowsHide: true, stdio: 'ignore' })
+    const until = Date.now() + 30_000
+    while (!existsSync(held) && Date.now() < until) await new Promise(resolve => setTimeout(resolve, 50))
+    assert.ok(existsSync(held), 'the outside holder took the lock')
+    return child
+  }
+
+  test('R2 (final): a holder that never lets go: the writer waits about 10 seconds, then answers refused lock, writing nothing', async () => {
+    const dirs = lab()
+    const child = await hold(dirs, 30)
+    try {
+      const started = Date.now()
+      const ran = await write(machine.leftScript({ stateDir: dirs.state, id: dirs.id, how: 'in-place', configDirs: [dirs.config], by: 'self-switch' }))
+      const took = Date.now() - started
+      assert.match(ran.stdout, /^refused lock another writer held this record for 10 seconds\s*$/m, ran.stdout + ran.stderr)
+      assert.ok(took > 8000, `it waited for the lock (${took} ms)`)
+      assert.ok(!existsSync(join(dirs.state, 'left', `${dirs.id}.json`)), 'nothing written')
+    } finally {
+      child.kill()
+    }
+  })
+
+  test('R2 (final): a holder that lets go within the wait: the writer takes the lock then, and writes', async () => {
+    const dirs = lab()
+    const child = await hold(dirs, 3)
+    try {
+      const ran = await write(machine.leftScript({ stateDir: dirs.state, id: dirs.id, how: 'in-place', configDirs: [dirs.config], by: 'self-switch' }))
+      assert.equal(machine.LEFT_WRITTEN.exec(ran.stdout)?.[1], dirs.id, ran.stdout + ran.stderr)
+    } finally {
+      child.kill()
+    }
+  })
+
+  test('R1 (final): a lock file an OS crash left behind, held by no one, is opened at once and deleted on close, never waited out', async () => {
+    const dirs = lab()
+    mkdirSync(join(dirs.state, 'left'), { recursive: true })
+    writeFileSync(lockOf(dirs), '')
+    const started = Date.now()
+    const ran = await write(machine.leftScript({ stateDir: dirs.state, id: dirs.id, how: 'in-place', configDirs: [dirs.config], by: 'self-switch' }))
+    assert.equal(machine.LEFT_WRITTEN.exec(ran.stdout)?.[1], dirs.id, ran.stdout + ran.stderr)
+    assert.ok(Date.now() - started < 8000, 'no wait for a lock no one holds')
+    assert.ok(!existsSync(lockOf(dirs)), 'the leftover is gone')
   })
 })
