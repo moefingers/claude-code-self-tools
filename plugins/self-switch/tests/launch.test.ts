@@ -41,6 +41,11 @@ import {
   SLOT_SCRIPT_SHA256,
   STDIN_BOOTSTRAP,
   wakePath,
+  PWSH_PATH,
+  pwshPath,
+  WRAPPER_SCRIPT_SHA256,
+  WRAPPER_SCRIPT_TEXT,
+  wrapperScriptPath,
 } from '../hooks/machine'
 import { decode, ELSEWHERE, ft, inSlot, LAUNCH, machine, NOW, PERMISSION_FLAGS, type RawProbe, REPO, T, W } from './fixtures'
 
@@ -163,10 +168,10 @@ describe('launch(): one powershellCall, the script on standard input', () => {
   })
 
   test('the window hands claude-launch.ps1 every config folder it read and the left record\'s stat, so its own last look is the same (F1)', () => {
-    expect(innerOf(launchScriptText(input()))).toContain('  & $launchPath -Resume $id -Dir $folder -ConfigDir $configDirs\r\n')
-    expect(innerOf(launchScriptText(input({ left: { exitAt: NOW - 60_000 } })))).toContain(`  & $launchPath -Resume $id -Dir $folder -ConfigDir $configDirs -LeftExitAt '${NOW - 60_000}'\r\n`)
-    expect(innerOf(launchScriptText(input({ left: { size: 4096, mtime: NOW - 1000 } })))).toContain(`  & $launchPath -Resume $id -Dir $folder -ConfigDir $configDirs -LeftSize '4096' -LeftMtime '${NOW - 1000}'\r\n`)
-    expect(innerOf(launchScriptText(START))).toContain('  & $launchPath -Start $id -Name $name -Dir $folder -ConfigDir $configDirs\r\n')
+    expect(innerOf(launchScriptText(input()))).toContain('  & $launchPath -Resume $id -Dir $folder -ConfigDir $configDirs -Wrapper\r\n')
+    expect(innerOf(launchScriptText(input({ left: { exitAt: NOW - 60_000 } })))).toContain(`  & $launchPath -Resume $id -Dir $folder -ConfigDir $configDirs -LeftExitAt '${NOW - 60_000}' -Wrapper\r\n`)
+    expect(innerOf(launchScriptText(input({ left: { size: 4096, mtime: NOW - 1000 } })))).toContain(`  & $launchPath -Resume $id -Dir $folder -ConfigDir $configDirs -LeftSize '4096' -LeftMtime '${NOW - 1000}' -Wrapper\r\n`)
+    expect(innerOf(launchScriptText(START))).toContain('  & $launchPath -Start $id -Name $name -Dir $folder -ConfigDir $configDirs -Wrapper\r\n')
     expect(innerOf(launchScriptText(input()))).toContain(`$configDirs = @('${CONFIG}', '${OTHER_CONFIG}')`)
   })
 
@@ -233,9 +238,45 @@ describe('launch(): one powershellCall, the script on standard input', () => {
     }
   })
 
+  test('the window\'s interpreter: PowerShell 7 at its standard path when it is there, else Windows PowerShell by its known path, chosen right before Start-Process', () => {
+    const script = SCRIPTS[0]?.[1] ?? ''
+    const lines = script.split('\r\n').map(line => line.trim())
+    const shell = lines.indexOf(`$windowShell = '${POWERSHELL}'`)
+    const path = lines.indexOf("if ($env:ProgramFiles) { $pwsh = $env:ProgramFiles.TrimEnd([char]92) + '\\PowerShell\\7\\pwsh.exe' }")
+    const rule = lines.indexOf("if ($null -ne $pwsh -and $pwsh -cmatch '^[A-Za-z]:\\\\[A-Za-z0-9_ -]{1,64}\\\\PowerShell\\\\7\\\\pwsh\\.exe\\z' -and (Test-Path -LiteralPath $pwsh -PathType Leaf)) { $windowShell = $pwsh }")
+    const start = lines.indexOf("$window = Start-Process -FilePath $windowShell -ArgumentList '-NoProfile', '-ExecutionPolicy', 'Bypass', '-EncodedCommand', $encoded -PassThru")
+    expect([shell > 0, path > shell, rule > path, start > rule]).toEqual([true, true, true, true])
+    // The rule's pattern is the machine code's PWSH_PATH, as POWERSHELL_PATH holds Windows PowerShell to its path.
+    expect(script).toContain(PWSH_PATH.source.replace(/\$$/, '\\z'))
+    expect(PWSH_PATH.test('C:\\Program Files\\PowerShell\\7\\pwsh.exe')).toBe(true)
+    expect(pwshPath('C:\\Program Files\\')).toBe('C:\\Program Files\\PowerShell\\7\\pwsh.exe')
+    for (const other of ['C:\\Program Files (x86)\\PowerShell\\7\\pwsh.exe', 'C:\\Program Files\\PowerShell\\6\\pwsh.exe', 'C:\\Program Files\\PowerShell\\7-preview\\pwsh.exe', 'pwsh.exe', 'C:\\a\\b\\PowerShell\\7\\pwsh.exe', "C:\\o'brien\\PowerShell\\7\\pwsh.exe", 'C:\\Program Files\\PowerShell\\7\\pwsh.exe.bak']) {
+      expect([other, PWSH_PATH.test(other)]).toEqual([other, false])
+    }
+    // Only a window chooses: this tab and a slot open nothing.
+    for (const script of [SCRIPTS[4]?.[1] ?? '', SCRIPTS[5]?.[1] ?? '']) expect(script).not.toContain('$windowShell')
+  })
+
+  test("a window's launch puts the claude wrapper's copy in place at its hash's name, never refused on; this tab and a slot don't", () => {
+    for (const where of [{ window: true } as const, 'auto' as const]) {
+      const script = launchScriptText(input({ where, waitForExit: { pid: 100, created: ft(1) }, now: NOW }))
+      expect(script).toContain(`$wrapperPath = '${wrapperScriptPath(STATE)}'`)
+      expect(script).toContain(`$wrapperCopy = '${asciiBase64(WRAPPER_SCRIPT_TEXT)}'`)
+      expect(script).toContain(`[void](Install-Launcher $wrapperPath $wrapperCopy '${WRAPPER_SCRIPT_SHA256}')`)
+      // After the launcher's own install, before the claim.
+      expect(script.indexOf('[void](Install-Launcher $wrapperPath')).toBeGreaterThan(script.indexOf('$installWhy = Install-Launcher $launchPath'))
+      expect(script.indexOf('[void](Install-Launcher $wrapperPath')).toBeLessThan(script.indexOf('"claim " + $by'))
+    }
+    expect(wrapperScriptPath(STATE)).toBe(`${STATE}\\claude-wrapper-${WRAPPER_SCRIPT_SHA256.slice(0, 8)}.ps1`)
+    expect(wrapperScriptPath(STATE)).not.toBe(`${STATE}\\claude-wrapper.ps1`)
+    expect(() => wrapperScriptPath(STATE, 'abc')).toThrow()
+    for (const script of [SCRIPTS[4]?.[1] ?? '', SCRIPTS[5]?.[1] ?? '']) expect(script).not.toContain('$wrapperCopy')
+  })
+
   test('Windows PowerShell by its known path, -ExecutionPolicy Bypass for the window alone (it pins claude-launch.ps1 by its hash), the window script compressed into a fixed bootstrap', () => {
     const script = SCRIPTS[0]?.[1] ?? ''
-    expect(script).toContain(`$window = Start-Process -FilePath '${POWERSHELL}' -ArgumentList '-NoProfile', '-ExecutionPolicy', 'Bypass', '-EncodedCommand', $encoded -PassThru`)
+    expect(script).toContain(`$windowShell = '${POWERSHELL}'`)
+    expect(script).toContain("$window = Start-Process -FilePath $windowShell -ArgumentList '-NoProfile', '-ExecutionPolicy', 'Bypass', '-EncodedCommand', $encoded -PassThru")
     expect(script).not.toContain('RemoteSigned')
     expect(script).not.toContain('$PSHOME')
     expect(script).toContain('$gzip = [IO.Compression.GZipStream]::new($packed, [IO.Compression.CompressionMode]::Compress)')

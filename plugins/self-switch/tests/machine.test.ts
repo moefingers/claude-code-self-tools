@@ -1142,8 +1142,9 @@ describe('the scripts, as text', () => {
   test('no permission flag of any kind, in any script', () => {
     for (const script of [probe, restart, window, release]) for (const flag of PERMISSION_FLAGS) expect(script).not.toContain(flag)
     // claude-launch.ps1 runs with -Resume and the id, -Dir and the folder, -ConfigDir and the config folders
-    // the launch read (its own last look reads them again), and nothing else.
-    for (const script of [restart, window]) expect(script.split(/\r?\n/).filter(line => line.includes('& $launchPath'))).toEqual(['  & $launchPath -Resume $id -Dir $folder -ConfigDir $configDirs'])
+    // the launch read (its own last look reads them again), and -Wrapper (claude through the claude
+    // wrapper's verified copy, so later moves come back in that window), and nothing else.
+    for (const script of [restart, window]) expect(script.split(/\r?\n/).filter(line => line.includes('& $launchPath'))).toEqual(['  & $launchPath -Resume $id -Dir $folder -ConfigDir $configDirs -Wrapper'])
   })
 
   test('the release removes the lock only when it names the claimant', () => {

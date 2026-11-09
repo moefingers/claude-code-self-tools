@@ -5,6 +5,13 @@
 #
 #   . "$env:LOCALAPPDATA\claude-self-tools\claude-wrapper.ps1"
 #
+# That is for the `claude` you type. A window that self-restart or self-switch opens needs none of it:
+# the plugins carry this same file, pinned by its SHA-256 (WRAPPER_SCRIPT_SHA256), put it beside
+# claude-launch.ps1 as claude-wrapper-<the first 8 hex digits of that SHA-256>.ps1, and the window's
+# claude-launch.ps1 -Wrapper runs claude through that copy, checked byte for byte, whatever the execution
+# policy. Your copy here is never read by a launch. Both write the same pane file (version 3) and read the
+# same ticket (version 1).
+#
 # What it does:
 # - It runs the real claude.exe with your arguments, in this tab, and waits for it, as before.
 # - It gives this run a fresh token, CLAUDE_PANE_TOKEN, which claude inherits, and writes a pane file,

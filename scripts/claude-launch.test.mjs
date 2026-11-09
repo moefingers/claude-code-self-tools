@@ -4,10 +4,15 @@
 // never named; its argument checks before anything changes; -Lane through lanes.json, saying which
 // conversation; its own last look (RECHECK and LEFT_RECHECK, line for line), by hand too, against a
 // holder the stub plays. And a scan: nothing else in the repository starts
-// claude but the claude wrapper, the person's own `claude`; the slot runner goes through this script. Then, on Windows, it runs for real in Windows PowerShell 5.1 and PowerShell 7 against
+// claude but the claude wrapper, the person's own `claude`; the slot runner goes through this script.
+// -Wrapper: the claude wrapper's copy the machine code carries (WRAPPER_SCRIPT_TEXT, the tools/ file byte
+// for byte, pinned by WRAPPER_SCRIPT_SHA256 and by the script's own $WrapperSha256), checked by its bytes
+// and run from them, before the last look. Then, on Windows, it runs for real in Windows PowerShell 5.1 and PowerShell 7 against
 // the stub claude.exe (scripts/claude-wrapper-stub.cs, compiled into a temporary folder), whose
-// USERPROFILE, LOCALAPPDATA and CLAUDE_CONFIG_DIR are temporary folders, and faults are planted in a
-// copy of the script, each caught. Run with `node --test "scripts/*.test.mjs"`.
+// USERPROFILE, LOCALAPPDATA and CLAUDE_CONFIG_DIR are temporary folders and whose PATH holds no claude
+// (stub.mjs's fence), with and without the wrapper's copy, and under a Restricted execution policy set
+// for the process alone; and faults are planted in a copy of the script, each caught. Run with
+// `node --test "scripts/*.test.mjs"`.
 import assert from 'node:assert/strict'
 import { spawn, spawnSync } from 'node:child_process'
 import { createHash, randomUUID } from 'node:crypto'
@@ -16,13 +21,16 @@ import { tmpdir } from 'node:os'
 import { join, relative } from 'node:path'
 import { after, before, describe, test } from 'node:test'
 import { pathToFileURL } from 'node:url'
-import { compileStub, holder, stubWork } from './stub.mjs'
+import { compileStub, fence, holder, stubWork } from './stub.mjs'
 import { ROOT } from './sync-shared.mjs'
 
 const LAUNCH = join(ROOT, 'plugins', 'self-switch', 'slot', 'claude-launch.ps1')
 const bytes = readFileSync(LAUNCH)
 const script = bytes.toString('utf8')
 const machine = await import(pathToFileURL(join(ROOT, 'shared', 'hooks', 'machine.ts')).href)
+const WRAPPER = join(ROOT, 'tools', 'claude-wrapper', 'claude-wrapper.ps1')
+const wrapperBytes = readFileSync(WRAPPER)
+const sha256 = data => createHash('sha256').update(data).digest('hex')
 
 const isWindows = process.platform === 'win32'
 const SYSTEM_ROOT = process.env.SystemRoot ?? 'C:\\Windows'
@@ -136,6 +144,63 @@ test('its last look is RECHECK and LEFT_RECHECK, line for line, as the window an
   assert.ok(script.includes("  if ($null -ne $why) { Stop-Launch ('conversation ' + $lookId + ' is not run here, so that two copies never write it: ' + $why + '.') }"))
 })
 
+test("the claude wrapper's copy (WRAPPER_SCRIPT_TEXT) is tools/claude-wrapper/claude-wrapper.ps1 byte for byte, pinned by WRAPPER_SCRIPT_SHA256 and by the script's own $WrapperSha256", () => {
+  assert.equal(machine.WRAPPER_SCRIPT_TEXT, wrapperBytes.toString('utf8'), 'run `node scripts/embed-launch.mjs` after an edit to the wrapper')
+  assert.equal(sha256(wrapperBytes), machine.WRAPPER_SCRIPT_SHA256)
+  assert.ok(wrapperBytes.every(b => b < 128) && !wrapperBytes.includes(13), 'ASCII with LF line ends, so its hash is of that')
+  assert.equal(script.match(/^\$WrapperSha256 = '([0-9a-f]{64})'$/m)?.[1], machine.WRAPPER_SCRIPT_SHA256)
+  assert.equal(Buffer.from(machine.asciiBase64(machine.WRAPPER_SCRIPT_TEXT), 'base64').toString('utf8'), machine.WRAPPER_SCRIPT_TEXT)
+  // Its own name beside the launcher, by its hash; never the person's claude-wrapper.ps1.
+  const state = ['C:', 'x', 'claude-self-tools'].join('\\')
+  assert.equal(machine.wrapperScriptPath(state), `${state}\\claude-wrapper-${machine.WRAPPER_SCRIPT_SHA256.slice(0, 8)}.ps1`)
+  assert.ok(script.includes("$wrapperPath = Join-Path $env:LOCALAPPDATA ('claude-self-tools\\claude-wrapper-' + $WrapperSha256.Substring(0, 8) + '.ps1')"))
+  const code = script.split('\n').filter(line => !line.trimStart().startsWith('#')).join('\n')
+  assert.ok(!code.includes('claude-wrapper.ps1'), "the person's own copy is never named in code")
+  assert.throws(() => machine.wrapperScriptPath(state, 'not-a-sha'), /not a SHA-256/)
+  // The formats a window's copy and a profile's copy share: it writes the pane file of PANE_VERSION (3), and
+  // reads the ticket of version 1 the plugins write (paneTicket), with its config folders and left record.
+  assert.equal(machine.PANE_VERSION, 3)
+  assert.ok(machine.WRAPPER_SCRIPT_TEXT.includes(`[ordered]@{ v = ${machine.PANE_VERSION}; pid = $PID; started = $started }`))
+  assert.ok(machine.WRAPPER_SCRIPT_TEXT.includes("elseif (-not ((& $isNumber $t.v) -and $t.v -eq 1)) { 'it is not version 1' }"))
+  assert.equal(JSON.parse(machine.paneTicket({ token: '00000000-0000-4000-8000-000000000000', resume: '00000000-0000-4000-8000-000000000001', by: 'launch:00000000-0000-4000-8000-000000000002', dir: state, at: 1, configDirs: [state] })).v, 1)
+})
+
+test("the wrapper's top level defines its claude function and nothing else, so loading it changes nothing until claude is called", () => {
+  const lines = wrapperBytes.toString('utf8').split('\n')
+  const open = lines.indexOf('function claude {')
+  const close = lines.lastIndexOf('}')
+  assert.ok(open > 0 && close > open)
+  assert.deepEqual(lines.slice(0, open).filter(line => line !== '' && !line.startsWith('#')), [])
+  assert.deepEqual(lines.slice(close + 1).filter(line => line !== ''), [])
+})
+
+test("-Wrapper: the copy's bytes read once, their SHA-256 checked, the function made from those same bytes (no file dot-sourced, no policy asked), before the last look; claude through it after the environment; said when it isn't used", () => {
+  const read = script.indexOf('try { $wrapperBytes = [IO.File]::ReadAllBytes($wrapperPath) }')
+  const hash = script.indexOf('$wrapperGot = [BitConverter]::ToString($hasher.ComputeHash($wrapperBytes))')
+  const compare = script.indexOf('if ($wrapperGot -cne $WrapperSha256)')
+  const load = script.indexOf('. ([scriptblock]::Create([Text.Encoding]::UTF8.GetString($wrapperBytes)))')
+  const look = script.indexOf('  $why = Get-Live $lookId $lookIn')
+  const clear = script.indexOf('foreach ($n in $Clear)')
+  const via = script.indexOf('if ($Wrapper -and $null -eq $wrapperWhy) {')
+  const said = script.indexOf("if ($Wrapper) { Write-Host ('claude-launch: ' + $wrapperWhy + '. Claude starts directly, so a restart from this session opens a new window.') }")
+  const direct = script.indexOf('if ($Resume) { & $exe --resume $Resume }')
+  assert.ok(read > 0 && read < hash && hash < compare && compare < load, 'read, hashed, compared, then loaded')
+  assert.ok(load < look && look < clear && clear < via && via < said && said < direct, 'loaded before the last look; run through after the environment; said before a direct start')
+  assert.equal(script.split('ReadAllBytes($wrapperPath)').length - 1, 1, 'read once')
+  // Never by its path: a file dot-sourced asks the execution policy, and could change between the check and the run.
+  const code = script.split('\n').filter(line => !line.trimStart().startsWith('#'))
+  assert.deepEqual(code.filter(line => /(^|[;{]\s*)\.\s+[$'"]/.test(line.trim())), [], 'no file is dot-sourced')
+  assert.deepEqual(code.filter(line => /Invoke-Expression|\biex\b|Import-Module/.test(line)), [])
+  const runs = code.filter(line => /\{ claude( |\s*\})/.test(line))
+  assert.deepEqual(runs.map(line => line.trim()), ['if ($Resume) { claude --resume $Resume }', 'elseif ($Start) { claude --session-id $Start --name $Name }', 'else { claude }'])
+  for (const flag of ['--permission-mode', '--dangerously-skip-permissions', 'bypassPermissions']) assert.ok(!script.includes(flag))
+  // The wrapper runs as from a prompt: this script's Stop is lifted first. A native exit code is never an error here.
+  assert.ok(script.slice(via, said).includes("  $ErrorActionPreference = 'Continue'\n"))
+  assert.ok(script.includes('$PSNativeCommandUseErrorActionPreference = $false\n'))
+  // A slot runner never asks for it: it has its own loop.
+  assert.ok(!readFileSync(join(ROOT, 'plugins', 'self-switch', 'slot', 'claude-slot.ps1'), 'utf8').includes('-Wrapper'))
+})
+
 /** Every file of the repository that could start claude: scripts, the plugins' hooks, the tools. */
 function sources(dir = ROOT) {
   return readdirSync(dir).flatMap(name => {
@@ -149,11 +214,14 @@ function sources(dir = ROOT) {
 test('nothing but claude-launch.ps1 starts claude, but the claude wrapper; the slot runner runs it; each list of what to clear is the one list', () => {
   const starters = []
   for (const path of sources()) {
-    // The machine code carries claude-launch.ps1 itself (LAUNCH_SCRIPT_TEXT), byte for byte (the next
-    // test): the same starter, not another. Everything else in it is scanned.
-    const whole = readFileSync(path, 'utf8')
-    const from = whole.indexOf('export const LAUNCH_SCRIPT_TEXT = [')
-    const text = from === -1 ? whole : whole.slice(0, from) + whole.slice(whole.indexOf("].join('\\n')", from))
+    // The machine code carries claude-launch.ps1 itself (LAUNCH_SCRIPT_TEXT) and the claude wrapper
+    // (WRAPPER_SCRIPT_TEXT), byte for byte (the tests above): the same starters, not others. Everything
+    // else in it is scanned.
+    let text = readFileSync(path, 'utf8')
+    for (const name of ['LAUNCH_SCRIPT_TEXT', 'WRAPPER_SCRIPT_TEXT']) {
+      const from = text.indexOf(`export const ${name} = [`)
+      if (from !== -1) text = text.slice(0, from) + text.slice(text.indexOf("].join('\\n')", from))
+    }
     const code = text
       .split('\n')
       .filter(line => !/^\s*(#|\/\/|\*)/.test(line))
@@ -238,14 +306,24 @@ function envOf(dirs, extra = {}) {
   for (const name of ['USERPROFILE', 'LOCALAPPDATA', 'CLAUDE_CONFIG_DIR']) {
     if (typeof env[name] !== 'string' || !env[name].startsWith(work)) throw new Error(`${name} must be in the test's temporary folder`)
   }
+  fence(env, work)
   return env
 }
 
-/** The script run as a window runs it, -ExecutionPolicy Bypass (here by -File), in envOf's environment. */
-function run(shell, dirs, args, { script: path = LAUNCH, extra = {} } = {}) {
+/**
+ * The script run as a window runs it, -ExecutionPolicy Bypass (here by -File), in envOf's environment;
+ * or, with `restricted`, under -ExecutionPolicy Restricted for this process alone, the script made a
+ * script block from its text (a file can't run under Restricted), as the window's own bootstrap runs one.
+ * Its exit code, output, the claude runs the stub logged, and the shell's own pid.
+ */
+function run(shell, dirs, args, { script: path = LAUNCH, extra = {}, restricted = false } = {}) {
   const env = envOf(dirs, extra)
+  const argv = restricted
+    ? ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Restricted', '-Command', `& ([scriptblock]::Create([IO.File]::ReadAllText('${path}'))) ${args.map(arg => (arg.startsWith('-') ? arg : `'${arg}'`)).join(' ')}`]
+    : ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', path, ...args]
+  if (restricted) assert.ok(![path, ...args].some(arg => arg.includes("'")), 'no quote in a value spliced into the command')
   return new Promise(resolve => {
-    const child = spawn(shell, ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', path, ...args], { env, cwd: dirs.start, windowsHide: true })
+    const child = spawn(shell, argv, { env, cwd: dirs.start, windowsHide: true })
     let stdout = ''
     child.stdout.on('data', chunk => (stdout += chunk))
     child.stderr.on('data', chunk => (stdout += chunk))
@@ -254,9 +332,59 @@ function run(shell, dirs, args, { script: path = LAUNCH, extra = {} } = {}) {
       clearTimeout(timer)
       const log = join(dirs.root, 'log.jsonl')
       const runs = existsSync(log) ? readFileSync(log, 'utf8').split('\n').filter(Boolean).map(line => JSON.parse(line)) : []
-      resolve({ code, stdout, runs })
+      resolve({ code, stdout, runs, pid: child.pid })
     })
   })
+}
+
+/** The claude wrapper's copy in a lab, where a launch that opens a window puts it: `text` (the carried copy, unless a fault is planted) under the name of `sha`. */
+function placeWrapper(dirs, text = machine.WRAPPER_SCRIPT_TEXT, sha = machine.WRAPPER_SCRIPT_SHA256) {
+  const path = machine.wrapperScriptPath(join(dirs.local, 'claude-self-tools'), sha)
+  mkdirSync(join(dirs.local, 'claude-self-tools'), { recursive: true })
+  writeFileSync(path, text)
+  return path
+}
+
+/** The pane file's start and its process's, 1 ms apart at most, as the plugins compare them. */
+const near = (a, b) => {
+  const apart = BigInt(a) - BigInt(b)
+  return apart <= 10_000n && apart >= -10_000n
+}
+
+/**
+ * What a launch through the claude wrapper must look like in claude's process, beside launched()'s: claude
+ * runs right under the PowerShell that ran the script (`shell`, process `pid`), with a fresh
+ * CLAUDE_PANE_TOKEN, not the one inherited, and the wrapper's pane file (version 3) naming that PowerShell
+ * by its id and start; everything else of the launch environment as without it.
+ */
+function throughWrapper(result, args, cwd, shell) {
+  const found = launched({ ...result, runs: result.runs.map(r => ({ ...r, env: r.env.filter(name => name !== 'CLAUDE_PANE_TOKEN') })) }, args, cwd)
+  const check = (ok, what) => {
+    if (!ok) found.push(what)
+  }
+  const [only] = result.runs
+  if (only === undefined) return found
+  check(only.parent?.pid === result.pid, `claude.exe's parent is the PowerShell that ran the launch (${only.parent?.pid}, the shell ${result.pid})`)
+  check(only.parent?.path?.toLowerCase() === shell.toLowerCase(), `that PowerShell is ${shell} (${only.parent?.path})`)
+  check(only.env.includes('CLAUDE_PANE_TOKEN') && typeof only.token === 'string' && only.token !== '00000000-0000-4000-a000-0000000000ff', `claude carries a fresh CLAUDE_PANE_TOKEN (${only.token})`)
+  const pane = only.pane === null ? undefined : machine.parsePane(only.pane)
+  check(pane !== undefined && !('why' in pane) && pane.v === 3, `the pane file is written, version 3 (${only.pane})`)
+  if (pane !== undefined && !('why' in pane) && only.parent) {
+    check(pane.pid === only.parent.pid, `the pane file names claude.exe's parent (${pane.pid})`)
+    check(near(pane.started, only.parent.created), `the pane file's start is that process's (${pane.started}, ${only.parent.created})`)
+  }
+  check(!result.stdout.includes('the claude wrapper is not used'), `nothing says the wrapper is not used (${result.stdout.slice(0, 300)})`)
+  return found
+}
+
+/** A direct start with -Wrapper: claude.exe as without it (no token, no pane file), and one line saying why. */
+function directSaid(result, args, why) {
+  const found = launched(result, args, undefined)
+  const [only] = result.runs
+  if (only !== undefined && (only.token !== null || only.pane !== null)) found.push(`no token and no pane file (${only.token}, ${only.pane})`)
+  const said = result.stdout.split(/\r?\n/).filter(line => line.startsWith('claude-launch: the claude wrapper is not used: '))
+  if (said.length !== 1 || !why.test(said[0]) || !said[0].endsWith('. Claude starts directly, so a restart from this session opens a new window.')) found.push(`one line says why it is not used (${JSON.stringify(said)})`)
+  return found
 }
 
 /** What a launch must look like in claude's process: the args, the folder, the environment. */
@@ -475,6 +603,46 @@ describe('claude-launch.ps1, run for real against the stub', { skip: !isWindows 
         assert.equal(result.runs.length, 1)
         assert.equal(result.runs[0].exe, join(bin, 'claude.exe'))
       })
+
+      test('-Resume -Wrapper: claude --resume <id> through the wrapper\'s verified copy, right under this PowerShell, a fresh token and its pane file; the launch environment as ever, NO_COLOR cleared', async () => {
+        const dirs = lab()
+        placeWrapper(dirs)
+        const id = randomUUID()
+        assert.deepEqual(throughWrapper(await run(shell, dirs, ['-Resume', id, '-Dir', dirs.work, '-Wrapper']), ['--resume', id], dirs.work, shell), [])
+      })
+
+      test('-Start -Wrapper and -Lane -Wrapper: every mode a window or a person runs goes through it', async () => {
+        const dirs = lab()
+        placeWrapper(dirs)
+        const id = randomUUID()
+        assert.deepEqual(throughWrapper(await run(shell, dirs, ['-Start', id, '-Name', 'lane-x', '-Dir', dirs.work, '-Wrapper']), ['--session-id', id, '--name', 'lane-x'], dirs.work, shell), [])
+        const lane = lab()
+        placeWrapper(lane)
+        const other = randomUUID()
+        writeFileSync(join(lane.config, 'lanes.json'), JSON.stringify({ v: 1, at: Date.now(), lanes: { 'lane-w': { session: other, folder: lane.work, ws: 'default', at: Date.now() } } }))
+        assert.deepEqual(throughWrapper(await run(shell, lane, ['-Lane', 'lane-w', '-Wrapper']), ['--resume', other], lane.work, shell), [])
+      })
+
+      test('-Wrapper with no verified copy, or one changed since: claude starts directly, and one line says why', async () => {
+        const id = randomUUID()
+        const none = lab()
+        assert.deepEqual(directSaid(await run(shell, none, ['-Resume', id, '-Wrapper']), ['--resume', id], /its verified copy is not at .+claude-wrapper-[0-9a-f]{8}\.ps1 \(a launch that opens a window puts it there\)\. /), [])
+        const changed = lab()
+        placeWrapper(changed, `${machine.WRAPPER_SCRIPT_TEXT}# one line more\n`)
+        assert.deepEqual(directSaid(await run(shell, changed, ['-Resume', id, '-Wrapper']), ['--resume', id], /does not have the SHA-256 this launcher pins \(it was changed after the launch put it there\)\. /), [])
+        // The person's own copy, beside it under the name the README gives, is never read.
+        const theirs = lab()
+        mkdirSync(join(theirs.local, 'claude-self-tools'), { recursive: true })
+        writeFileSync(join(theirs.local, 'claude-self-tools', 'claude-wrapper.ps1'), machine.WRAPPER_SCRIPT_TEXT)
+        assert.deepEqual(directSaid(await run(shell, theirs, ['-Resume', id, '-Wrapper']), ['--resume', id], /its verified copy is not at /), [])
+      })
+
+      test('-Wrapper under a Restricted execution policy, set for this process alone: the copy loads all the same (its bytes, never a script file)', async () => {
+        const dirs = lab()
+        placeWrapper(dirs)
+        const id = randomUUID()
+        assert.deepEqual(throughWrapper(await run(shell, dirs, ['-Resume', id, '-Dir', dirs.work, '-Wrapper'], { restricted: true }), ['--resume', id], dirs.work, shell), [])
+      })
     })
   }
 })
@@ -521,6 +689,42 @@ describe('planted faults in claude-launch.ps1, each caught', { skip: !isWindows 
   test('CLAUDE_PANE_TOKEN no longer dropped: a session resumed here inherits the tab\'s token (N1)', async () => {
     assert.notDeepEqual(await resume(planted("$Drop = 'PSExecutionPolicyPreference', 'CLAUDE_PANE_TOKEN'\n", "$Drop = 'PSExecutionPolicyPreference'\n")), [])
   })
+  const wrapped = async (path, { place = dirs => placeWrapper(dirs), restricted = false } = {}) => {
+    const dirs = lab()
+    place(dirs)
+    const id = randomUUID()
+    return throughWrapper(await run(shell, dirs, ['-Resume', id, '-Dir', dirs.work, '-Wrapper'], { script: path, restricted }), ['--resume', id], dirs.work, shell)
+  }
+  const VIA = 'if ($Wrapper -and $null -eq $wrapperWhy) {'
+  const SAID = "if ($Wrapper) { Write-Host ('claude-launch: ' + $wrapperWhy + '. Claude starts directly, so a restart from this session opens a new window.') }\n"
+  const LOAD = '. ([scriptblock]::Create([Text.Encoding]::UTF8.GetString($wrapperBytes)))'
+
+  test('no wrapper use: -Wrapper given, the copy loaded, and claude.exe run directly all the same', async () => {
+    assert.notDeepEqual(await wrapped(planted(VIA, 'if ($false) {')), [])
+  })
+  test('the fallback silent: no copy, a direct start, and nothing said', async () => {
+    const dirs = lab()
+    const id = randomUUID()
+    assert.notDeepEqual(directSaid(await run(shell, dirs, ['-Resume', id, '-Wrapper'], { script: planted(SAID, '') }), ['--resume', id], /its verified copy is not at /), [])
+  })
+  test('the hash check skipped: a copy changed since the launch put it there is run', async () => {
+    const dirs = lab()
+    placeWrapper(dirs, `${machine.WRAPPER_SCRIPT_TEXT}# one line more\n`)
+    const id = randomUUID()
+    assert.notDeepEqual(directSaid(await run(shell, dirs, ['-Resume', id, '-Wrapper'], { script: planted('if ($wrapperGot -cne $WrapperSha256)', 'if ($false)') }), ['--resume', id], /does not have the SHA-256/), [])
+  })
+  test('the token dropped: a wrapper copy that gives claude no CLAUDE_PANE_TOKEN (pinned as its own)', async () => {
+    const TOKEN = '    $env:CLAUDE_PANE_TOKEN = $token\n'
+    assert.ok(machine.WRAPPER_SCRIPT_TEXT.includes(TOKEN))
+    const faulty = machine.WRAPPER_SCRIPT_TEXT.replace(TOKEN, '')
+    const faultySha = sha256(faulty)
+    const path = planted(`$WrapperSha256 = '${machine.WRAPPER_SCRIPT_SHA256}'`, `$WrapperSha256 = '${faultySha}'`)
+    assert.notDeepEqual(await wrapped(path, { place: dirs => placeWrapper(dirs, faulty, faultySha) }), [])
+  })
+  test('the copy dot-sourced by its path: under a Restricted policy it does not load', async () => {
+    assert.notDeepEqual(await wrapped(planted(LOAD, '. $wrapperPath'), { restricted: true }), [])
+  })
+
   test('the environment block placed before a later step that sets a marker again (a profile, say)', async () => {
     // The block moved above the folder and claude's path, and a marker set after it: claude inherits it.
     const block = "foreach ($n in $Clear) { [Environment]::SetEnvironmentVariable($n, [NullString]::Value, [EnvironmentVariableTarget]::Process) }\n"

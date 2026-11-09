@@ -4,7 +4,10 @@
 // hidden Windows PowerShell exactly as the window runs it (the same bootstrap, -ExecutionPolicy Bypass),
 // against claude-launch.ps1 and the stub. Temporary folders only (USERPROFILE, LOCALAPPDATA and the
 // config folder), and never a window: no test lets a script reach Start-Process, and each script run
-// here has it replaced by a throw besides, so a fault can only fail a test. Run with
+// here has it replaced by a throw besides, or by a function that only records what the window would
+// have been started with (recordWindow), so a fault can only fail a test. The last part runs a window's
+// launch from end to end, its recorded command run hidden here: PowerShell 7 or 5.1 by the rule, the
+// claude wrapper's verified copy, and a restart taken in the same window. Run with
 // `node --test "scripts/*.test.mjs"`.
 import assert from 'node:assert/strict'
 import { spawn } from 'node:child_process'
@@ -15,7 +18,7 @@ import { join } from 'node:path'
 import { after, before, describe, test } from 'node:test'
 import { pathToFileURL } from 'node:url'
 import { gzipSync } from 'node:zlib'
-import { compileStub, fence, holder, noWindow, underStub, WINDOWS_POWERSHELL, stubWork } from './stub.mjs'
+import { compileStub, fence, holder, noWindow, recordWindow, underStub, WINDOWS_POWERSHELL, stubWork } from './stub.mjs'
 import { ROOT } from './sync-shared.mjs'
 
 const machine = await import(pathToFileURL(join(ROOT, 'shared', 'hooks', 'machine.ts')).href)
@@ -456,4 +459,181 @@ describe('S3: the window waits for the old process by its handle, keeps waiting,
     await runWindow(fine.inner, fine.dirs)
     assert.ok(!existsSync(machine.refusedPath(fine.dirs.state, fine.input.id)), 'none for a run that resumed')
   })
+})
+
+// ---------------------------------------------------------------------------------------------
+// A window's launch from end to end: the launch script run under the stub as a restart runs it (it waits
+// for its caller), its Start-Process a recording function (stub.mjs's recordWindow: it opens nothing), and
+// then the very command the window would have been started with, run here hidden: the interpreter the
+// launch chose, the window script, claude-launch.ps1 -Wrapper, the claude wrapper's verified copy the
+// launch put in place, and the stub as claude. The stub, as self-restart would, runs the probe under itself
+// and leaves the wrapper a ticket, so the restart from that window is taken in that window.
+
+const PWSH = join(process.env.ProgramFiles ?? 'C:\\Program Files', 'PowerShell', '7', 'pwsh.exe')
+const hasPwsh = existsSync(PWSH)
+/** The token a ticket is built with before the stub puts the tab's own in its place. */
+const PLACEHOLDER = '00000000-0000-4000-8000-000000000000'
+
+/** The launch of a window that resumes `id` in its folder, run under the stub, its Start-Process recorded: the answer, the input, and what the window was given. */
+async function launchWindow(dirs, id, extra) {
+  const record = join(dirs.root, 'window.json')
+  let input
+  const ran = await underStub({
+    stub,
+    work,
+    env: envOf(dirs, extra),
+    script: self => {
+      input = launchInput(dirs, { id, waitForExit: { pid: self.pid, created: self.created }, now: Date.now(), deadline: Date.now() + 60_000, tool: 'self-restart' })
+      return recordWindow(machine.launchScriptText(input), record)
+    },
+  })
+  return { ran, input, answer: machine.parseLaunch(ran.stdout), window: existsSync(record) ? JSON.parse(readFileSync(record, 'utf8')) : undefined }
+}
+
+/** The recorded window's command run here, hidden, as Start-Process would have started it; its Enter prompts answered. */
+function openRecorded(window, dirs, extra) {
+  const env = envOf(dirs, extra)
+  return new Promise(resolve => {
+    const child = spawn(window.file, window.args, { env, cwd: dirs.root, windowsHide: true })
+    let out = ''
+    child.stdout.on('data', chunk => (out += chunk))
+    child.stderr.on('data', chunk => (out += chunk))
+    const timer = setTimeout(() => child.kill(), 120_000)
+    child.on('close', code => {
+      clearTimeout(timer)
+      resolve({ code, out, runs: runsOf(dirs), pid: child.pid })
+    })
+    child.stdin.end('\r\n\r\n\r\n')
+  })
+}
+
+/**
+ * A restart's window, end to end: `programFiles` (the real one, or a folder with no PowerShell 7 in it),
+ * `restricted` (a Restricted execution policy for these processes alone), `copy` ('ok', 'missing',
+ * 'changed': the wrapper's copy as the launch left it, or not), `ticket` (the stub leaves the wrapper a
+ * ticket for the same conversation, as self-restart would).
+ */
+async function windowRun({ programFiles = 'real', restricted = false, copy = 'ok', ticket = true } = {}) {
+  const dirs = lab()
+  const id = randomUUID()
+  const other = randomUUID()
+  const otherFolder = join(dirs.root, 'other folder')
+  mkdirSync(otherFolder)
+  for (const [conversation, folder] of [
+    [id, dirs.folder],
+    [other, otherFolder],
+  ]) {
+    mkdirSync(join(dirs.config, 'projects', machine.projectName(folder)), { recursive: true })
+    writeFileSync(join(dirs.config, 'projects', machine.projectName(folder), `${conversation}.jsonl`), '')
+  }
+  // Windows sets a 64-bit process's ProgramFiles from ProgramW6432 when it starts: both point at the folder.
+  const noPwsh = programFiles === 'real' ? undefined : mkdtempSync(join(work, 'no-pwsh-'))
+  const extra = {
+    ...(noPwsh === undefined ? {} : { ProgramFiles: noPwsh, ProgramW6432: noPwsh }),
+    ...(restricted ? { PSExecutionPolicyPreference: 'Restricted' } : {}),
+  }
+  const launched = await launchWindow(dirs, id, extra)
+  const wrapperCopy = machine.wrapperScriptPath(dirs.state)
+  const installed = existsSync(wrapperCopy) ? readFileSync(wrapperCopy) : undefined
+  if (copy === 'missing') rmSync(wrapperCopy, { force: true })
+  if (copy === 'changed') writeFileSync(wrapperCopy, `${machine.WRAPPER_SCRIPT_TEXT}# one line more\n`)
+  // The stub, as self-restart would: the probe under itself, then a ticket for the wrapper.
+  const plan = join(dirs.root, 'plan')
+  mkdirSync(plan)
+  if (ticket) {
+    const built = JSON.parse(machine.paneTicket({ token: PLACEHOLDER, resume: id, by: launched.input.claim, dir: dirs.folder, at: 1, configDirs: [dirs.config] }))
+    writeFileSync(join(plan, '1.json'), JSON.stringify({ ...built, token: '{TOKEN}', at: '{NOW}' }))
+  }
+  const probeIn = join(dirs.root, 'probe.ps1')
+  writeFileSync(probeIn, machine.probeScript({ ids: [id, other], configDirs: [dirs.config] }))
+  const call = machine.powershellCall(WINDOWS_POWERSHELL, '')
+  const stubExtra = { STUB_PLAN: plan, STUB_CHILD_EXE: call.argv[0], STUB_CHILD_ARGS: call.argv.slice(1).join(' '), STUB_CHILD_STDIN: probeIn, STUB_CHILD_OUT: join(dirs.root, 'probe-{RUN}.out'), STUB_CHILD_ERR: join(dirs.root, 'probe-{RUN}.err') }
+  const opened = launched.window === undefined ? undefined : await openRecorded(launched.window, dirs, { ...extra, ...stubExtra })
+  const probeOf = n => {
+    const path = join(dirs.root, `probe-${n}.out`)
+    return existsSync(path) ? machine.parseProbe(readFileSync(path, 'utf8')) : { error: 'no probe output' }
+  }
+  return { dirs, id, other, otherFolder, launched, installed, opened, probeOf }
+}
+
+/** Two FILETIMEs within 1 ms, as the plugins compare a pane file's start with its process's. */
+const nearTicks = (a, b) => BigInt(a) - BigInt(b) <= 10_000n && BigInt(b) - BigInt(a) <= 10_000n
+
+describe("a window's launch, end to end: the interpreter it chose, the wrapper's verified copy, and the restart from it in the same window", { skip: !isWindows && 'Windows only', concurrency: 2 }, () => {
+  test(`PowerShell 7 at its standard path${hasPwsh ? '' : ' (not on this machine: Windows PowerShell)'}: the window runs in it, claude right under it through the wrapper, and its restart comes back in it (pane)`, async () => {
+    const r = await windowRun()
+    const shell = hasPwsh ? PWSH : WINDOWS_POWERSHELL
+    assert.equal(r.launched.answer.launched?.transport, 'window', r.launched.ran.stdout + r.launched.ran.stderr)
+    // (c) The interpreter rule, and the command as ever: -NoProfile, Bypass for the window's scripts, the fixed bootstrap.
+    assert.equal(r.launched.window.file.toLowerCase(), shell.toLowerCase())
+    assert.deepEqual(r.launched.window.args.slice(0, 4), ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-EncodedCommand'])
+    // The wrapper's copy put in place by the launch, at its hash's name, byte for byte.
+    assert.equal(r.installed?.toString('utf8'), machine.WRAPPER_SCRIPT_TEXT)
+    assert.equal(createHash('sha256').update(r.installed).digest('hex'), machine.WRAPPER_SCRIPT_SHA256)
+    const { opened } = r
+    assert.equal(opened.runs.length, 2, opened.out)
+    const [first, second] = opened.runs
+    // (a) claude.exe right under the window's PowerShell, a fresh token, the pane file (version 3) naming that process.
+    assert.deepEqual(first.args, ['--resume', r.id])
+    assert.equal(first.cwd, r.dirs.folder)
+    assert.equal(first.parent?.pid, opened.pid, 'claude.exe runs right under the window')
+    assert.equal(first.parent?.path?.toLowerCase(), shell.toLowerCase())
+    assert.ok(first.token !== null && first.token !== '00000000-0000-4000-a000-0000000000ff', `a fresh CLAUDE_PANE_TOKEN (${first.token})`)
+    const pane = machine.parsePane(first.pane ?? '')
+    assert.ok(!('why' in pane) && pane.v === 3 && pane.pid === opened.pid, `the pane file names the window (${first.pane})`)
+    assert.ok(nearTicks(pane.started, first.parent.created), 'by its start too')
+    // (d) The launch environment, NO_COLOR and the rest cleared; the token the wrapper's own.
+    for (const name of [...machine.LAUNCH_ENV_CLEAR, 'PSExecutionPolicyPreference']) assert.ok(!first.env.includes(name), `${name} is cleared`)
+    assert.ok(first.forceIsOne && first.reapIsOne)
+    assert.ok(first.env.includes('CLAUDE_PANE_TOKEN'))
+    // (e) The probe the restart would take, run under that claude.exe: this tab, by pickLaunchTransport and pickTransport alike.
+    const probe = r.probeOf(1)
+    assert.ok(!('error' in probe), JSON.stringify(probe))
+    assert.equal(machine.paneFallback(probe, pane), undefined)
+    assert.deepEqual(machine.pickLaunchTransport(probe, null, { replacing: true, pane: { token: first.token, pane }, configCount: 1, needsLeft: false }), { where: { pane: { token: first.token } } })
+    assert.deepEqual(machine.pickTransport(probe, r.id, r.other, r.otherFolder, { token: first.token, pane }), { transport: 'pane', token: first.token, folder: r.otherFolder })
+    // The restart itself: the ticket the plugins write (paneTicket, version 1), read by the window's copy, resumed in the same window.
+    assert.deepEqual(second.args, ['--resume', r.id])
+    assert.equal(second.parent?.pid, opened.pid, 'the restart runs in the same window')
+    assert.equal(second.token, first.token)
+    assert.equal(second.pane, first.pane)
+    assert.equal(second.ticketPresent, false)
+    assert.ok(opened.out.includes(`Resuming ${r.id} here, in ${r.dirs.folder}.`), opened.out)
+    assert.ok(!opened.out.includes('the claude wrapper is not used'), opened.out)
+  })
+
+  test('no PowerShell 7 at its standard path, and a Restricted execution policy for these processes alone: the window is Windows PowerShell 5.1, and the wrapper works all the same', async () => {
+    const r = await windowRun({ programFiles: 'none', restricted: true })
+    assert.equal(r.launched.answer.launched?.transport, 'window', r.launched.ran.stdout + r.launched.ran.stderr)
+    assert.equal(r.launched.window.file.toLowerCase(), WINDOWS_POWERSHELL.toLowerCase())
+    const { opened } = r
+    assert.equal(opened.runs.length, 2, opened.out)
+    const [first, second] = opened.runs
+    assert.equal(first.parent?.pid, opened.pid)
+    assert.equal(first.parent?.path?.toLowerCase(), WINDOWS_POWERSHELL.toLowerCase())
+    const pane = machine.parsePane(first.pane ?? '')
+    assert.ok(!('why' in pane) && pane.pid === opened.pid, `the pane file names the window (${first.pane})`)
+    assert.ok(!first.env.includes('PSExecutionPolicyPreference'), "the window's policy never reaches claude")
+    assert.deepEqual(machine.pickLaunchTransport(r.probeOf(1), null, { replacing: true, pane: { token: first.token, pane }, configCount: 1, needsLeft: false }), { where: { pane: { token: first.token } } })
+    assert.equal(second.parent?.pid, opened.pid, 'the restart runs in the same window')
+    assert.deepEqual(second.args, ['--resume', r.id])
+  })
+
+  for (const copy of ['missing', 'changed']) {
+    test(`the wrapper's copy ${copy === 'missing' ? 'gone' : 'changed'} after the launch put it there: claude starts directly in the window, and the window says why`, async () => {
+      const r = await windowRun({ copy, ticket: false })
+      const { opened } = r
+      assert.equal(opened.runs.length, 1, opened.out)
+      const [only] = opened.runs
+      assert.deepEqual(only.args, ['--resume', r.id])
+      assert.equal(only.parent?.pid, opened.pid)
+      assert.equal(only.token, null)
+      assert.equal(only.pane, null)
+      const why = copy === 'missing' ? /its verified copy is not at .+claude-wrapper-[0-9a-f]{8}\.ps1/ : /does not have the SHA-256 this launcher pins/
+      const said = opened.out.split(/\r?\n/).filter(line => line.startsWith('claude-launch: the claude wrapper is not used: '))
+      assert.equal(said.length, 1, opened.out)
+      assert.match(said[0], why)
+      assert.match(said[0], /\. Claude starts directly, so a restart from this session opens a new window\.$/)
+    })
+  }
 })

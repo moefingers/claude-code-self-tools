@@ -210,9 +210,9 @@ function leftAsItWas(check, dirs, result) {
 }
 
 /** A ticket that holds: the conversation resumed, here, in its folder, with the launch environment. */
-async function resumesOnce(shell, wrapper = WRAPPER) {
+async function resumesOnce(shell, wrapper = WRAPPER, env = {}) {
   const dirs = lab()
-  const result = await run(shell, dirs, { wrapper, plan: { 1: ticketFor(dirs) } })
+  const result = await run(shell, dirs, { wrapper, plan: { 1: ticketFor(dirs) }, env })
   const { found, check } = problems()
   const [first, second, third] = result.runs
   check(result.runs.length === 2, `claude ran twice, the user's run and one resume (${result.runs.length})`)
@@ -591,6 +591,9 @@ describe('the claude wrapper, in each PowerShell', { skip: !isWindows && 'Window
     describe(name, { concurrency: 3 }, () => {
       test('a ticket that holds: claude --resume <id> in its folder, the markers and NO_COLOR cleared, FORCE set, WT_* kept, then all put back', async () => {
         assert.deepEqual(await resumesOnce(shell), [])
+      })
+      test("under a Restricted execution policy, set for this process alone (Windows' default on a client): the function runs no script file, so a ticket that holds resumes all the same", async () => {
+        assert.deepEqual(await resumesOnce(shell, WRAPPER, { PSExecutionPolicyPreference: 'Restricted' }), [])
       })
       for (const broken of BROKEN) {
         test(`a ticket ${broken.name} is refused, saying "${broken.why}", and deleted`, async () => {

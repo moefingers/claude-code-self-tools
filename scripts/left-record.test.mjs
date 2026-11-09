@@ -13,7 +13,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { after, before, describe, test } from 'node:test'
 import { pathToFileURL } from 'node:url'
-import { compileStub, underStub, stubWork } from './stub.mjs'
+import { compileStub, underStub, stubWork, withoutClaude } from './stub.mjs'
 import { ROOT } from './sync-shared.mjs'
 
 const machine = await import(pathToFileURL(join(ROOT, 'shared', 'hooks', 'machine.ts')).href)
@@ -37,7 +37,7 @@ after(() => {
 function run(script) {
   const call = machine.powershellCall(POWERSHELL, script)
   return new Promise(resolve => {
-    const child = spawn(call.argv[0], call.argv.slice(1), { windowsHide: true, env: { ...process.env, LOCALAPPDATA: join(work, 'local'), USERPROFILE: join(work, 'home') } })
+    const child = spawn(call.argv[0], call.argv.slice(1), { windowsHide: true, env: withoutClaude({ ...process.env, LOCALAPPDATA: join(work, 'local'), USERPROFILE: join(work, 'home') }) })
     let stdout = ''
     let stderr = ''
     child.stdout.on('data', chunk => (stdout += chunk))
@@ -53,7 +53,7 @@ function run(script) {
 
 /** leftScript run as self-switch runs it, under its session's claude.exe: here the stub's. Output and errors both kept. */
 async function write(script) {
-  const ran = await underStub({ stub, work, env: { ...process.env, LOCALAPPDATA: join(work, 'local'), USERPROFILE: join(work, 'home') }, script })
+  const ran = await underStub({ stub, work, env: withoutClaude({ ...process.env, LOCALAPPDATA: join(work, 'local'), USERPROFILE: join(work, 'home') }), script })
   assert.ok(!ran.stdout.includes('refused session'), 'the stub is the claude.exe above the script')
   return { code: 0, stdout: ran.stdout, stderr: ran.stderr }
 }

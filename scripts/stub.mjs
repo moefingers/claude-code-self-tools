@@ -37,12 +37,36 @@ export function compileStub(dir) {
   return stub
 }
 
-/** Throws unless USERPROFILE and LOCALAPPDATA (and CLAUDE_CONFIG_DIR, when set) are in `work`: a run that found the real claude.exe would start Claude Code. */
+/**
+ * Throws unless USERPROFILE and LOCALAPPDATA (and CLAUDE_CONFIG_DIR, when set) are in `work`, and no folder
+ * on PATH outside `work` holds a claude program: a run that found the real claude.exe (in the person's
+ * %USERPROFILE%\.local\bin, or on their PATH) would start Claude Code. claude-launch.ps1 and the claude
+ * wrapper look in exactly those two places.
+ */
 export function fence(env, work) {
   for (const name of ['USERPROFILE', 'LOCALAPPDATA']) {
     if (typeof env[name] !== 'string' || !env[name].startsWith(work)) throw new Error(`${name} must be in the test's temporary folder`)
   }
-  if (env.CLAUDE_CONFIG_DIR !== undefined && !env.CLAUDE_CONFIG_DIR.startsWith(work)) throw new Error("CLAUDE_CONFIG_DIR must be in the test's temporary folder")
+  if (env.CLAUDE_CONFIG_DIR !== undefined && env.CLAUDE_CONFIG_DIR !== null && !env.CLAUDE_CONFIG_DIR.startsWith(work)) throw new Error("CLAUDE_CONFIG_DIR must be in the test's temporary folder")
+  const paths = Object.keys(env).filter(name => name.toLowerCase() === 'path')
+  if (paths.length !== 1 || typeof env[paths[0]] !== 'string') throw new Error('a run names its own PATH, once')
+  for (const dir of env[paths[0]].split(';').filter(Boolean)) {
+    if (dir.startsWith(work)) continue
+    if (holdsClaude(dir)) throw new Error(`${dir} holds a claude program, and is on the run's PATH`)
+  }
+}
+
+const holdsClaude = dir => ['.exe', '.com', '.cmd', '.bat'].some(ext => existsSync(join(dir, `claude${ext}`)))
+
+/** `env` (process.env and the like) with every folder that holds a claude program taken off its PATH, for fence. */
+export function withoutClaude(env) {
+  const out = Object.fromEntries(Object.entries(env).filter(([name]) => name.toLowerCase() !== 'path'))
+  const path = Object.entries(env).find(([name]) => name.toLowerCase() === 'path')?.[1] ?? ''
+  out.PATH = path
+    .split(';')
+    .filter(dir => dir !== '' && !holdsClaude(dir))
+    .join(';')
+  return out
 }
 
 /** Waits for `path` to be there, up to `ms`. */
@@ -62,6 +86,24 @@ export function noWindow(script) {
   const held = (guarded.match(/throw 'a test never opens a window'; \$window = Start-Process/g) ?? []).length
   if (starts !== held) throw new Error('every Start-Process in a script a test runs is guarded')
   return guarded
+}
+
+/**
+ * A launch script whose Start-Process is a function of the test's own, defined first: it opens nothing,
+ * and writes to `file` what the window would have been started with (`{ file, args }`: the program and
+ * its argument list), so a test can read the interpreter chosen and run that very command hidden. It
+ * throws when the script could reach the real cmdlet past the function (by its module's name, or .NET).
+ */
+export function recordWindow(script, file) {
+  if (/\\Start-Process|Diagnostics\.Process\]::Start|ProcessStartInfo/.test(script)) throw new Error('the script reaches a process start past the recording function')
+  if (/['"]/.test(file)) throw new Error('a record file without quotes')
+  const shadow = [
+    'function Start-Process { param([string]$FilePath, [string[]]$ArgumentList, [switch]$PassThru)',
+    `  [IO.File]::WriteAllText('${file}', (ConvertTo-Json -Compress -InputObject ([ordered]@{ file = $FilePath; args = @($ArgumentList) })))`,
+    '  [pscustomobject]@{ Id = 0 } | Add-Member -MemberType ScriptMethod -Name Kill -Value { } -PassThru',
+    '}',
+  ]
+  return [...shadow, script].join('\r\n')
 }
 
 /**

@@ -1,9 +1,11 @@
 // A stub claude.exe for scripts/claude-wrapper.test.mjs and scripts/claude-launch.test.mjs, compiled
 // there by Windows PowerShell's Add-Type into a temporary folder. It never runs Claude Code. Each run
 // appends one JSON line to %STUB_LOG%: its arguments, its folder, the NAMES of its environment variables
-// (never a value), whether CLAUDE_CODE_FORCE_SESSION_PERSISTENCE and
+// (never a value, but the tab's token below), whether CLAUDE_CODE_FORCE_SESSION_PERSISTENCE and
 // CLAUDE_CODE_DISABLE_BG_SHELL_PRESSURE_REAP are "1", whether the wrapper's ticket was still there when it
-// started, and the wrapper's pane file. Then, as self-restart or self-switch would, it writes the
+// started, the wrapper's pane file, CLAUDE_PANE_TOKEN when it is a lowercase UUID (the claude wrapper's
+// token, no secret: it names the pane file), and its parent process: its id, its start (a FILETIME) and
+// its program's path, as the probe and the pane file name it. Then, as self-restart or self-switch would, it writes the
 // ticket for its run from %STUB_PLAN%\<run>.json, if there is one, with {TOKEN} replaced by its
 // CLAUDE_PANE_TOKEN and "{NOW}", "{OLD}" and "{AHEAD}" by the time now, 200 s ago and 60 s ahead, in
 // milliseconds. It sleeps %STUB_SLEEP_MS% and exits with %STUB_EXIT%, when they are set.
@@ -14,16 +16,39 @@
 // %STUB_CHILD_EXE%, it runs that program with %STUB_CHILD_ARGS% as its own child, as Claude Code runs a
 // plugin's script: it waits (up to 30 s) for %STUB_CHILD_STDIN% to be there, hands the child that file's
 // bytes on standard input, and writes the child's standard output and error, as UTF-8, to
-// %STUB_CHILD_OUT% and %STUB_CHILD_ERR%. The script can so be written once this process is known.
+// %STUB_CHILD_OUT% and %STUB_CHILD_ERR% ({RUN} in either is this run's number). The script can so be
+// written once this process is known.
 using System;
 using System.Collections;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
+using System.Runtime.InteropServices;
 using System.Text;
+using System.Text.RegularExpressions;
 using System.Threading;
 
 public static class ClaudeStub {
+  [StructLayout(LayoutKind.Sequential)]
+  struct BasicInfo { public IntPtr ExitStatus; public IntPtr PebBaseAddress; public IntPtr AffinityMask; public IntPtr BasePriority; public IntPtr UniqueProcessId; public IntPtr InheritedFromUniqueProcessId; }
+
+  [DllImport("ntdll.dll")]
+  static extern int NtQueryInformationProcess(IntPtr process, int infoClass, ref BasicInfo info, int size, out int returned);
+
+  // This process's parent, as JSON: its id, its start (a FILETIME, as the probe reads one) and its program's path; null when it can't be read.
+  static string Parent() {
+    try {
+      BasicInfo info = new BasicInfo();
+      int returned;
+      if (NtQueryInformationProcess(Process.GetCurrentProcess().Handle, 0, ref info, Marshal.SizeOf(info), out returned) != 0) return "null";
+      using (Process parent = Process.GetProcessById(info.InheritedFromUniqueProcessId.ToInt32())) {
+        string path = null;
+        try { path = parent.MainModule.FileName; } catch { path = null; }
+        return "{\"pid\":" + parent.Id + ",\"created\":\"" + parent.StartTime.ToFileTimeUtc() + "\",\"path\":" + Q(path) + "}";
+      }
+    } catch { return "null"; }
+  }
+
   static string Q(string s) {
     if (s == null) return "null";
     StringBuilder b = new StringBuilder("\"");
@@ -35,10 +60,10 @@ public static class ClaudeStub {
     return b.Append('"').ToString();
   }
 
-  static void RunChild(string exe) {
+  static void RunChild(string exe, int run) {
     string input = Environment.GetEnvironmentVariable("STUB_CHILD_STDIN");
-    string output = Environment.GetEnvironmentVariable("STUB_CHILD_OUT");
-    string error = Environment.GetEnvironmentVariable("STUB_CHILD_ERR");
+    string output = (Environment.GetEnvironmentVariable("STUB_CHILD_OUT") ?? "").Replace("{RUN}", run.ToString());
+    string error = (Environment.GetEnvironmentVariable("STUB_CHILD_ERR") ?? "").Replace("{RUN}", run.ToString());
     for (int i = 0; i < 600 && !string.IsNullOrEmpty(input) && !File.Exists(input); i++) Thread.Sleep(50);
     ProcessStartInfo info = new ProcessStartInfo(exe, Environment.GetEnvironmentVariable("STUB_CHILD_ARGS") ?? "");
     info.UseShellExecute = false;
@@ -71,9 +96,10 @@ public static class ClaudeStub {
       File.WriteAllText(self + ".tmp", "{\"pid\":" + me.Id + ",\"created\":\"" + me.StartTime.ToFileTimeUtc() + "\"}");
       File.Move(self + ".tmp", self);
     }
-    string childExe = Environment.GetEnvironmentVariable("STUB_CHILD_EXE");
-    if (!string.IsNullOrEmpty(childExe)) RunChild(childExe);
     string log = Environment.GetEnvironmentVariable("STUB_LOG");
+    int run = File.Exists(log) ? File.ReadAllLines(log).Length + 1 : 1;
+    string childExe = Environment.GetEnvironmentVariable("STUB_CHILD_EXE");
+    if (!string.IsNullOrEmpty(childExe)) RunChild(childExe, run);
     string plan = Environment.GetEnvironmentVariable("STUB_PLAN");
     string token = Environment.GetEnvironmentVariable("CLAUDE_PANE_TOKEN");
     string local = Environment.GetEnvironmentVariable("LOCALAPPDATA");
@@ -83,7 +109,6 @@ public static class ClaudeStub {
     List<string> names = new List<string>();
     foreach (DictionaryEntry e in Environment.GetEnvironmentVariables()) names.Add((string)e.Key);
     names.Sort(StringComparer.OrdinalIgnoreCase);
-    int run = File.Exists(log) ? File.ReadAllLines(log).Length + 1 : 1;
     StringBuilder line = new StringBuilder("{");
     line.Append("\"run\":" + run);
     line.Append(",\"exe\":" + Q(System.Reflection.Assembly.GetExecutingAssembly().Location));
@@ -94,6 +119,8 @@ public static class ClaudeStub {
     line.Append(",\"reapIsOne\":" + (Environment.GetEnvironmentVariable("CLAUDE_CODE_DISABLE_BG_SHELL_PRESSURE_REAP") == "1" ? "true" : "false"));
     line.Append(",\"ticketPresent\":" + (ticket != null && File.Exists(ticket) ? "true" : "false"));
     line.Append(",\"pane\":" + (pane != null && File.Exists(pane) ? Q(File.ReadAllText(pane)) : "null"));
+    line.Append(",\"token\":" + (token != null && Regex.IsMatch(token, "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$") ? Q(token) : "null"));
+    line.Append(",\"parent\":" + Parent());
     line.Append("}");
     File.AppendAllText(log, line.ToString() + "\n");
     string next = plan == null ? null : Path.Combine(plan, run + ".json");
