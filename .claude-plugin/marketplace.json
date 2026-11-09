@@ -1,6 +1,6 @@
 {
   "name": "claude-code-self-tools",
-  "description": "Small Claude Code plugins that let a session act on itself: compact or clear its conversation, reload its plugins, reconnect an MCP server, read its context window, check its own tools, wake itself later, turn on Remote Control under a title, set its prompt bar color, exit or restart, and switch to another conversation. Install only the ones you want.",
+  "description": "Small Claude Code plugins that let a session act on itself: compact or clear its conversation, reload its plugins, reconnect an MCP server, read its context window, check its own tools, wake itself later, turn on Remote Control under a title, set its prompt bar color, exit or restart, and switch to another conversation; and a skill for running several sessions as a hierarchy. Install only the ones you want.",
   "owner": {
     "name": "moefingers",
     "url": "https://github.com/moefingers"
@@ -65,6 +65,11 @@
       "name": "self-switch",
       "source": "./plugins/self-switch",
       "description": "Switches the terminal to another conversation on Windows once the turn ends, for your own use: only when that conversation is open nowhere on this machine and nothing runs under this session; in place, in the pane's slot, or in a new window. It refuses where the coordinator runs switches."
+    },
+    {
+      "name": "self-hierarchy",
+      "source": "./plugins/self-hierarchy",
+      "description": "A skill, not a mod: how several sessions on one machine run as a hierarchy (an owner, a coordinator, a merger, lanes, and builder and reviewer subagents), and how the self tools keep each session healthy."
     }
   ]
 }
