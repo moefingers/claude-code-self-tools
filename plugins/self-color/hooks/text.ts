@@ -17,3 +17,6 @@ export const oneLine = (said: string): string => said.replace(/\s*\n\s*/g, ' ')
 
 /** A sentence's end: a full stop, unless it ends in one already, or in another mark. */
 export const sentence = (said: string): string => (/[.!?]$/.test(said) ? said : `${said}.`)
+
+/** The model's note when Claude Code refused to run /color: the reason, ending in one full stop. */
+export const didntRun = (color: string, reason: string): string => `The prompt bar color change to ${color} you queued didn't run: ${sentence(reason)}`

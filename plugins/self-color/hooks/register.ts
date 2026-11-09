@@ -19,9 +19,9 @@
 //
 // What is queued lives in $.state for one turn: the turn's end takes it and clears it, and from then
 // the module holds it until it runs or is dropped, so nothing here needs to outlive a /clear or a /resume.
-import type { EngineInterface, Register } from 'claude-code'
+import type { EngineInterface, Register, Timer } from 'claude-code'
 import type { Color, Queued } from '../types'
-import { oneLine, sentence, text, why } from './text'
+import { didntRun, oneLine, text, why } from './text'
 import { configureUpdateCheck, loadUpdateCheck, withUpdateNotice } from './update-check'
 
 const queued = { plugin: 'self-color', key: 'queued' } as const
@@ -52,7 +52,20 @@ const DESCRIPTION = [
 
 const SUBAGENT = "A subagent can't set the session's prompt bar color. Finish your piece and return its result; the main session can set it."
 
-const DROPPED = 'Prompt bar color change dropped: this session moved to another conversation.'
+/** What the call answers: queued, not done, and what would take it back. */
+const queuedResult = (color: Color) =>
+  `Queued: /color ${color} runs once this turn ends; an interrupted turn, or a /resume or /clear that runs first, drops it.`
+
+/** The toast, and the model's note, when the turn that queued a change didn't finish. */
+const cancelledToast = (color: Color) => `Prompt bar color change to ${color} cancelled: the turn didn't finish.`
+const cancelledNote = (color: Color) =>
+  `The prompt bar color change to ${color} you queued was cancelled: the turn didn't finish. To set it, call color_after_turn again.`
+
+/**
+ * The toast when the session moved to another conversation before the change ran. The model isn't told: by then the
+ * session is in the conversation moved to, which never asked for the change, and a note can only go there.
+ */
+const droppedToast = (color: Color) => `Prompt bar color change to ${color} dropped: this session moved to another conversation.`
 
 /** The change a turn's end took from $.state and that hasn't gone to Claude Code yet. */
 let waiting: Queued | undefined
@@ -60,6 +73,8 @@ let waiting: Queued | undefined
 let isTurnRunning = false
 /** The /resume and /clear runs under way: a waiting change goes once each has ended without moving the session. */
 let moving = 0
+/** The one look pending: a new one replaces it, and a main-loop turn's start cancels it, so no older look goes early. */
+let look: Timer | undefined
 
 const isColor = (raw: unknown): raw is Color => typeof raw === 'string' && (COLORS as readonly string[]).includes(raw)
 
@@ -86,7 +101,7 @@ async function colorNow($: EngineInterface, value: Queued): Promise<void> {
     said = text((await $.command.run({ command: 'color', args: value.color })).text)
   } catch (err) {
     $.ui.toast(`/color didn't run: ${why(err)}`)
-    await tellModel($, `The prompt bar color change to ${value.color} you queued didn't run: ${sentence(why(err))}`)
+    await tellModel($, didntRun(value.color, why(err)))
     return
   }
   // Interactive: /color prints its line itself and hands back none, so only Claude Code's line says whether it took.
@@ -111,8 +126,20 @@ function handOff($: EngineInterface): void {
   void colorNow($, value).catch(() => undefined)
 }
 
-/** Looks again half a second from now. */
-const settle = ($: EngineInterface) => void $.clock.after(SETTLE_MS, () => handOff($))
+/** Stops the look pending, if there is one. */
+function stopLooking(): void {
+  look?.cancel()
+  look = undefined
+}
+
+/** Looks again half a second from now, in place of any look pending. */
+function settle($: EngineInterface): void {
+  stopLooking()
+  look = $.clock.after(SETTLE_MS, () => {
+    look = undefined
+    handOff($)
+  })
+}
 
 /** Holds a waiting change while a /resume or /clear runs, and looks again once it has ended. */
 async function aroundMove<T>($: EngineInterface, run: () => Promise<T>): Promise<T> {
@@ -161,23 +188,20 @@ export const register: Register = (on, options) => {
     if (!isColor(color)) return { deny: `\`color\` must be one of: ${LISTED} (which resets it).` }
     await $.state.set(queued, { color })
     $.ui.status(`/color ${color} queued for when this turn ends`)
-    return {
-      result:
-        color === 'default'
-          ? 'Queued. The prompt bar goes back to its default color once this turn ends.'
-          : `Queued. The prompt bar turns ${color} once this turn ends, and stays ${color} until it's changed.`,
-    }
+    return { result: queuedResult(color) }
   }).catch(($, e, next) => (next.called ? next(e) : { deny: 'self-color: queuing the color change failed; nothing is queued.' }))
 
+  // A main-loop turn: running from before its start passes down until its end has passed down; the look pending stops.
   on('turn.start', async ($, e, next) => {
-    const started = await next(e)
-    if (e.agentId === undefined) isTurnRunning = true
-    return started
+    if (e.agentId === undefined) {
+      isTurnRunning = true
+      stopLooking()
+    }
+    return next(e)
   }).catch(($, e, next) => next(e))
 
   on('turn.complete', async ($, e, next) => {
     if (e.agentId !== undefined) return next(e)
-    isTurnRunning = false
     try {
       const done = await next(e)
       const { value } = await $.state.get(queued)
@@ -185,12 +209,14 @@ export const register: Register = (on, options) => {
       await $.state.set(queued, null)
       if (e.isAborted || e.reason !== 'answer') {
         $.ui.status(undefined)
-        $.ui.toast("Prompt bar color change cancelled: the turn didn't finish.")
+        $.ui.toast(cancelledToast(value.color))
+        await tellModel($, cancelledNote(value.color))
         return done
       }
       waiting = value
       return done
     } finally {
+      isTurnRunning = false
       if (waiting !== undefined) settle($)
     }
   })
@@ -203,9 +229,11 @@ export const register: Register = (on, options) => {
   on('classic.SessionStart', async ($, e, next) => {
     const done = await next(e)
     if (e.agent_id === undefined && (e.source === 'resume' || e.source === 'clear') && waiting !== undefined) {
+      const { color } = waiting
       waiting = undefined
+      stopLooking()
       $.ui.status(undefined)
-      $.ui.toast(DROPPED)
+      $.ui.toast(droppedToast(color))
     }
     return done
   }).catch(($, e, next) => next(e))
