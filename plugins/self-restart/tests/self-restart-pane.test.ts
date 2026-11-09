@@ -6,7 +6,7 @@
 import { expect, mock, test } from 'claude-code/testing'
 import type { On } from 'claude-code'
 import { launchScriptText } from '../hooks/launcher'
-import { checkPaneTicket, type LaunchInput, panePath, paneTicketPath, quoted, SLOT_SCRIPT_SHA256, slotRecordPath } from '../hooks/machine'
+import { checkPaneTicket, type LaunchInput, panePath, paneTicketPath, placementPath, quoted, SLOT_SCRIPT_SHA256, slotRecordPath } from '../hooks/machine'
 
 const TOOL = 'mcp__self-restart__restart_after_turn'
 /** A transcript under the repo's project folder, in any config folder: where `claude --resume` finds the session. */
@@ -225,6 +225,42 @@ test('started through the claude wrapper: one script takes the claim and leaves 
   expect(toasts).toContain('Restarting: this tab resumes this session once it has exited. Switched accounts.')
   expect((held.get('restarts') as Record<string, { claim?: string }>)[ID]?.claim).toBe(by)
   expect(rows().at(-1)).toBe('This session restarted at its own request (restart_after_turn). Reason: Switched accounts.')
+})
+
+/** A pane file the window's own wrapper writes: version 3, hosted by claude-launch.ps1 -Wrapper. */
+const HOSTED = JSON.stringify({ v: 3, pid: 20, started: SHELL_STARTED, hosted: true })
+/** placement.json naming a window for a restart (the launch section's, which a restart's falls back to). */
+const PLACED = JSON.stringify({ v: 1, layout: [], restart: { prefer: ['window'] }, launch: { prefer: ['window'], window: { name: 'claude-overflow' } } })
+
+test("in a window a launch opened (its wrapper hosted), placement.json naming a window: the restart goes there, not this window's ticket", async ($, on) => {
+  const { scripts, kinds, files, clock } = engine(on, { pane: HOSTED })
+  files.set(placementPath(STATE), PLACED)
+  await $.session.start(start)
+  await $.tool.call({ tool: TOOL, reason: 'Switched accounts.' })
+  await $.turn.complete(answered)
+  await clock.advance(1000)
+  expect(kinds).toEqual(['launcher'])
+  expect(scripts[0]).toContain('Start-Process $wtExe -ArgumentList $wtLine')
+  expect(scripts[0]).toContain("-w claude-overflow nt")
+})
+
+test('in a hosted window with no placement: its ticket, the same window, as before', async ($, on) => {
+  const hosted = engine(on, { pane: HOSTED })
+  await $.session.start(start)
+  await $.tool.call({ tool: TOOL, reason: 'Switched accounts.' })
+  await $.turn.complete(answered)
+  await hosted.clock.advance(1000)
+  expect(hosted.kinds).toEqual(['pane'])
+})
+
+test('in a tab typed in (its pane file not hosted), placement.json naming a window: still this tab', async ($, on) => {
+  const typed = engine(on, { pane: JSON.stringify({ v: 3, pid: 20, started: SHELL_STARTED }) })
+  typed.files.set(placementPath(STATE), PLACED)
+  await $.session.start(start)
+  await $.tool.call({ tool: TOOL, reason: 'Switched accounts.' })
+  await $.turn.complete(answered)
+  await typed.clock.advance(1000)
+  expect(typed.kinds).toEqual(['pane'])
 })
 
 test("the resumed session releases the tab's claim, once", async ($, on) => {

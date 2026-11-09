@@ -339,8 +339,9 @@ test('the launch script: quiet progress, parents older than their children, valu
   expect(script).toContain('if ($code -ne 0 -or ((Get-Date) - $started).TotalSeconds -lt 10) {')
   // Inside the window's own literal, each quote doubled.
   expect(script).toContain(`"Once it is safe, resume it yourself: " + "& ''" + $handPath + "'' -Resume " + $id + " -Dir ''" + $folder + "''"`)
-  // Three pauses: a refusal, a run of claude-launch.ps1 that stops on an error (caught), and an end within seconds.
-  expect(script.split('Read-Host "Press Enter to close this window"').length - 1).toBe(3)
+  // Four pauses: a refusal, a run of claude-launch.ps1 that stops on an error (caught), a ticket the window's
+  // claude wrapper didn't use (recorded), and an end within seconds.
+  expect(script.split('Read-Host "Press Enter to close this window"').length - 1).toBe(4)
   expect(script).not.toContain('-NoExit')
 })
 

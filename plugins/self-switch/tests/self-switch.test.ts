@@ -2415,6 +2415,29 @@ describe('placement.json: where the new window goes', () => {
     expect(commands).toEqual([{ command: 'exit' }])
   })
 
+  test("from a window a launch opened (its wrapper hosted): placement.json's tab first, not this window's ticket", async ($, on) => {
+    const HOSTED = JSON.stringify({ v: 3, pid: 20, started: ft(1), hosted: true })
+    const { runs, files, commands, toasts, clock } = engine(on, { env: { ...WINDOWS, CLAUDE_PANE_TOKEN: TOKEN }, pane: HOSTED, probe: machine(noSlots), store: THERE })
+    files.set(placementPath(STATE), FILE)
+    await $.session.start(start)
+    await switchNow($, clock)
+    expect(runs.filter(r => r.kind === 'pane')).toEqual([])
+    expect(runs.find(r => r.kind === 'launcher')?.script ?? '').toContain('Start-Process $wtExe -ArgumentList $wtLine')
+    expect(commands).toEqual([{ command: 'exit' }])
+    expect(toasts).toContain(`Switching to ${T}: this session exits, and a new tab in window claude-4 resumes it once this process has gone.`)
+  })
+
+  test("from a hosted window, the placed tab refused for want of Windows Terminal: this window's own ticket, before a new window", async ($, on) => {
+    const HOSTED = JSON.stringify({ v: 3, pid: 20, started: ft(1), hosted: true })
+    const { runs, files, commands, toasts, clock } = engine(on, { env: { ...WINDOWS, CLAUDE_PANE_TOKEN: TOKEN }, pane: HOSTED, probe: machine(noSlots), store: THERE, launcher: 'no-wt' })
+    files.set(placementPath(STATE), JSON.stringify({ v: 1, layout: [], launch: { prefer: ['tab'], tab: { window: 'claude-4', maxTabs: 2 } } }))
+    await $.session.start(start)
+    await switchNow($, clock)
+    expect(runs.filter(r => r.kind === 'launcher' || r.kind === 'pane').map(r => r.kind)).toEqual(['launcher', 'pane'])
+    expect(commands).toEqual([{ command: 'exit' }])
+    expect(toasts).toContain(`Switching to ${T}: this session exits, and this tab resumes it here once this process has gone.`)
+  })
+
   test('refused for want of Windows Terminal: the next place, then the plain window', async ($, on) => {
     const { runs, files, commands, clock } = engine(on, { probe: machine(noSlots), store: THERE, launcher: 'no-wt' })
     files.set(placementPath(STATE), JSON.stringify({ v: 1, layout: [], launch: { prefer: ['tab'], tab: { window: 'claude-4', maxTabs: 2 } } }))

@@ -70,7 +70,7 @@ param([switch]$Idle, [string]$Start, [string]$Name, [string]$Resume, [string]$Wa
 
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
-$env:PSModulePath = @([Environment]::GetFolderPath("MyDocuments") + "\WindowsPowerShell\Modules", [Environment]::GetFolderPath("ProgramFiles") + "\WindowsPowerShell\Modules", [Environment]::GetFolderPath("System") + "\WindowsPowerShell\v1.0\Modules") -join ";"
+$env:PSModulePath = @(([Environment]::GetFolderPath("MyDocuments") + "\WindowsPowerShell\Modules"), ([Environment]::GetFolderPath("ProgramFiles") + "\WindowsPowerShell\Modules"), ([Environment]::GetFolderPath("System") + "\WindowsPowerShell\v1.0\Modules")) -join ";"
 
 $SessionId = '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\z'
 $AreaName = '^[a-z0-9][a-z0-9-]{0,39}\z'

@@ -229,6 +229,8 @@ async function resumesOnce(shell, wrapper = WRAPPER, env = {}) {
     check(apart <= 10_000n && apart >= -10_000n, `the pane file's start is the shell's, within 1 ms, as the probe reads it (${apart} ticks apart)`)
   }
   check(pane !== undefined && JSON.parse(first?.pane ?? '{}').v === 3, 'the pane file is version 3: the wrapper that checks the claim and takes the last look in every config folder the ticket names')
+  // Typed at a prompt, never hosted: a move out of it keeps the tab, as ever.
+  check(pane !== undefined && !('why' in pane) && pane.hosted === undefined && !('hosted' in JSON.parse(first?.pane ?? '{}')), `a profile's pane file says nothing of hosting (${first?.pane})`)
   check(second !== undefined && JSON.stringify(second.args) === JSON.stringify(['--resume', dirs.id]), `the resume runs claude --resume <id>, nothing more (${JSON.stringify(second?.args)})`)
   check(second?.cwd === dirs.work, `the resume runs in the ticket's folder (${second?.cwd})`)
   check(second?.ticketPresent === false, 'the ticket was deleted before the resume ran')
@@ -687,7 +689,7 @@ describe('planted faults, each caught', { skip: !isWindows && 'Windows only', co
   const DELETE = '      try { [IO.File]::Delete($ticketFile) } catch { $deleted = $false }\n'
   const RESUME = '      & $exe --resume $t.resume\n'
   const CLEAR = '      foreach ($name in $markers) { Remove-Item -LiteralPath "Env:$name" -ErrorAction SilentlyContinue }\n'
-  const CAP_10 = "        elseif ($resumes.Count -ge 10) { 'this tab has resumed 10 times already' }\n"
+  const CAP_10 = "        elseif (-not $hosted -and $resumes.Count -ge 10) { 'this tab has resumed 10 times already' }\n"
   const CAP_30S = "        elseif (@($resumes | Where-Object { ([datetime]::UtcNow - $_).TotalSeconds -lt 30 }).Count -ge 3) { 'this tab resumed 3 times within 30 seconds' }\n"
 
   test('the ticket deleted only after it is used: the resumed claude still sees it', async () => {
