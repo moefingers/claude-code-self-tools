@@ -1,6 +1,6 @@
 # claude-code-self-tools
 
-Small [Claude Code](https://code.claude.com/docs) plugins that let a session act on itself. Each one gives Claude a tool or two for something you would otherwise do by hand from the prompt: compact or clear the conversation, reload plugins, reconnect an MCP server, check the context window, check that its own tools answer, come back to a task later, turn on Remote Control under a title, exit or restart, or switch to another conversation.
+Small [Claude Code](https://code.claude.com/docs) plugins that let a session act on itself. Each one gives Claude a tool or two for something you would otherwise do by hand from the prompt: compact or clear the conversation, reload plugins, reconnect an MCP server, check the context window, check that its own tools answer, come back to a task later, turn on Remote Control under a title, exit or restart, or switch to another conversation. One more, self-hierarchy, is a skill: how several sessions on one machine run together as a hierarchy, on these tools.
 
 Each plugin is separate. Install only the ones you want.
 
@@ -19,12 +19,13 @@ Each plugin is separate. Install only the ones you want.
 | [self-exit](plugins/self-exit) | `exit_after_turn` | Runs `/exit` once the turn ends, its reason (and a note for whoever resumes it) recorded in the transcript first. Refuses while a session cron, a background job or a subagent would make `/exit` ask, saying how to stop each. | When you asked it to end the session, or its instructions say to close once its work is done or handed off. Only at a finished break, never mid-merge, mid-push or mid-task. |
 | [self-restart](plugins/self-restart) | `restart_after_turn` | On Windows: exits, and the same conversation resumes once the old process has gone, then can resume on its own: in the same tab when Claude Code was started through the [claude wrapper](tools/claude-wrapper/claude-wrapper.ps1), in a slot pane's slot, or else in a new terminal window. | After an account switch, a setting that takes effect at startup, or a plugin that won't reload. Only at a finished break, never mid-merge, mid-push or mid-task. |
 | [self-switch](plugins/self-switch) | `switch_after_turn` | On Windows: switches the terminal to another conversation, only when that one is open nowhere on this machine and nothing runs under this session: in place, in the pane's slot, in the same tab through the claude wrapper, or in a new window. For your own use; it refuses where the coordinator runs switches. | When you ask it to switch to another conversation, at a finished break, its notes written first. |
+| [self-hierarchy](plugins/self-hierarchy) | none: a skill, `session-hierarchy` | Says how several sessions on one machine run as a hierarchy: the owner, a coordinator, a merger and lanes, with builder and reviewer subagents; who answers what; the review loop; and what each tool above costs in a hierarchy, and when to use which. No hooks, no tools, no network. | When a session is told it is the coordinator, the merger or a lane in a group of sessions, or asks how to run or join one. Never in ordinary single-session work. |
 
 Claude sees each tool as `mcp__<plugin>__<tool>`, for example `mcp__self-wake__wake_after`.
 
 ## Install
 
-You need Claude Code v2.1.287 or later (v2.1.286 in the Desktop app). Those are the versions that run mods, the plugins with a hooks module, and these plugins are mods.
+You need Claude Code v2.1.287 or later (v2.1.286 in the Desktop app). Those are the versions that run mods, the plugins with a hooks module, and these plugins are mods, but for self-hierarchy, a skill alone.
 
 In a Claude Code session, add the marketplace once:
 
@@ -46,6 +47,7 @@ Then install each plugin you want by name:
 /plugin install self-exit@claude-code-self-tools
 /plugin install self-restart@claude-code-self-tools
 /plugin install self-switch@claude-code-self-tools
+/plugin install self-hierarchy@claude-code-self-tools
 ```
 
 Each install opens the plugin in the `/plugin` panel, where you choose a scope.
@@ -65,6 +67,7 @@ claude plugin install self-clear@claude-code-self-tools
 claude plugin install self-exit@claude-code-self-tools
 claude plugin install self-restart@claude-code-self-tools
 claude plugin install self-switch@claude-code-self-tools
+claude plugin install self-hierarchy@claude-code-self-tools
 ```
 
 The install says whether the plugin is already active in the open session or needs `/reload-plugins` there. New sessions load it when they start.
@@ -270,6 +273,7 @@ The tool descriptions say when to call each tool and when not to. To make it a h
 > - **A fresh start, rarely:** keep the context healthy by compacting; restart into the same conversation for a fresh process. Clear only when the work is complete and its notes are written (`why: 'complete'`), or the context is contaminated (`why: 'contaminated'`): write your notes, then call `clear_after_turn` with the `why` and a `handoff` naming the next piece and where its notes are.
 > - **A tool seems dead:** when Bash or PowerShell answers with nothing, or a call never answers, call `tools_check` before working around it; if it says a tool failed, follow the repair it gives: for a dead Bash whose env is too long, move the PowerShell tool's directory and back in two calls, then try Bash again; for any other dead tool, restart (`restart_after_turn`) at the next finished break.
 > - **Ending, restarting or switching:** only at a finished break, never mid-merge, mid-push or mid-task. Call `exit_after_turn` only when I ask you to end the session or your brief says to close it when done, with the `reason`. After I switch accounts or change a setting that needs a restart, call `restart_after_turn` with the `reason` and a `resume` naming the next step. Call `switch_after_turn` only when I ask you to switch to another conversation, with `to`, the `reason` and where your `notes` are, written first; where the coordinator runs, it starts switches, and the tool refuses.
+> - **In a group of sessions:** when I say this session is the coordinator, the merger or a lane, follow the `session-hierarchy` skill (self-hierarchy) for who answers what, the review loop and when to use each tool.
 
 ## Develop
 
@@ -282,7 +286,7 @@ claude plugin test plugins/self-wake
 
 `validate` checks the manifest and lists the events the hooks module handles and the calls it makes. `test` runs the plugin's `tests/*.test.ts` with no session, sign-in or network. `claude plugin validate .` at the top checks the marketplace file.
 
-Code the plugins share lives once under `shared/`: the update check (`shared/hooks/update-check.ts`) and its tests (`shared/tests/update-check.test.ts`), which every plugin carries, and the machine code (`shared/hooks/machine.ts`), which only self-restart and self-switch carry. The plugins install separately, so each carries a copy at the same path in its own folder. A shared file with a line `Copies: <plugin>, <plugin>` goes only to the plugins it names, and a copy anywhere else is stale. Edit the files under `shared/`, then write the copies (which also removes the copies of files no longer in `shared/`) and check them, with Node:
+Code the plugins share lives once under `shared/`: the update check (`shared/hooks/update-check.ts`) and its tests (`shared/tests/update-check.test.ts`), which every mod carries (each plugin with a hooks module; self-hierarchy, a skill alone, carries no shared code), and the machine code (`shared/hooks/machine.ts`), which only self-restart and self-switch carry. The plugins install separately, so each carries a copy at the same path in its own folder. A shared file with a line `Copies: <plugin>, <plugin>` goes only to the plugins it names, and a copy anywhere else is stale. Edit the files under `shared/`, then write the copies (which also removes the copies of files no longer in `shared/`) and check them, with Node:
 
 ```
 node scripts/sync-shared.mjs
@@ -291,7 +295,7 @@ node --test "scripts/*.test.mjs"
 
 The test fails when a copy differs from `shared/`, or is left over from a file removed from it or kept in a plugin its `Copies:` line leaves out. `scripts/slot-runner.test.mjs` checks the slot runner against the hash the plugins ship. `scripts/claude-wrapper.test.mjs` runs the claude wrapper in Windows PowerShell 5.1 and PowerShell 7 against a stub `claude.exe` (`scripts/claude-wrapper-stub.cs`, compiled into a temporary folder), never a real Claude Code, then plants faults in copies of it and checks each is caught; it takes about five minutes, most of it the 10-resume cap. Each plugin's `tests/update-check.fixture.ts` gives the shared test that plugin's name and a call of one of its tools.
 
-To run every check at once (the copies, then each plugin's `validate --strict` and `test`, then the marketplace file):
+To run every check at once (the copies, then each plugin's `validate --strict` and each mod's `test`, then the marketplace file):
 
 ```
 node scripts/test-all.mjs

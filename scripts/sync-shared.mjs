@@ -4,8 +4,11 @@
 // (shared/hooks/update-check.ts to plugins/<name>/hooks/update-check.ts).
 //
 // Every shared file names itself on a line `Canonical copy: shared/<path>`. By default it is copied
-// into every plugin. A file that also carries a line `Copies: <plugin>, <plugin>` is copied only into
-// those plugins (shared/hooks/machine.ts: `Copies: self-restart, self-switch`).
+// into every mod: each plugin with a hooks module (hooks/hooks.json). A plugin of skills alone
+// (self-hierarchy) has no hooks/ folder, so it gets none. A plugin with a hooks/ folder but no
+// hooks/hooks.json is an error, named, and nothing is written or removed. A file that also carries a line
+// `Copies: <plugin>, <plugin>` is copied only into those plugins (shared/hooks/machine.ts:
+// `Copies: self-restart, self-switch`).
 //
 // A file in a plugin that carries the canonical line is stale, and is removed, when its path is no
 // longer under shared/, when it sits at another path than the one it names, or when it sits in a
@@ -59,9 +62,52 @@ export function plugins(root = ROOT) {
     .sort()
 }
 
-/** Each shared file, with the plugins it goes to. */
+/** Whether `path` is a file; false when it is anything else or isn't there. */
+function isFile(path) {
+  try {
+    return statSync(path).isFile()
+  } catch {
+    return false
+  }
+}
+
+/** Whether `path` is a folder; false when it is anything else or isn't there. */
+function isFolder(path) {
+  try {
+    return statSync(path).isDirectory()
+  } catch {
+    return false
+  }
+}
+
+/**
+ * Each plugin with a hooks/ folder but no hooks/hooks.json. That is an error, never a plugin of skills
+ * alone: taken for one, a hooks.json deleted or renamed by mistake would cost the plugin its shared copies
+ * (removed as stale) and its `claude plugin test`, while `claude plugin validate --strict` still passes.
+ */
+export function hooksWithoutManifest(root = ROOT) {
+  return plugins(root).filter(name => isFolder(join(root, 'plugins', name, 'hooks')) && !isFile(join(root, 'plugins', name, 'hooks', 'hooks.json')))
+}
+
+/** The error for a plugin with a hooks/ folder but no hooks/hooks.json: one line, naming it and what is missing. */
+export function missingManifest(name) {
+  return `plugins/${name} has a hooks/ folder but no hooks/hooks.json: a mod needs hooks/hooks.json naming its hooks module, and a plugin of skills alone has no hooks/ folder. Put hooks/hooks.json back, or remove hooks/.`
+}
+
+/**
+ * The plugins that are mods: each one with a hooks module, hooks/hooks.json. A plugin of skills alone has
+ * no hooks/ folder. Throws, one line per plugin (missingManifest), when a plugin has a hooks/ folder but no
+ * hooks/hooks.json.
+ */
+export function mods(root = ROOT) {
+  const broken = hooksWithoutManifest(root)
+  if (broken.length > 0) throw new Error(broken.map(missingManifest).join('\n'))
+  return plugins(root).filter(name => isFile(join(root, 'plugins', name, 'hooks', 'hooks.json')))
+}
+
+/** Each shared file, with the plugins it goes to: those its `Copies:` line names, else every mod. */
 export function shared(root = ROOT) {
-  const all = plugins(root)
+  const all = mods(root)
   return files(join(root, 'shared')).map(file => {
     const only = copiesOf(readFileSync(join(root, 'shared', file), 'utf8'))
     return { file, plugins: only === undefined ? all : only }
@@ -106,10 +152,18 @@ export function stale(root = ROOT) {
 // Run as a command only: never when the test runner loads this file (it sets NODE_TEST_CONTEXT).
 if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1] && !process.env.NODE_TEST_CONTEXT) {
   const isCheck = process.argv.includes('--check')
-  const all = copies()
+  let all
+  let left
+  try {
+    all = copies()
+    left = stale()
+  } catch (error) {
+    // A plugin with a hooks/ folder but no hooks/hooks.json (mods): nothing is written or removed.
+    console.error(error instanceof Error ? error.message : String(error))
+    process.exit(1)
+  }
   const unknown = all.filter(c => !c.isPlugin)
   const differ = all.filter(c => c.isPlugin && !c.isSame)
-  const left = stale()
   for (const c of unknown) console.error(`shared/${c.file} names a plugin that isn't here: ${c.plugin}`)
   if (isCheck) {
     for (const c of differ) console.error(`differs from shared/${c.file}: plugins/${c.plugin}/${c.file}`)
