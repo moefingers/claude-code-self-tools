@@ -116,19 +116,6 @@ function Test-Shape($path) {
   return $true
 }
 
-# Why $path is not a folder of that shape, naming the class at fault (folderFault in the plugins'
-# machine code); $null when it is one.
-function Get-ShapeFault($path) {
-  if (Test-Shape $path) { return $null }
-  if ($path -isnot [string] -or $path -eq '') { return 'is not set' }
-  if ($path.Length -gt 240) { return 'is longer than 240 characters' }
-  if ($path.Length -lt 3 -or $path -cnotmatch '^[A-Za-z]:\\') { return 'is not an absolute folder (a drive letter, a colon and a backslash first)' }
-  if ($path -match '[\x00-\x1f\x7f-\x9f]') { return 'holds a control character' }
-  if ($path -match '[\x22\x27\u2018-\u201e]') { return 'holds a quote (straight or typographic)' }
-  if ($path -match '[<>|?*/]' -or $path.IndexOf(':', 2) -ge 0) { return 'holds a character Windows does not take in a folder name (< > | ? * / or a second colon)' }
-  return "has a '.' or '..' part, an empty part, or a part with spaces at either end"
-}
-
 # A folder a launch takes: of that shape, with no ';', and there.
 function Test-Folder($path) { return ((Test-Shape $path) -and $path.IndexOf(';') -lt 0 -and (Test-Path -LiteralPath $path -PathType Container)) }
 
@@ -191,6 +178,19 @@ function Test-Left($id, $configDirs, $leftSize, $leftMtime, $leftExitAt) {
     }
   } catch { $live = 'whether its transcript changed since it was left is unknown (' + $_.Exception.Message + ')' }
   return $live
+}
+
+# Why $path is not a folder of that shape, naming the class at fault (folderFault in the plugins'
+# machine code); $null when it is one.
+function Get-ShapeFault($path) {
+  if (Test-Shape $path) { return $null }
+  if ($path -isnot [string] -or $path -eq '') { return 'is not set' }
+  if ($path.Length -gt 240) { return 'is longer than 240 characters' }
+  if ($path.Length -lt 3 -or $path -cnotmatch '^[A-Za-z]:\\') { return 'is not an absolute folder (a drive letter, a colon and a backslash first)' }
+  if ($path -match '[\x00-\x1f\x7f-\x9f]') { return 'holds a control character' }
+  if ($path -match '[\x22\x27\u2018-\u201e]') { return 'holds a quote (straight or typographic)' }
+  if ($path -match '[<>|?*/]' -or $path.IndexOf(':', 2) -ge 0) { return 'holds a character Windows does not take in a folder name (< > | ? * / or a second colon)' }
+  return "has a '.' or '..' part, an empty part, or a part with spaces at either end"
 }
 
 # 1. The arguments, each checked before anything changes.

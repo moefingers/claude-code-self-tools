@@ -417,7 +417,7 @@ const CHECKS = {
     // The 10-minute line by the clock, never by the count of looks (a start time that can't be read makes each look short).
     assert.ok(inner.includes('  if (-not $toldLong -and $waitClock.Elapsed.TotalSeconds -ge 600) { $toldLong = $true; Write-Host '), 'the 10-minute line by the clock')
     // Exit 2 recorded as a refusal only at once: claude-launch.ps1's own refusal, never Claude Code's own exit code after a session.
-    assert.ok(inner.includes('  if ($code -eq 2 -and ((Get-Date) - $started).TotalSeconds -lt 60) { Write-Refused '), 'exit 2 recorded only within a minute (the launcher\'s last look under load)')
+    assert.ok(inner.includes('  if ($code -eq 2 -and -not $resumedHere -and ((Get-Date) - $started).TotalSeconds -lt 60) { Write-Refused '), 'exit 2 recorded only within a minute (the launcher\'s last look under load), and never once the window resumed another conversation')
     // R3 (delta): only a clear answer ends the wait: the claim gone, or naming another; one that can't be read is looked at again.
     assert.ok(inner.includes('  if ($claimSays -eq "gone" -or $claimSays -eq "other") { $refusal = '), 'only a clear answer ends the wait')
     assert.ok(inner.includes('  if ($claimSays -eq "unknown") { $unread++ } else { $unread = 0 }') && inner.includes('  if ($unread -ge 10) { $refusal = '), 'a claim unreadable for 10 looks in a row ends the wait, saying so')
@@ -703,7 +703,7 @@ const FAULTS = [
   ['S3: a window that gives up after its first look', 'windowRefusal', "          'while (-not $gone) {',", "          'if (-not $gone) {',"],
   ['R4: the claim not read while waiting', 'windowRefusal', "          '  if (-not (Test-Path -LiteralPath $claimPath)) { $claimSays = \"gone\" } else { try { $held = ", "          '  if ($false) { $claimSays = \"gone\" } else { try { $held = "],
   ['R4: a refusal while waiting cleared after the wait', 'windowRefusal', "    '$refusal = $null',\n    ...(v.waitFor === undefined", "    ...(v.waitFor === undefined"],
-  ['R5: exit 2 after a long session recorded as a refusal', 'windowRefusal', "`  if ($code -eq 2 -and ((Get-Date) - $started).TotalSeconds -lt ${LAUNCH_REFUSED_SECONDS}) {", "`  if ($code -eq 2) {"],
+  ['R5: exit 2 after a long session recorded as a refusal', 'windowRefusal', "`  if ($code -eq 2 -and -not $resumedHere -and ((Get-Date) - $started).TotalSeconds -lt ${LAUNCH_REFUSED_SECONDS}) {", "`  if ($code -eq 2 -and -not $resumedHere) {"],
   ['R3: a claim that cannot be read now ends the wait', 'windowRefusal', "'  if ($claimSays -eq \"gone\" -or $claimSays -eq \"other\") { $refusal = ", "'  if ($claimSays -ne \"ours\") { $refusal = "],
   ['R5 (final): a claim unreadable for ever holds the wait for ever', 'windowRefusal', "  if ($unread -ge ${CLAIM_UNREAD_LOOKS}) {", "  if ($false) {"],
   ['S3: a refusal no one but the window hears of', 'windowRefusal', "    '  Write-Refused $refusal',\n", ''],
