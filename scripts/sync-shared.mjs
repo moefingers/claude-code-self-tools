@@ -4,8 +4,10 @@
 // (shared/hooks/update-check.ts to plugins/<name>/hooks/update-check.ts).
 //
 // Every shared file names itself on a line `Canonical copy: shared/<path>`. By default it is copied
-// into every plugin. A file that also carries a line `Copies: <plugin>, <plugin>` is copied only into
-// those plugins (shared/hooks/machine.ts: `Copies: self-restart, self-switch`).
+// into every mod: each plugin with a hooks module (hooks/hooks.json). A plugin of skills alone
+// (self-hierarchy) has no hooks, so it gets none. A file that also carries a line
+// `Copies: <plugin>, <plugin>` is copied only into those plugins (shared/hooks/machine.ts:
+// `Copies: self-restart, self-switch`).
 //
 // A file in a plugin that carries the canonical line is stale, and is removed, when its path is no
 // longer under shared/, when it sits at another path than the one it names, or when it sits in a
@@ -59,9 +61,20 @@ export function plugins(root = ROOT) {
     .sort()
 }
 
-/** Each shared file, with the plugins it goes to. */
+/** The plugins that are mods: each one with a hooks module, hooks/hooks.json. A plugin of skills alone has none. */
+export function mods(root = ROOT) {
+  return plugins(root).filter(name => {
+    try {
+      return statSync(join(root, 'plugins', name, 'hooks', 'hooks.json')).isFile()
+    } catch {
+      return false
+    }
+  })
+}
+
+/** Each shared file, with the plugins it goes to: those its `Copies:` line names, else every mod. */
 export function shared(root = ROOT) {
-  const all = plugins(root)
+  const all = mods(root)
   return files(join(root, 'shared')).map(file => {
     const only = copiesOf(readFileSync(join(root, 'shared', file), 'utf8'))
     return { file, plugins: only === undefined ? all : only }

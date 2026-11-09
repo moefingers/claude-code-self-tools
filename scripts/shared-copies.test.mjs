@@ -7,7 +7,7 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'nod
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { test } from 'node:test'
-import { copies, copiesOf, plugins, ROOT, stale } from './sync-shared.mjs'
+import { copies, copiesOf, mods, plugins, ROOT, stale } from './sync-shared.mjs'
 
 test('every plugin has every shared file meant for it, unchanged', () => {
   const all = copies()
@@ -30,11 +30,17 @@ test('no plugin keeps a copy of a file that is not in shared/, or not meant for 
 test('the machine code goes to self-check, self-exit, self-restart, self-switch and self-wake only', () => {
   const machine = copies().filter(c => c.file === 'hooks/machine.ts')
   assert.deepEqual(machine.map(c => c.plugin).sort(), ['self-check', 'self-exit', 'self-restart', 'self-switch', 'self-wake'])
-  // The update check, which names no plugins, still goes to every one.
-  assert.deepEqual(copies().filter(c => c.file === 'hooks/update-check.ts').map(c => c.plugin), plugins())
+  // The update check, which names no plugins, still goes to every mod.
+  assert.deepEqual(copies().filter(c => c.file === 'hooks/update-check.ts').map(c => c.plugin), mods())
 })
 
-test('a Copies: line limits a file to the plugins it names; without one, a file goes to every plugin', () => {
+test('a plugin of skills alone, with no hooks module, gets no shared code', () => {
+  const skillsOnly = plugins().filter(plugin => !mods().includes(plugin))
+  assert.deepEqual(skillsOnly, ['self-hierarchy'])
+  assert.deepEqual(copies().filter(c => skillsOnly.includes(c.plugin)).map(c => `${c.plugin}:${c.file}`), [])
+})
+
+test('a Copies: line limits a file to the plugins it names; without one, a file goes to every mod', () => {
   assert.equal(copiesOf('// Canonical copy: shared/hooks/x.ts.\n// nothing else\n'), undefined)
   assert.deepEqual(copiesOf('// Canonical copy: shared/hooks/x.ts.\n// Copies: self-restart, self-switch\nexport {}\n'), ['self-restart', 'self-switch'])
   assert.deepEqual(copiesOf('# Copies: self-exit.\r\n'), ['self-exit'])
@@ -47,7 +53,13 @@ test('a Copies: line limits a file to the plugins it names; without one, a file 
       mkdirSync(dirname(join(root, path)), { recursive: true })
       writeFileSync(join(root, path), text)
     }
-    for (const name of ['alpha', 'beta', 'gamma']) put(`plugins/${name}/.claude-plugin/plugin.json`, '{}')
+    for (const name of ['alpha', 'beta', 'gamma']) {
+      put(`plugins/${name}/.claude-plugin/plugin.json`, '{}')
+      put(`plugins/${name}/hooks/hooks.json`, '{ "modules": ["./register.ts"] }')
+    }
+    // A plugin of skills alone: no hooks module, so no shared file goes to it.
+    put('plugins/delta/.claude-plugin/plugin.json', '{}')
+    put('plugins/delta/skills/x/SKILL.md', '---\nname: x\ndescription: x\n---\n')
     const everyone = '// Canonical copy: shared/hooks/all.ts.\n'
     const some = '// Canonical copy: shared/hooks/some.ts.\n// Copies: alpha, beta\n'
     put('shared/hooks/all.ts', everyone)
@@ -56,8 +68,9 @@ test('a Copies: line limits a file to the plugins it names; without one, a file 
     put('plugins/alpha/hooks/some.ts', some)
     put('plugins/beta/hooks/all.ts', everyone)
     put('plugins/gamma/hooks/all.ts', everyone)
-    // A copy in a plugin the line leaves out is stale.
+    // A copy in a plugin the line leaves out is stale, and so is any copy in a plugin of skills alone.
     put('plugins/gamma/hooks/some.ts', some)
+    put('plugins/delta/hooks/all.ts', everyone)
 
     const wanted = copies(root).map(c => `${c.plugin}:${c.file}:${c.isSame ? 'same' : 'missing'}`)
     assert.deepEqual(wanted, [
@@ -69,8 +82,9 @@ test('a Copies: line limits a file to the plugins it names; without one, a file 
     ])
     assert.deepEqual(
       stale(root).map(c => `${c.plugin}:${c.file}`),
-      ['gamma:hooks/some.ts'],
+      ['delta:hooks/all.ts', 'gamma:hooks/some.ts'],
     )
+    assert.deepEqual(mods(root), ['alpha', 'beta', 'gamma'])
   } finally {
     rmSync(root, { recursive: true, force: true })
   }

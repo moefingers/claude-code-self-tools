@@ -1,19 +1,20 @@
 #!/usr/bin/env node
 // Every check the repository has, in one run: the shared-copies test, the tools' tests, then for each plugin
-// `claude plugin validate --strict` and `claude plugin test`, then the marketplace file. Exits 1
-// when any of them fails.
+// `claude plugin validate --strict` and, for each mod, `claude plugin test`, then the marketplace file. Exits 1
+// when any of them fails. A plugin of skills alone (no hooks/hooks.json) has no hooks module for `test` to
+// load, and `test` refuses one, so it is validated only.
 //
 //   node scripts/test-all.mjs
 import { spawnSync } from 'node:child_process'
 import { join } from 'node:path'
-import { plugins, ROOT } from './sync-shared.mjs'
+import { mods, plugins, ROOT } from './sync-shared.mjs'
 
 const steps = [
   ['node', ['--test', 'scripts/*.test.mjs']],
   ['node', ['--test', 'tools/dev-run/dev-run.test.mjs']],
   ...plugins().flatMap(plugin => [
     ['claude', ['plugin', 'validate', join('plugins', plugin), '--strict']],
-    ['claude', ['plugin', 'test', join('plugins', plugin)]],
+    ...(mods().includes(plugin) ? [['claude', ['plugin', 'test', join('plugins', plugin)]]] : []),
   ]),
   ['claude', ['plugin', 'validate', '.']],
 ]

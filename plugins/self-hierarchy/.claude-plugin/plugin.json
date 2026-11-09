@@ -1,0 +1,10 @@
+{
+  "name": "self-hierarchy",
+  "version": "0.1.0",
+  "description": "A skill for running several Claude Code sessions together on one machine as a hierarchy: one owner, a coordinator, a merger and lane sessions, with builder and reviewer subagents, kept healthy with the self tools. A skill alone: no hooks, no tools, no network.",
+  "author": { "name": "moefingers", "url": "https://github.com/moefingers" },
+  "homepage": "https://github.com/moefingers/claude-code-self-tools/tree/main/plugins/self-hierarchy#readme",
+  "repository": "https://github.com/moefingers/claude-code-self-tools",
+  "license": "MIT",
+  "keywords": ["sessions", "hierarchy", "coordinator", "merger", "skill"]
+}
