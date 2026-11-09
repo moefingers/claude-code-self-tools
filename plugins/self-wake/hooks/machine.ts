@@ -1386,6 +1386,42 @@ const GET_LEFT_FIELDS = [
   '}',
 ]
 
+/**
+ * Which of `$ids` a registry file's parsed JSON `$e` names outside its sessionId, cwd and name (free
+ * text: a session can work under a folder named for another conversation): `former`, each that is a
+ * formerNames entry's sessionId exactly (the conversations Claude Code records this process held
+ * earlier); and `mentions`, each found anywhere else, matched in each key's JSON without regard to
+ * case. A formerNames that isn't a list, an entry that isn't an object, an entry's other keys and
+ * their names, and a sessionId of another case or text are all searched as text, so they land in
+ * `mentions`. The probe reads it, and so does the in-place last look of a return trip (RECHECK_SELF).
+ */
+const GET_MENTIONS = [
+  'function Get-Mentions($e, $ids) {',
+  '  $mentioned = New-Object System.Collections.ArrayList',
+  '  $former = New-Object System.Collections.ArrayList',
+  '  foreach ($prop in $e.PSObject.Properties) {',
+  '    if ($prop.Name -ceq "sessionId" -or $prop.Name -ceq "cwd" -or $prop.Name -ceq "name") { continue }',
+  '    $texts = New-Object System.Collections.ArrayList',
+  '    $held = New-Object System.Collections.ArrayList',
+  '    if ($prop.Name -ceq "formerNames" -and $prop.Value -is [Array]) {',
+  '      foreach ($el in $prop.Value) {',
+  '        if ($el -is [Management.Automation.PSCustomObject]) {',
+  '          foreach ($q in $el.PSObject.Properties) {',
+  '            if ($q.Name -ceq "sessionId" -and $q.Value -is [string]) { [void]$held.Add($q.Value) }',
+  '            else { [void]$texts.Add($q.Name); [void]$texts.Add("$(ConvertTo-Json -InputObject $q.Value -Compress -Depth 8)") }',
+  '          }',
+  '        } else { [void]$texts.Add("$(ConvertTo-Json -InputObject $el -Compress -Depth 8)") }',
+  '      }',
+  '    } else { [void]$texts.Add("$(ConvertTo-Json -InputObject $prop.Value -Compress -Depth 8)") }',
+  '    foreach ($a in $ids) {',
+  '      if (-not $former.Contains($a) -and $held -ccontains $a) { [void]$former.Add($a) }',
+  '      foreach ($t in @($texts) + @($held | Where-Object { $_ -cne $a })) { if (-not $mentioned.Contains($a) -and "$t".IndexOf($a, [StringComparison]::OrdinalIgnoreCase) -ge 0) { [void]$mentioned.Add($a) } }',
+  '    }',
+  '  }',
+  '  return @{ mentions = $mentioned; former = $former }',
+  '}',
+]
+
 function checkFolder(what: string, path: unknown): string {
   const fault = folderFault(path)
   if (fault !== undefined || !isSafeFolder(path)) throw new Error(`${what} ${JSON.stringify(path)} ${fault ?? 'is not a folder a script takes'}, so it is not an absolute folder a script takes (no quote, control character, < > | ? * or /, no '.' or '..' part)`)
@@ -1556,7 +1592,9 @@ export function probeScript(input: ProbeInput): string {
     // The registry: per file, whether it parses, its key names, and seven values as their JSON types; a
     // value that is a list or an object comes as { nested = "list" } or { nested = "object" }, never as null.
     // And which of the asked-about ids it names in any key but sessionId, cwd and name (free text: a
-    // session can work under a folder named for another conversation) (`mentions`): the ids, never a value.
+    // session can work under a folder named for another conversation): as a formerNames entry's
+    // sessionId (`former`), or anywhere else (`mentions`), by Get-Mentions: the ids, never a value.
+    ...GET_MENTIONS,
     '$registry = New-Object System.Collections.ArrayList',
     'for ($k = 0; $k -lt $configDirs.Count; $k++) {',
     '  $reg = Join-Path $configDirs[$k] "sessions"',
@@ -1578,13 +1616,9 @@ export function probeScript(input: ProbeInput): string {
     '          $prop = $e.PSObject.Properties | Where-Object { $_.Name -ceq $key } | Select-Object -First 1',
     '          if ($null -ne $prop) { $v = $prop.Value; if ($null -ne $v -and -not ($v -is [string] -or $v -is [ValueType])) { if ($v -is [Array]) { $v = [ordered]@{ nested = "list" } } else { $v = [ordered]@{ nested = "object" } } }; $o[$key] = $v }',
     '        }',
-    '        $mentioned = New-Object System.Collections.ArrayList',
-    '        foreach ($prop in $e.PSObject.Properties) {',
-    '          if ($prop.Name -ceq "sessionId" -or $prop.Name -ceq "cwd" -or $prop.Name -ceq "name") { continue }',
-    '          $valueText = "$(ConvertTo-Json -InputObject $prop.Value -Compress -Depth 8)"',
-    '          foreach ($a in $ids) { if (-not $mentioned.Contains($a) -and $valueText.IndexOf($a, [StringComparison]::OrdinalIgnoreCase) -ge 0) { [void]$mentioned.Add($a) } }',
-    '        }',
-    '        if ($mentioned.Count -gt 0) { $o["mentions"] = [object[]]$mentioned }',
+    '        $said = Get-Mentions $e $ids',
+    '        if ($said.mentions.Count -gt 0) { $o["mentions"] = [object[]]$said.mentions }',
+    '        if ($said.former.Count -gt 0) { $o["former"] = [object[]]$said.former }',
     '      }',
     '      [void]$registry.Add($o)',
     '    }',
@@ -1710,8 +1744,16 @@ export type RegistryEntry =
       readonly procStart: number | string
       /** Keys not in REGISTRY_KEYS: ignored, and logged once per process by the plugin. */
       readonly extra: readonly string[]
-      /** The asked-about conversations it names in any key but sessionId, cwd and name. */
+      /**
+       * The asked-about conversations it names in any key but sessionId, cwd and name, past `former`:
+       * a conversation named there too, or named in a formerNames entry any other way, is here.
+       */
       readonly mentions: readonly string[]
+      /**
+       * The asked-about conversations it names as the sessionId of a formerNames entry, exactly: Claude
+       * Code's record of a conversation this process held earlier and left, which it holds no longer.
+       */
+      readonly former: readonly string[]
     }
   | { readonly dir: number; readonly file: number; readonly shape: 'bad'; readonly why: string }
 
@@ -1837,7 +1879,8 @@ const kindOf = (value: unknown): string => {
  * REGISTRY_VERSION_MARKERS, or a `version` that isn't a string, is a new format: `bad` too, naming it.
  * Any other key is ignored, and listed in `extra` when it isn't in REGISTRY_KEYS. `mentions` are the
  * asked-about ids it names in any key but sessionId, cwd and name, which liveness reads (a
- * conversation named there is unknown).
+ * conversation named there is unknown); `former`, those it names as a formerNames entry's sessionId,
+ * exactly (unknown too, but for a return trip of this very process: liveness).
  */
 function registryShape(raw: Record<string, unknown>, dir: number, file: number): RegistryEntry {
   const no = (why: string): RegistryEntry => ({ dir, file, shape: 'bad', why })
@@ -1860,7 +1903,8 @@ function registryShape(raw: Record<string, unknown>, dir: number, file: number):
   } else return no(`has a procStart that is a ${kindOf(procStart)}, not a number or a string of digits`)
   const extra = names.filter(key => !(REGISTRY_KEYS as readonly string[]).includes(key))
   const mentions = 'mentions' in raw ? (raw.mentions as string[]) : []
-  return { dir, file, shape: 'ok', pid, sessionId, procStart, extra, mentions }
+  const former = 'former' in raw ? (raw.former as string[]) : []
+  return { dir, file, shape: 'ok', pid, sessionId, procStart, extra, mentions, former }
 }
 
 /** A go's id, as a left record may name the coordinator's go it was written for. */
@@ -1979,10 +2023,13 @@ export function parseProbe(stdout: string): Probe | { error: string } {
       }
     })
     const registry = list(top.registry, 'the registry').map((value): RegistryEntry => {
-      const r = fields(value, 'a registry entry', ['dir', 'file', 'ok'], ['keys', 'pid', 'sessionId', 'procStart', 'status', 'statusUpdatedAt', 'kind', 'version', 'mentions'])
+      const r = fields(value, 'a registry entry', ['dir', 'file', 'ok'], ['keys', 'pid', 'sessionId', 'procStart', 'status', 'statusUpdatedAt', 'kind', 'version', 'mentions', 'former'])
       if (!isCount(r.dir, 7) || !isPid(r.file) || typeof r.ok !== 'boolean') bad('a registry entry has no folder, file or parse flag')
       if ('mentions' in r && (r.ok !== true || !Array.isArray(r.mentions) || r.mentions.length > 8 || !r.mentions.every(m => typeof m === 'string' && SESSION_ID.test(m)))) {
         bad("a registry entry's mentions are not session ids")
+      }
+      if ('former' in r && (r.ok !== true || !Array.isArray(r.former) || r.former.length > 8 || !r.former.every(m => typeof m === 'string' && SESSION_ID.test(m)))) {
+        bad("a registry entry's former conversations are not session ids")
       }
       if (r.ok === false && 'keys' in r) bad('a registry entry that did not parse has keys')
       return registryShape(r, r.dir as number, r.file as number)
@@ -2258,7 +2305,11 @@ export type ProcessRef = { readonly pid: number; readonly created: string }
  *   restart, self-restart): its own registry entry and command line are no evidence against it, and its
  *   transcript writes and heartbeat (L3, L5) aren't read, but only while the probe sees it running with
  *   that start and its own current registry entry names `id`; otherwise L3 and L5 are read, saying why.
- *   Any other holder still is evidence, and an unknown stays unknown;
+ *   Any other holder still is evidence, and an unknown stays unknown. And, with `left`, for a return
+ *   trip in place (#31): its own current registry entry naming `id` only as a formerNames entry's
+ *   sessionId (a conversation it held earlier) is no unknown, when the probe read one left record of
+ *   `id`, of its shape, its MAC matched, naming `id`, by this pid and start. Another process's
+ *   formerNames naming `id`, or this one's without that record, is unknown as before;
  * - `left`: take the probe's left record for `id` into account (\u00a73.4): it waives L3 and L5, and only
  *   those, under all six of its conditions; otherwise it is ignored, saying why.
  */
@@ -2310,6 +2361,17 @@ export function liveness(probe: Probe, id: string, now: number, opts: LivenessOp
     const p = table.get(pid)
     return p !== undefined && near(p.created, opts.self.created)
   }
+  /**
+   * Whether this very process left `id` (opts.self, with opts.left): the probe read one left record of
+   * `id`, of its shape, its MAC matched, naming `id`, by this pid and start, as leftRefusal reads one.
+   */
+  const selfLeft = ((): boolean => {
+    const self = opts.self
+    if (self === undefined || opts.left !== true || !isSelf(self.pid) || probe.errors.some(e => e.source === 'left')) return false
+    const records = (probe.left ?? []).filter(l => l.asked === id)
+    const record = records[0]
+    return records.length === 1 && record !== undefined && record.ok && record.macOk && record.id === id && record.pid === self.pid && near(record.created, self.created)
+  })()
   for (const e of probe.errors) {
     if (e.source === 'registry') unknown.push(`unknown: the session registry of config folder ${e.dir ?? '?'} can't be read`)
     if (e.source === 'transcripts') unknown.push(`unknown: the transcripts of config folder ${e.dir ?? '?'} can't be read`)
@@ -2320,6 +2382,8 @@ export function liveness(probe: Probe, id: string, now: number, opts: LivenessOp
   const snapshot = table.get(probe.self)
   /** The conversations each claude.exe's own current, well-formed registry entries name. */
   const holds = new Map<number, string[]>()
+  /** This very process's formerNames naming `id`, with its left record of it: held earlier, said. */
+  const earlier: string[] = []
   for (const entry of probe.registry) {
     const owner = table.get(entry.file)
     const isLiveClaude = owner !== undefined && isClaude(owner)
@@ -2327,9 +2391,14 @@ export function liveness(probe: Probe, id: string, now: number, opts: LivenessOp
       if (isLiveClaude) unknown.push(`unknown: the registry file of running claude.exe ${entry.file} ${entry.why}`)
       continue
     }
-    // Named outside its sessionId (a key this check doesn't read): what that process holds is unclear.
-    if (isLiveClaude && entry.sessionId !== id && entry.mentions.includes(id)) {
-      unknown.push(`unknown: the registry file of running claude.exe ${entry.file} names it outside its sessionId`)
+    // Named outside its sessionId (a key this check doesn't read, or formerNames): what that process
+    // holds is unclear. Save for a return trip in place (#31): this very process's own current file
+    // naming it only as a formerNames entry's sessionId, with its own left record of it (selfLeft), is a
+    // conversation it held earlier and left.
+    if (isLiveClaude && entry.sessionId !== id && (entry.mentions.includes(id) || entry.former.includes(id))) {
+      const heldEarlier = !entry.mentions.includes(id) && selfLeft && isSelf(entry.file) && near(owner.created, entry.procStart)
+      if (heldEarlier) earlier.push(`held earlier, not now: the registry file of claude.exe ${entry.file}, this process, names it only in formerNames, and this process's left record says it left it`)
+      else unknown.push(`unknown: the registry file of running claude.exe ${entry.file} names it outside its sessionId`)
     }
     if (!isLiveClaude || !near(owner.created, entry.procStart)) continue
     current.add(entry.pid)
@@ -2409,7 +2478,7 @@ export function liveness(probe: Probe, id: string, now: number, opts: LivenessOp
   const verdict = live.length > 0 ? 'live' : unknown.length > 0 ? 'unknown' : 'not-live'
   const record = waived ? (probe.left ?? []).find(l => l.asked === id) : undefined
   const stat = record !== undefined && record.ok ? leftStat(record) : undefined
-  return { verdict, evidence: [...live, ...unknown, ...waivers], ...(stat === undefined ? {} : { waived: stat }) }
+  return { verdict, evidence: [...live, ...unknown, ...earlier, ...waivers], ...(stat === undefined ? {} : { waived: stat }) }
 }
 
 /**
@@ -4372,25 +4441,67 @@ export const CLAIM_CHECKED = /^(ours|not-ours|absent)\s*$/m
 export const CLAIM_CHECK_LIVE = /^live (.{1,1000}?)\s*$/m
 
 /**
+ * RECHECK for the in-place last look of a return trip (claimCheckScript's `self`, #31): one line more,
+ * right before the refusal of a conversation named outside its sessionId. That refusal stands, but for
+ * this very process's own current registry file (its pid, and its start as the file and the process
+ * table both say) naming `$id` only as a formerNames entry's sessionId (Get-Mentions), while its own left
+ * record of `$id` is there (`$selfLeft`): a conversation it held earlier and left, as liveness reads it.
+ * Every other line is RECHECK's: the window's, the slot runner's, the claude wrapper's and
+ * claude-launch.ps1's copies stay as they are, since none of them runs beside the process it checks.
+ */
+export const RECHECK_SELF: readonly string[] = (() => {
+  const at = RECHECK.findIndex(line => line.startsWith('    if ($named) {'))
+  if (at < 0) throw new Error("RECHECK has no refusal of a conversation named outside its sessionId")
+  return [
+    ...RECHECK.slice(0, at),
+    `    if ($named -and $selfLeft -and [long]$f.BaseName -eq $selfPid -and $near) { $selfStart = $false; try { $selfStart = [long]$e.pid -eq $selfPid -and [math]::Abs([decimal]$p.CreationDate.ToFileTimeUtc() - [decimal]$selfCreated) -le ${PROC_START_TOLERANCE} } catch { $selfStart = $false }; $said = Get-Mentions $e @($id); if ($selfStart -and $said.former -ccontains $id -and $said.mentions.Count -eq 0) { $named = $false } }`,
+    ...RECHECK.slice(at),
+  ]
+})()
+
+/**
+ * The lines RECHECK_SELF needs, before it: `$selfPid` and `$selfCreated` (this process, checked), Get-Mentions,
+ * and `$selfLeft`, whether this process's left record of `id` is there, read as the probe reads it
+ * (leftReadLines, its MAC checked inside the script): one record, of its shape, its MAC matched, naming
+ * `id`, by this pid and start. Anything unread is no record.
+ */
+function selfLeftLines(state: string, id: string, self: ProcessRef): string[] {
+  return [
+    `$selfPid = ${self.pid}`,
+    `$selfCreated = '${self.created}'`,
+    '$errors = New-Object System.Collections.ArrayList',
+    ...GET_MENTIONS,
+    ...leftReadLines(state, [id]),
+    '$selfLeft = $false',
+    `try { if ($errors.Count -eq 0 -and $leftOut.Count -eq 1) { $l = $leftOut[0]; $selfLeft = ($l.ok -eq $true -and $l.macOk -eq $true -and $l.id -ceq $id -and [long]$l.pid -eq $selfPid -and [math]::Abs([decimal]$l.created - [decimal]$selfCreated) -le ${PROC_START_TOLERANCE}) } } catch { $selfLeft = $false }`,
+  ]
+}
+
+/**
  * The last look before an in-place /resume, as the window and the slot take theirs: first the
  * re-check (RECHECK: L1 and L2 of `id`, from `configDirs`' registries and every process's command
  * line), and, with `left`, the left record's stat (leftRecheck: the transcript unchanged since it was
  * left), answering `live <why>` when anything holds it, changed or can't be read; then the claim lock
- * on `id`, whether it names `by`. Changes nothing.
+ * on `id`, whether it names `by`. With `self`, this process (its pid and creation time, as liveness's
+ * `self`), the re-check is RECHECK_SELF: a return trip in place to a conversation this process held
+ * earlier and left (its formerNames, and its left record) is not refused for that. Changes nothing.
  */
-export function claimCheckScript(input: { readonly stateDir: string; readonly id: string; readonly by: string; readonly configDirs: readonly string[]; readonly left?: LeftStat }): string {
+export function claimCheckScript(input: { readonly stateDir: string; readonly id: string; readonly by: string; readonly configDirs: readonly string[]; readonly left?: LeftStat; readonly self?: ProcessRef }): string {
   const { state, id, by } = checkClaim(input)
   if (input.configDirs.length < 1 || input.configDirs.length > 8) throw new Error('the claim check reads 1 to 8 config folders')
   const configDirs = input.configDirs.map(dir => checkFolder('a config folder', dir))
+  const self = input.self
+  if (self !== undefined && (!isPid(self.pid) || !isTicks(self.created))) throw new Error('this process is not a pid and a time as a string')
   return [
     "$ErrorActionPreference = 'Stop'",
     "$ProgressPreference = 'SilentlyContinue'",
     PSMODULEPATH_RESET,
     `$id = '${id}'`,
     `$configDirs = @(${configDirs.map(literal).join(', ')})`,
+    ...(self === undefined ? [] : selfLeftLines(state, id, self)),
     '$live = $null',
     'try {',
-    ...RECHECK.map(line => `  ${line}`),
+    ...(self === undefined ? RECHECK : RECHECK_SELF).map(line => `  ${line}`),
     ...(input.left === undefined ? [] : leftRecheck(input.left).map(line => `  ${line}`)),
     '} catch { $live = "whether it is open elsewhere is unknown: the registry or the process table could not be read (" + $_.Exception.Message + ")" }',
     String.raw`if ($null -ne $live) { "live " + ($live -split "\r?\n")[0]; exit 0 }`,

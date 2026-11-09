@@ -951,11 +951,14 @@ describe('the scripts, as text', () => {
     expect(probe).toContain('foreach ($key in "pid", "sessionId", "procStart", "status", "statusUpdatedAt", "kind", "version")')
     // Which asked-about ids a registry file's text names: the ids, never the text.
     // Per key, past sessionId, cwd and name: free text, where a folder may be named for another conversation.
-    expect(probe).toContain('          if ($prop.Name -ceq "sessionId" -or $prop.Name -ceq "cwd" -or $prop.Name -ceq "name") { continue }')
-    expect(probe).toContain('          $valueText = "$(ConvertTo-Json -InputObject $prop.Value -Compress -Depth 8)"')
-    expect(probe).toContain('          foreach ($a in $ids) { if (-not $mentioned.Contains($a) -and $valueText.IndexOf($a, [StringComparison]::OrdinalIgnoreCase) -ge 0) { [void]$mentioned.Add($a) } }')
-    expect(probe).toContain('if ($mentioned.Count -gt 0) { $o["mentions"] = [object[]]$mentioned }')
-    expect(probe).not.toMatch(/\$o\["(text|valueText|cwd|name)"\]/)
+    expect(probe).toContain('    if ($prop.Name -ceq "sessionId" -or $prop.Name -ceq "cwd" -or $prop.Name -ceq "name") { continue }')
+    expect(probe).toContain('    } else { [void]$texts.Add("$(ConvertTo-Json -InputObject $prop.Value -Compress -Depth 8)") }')
+    expect(probe).toContain('      foreach ($t in @($texts) + @($held | Where-Object { $_ -cne $a })) { if (-not $mentioned.Contains($a) -and "$t".IndexOf($a, [StringComparison]::OrdinalIgnoreCase) -ge 0) { [void]$mentioned.Add($a) } }')
+    expect(probe).toContain('        $said = Get-Mentions $e $ids')
+    expect(probe).toContain('if ($said.mentions.Count -gt 0) { $o["mentions"] = [object[]]$said.mentions }')
+    // And a formerNames entry's sessionId, exactly, apart (#31): the id alone, never the entry.
+    expect(probe).toContain('if ($said.former.Count -gt 0) { $o["former"] = [object[]]$said.former }')
+    expect(probe).not.toMatch(/\$o\["(text|texts|valueText|held|cwd|name|formerNames)"\]/)
     // A nested value comes as what it is, never as null: a null would read as a missing field's type.
     expect(probe).toContain('if ($v -is [Array]) { $v = [ordered]@{ nested = "list" } } else { $v = [ordered]@{ nested = "object" } }')
     expect(probe).not.toMatch(/\.jsonl"\)\s*-Raw|Get-Content[^\n]*\.jsonl/)
