@@ -471,6 +471,7 @@ describe('S3: the window waits for the old process by its handle, keeps waiting,
 
 const PWSH = join(process.env.ProgramFiles ?? 'C:\\Program Files', 'PowerShell', '7', 'pwsh.exe')
 const hasPwsh = existsSync(PWSH)
+const SYSTEM_ROOT = process.env.SystemRoot ?? 'C:\\Windows'
 /** The token a ticket is built with before the stub puts the tab's own in its place. */
 const PLACEHOLDER = '00000000-0000-4000-8000-000000000000'
 
@@ -526,8 +527,11 @@ async function windowRun({ programFiles = 'real', restricted = false, copy = 'ok
     mkdirSync(join(dirs.config, 'projects', machine.projectName(folder)), { recursive: true })
     writeFileSync(join(dirs.config, 'projects', machine.projectName(folder), `${conversation}.jsonl`), '')
   }
-  // Windows sets a 64-bit process's ProgramFiles from ProgramW6432 when it starts: both point at the folder.
-  const noPwsh = programFiles === 'real' ? undefined : mkdtempSync(join(work, 'no-pwsh-'))
+  // 'none': a Program Files folder of the standard shape (a drive and one folder) with no PowerShell 7 in
+  // it, the Windows folder, so only the check that pwsh.exe is there turns the window to Windows PowerShell.
+  // Windows sets a 64-bit process's ProgramFiles from ProgramW6432 when it starts: both name the folder.
+  const noPwsh = programFiles === 'real' ? undefined : SYSTEM_ROOT
+  if (noPwsh !== undefined) assert.ok(machine.PWSH_PATH.test(machine.pwshPath(noPwsh)) && !existsSync(machine.pwshPath(noPwsh)), `${noPwsh} is of the shape, with no PowerShell 7 in it`)
   const extra = {
     ...(noPwsh === undefined ? {} : { ProgramFiles: noPwsh, ProgramW6432: noPwsh }),
     ...(restricted ? { PSExecutionPolicyPreference: 'Restricted' } : {}),
@@ -617,6 +621,18 @@ describe("a window's launch, end to end: the interpreter it chose, the wrapper's
     assert.deepEqual(machine.pickLaunchTransport(r.probeOf(1), null, { replacing: true, pane: { token: first.token, pane }, configCount: 1, needsLeft: false }), { where: { pane: { token: first.token } } })
     assert.equal(second.parent?.pid, opened.pid, 'the restart runs in the same window')
     assert.deepEqual(second.args, ['--resume', r.id])
+  })
+
+  test('a pwsh.exe under a Program Files folder not of the standard shape (a drive and one folder) is never the window\'s interpreter', async () => {
+    const dirs = lab()
+    // A file named pwsh.exe, where a folder deep in the temporary folder would put PowerShell 7: never run (the window is only recorded).
+    const odd = mkdtempSync(join(work, 'odd-pf-'))
+    mkdirSync(join(odd, 'PowerShell', '7'), { recursive: true })
+    writeFileSync(join(odd, 'PowerShell', '7', 'pwsh.exe'), 'not a program')
+    assert.ok(!machine.PWSH_PATH.test(machine.pwshPath(odd)))
+    const launched = await launchWindow(dirs, randomUUID(), { ProgramFiles: odd, ProgramW6432: odd })
+    assert.equal(launched.answer.launched?.transport, 'window', launched.ran.stdout + launched.ran.stderr)
+    assert.equal(launched.window.file.toLowerCase(), WINDOWS_POWERSHELL.toLowerCase())
   })
 
   for (const copy of ['missing', 'changed']) {
