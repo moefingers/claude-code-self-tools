@@ -304,10 +304,10 @@ const SETTLE = 45_000
 /** Long enough for a change and its resume, after this session's own delay. */
 const FLOW = SETTLE + DELAY + 15_000
 
-/** A session titled TITLE, watched long enough for a baseline. */
+/** A session titled TITLE, watched long enough for a baseline; its SessionStart names it as the engine does, by its id. */
 async function begin($: Engine, w: World) {
   await $.session.start(start)
-  await $.classic.SessionStart({ source: 'startup', session_title: TITLE })
+  await $.classic.SessionStart({ source: 'startup', session_id: SESSION, session_title: TITLE })
   await w.clock.advance(6000)
 }
 
@@ -1471,4 +1471,107 @@ test('after a retry settles, a cap within the next minutes is told again', async
   expect(runsOf(w, 'remote-control')).toBe(1)
   expect(w.toasts).toHaveLength(2)
   expect(w.toasts[1]).toContain(RC_CAPPED)
+})
+
+// Claude Code empties a plugin's `$.state` at an in-process /clear or /resume, and no session.start follows
+// (claude-code-self-tools#24). The login record and the servers seen are the machine's and the session's, so
+// they outlive it in the module's mirrors; the resume claim is keyed by the conversation the stop was recorded
+// in (#23). `wipe` empties the state as Claude Code does.
+
+/** The conversation a /resume brings this process back to, while `$.session.id()` still answers SESSION. */
+const A = '00000000-0000-4000-8000-00000000000a'
+const LOGIN_KEY = 'self-remote-control/login'
+const SERVERS_KEY = 'self-remote-control/servers'
+
+test('a /resume empties $.state and no session.start follows: the login record goes back at its SessionStart, so the next login change reconnects', async ($, on) => {
+  const state = new Map<string, { value: unknown; version: number }>()
+  const w = machine(on, { state })
+  await begin($, w)
+  expect(state.get(LOGIN_KEY)?.value).toMatchObject({ account: fingerprint('account-a') })
+
+  state.clear()
+  await $.classic.SessionStart({ source: 'resume', session_id: SESSION, session_title: TITLE })
+  // Back before the watch's next look.
+  expect(state.get(LOGIN_KEY)?.value).toMatchObject({ account: fingerprint('account-a') })
+
+  w.switchTo('account-b')
+  await w.clock.advance(SETTLE)
+  expect(w.commands).toEqual([`remote-control ${TITLE}`])
+})
+
+test("a wipe that lands after a /clear's SessionStart: the next look finds the login record empty, writes the mirror back, and the change is still seen", async ($, on) => {
+  const state = new Map<string, { value: unknown; version: number }>()
+  const w = machine(on, { state })
+  await begin($, w)
+  await $.classic.SessionStart({ source: 'clear', session_id: SESSION, session_title: TITLE })
+  state.clear()
+
+  // Without the record, the new account would be taken as the baseline, and nothing would reconnect. (Bare: the
+  // title went with the wipe, and comes back with the next prompt or SessionStart that carries it.)
+  w.switchTo('account-b')
+  await w.clock.advance(SETTLE)
+  expect(w.commands).toEqual(['remote-control'])
+  expect(state.get(LOGIN_KEY)?.value).toMatchObject({ account: fingerprint('account-b') })
+})
+
+test('a change being handled when the wipe comes is not dropped: Remote Control still reconnects', async ($, on) => {
+  const state = new Map<string, { value: unknown; version: number }>()
+  const w = machine(on, { state })
+  await begin($, w)
+  w.switchTo('account-b')
+  // Confirmed, and waiting for the old link to stop.
+  await w.clock.advance(10_000)
+  expect((state.get(LOGIN_KEY)?.value as { pending?: unknown } | undefined)?.pending).toBeDefined()
+  state.clear()
+  await w.clock.advance(SETTLE)
+  // Bare: the title went with the wipe.
+  expect(w.commands).toEqual(['remote-control'])
+})
+
+test('the servers seen outlive a wipe: Claude in Chrome, listed before it and dropped with the account, is still reconnected', async ($, on) => {
+  const state = new Map<string, { value: unknown; version: number }>()
+  const w = machine(on, { state, chrome: true })
+  await begin($, w)
+  await $.turn.start({ text: 'go on', turnId: T3 })
+  await $.turn.complete({ ...answered, turnId: T3 })
+  await w.clock.advance(1000)
+  expect(state.get(SERVERS_KEY)?.value).toEqual({ chrome: true })
+
+  state.clear()
+  await $.classic.SessionStart({ source: 'resume', session_id: SESSION, session_title: TITLE })
+  expect(state.get(SERVERS_KEY)?.value).toEqual({ chrome: true })
+  // And once more after it: the read that finds it empty puts it back.
+  state.clear()
+  w.tools.chrome = false
+  await cutOff($, w)
+  w.switchTo('account-b')
+  await w.clock.advance(CHROME_FLOW)
+  // Remote Control bare: the title went with the second wipe.
+  expect(w.commands).toEqual(['remote-control', 'mcp reconnect claude-in-chrome'])
+})
+
+test("the resume claim right after a move back to another conversation, while $.session.id() still names the one left: keyed by the stop's own conversation", async ($, on) => {
+  const w = machine(on)
+  await begin($, w)
+  // A /resume back to A: its SessionStart names A; `$.session.id()` still answers SESSION, the one left.
+  await $.classic.SessionStart({ source: 'resume', session_id: A, session_title: TITLE })
+  // The stop comes within the id's lag, and the claim after it; `$.session.id()` answers SESSION throughout.
+  await cutOff($, w)
+  w.switchTo('account-b')
+  await w.clock.advance(FLOW)
+  expect(w.prompts).toEqual([RESUME])
+  expect(w.claims).toEqual([`${LOCAL}\\claude-self-tools\\resumed\\${A}.${T1}.json`])
+})
+
+test('a stop recorded with no conversation (a turn written before this version) claims nothing and resumes nothing, saying why', async ($, on) => {
+  const now = 100 * HOUR
+  const state = new Map<string, { value: unknown; version: number }>()
+  const w = machine(on, { state })
+  await begin($, w)
+  state.set('self-remote-control/turn', { version: 9, value: { running: false, at: now + 5000, outcome: 'error', error: 'rate_limit', turnId: T1 } })
+  w.switchTo('account-b')
+  await w.clock.advance(FLOW)
+  expect(w.prompts).toEqual([])
+  expect(w.claims).toEqual([])
+  expect(w.toasts[0]).toContain("no resume: the conversation the interrupted turn ran in isn't known, so the resume can't be claimed")
 })

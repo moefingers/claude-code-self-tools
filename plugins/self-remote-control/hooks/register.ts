@@ -36,7 +36,7 @@ import type { EngineInterface, Register } from 'claude-code'
 import type { Held, Queued } from '../types'
 import { read, readNow, runRemoteControl, sessionTitle, why, type Reading } from './connection'
 import { LOCK_HOLD_MS, releaseLock, takeLock } from './rc-lock'
-import { aroundLogin, configureRelogin, forgetTurn, noteFailure, notePersonPrompt, noteServers, noteTurnEnd, noteTurnStart, startWatch } from './relogin'
+import { aroundLogin, configureRelogin, forgetTurn, noteFailure, notePersonPrompt, noteServers, noteTurnEnd, noteTurnStart, restoreAfterMove, startWatch } from './relogin'
 import { configureUpdateCheck, loadUpdateCheck, withUpdateNotice } from './update-check'
 
 const queued = { plugin: 'self-remote-control', key: 'queued' } as const
@@ -444,6 +444,8 @@ export const register: Register = (on, options) => {
   on('classic.SessionStart', async ($, e, next) => {
     const done = await next(e)
     await remember($, e)
+    // The conversation it names; at a /clear or a /resume, the login record and the servers seen back from their mirrors.
+    if (e.agent_id === undefined) await restoreAfterMove($, e.source, e.session_id)
     // Another conversation: its last turn isn't the one this plugin saw end.
     if (e.agent_id === undefined && (e.source === 'clear' || e.source === 'resume' || e.source === 'fork')) await forgetTurn($)
     return done

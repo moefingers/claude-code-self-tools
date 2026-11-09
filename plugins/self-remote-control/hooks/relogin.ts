@@ -60,10 +60,20 @@
 //      part is left out, and a toast with nothing else new (a resume, a step that did something) isn't
 //      shown. A resume names the error kind its turn ended on and how long ago, there and in a debug
 //      line, so it can be checked after.
+//
+// The login record and the servers seen are the machine's sign-in and the session's tools, not the
+// conversation's, so they outlive a move: Claude Code empties $.state at an in-process /clear or /resume,
+// with no session.start after, and the module keeps a mirror of each, set at every write. A read that finds
+// one empty while its mirror is set writes the mirror back and goes by it; and each goes back at every
+// main-loop classic SessionStart of a clear or a resume (restoreAfterMove), since the wipe may land before
+// that SessionStart or after it. The last turn and the resume's record are the conversation's, and are
+// forgotten at a move (forgetTurn). A turn keeps the conversation it ran in (`session`), named by the last
+// main-loop SessionStart of a startup, a resume or a clear while `$.session.id()` lags it: the resume claim
+// is keyed by it, never by `$.session.id()` read when the claim is made.
 import type { EngineInterface, PluginOptions, Timer } from 'claude-code'
 import type { Login, Pending, Resumes, Servers, Turn } from '../types'
 import { readNow, runRemoteControl, sessionTitle, why } from './connection'
-import { LOCK_HOLD_MS, releaseLock, takeLock } from './rc-lock'
+import { LOCK_HOLD_MS, releaseLock, SESSION_ID, takeLock } from './rc-lock'
 import { claimResume } from './resume-claim'
 
 const loginRef = { plugin: 'self-remote-control', key: 'login' } as const
@@ -114,6 +124,12 @@ export const QUICK_MS = 30_000
 export const CHROME_LOOK_MS = [10_000, 30_000] as const
 /** How long after the resume was sent a turn starting with it counts as its turn. */
 const SENT_MS = 10 * 60_000
+/**
+ * How long after a move's SessionStart `$.session.id()` may still name the conversation left: within it the
+ * event's id stands; past it the id is the conversation (the shared machine code's ID_LAG_MS, self-switch's
+ * and self-wake's rule).
+ */
+const ID_LAG_MS = 15_000
 
 /**
  * API error kinds a new login can clear: the limits, a failed or refused sign-in, billing, and an
@@ -157,6 +173,11 @@ let logins: number[] = []
 let connectedAtLogin: number | undefined
 let watchTimer: Timer | undefined
 let tickTimer: Timer | undefined
+/** The login record and the servers seen as this module last wrote or read them: the copies a /clear or a /resume doesn't empty. */
+let loginMirror: Login | undefined
+let serversMirror: Servers | undefined
+/** The conversation the last main-loop SessionStart of a startup, a resume or a clear named, and when. */
+let conversation: { readonly id: string; readonly at: number } | undefined
 
 /** Reads this load's settings and starts over; at register. */
 export function configureRelogin(options: PluginOptions): void {
@@ -173,6 +194,9 @@ export function configureRelogin(options: PluginOptions): void {
   connectedAtLogin = undefined
   watchTimer = undefined
   tickTimer = undefined
+  loginMirror = undefined
+  serversMirror = undefined
+  conversation = undefined
 }
 
 /** Whether the watch runs at all: off when both settings are, and then Claude in Chrome's step doesn't run either. */
@@ -297,8 +321,75 @@ async function isSettingOn($: EngineInterface): Promise<boolean> {
   }
 }
 
+/**
+ * The login record: $.state's, which the mirror then follows; read empty while the mirror is set (Claude Code
+ * emptied $.state at a /clear or a /resume), the mirror, written back.
+ */
 async function getLogin($: EngineInterface): Promise<Login | null> {
-  return (await $.state.get(loginRef)).value ?? null
+  const value = (await $.state.get(loginRef)).value ?? null
+  if (value !== null) {
+    loginMirror = value
+    return value
+  }
+  if (loginMirror === undefined) return null
+  await $.state.set(loginRef, loginMirror)
+  return loginMirror
+}
+
+/** Writes the login record, its mirror first. */
+async function setLogin($: EngineInterface, value: Login): Promise<void> {
+  loginMirror = value
+  await $.state.set(loginRef, value)
+}
+
+/** The servers seen, as getLogin reads the login: $.state's, else the mirror, written back; none when neither has any. Never throws. */
+async function getServers($: EngineInterface): Promise<Servers> {
+  const value = (await $.state.get(serversRef).catch(() => ({ value: null }))).value ?? null
+  if (value !== null) {
+    serversMirror = value
+    return value
+  }
+  if (serversMirror === undefined) return {}
+  await $.state.set(serversRef, serversMirror).catch(() => undefined)
+  return serversMirror
+}
+
+/**
+ * At a main-loop classic SessionStart: the conversation it names, by its own id, at a startup, a resume or a
+ * clear; and at a clear or a resume, which empty $.state now or a moment after, the login record and the
+ * servers seen written back from their mirrors, with plain sets. Safe to repeat. Never throws.
+ */
+export async function restoreAfterMove($: EngineInterface, source: unknown, id: unknown): Promise<void> {
+  try {
+    if ((source === 'startup' || source === 'resume' || source === 'clear') && typeof id === 'string' && SESSION_ID.test(id)) conversation = { id, at: await $.clock.now() }
+    if (source !== 'clear' && source !== 'resume') return
+    if (loginMirror !== undefined) await $.state.set(loginRef, loginMirror)
+    if (serversMirror !== undefined) await $.state.set(serversRef, serversMirror)
+  } catch {
+    // The next read that finds either empty puts it back.
+  }
+}
+
+/**
+ * The conversation this process holds now: the one the last moving SessionStart named, while `$.session.id()`
+ * still reads another within ID_LAG_MS of it (the id lags the move); else `$.session.id()`, adopted from
+ * here (past the lag, or a /branch, whose fork's SessionStart names nothing). Undefined when neither knows.
+ */
+async function conversationOf($: EngineInterface): Promise<string | undefined> {
+  let own: string | undefined
+  try {
+    const id = await $.session.id()
+    own = SESSION_ID.test(id) ? id : undefined
+  } catch {
+    own = undefined
+  }
+  const named = conversation
+  if (named === undefined) return own
+  if (own === undefined || own === named.id) return named.id
+  const now = await $.clock.now()
+  if (now - named.at >= 0 && now - named.at <= ID_LAG_MS) return named.id
+  conversation = { id: own, at: now }
+  return own
 }
 
 async function getTurn($: EngineInterface): Promise<Turn | null> {
@@ -429,7 +520,7 @@ export async function watch($: EngineInterface): Promise<void> {
       }
     }
     if (next !== null && next.pending === undefined && next.owedAt !== undefined && now >= next.owedAt) next = owedRetry(next, now)
-    if (next !== held) await $.state.set(loginRef, next)
+    if (next !== held && next !== null) await setLogin($, next)
     if (next?.pending !== undefined) startMoving($)
   } catch {
     // The next look tries again.
@@ -631,9 +722,10 @@ async function resume($: EngineInterface, held: Login, p: Pending, now: number):
   if ((await getResumes($))?.blocked === true) return 'no resume: the last one ended on an error at once, so it waits for you to type'
   const turn = await getTurn($)
   if (!isCutOff(turn, now)) return 'no turn was cut off'
-  await $.state.set(loginRef, { ...held, pending: { ...p, resumed: true } })
-  // The claim, right before the submit: whoever claims this stop first resumes it, and no one else.
-  const claim = await claimResume($, turn?.turnId, now)
+  await setLogin($, { ...held, pending: { ...p, resumed: true } })
+  // The claim, right before the submit: whoever claims this stop first resumes it, and no one else. Keyed by
+  // the conversation the stop was recorded in, never by `$.session.id()` now, which may lag a move.
+  const claim = await claimResume($, turn?.turnId, turn?.session, now)
   if ('lost' in claim) {
     $.ui.log(`self-remote-control: ${claim.lost}`, { to: 'debug' })
     return claim.lost
@@ -685,13 +777,16 @@ const isLoginRunning = (now: number): boolean => logins.some(at => now - at < LO
 
 /** The servers this session has listed tools of before, with what `tools` lists now added. Never throws. */
 async function rememberServers($: EngineInterface, tools: readonly { name: string }[]): Promise<Servers> {
-  const known: Servers = (await $.state.get(serversRef).catch(() => ({ value: null }))).value ?? {}
+  const known = await getServers($)
   const seen: Servers = {
     ...known,
     ...(tools.some(tool => tool.name.startsWith(`mcp__${CHROME}__`)) ? { chrome: true as const } : {}),
     ...(tools.some(tool => tool.name.startsWith(COORDINATOR_TOOLS)) ? { coordinator: true as const } : {}),
   }
-  if (seen.chrome !== known.chrome || seen.coordinator !== known.coordinator) await $.state.set(serversRef, seen).catch(() => undefined)
+  if (seen.chrome !== known.chrome || seen.coordinator !== known.coordinator) {
+    serversMirror = seen
+    await $.state.set(serversRef, seen).catch(() => undefined)
+  }
   return seen
 }
 
@@ -726,7 +821,7 @@ async function chromeStep($: EngineInterface, held: Login, p: Pending, now: numb
   if (runs.length >= RECONNECT_CAP) return { p: { ...q.p, chrome: 'capped' }, held: { ...held, chromeRuns: runs } }
   const marked: Pending = { ...q.p, chromeRanAt: now }
   const next: Login = { ...held, chromeRuns: [...runs, now], chromeAccount: held.account }
-  await $.state.set(loginRef, { ...next, pending: marked })
+  await setLogin($, { ...next, pending: marked })
   try {
     const ran = await within($, $.command.run({ command: 'mcp', args: `reconnect ${CHROME}` }), RUN_WAIT_MS)
     return { p: { ...without(marked, 'chromeRanAt'), chrome: ran === 'late' ? 'queued' : 'ran' }, held: next }
@@ -821,7 +916,7 @@ export async function move($: EngineInterface): Promise<void> {
     }
     /** Writes the change as it now stands, when anything moved. */
     const save = async (q: Pending, login: Login = stored) => {
-      if (q !== pending || login !== stored) await $.state.set(loginRef, { ...login, pending: q })
+      if (q !== pending || login !== stored) await setLogin($, { ...login, pending: q })
     }
     /** `q` with its idle moment forgotten: a turn or a /login runs. */
     const busyAgain = (q: Pending) => (q.idleAt === undefined ? q : without(q, 'idleAt'))
@@ -844,7 +939,7 @@ export async function move($: EngineInterface): Promise<void> {
       ;({ p, held } = await chromeStep($, held, p, now))
       if (p.chrome === undefined) return await save(p, held)
       // Its runs are kept now: the settle below reads the login again.
-      if (held !== before) await $.state.set(loginRef, { ...held, pending: p })
+      if (held !== before) await setLogin($, { ...held, pending: p })
     }
     if (p.resumeAt !== undefined && now < p.resumeAt) return await save(p, held)
     if ((await getTurn($))?.running === true) return await save(busyAgain(p), held)
@@ -877,7 +972,7 @@ export async function move($: EngineInterface): Promise<void> {
       ...(owed.length === 0 ? {} : { owedAt: Math.max(...owed) }),
       ...(rcOwed ? { rcOwed: true as const } : {}),
     }
-    await $.state.set(loginRef, settled)
+    await setLogin($, settled)
     // A cap's line is told once while that cap holds: after it, its part is left out.
     const rcPart = isCapToldAlready ? '' : rcSaid(p)
     const chromePart = isChromeCapToldAlready ? '' : chromeSaid(p).replace(/^; /, '')
@@ -912,7 +1007,8 @@ export async function noteTurnStart($: EngineInterface, text: string, turnId?: s
     const sentAt = resumes?.sentAt
     const isResumeTurn = sentAt !== undefined && now - sentAt < SENT_MS && text.includes(RESUME)
     if (resumes !== null && sentAt !== undefined && (isResumeTurn || now - sentAt >= SENT_MS)) await $.state.set(resumesRef, without(resumes, 'sentAt'))
-    await $.state.set(turnRef, { running: true, at: now, ...(isResumeTurn ? { fromResume: true as const } : {}), ...(turnId === undefined ? {} : { turnId }) })
+    const session = await conversationOf($)
+    await $.state.set(turnRef, { running: true, at: now, ...(isResumeTurn ? { fromResume: true as const } : {}), ...(turnId === undefined ? {} : { turnId }), ...(session === undefined ? {} : { session }) })
   } catch {
     // The turn's end sets it again.
   }
@@ -932,8 +1028,10 @@ export async function noteTurnEnd($: EngineInterface, end: TurnEnd): Promise<voi
     const isThisTurn = prior !== null && (prior.running || prior.outcome === undefined)
     const error = isThisTurn ? prior.error : undefined
     const fromResume = isThisTurn && prior.fromResume === true
-    // The id turn.complete carries, else the one its turn.start did: the resume claim's key.
+    // The id turn.complete carries, else the one its turn.start did, and the conversation its turn.start was
+    // in, else the one held now: the resume claim's key.
     const turnId = end.turnId ?? (isThisTurn ? prior.turnId : undefined)
+    const session = (isThisTurn ? prior.session : undefined) ?? (await conversationOf($))
     await $.state.set(turnRef, {
       running: false,
       at: await $.clock.now(),
@@ -941,6 +1039,7 @@ export async function noteTurnEnd($: EngineInterface, end: TurnEnd): Promise<voi
       ...(error === undefined ? {} : { error }),
       ...(fromResume ? { fromResume: true as const } : {}),
       ...(turnId === undefined ? {} : { turnId }),
+      ...(session === undefined ? {} : { session }),
     })
     if (fromResume && end.reason === 'error' && (end.usage === undefined || end.durationMs < QUICK_MS)) {
       const resumes = (await getResumes($)) ?? {}

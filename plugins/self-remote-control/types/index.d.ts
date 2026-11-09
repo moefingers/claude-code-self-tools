@@ -168,6 +168,11 @@ export type Turn = {
   fromResume?: true
   /** Its id, as turn.start and turn.complete carried it: the resume claim's key for a turn that ended on an error. */
   turnId?: string
+  /**
+   * The conversation it ran in: the one the last main-loop SessionStart of a startup, a resume or a clear named,
+   * while `$.session.id()` lagged that move, else `$.session.id()`. The resume claim's other key.
+   */
+  session?: string
 }
 
 /** The resume's own record, across changes. */

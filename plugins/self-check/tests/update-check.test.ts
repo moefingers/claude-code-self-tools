@@ -8,7 +8,14 @@ import { expect, mock, test } from 'claude-code/testing'
 import type { Engine } from 'claude-code/testing'
 import type { On } from 'claude-code'
 import { compareVersions, isVersion, manifestUrl, notice, publishedVersion, TIMEOUT_MS, toastText, WINDOW_MS } from '../hooks/update-check'
-import { CALL, PLUGIN, world } from './update-check.fixture'
+import * as fixture from './update-check.fixture'
+
+const { CALL, PLUGIN, world } = fixture
+/**
+ * What the fixture's call reads of the machine beneath each test's own environment (a fixture's optional
+ * `ENV`): self-restart plans its launch at the call, so it reads Windows' variables. A test's own win.
+ */
+const MACHINE: Readonly<Record<string, string>> = (fixture as unknown as { readonly ENV?: Readonly<Record<string, string>> }).ENV ?? {}
 
 const MINUTE = 60 * 1000
 const T0 = Date.UTC(2026, 10, 1)
@@ -62,7 +69,7 @@ function engine(on: On, { installed, env = {}, store, published = { text: manife
     return { value: undefined }
   })
   on('store.keys', () => ({ value: [...held.keys()] }))
-  mock.env(on, env)
+  mock.env(on, { ...MACHINE, ...env })
   on('session.start', (_, e) => ({ cwd: e.cwd }))
   on('session.id', () => ({ value: sessionId }))
   on('tool.register', (_, e) => ({ value: { tool: `mcp__${PLUGIN}__${e.name}` } }))

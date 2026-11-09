@@ -7,6 +7,11 @@ import { launchScriptText, SESSION_MARKERS } from '../hooks/launcher'
 import { type LaunchInput, leftScript, RECHECK, SLOT_SCRIPT_SHA256 } from '../hooks/machine'
 
 const TOOL = 'mcp__self-restart__restart_after_turn'
+/**
+ * A transcript under any project folder, in any config folder: the start folder each test gives holds the
+ * conversation's transcript (C:\work\a;b's too), so its own checks are the ones a test meets.
+ */
+const TRANSCRIPT = /\\projects\\[^\\]+\\[0-9a-f-]{36}\.jsonl$/
 const HOUR = 60 * 60 * 1000
 const ID = '0f8fad5b-d9cb-469f-a165-70867728950e'
 const WINDOWS = { OS: 'Windows_NT', SystemRoot: 'C:\\Windows', LOCALAPPDATA: 'C:\\Users\\u\\AppData\\Local', USERPROFILE: 'C:\\Users\\u' }
@@ -122,7 +127,8 @@ function engine(
   on('session.start', (_, e) => ({ cwd: e.cwd }))
   on('session.id', () => ({ value: ID }))
   on('tool.list', () => ({ value: [] }))
-  on('fs.exists', () => ({ value: false }))
+  // This conversation's transcript, under the repo's project folder: the start folder holds it.
+  on('fs.exists', (_, e) => ({ value: TRANSCRIPT.test(e.path) }))
   on('command.register', (_, e) => ({ value: { command: e.name } }))
   on('session.cwd', () => (world.cwd === 'reads' ? { value: 'C:\\work\\repo' } : { deny: 'no folder' }))
   on('tool.register', (_, e) => {

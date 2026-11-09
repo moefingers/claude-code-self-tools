@@ -7,7 +7,16 @@
 //
 // The armed wake lives in $.state, which survives a reload of this plugin; its timer doesn't. So
 // session.start arms it again for the time left, or fires it at once if that has passed. Firing
-// takes the wake with a compare-and-set on its version, so it is sent once.
+// takes the wake with a compare-and-set on its version (read just before), so it is sent once.
+//
+// Claude Code empties $.state at an in-process /clear or /resume, and no session.start follows. So the
+// module keeps a copy of the whole wake-up (`kept`), set at every write; $.state is only the copy that
+// outlives a reload. The copy goes back to $.state, with a plain set, at each main-loop classic
+// SessionStart of a clear or a resume, and at a read that finds it empty (the wipe may land after that
+// SessionStart); fire() goes by it when $.state reads empty. A wake-up armed before a /clear still fires,
+// into the conversation the /clear started, as it did when $.state outlived the /clear: it is the
+// process's one wake-up, and lasts as long as the session. A timer that sends nothing leaves the status
+// line pinned to a wake-up still armed, else clear.
 //
 // The wake marker (S10w's read, for self-switch and the coordinator): %LOCALAPPDATA%\claude-self-tools\
 // wake\<conversation>.json = { v: 1, armed, due?, at }, `armed` true only while this process holds a
@@ -65,6 +74,12 @@ let currentAt: number | undefined
 
 /** The wake-up this module's timer holds: the conversation it was armed in, its id, and when it is due. */
 let held: { conversation: string | undefined; readonly id: string; readonly dueAt: number } | undefined
+
+/**
+ * The armed wake-up as this module last wrote it to $.state, or found it there after a reload: the copy
+ * that outlives a /clear or a /resume, which empty $.state. Undefined once it fired or was cancelled.
+ */
+let kept: Wake | undefined
 
 /** Whether a failed marker write was logged already: once per process. */
 let warned = false
@@ -168,21 +183,50 @@ const dueIn = (dueAt: number, now: number): string => plural(Math.max(1, Math.ce
 /** The status line while a wake is armed, its note cut short. */
 const pinned = (note: string): string => `wake-up pending: ${note.length > 60 ? `${note.slice(0, 59)}…` : note}`
 
+/**
+ * The armed wake-up, as $.state holds it, with the version it stands at. Read empty while the module keeps
+ * one, it is written back (Claude Code emptied $.state at a /clear or a /resume) and the module's copy is
+ * what stands; read after a reload, the module takes it as its copy.
+ */
+async function armedWake($: EngineInterface): Promise<{ readonly value: Wake | null; readonly version: number }> {
+  const stored = await $.state.get(armed)
+  const value = stored.value ?? null
+  if (value !== null) {
+    kept ??= value
+    return { value, version: stored.version }
+  }
+  if (kept === undefined) return { value: null, version: stored.version }
+  const back = await $.state.set(armed, kept)
+  return { value: kept, version: back.version }
+}
+
+/** The status line once a timer sent nothing: pinned to the wake-up still armed, if there is one, else clear. */
+function restatus($: EngineInterface): void {
+  $.ui.status(kept === undefined ? undefined : pinned(kept.note))
+}
+
 async function fire($: EngineInterface, id: string): Promise<void> {
   // The timer has run: whatever comes of it, this process holds no wake-up for that conversation now.
   const was = held !== undefined && held.id === id ? held.conversation : undefined
   if (held !== undefined && held.id === id) held = undefined
   const stored = await $.state.get(armed)
-  if (stored.value?.id !== id) {
+  // $.state emptied at a /clear or a /resume: the module's copy says whether this is the wake-up armed.
+  const wake = stored.value ?? (kept?.id === id ? kept : null)
+  if (wake?.id !== id) {
     await mark($, was)
+    restatus($)
     return
   }
   const taken = await $.state.set(armed, null, { ifVersion: stored.version })
+  if (kept?.id === id) kept = undefined
   await mark($, was)
-  if (!taken.isSet) return
+  if (!taken.isSet) {
+    restatus($)
+    return
+  }
   $.ui.status(undefined)
   try {
-    const sent = await $.prompt.submit({ text: `Wake-up: ${stored.value.note}` })
+    const sent = await $.prompt.submit({ text: `Wake-up: ${wake.note}` })
     if (sent.drop !== undefined) $.ui.toast(`Wake-up not sent: ${sent.drop}`)
   } catch {
     $.ui.toast('Wake-up not sent; the session waits for the next message.')
@@ -243,7 +287,7 @@ export const register: Register = (on, options) => {
     })
     // After a reload: the wake is still in $.state, its timer gone. It is armed again for the
     // conversation it was armed in, kept with it: never the one a later SessionStart names.
-    const { value } = await $.state.get(armed)
+    const { value } = await armedWake($)
     const here = await conversation($)
     if (value) await arm($, value, await $.clock.now(), ownerOf(value, here))
     // The marker of the conversation this process starts in: armed or not, as its timer says.
@@ -270,6 +314,14 @@ export const register: Register = (on, options) => {
       void mark($, e.session_id)
       return done
     }
+    // A /clear or a /resume empties $.state, now or a moment after: the armed wake-up goes back in.
+    if ((e.source === 'clear' || e.source === 'resume') && kept !== undefined) {
+      try {
+        await $.state.set(armed, kept)
+      } catch {
+        // The next read that finds it empty puts it back, and the timer goes by the module's copy.
+      }
+    }
     const previous = current
     current = e.session_id
     currentAt = await $.clock.now()
@@ -287,7 +339,7 @@ export const register: Register = (on, options) => {
     const note = text(input.note)
     if (note === undefined) return { deny: 'Say what to wake up to (`note`).' }
     const minutes = Math.min(MAX_MINUTES, Math.max(MIN_MINUTES, asked))
-    const [before, earlier, now] = await Promise.all([$.state.get(queued), $.state.get(armed), $.clock.now()])
+    const [before, earlier, now] = await Promise.all([$.state.get(queued), armedWake($), $.clock.now()])
     await $.state.set(queued, { minutes, note })
     $.ui.status(`wake-up queued for when this turn ends: ${note.length > 40 ? `${note.slice(0, 39)}…` : note}`)
     const clamped = minutes === asked ? '' : ` (${asked} is outside 1 to 1440)`
@@ -303,8 +355,9 @@ export const register: Register = (on, options) => {
 
   on('tool.call', { tool: 'mcp__self-wake__cancel_wake' }, async ($, e) => {
     if (e.agentId !== undefined) return { deny: SUBAGENT }
-    const [before, earlier, now] = await Promise.all([$.state.get(queued), $.state.get(armed), $.clock.now()])
+    const [before, earlier, now] = await Promise.all([$.state.get(queued), armedWake($), $.clock.now()])
     await $.state.set(queued, null)
+    kept = undefined
     await $.state.set(armed, null)
     timer?.cancel()
     timer = undefined
@@ -329,7 +382,7 @@ export const register: Register = (on, options) => {
     if (!value) return done
     await $.state.set(queued, null)
     if (e.isAborted || e.reason !== 'answer') {
-      const { value: standing } = await $.state.get(armed)
+      const { value: standing } = await armedWake($)
       $.ui.status(standing ? pinned(standing.note) : undefined)
       $.ui.toast(`Wake-up not set: the turn didn't finish.${standing ? ' The one set before stands.' : ''}`)
       return done
@@ -342,6 +395,7 @@ export const register: Register = (on, options) => {
       note: value.note,
       ...(here === undefined ? {} : { conversation: here }),
     }
+    kept = wake
     await $.state.set(armed, wake)
     await arm($, wake, now, here)
     return done

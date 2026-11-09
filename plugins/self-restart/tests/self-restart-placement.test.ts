@@ -7,6 +7,8 @@ import { go } from '../hooks/go'
 import { goAnswer, GO_NOTHING, GO_VIA, placementPath, wakeMarker, wakePath } from '../hooks/machine'
 
 const TOOL = 'mcp__self-restart__restart_after_turn'
+/** A transcript under the repo's project folder, in any config folder: where `claude --resume` finds the session. */
+const TRANSCRIPT = /\\projects\\C--work-repo\\[0-9a-f-]{36}\.jsonl$/
 const ID = '00000000-0000-4000-a000-000000000011'
 const LOCAL = 'C:\\Users\\u\\AppData\\Local'
 const STATE = `${LOCAL}\\claude-self-tools`
@@ -51,7 +53,8 @@ function engine(on: On, { env = {}, placement, refuses = () => undefined, wake, 
   on('tool.check', { tool: 'CronList' }, () => ({ decision: 'allow' as const }))
   on('tool.call', { tool: 'CronList' }, () => ({ result: { jobs: [] }, text: '0 scheduled jobs.' }) as never)
   on('tool.list', () => ({ value: wake === undefined ? [] : [{ name: 'mcp__self-wake__wake_after', description: 'Wakes this session later.', mcp: true }] }))
-  on('fs.exists', (_, e) => ({ value: files.has(e.path) || (e.path === marker && typeof wake === 'string') }))
+  // This conversation's transcript, under the repo's project folder: the start folder holds it.
+  on('fs.exists', (_, e) => ({ value: files.has(e.path) || (e.path === marker && typeof wake === 'string') || TRANSCRIPT.test(e.path) }))
   on('fs.read', (_, e) => (files.has(e.path) ? { value: files.get(e.path) as string } : e.path === marker && typeof wake === 'string' ? { value: wake } : { deny: `ENOENT: ${e.path}` }))
   on('fs.write', (_, e) => {
     files.set(e.path, e.text)

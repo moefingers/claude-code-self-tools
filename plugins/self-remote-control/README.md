@@ -62,6 +62,8 @@ What the plugin adds, in each session:
    - **The loop-breaker.** If the turn the resume started ends on an error at once (no usage, or in under 30 seconds), that conversation isn't resumed again until you type a prompt, at the terminal or from the app. A prompt you type while that turn runs counts too. A resumed turn that did real work before it hit the limit stays resumable.
 5. **It shows one toast per change**, saying what happened. For example: *Login changed; Remote Control reconnected as "auth-refactor"; Claude in Chrome: /mcp reconnect ran, so its tab group starts over (Claude Code's own line says whether it reconnected); resumed: the turn ended on rate_limit 12 s ago.* The resume names the error kind its turn ended on and how long ago, in the toast and in a debug line, so a resume can be checked after the fact. While a cap holds, its line is told once: after that, a change's toast leaves it out, and a change with nothing else new to say (no reconnect that ran or failed, no resume) shows none.
 
+The account seen and the servers seen are the machine's sign-in and the session's tools, not the conversation's: they outlive a `/clear` or a `/resume` run inside the process, though Claude Code empties a plugin's session state then. The plugin keeps a copy of each and puts it back, at each `/clear` or `/resume` and at the first read that finds it gone, so a login change after one is still seen, and one being handled then isn't dropped. The last turn and the resume's own record are the conversation's, and are forgotten at a move, so a `/clear` or a `/resume` never resumes a turn of the conversation left.
+
 Nothing runs while a turn is running. To turn any part off, use the plugin's settings in `/config`, all three on by default:
 
 - `reconnectOnLoginChange`: reconnect Remote Control after a login change.
@@ -80,7 +82,7 @@ With `reconnectOnLoginChange` and `resumeAfterLoginChange` both off, the plugin 
 
 Two things can resume a session a usage limit stopped: this plugin's resume after a login change, and the coordinator plugin's auto-resume or the owner's Resume on its page. Each checks that no turn has run since the stop and then acts, so both could pass. The claim lets exactly one act. The protocol, the same in both plugins:
 
-- **The file**: `%LOCALAPPDATA%\claude-self-tools\resumed\<session id>.<turn id>.json`. `<session id>` is `$.session.id()`. `<turn id>` is the `turnId` of the main-loop `turn.complete` whose `reason` was `error`: one per turn, the same in every plugin's hook. Both must be UUIDs.
+- **The file**: `%LOCALAPPDATA%\claude-self-tools\resumed\<session id>.<turn id>.json`. `<session id>` is the conversation the stop is recorded in: the one the last main-loop SessionStart of a startup, a resume or a clear named when the stopped turn ran, while `$.session.id()` still named the conversation left (it can for up to about 15 seconds after an in-process `/resume` or `/clear`), else `$.session.id()` then. It is never `$.session.id()` read when the claim is made, which right after a move back to a conversation may still name the other one. `<turn id>` is the `turnId` of the main-loop `turn.complete` whose `reason` was `error`: one per turn, the same in every plugin's hook. Both must be UUIDs.
 - **What it holds**: `{"v":1,"by":"<name>","at":<ms>}` in UTF-8 with no BOM. `by` is `self-remote-control`, `coordinator` (its auto-resume) or `coordinator:owner` (the page's Resume).
 - **Taking it**: only through the canonical CLAIM script (`CLAIM_SCRIPT` in `hooks/claim-script.ts`, SHA-256 `CLAIM_SHA256`, checked by `scripts/resume-claim.test.mjs`; the coordinator plugin pins the same), run the way the lock's scripts are, with `RESUME_CLAIM_PATH` and `RESUME_CLAIM_TEXT`. Right before the resume, it prints:
   - `claimed`: it created the file, so this one resumes;
@@ -89,6 +91,7 @@ Two things can resume a session a usage limit stopped: this plugin's resume afte
 - **It never overwrites or deletes a claim** of the stop it was given. A winner whose resume the engine refused or dropped, even after the plugin stopped waiting on it, gives the claim back with the lock's RELEASE script and its own text, so a later resume can claim it. So does a winner that finds a turn started while it claimed, or one that started and ended on the limit again (another stop, with a claim of its own): it sends nothing.
 - **Clean-up**: each CLAIM deletes other claims untouched for 7 days.
 - **Off Windows**, where no coordinator runs, the claim is kept in the session's own state, and the plugin resumes each stop at most once.
+- **A stop recorded with no conversation** (a turn recorded before 0.4.1, the plugin reloaded since) claims nothing and resumes nothing, and the toast says why.
 
 ## The Remote Control lock
 

@@ -4,6 +4,8 @@ import { encodeCommand, launchScriptText, SESSION_MARKERS } from '../hooks/launc
 import { LAUNCH_ENV_CLEAR, LAUNCH_SCRIPT_SHA256, type LaunchInput, STDIN_BOOTSTRAP } from '../hooks/machine'
 
 const TOOL = 'mcp__self-restart__restart_after_turn'
+/** A transcript under the repo's project folder, in any config folder: where `claude --resume` finds the session. */
+const TRANSCRIPT = /\\projects\\C--work-repo\\[0-9a-f-]{36}\.jsonl$/
 const HOUR = 60 * 60 * 1000
 const ID = '0f8fad5b-d9cb-469f-a165-70867728950e'
 const POWERSHELL = 'C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe'
@@ -116,7 +118,8 @@ function engine(on: On, { env = WINDOWS, id = ID, launcher = 'opens', exit = 'ex
   on('session.start', (_, e) => ({ cwd: e.cwd }))
   on('session.id', () => ({ value: world.id }))
   on('tool.list', () => ({ value: [] }))
-  on('fs.exists', () => ({ value: false }))
+  // This conversation's transcript, under the repo's project folder: the start folder holds it.
+  on('fs.exists', (_, e) => ({ value: TRANSCRIPT.test(e.path) }))
   on('command.register', (_, e) => ({ value: { command: e.name } }))
   on('session.cwd', () => ({ value: 'C:\\work\\repo' }))
   on('tool.register', (_, e) => (described.push(String(e.description)), { value: { tool: TOOL } }))
@@ -282,27 +285,31 @@ test('a call without a reason is refused, and nothing is queued', async ($, on) 
   expect(commands).toEqual([])
 })
 
-describe('nothing launches, and nothing exits, when what the launch needs is not what it must be', () => {
+describe('nothing is queued, launches or exits when what the launch needs is not what it must be: the call says why', () => {
   for (const [name, options, said] of [
-    ['a session id that is not a UUID', { id: 'session-1' }, /is not one claude --resume takes/],
-    ['a session id with more spliced on', { id: `${ID}'; calc; '` }, /is not one claude --resume takes/],
-    ['an uppercase session id', { id: ID.toUpperCase() }, /is not one claude --resume takes/],
-    ['anything but Windows', { env: { SystemRoot: 'C:\\Windows' } }, /only on Windows/],
-    ['a Windows folder that is not a drive and one plain folder', { env: { OS: 'Windows_NT', SystemRoot: 'C:\\Windows\\..\\Users\\x' } }, /SystemRoot/],
-    ['a Windows folder on a share', { env: { OS: 'Windows_NT', SystemRoot: '\\\\server\\share' } }, /SystemRoot/],
-    ['no Windows folder at all', { env: { OS: 'Windows_NT' } }, /SystemRoot/],
+    ['a session id that is not a UUID', { id: 'session-1' }, /^Not queued: this session's id \("session-1"\) is not one claude --resume takes\.$/],
+    ['a session id with more spliced on', { id: `${ID}'; calc; '` }, /^Not queued: .+is not one claude --resume takes\.$/],
+    ['an uppercase session id', { id: ID.toUpperCase() }, /^Not queued: .+is not one claude --resume takes\.$/],
+    ['anything but Windows', { env: { SystemRoot: 'C:\\Windows' } }, /^Not queued: a restart opens its new window only on Windows so far\.$/],
+    ['a Windows folder that is not a drive and one plain folder', { env: { OS: 'Windows_NT', SystemRoot: 'C:\\Windows\\..\\Users\\x' } }, /^Not queued: the Windows folder \(SystemRoot\)/],
+    ['a Windows folder on a share', { env: { OS: 'Windows_NT', SystemRoot: '\\\\server\\share' } }, /^Not queued: the Windows folder \(SystemRoot\)/],
+    ['no Windows folder at all', { env: { OS: 'Windows_NT' } }, /^Not queued: the Windows folder \(SystemRoot\)/],
+    ['no config folder to find the transcript in', { env: { OS: 'Windows_NT', SystemRoot: 'C:\\Windows', LOCALAPPDATA: 'C:\\Users\\u\\AppData\\Local' } }, /^Not queued: this session's config folder \(CLAUDE_CONFIG_DIR, or %USERPROFILE%\\\.claude\) reads ""/],
   ] as const) {
     test(name, async ($, on) => {
       const { runs, commands, toasts, session, held, clock } = engine(on, options)
       await $.session.start(start)
 
-      expect((await $.tool.call({ tool: TOOL, reason: 'Switched accounts.' })).deny).toBeUndefined()
+      // Refused at the call, never "Queued" and refused after the turn.
+      const refused = await $.tool.call({ tool: TOOL, reason: 'Switched accounts.' })
+      expect(refused.deny).toMatch(said)
+      expect(refused.result).toBeUndefined()
       await $.turn.complete(answered)
       await clock.advance(1000)
       expect(runs).toEqual([])
       expect(commands).toEqual([])
-      expect(toasts.some(t => /Restart didn't run/.test(t))).toBe(true)
-      expect(JSON.stringify(session.appended())).toMatch(said)
+      expect(toasts).toEqual([])
+      expect(session.appended()).toEqual([])
       expect(held.get('restarts')).toBeUndefined()
     })
   }
