@@ -1,6 +1,6 @@
 {
   "name": "claude-code-self-tools",
-  "description": "Small Claude Code plugins that let a session act on itself: compact or clear its conversation, reload its plugins, reconnect an MCP server, read its context window, check its own tools, wake itself later, turn on Remote Control under a title, exit or restart, and switch to another conversation; and a skill for running several sessions as a hierarchy. Install only the ones you want.",
+  "description": "Small Claude Code plugins that let a session act on itself: compact or clear its conversation, reload its plugins, reconnect an MCP server, read its context window, check its own tools, wake itself later, turn on Remote Control under a title, set its prompt bar color, exit or restart, and switch to another conversation; and a skill for running several sessions as a hierarchy. Install only the ones you want.",
   "owner": {
     "name": "moefingers",
     "url": "https://github.com/moefingers"
@@ -45,6 +45,11 @@
       "name": "self-remote-control",
       "source": "./plugins/self-remote-control",
       "description": "Reports on the session's Remote Control, connects it under a title, and renames the session. After a login change it reconnects Remote Control and resumes a turn the change cut off. It runs /remote-control only while the session is not connected."
+    },
+    {
+      "name": "self-color",
+      "source": "./plugins/self-color",
+      "description": "Sets the session's prompt bar color once the turn ends, as /color does, to mark its role so sessions are told apart at a glance; default resets it."
     },
     {
       "name": "self-exit",
