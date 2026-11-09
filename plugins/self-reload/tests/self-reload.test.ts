@@ -200,17 +200,31 @@ test("the owner's note: the description says to end the turn and do nothing more
   expect(registeredDescriptions.at(-1) ?? '').toContain("After calling it, end your turn and do nothing more until it has run; then carry on.")
 })
 
-test('a turn that starts after the reload was queued, before it ran: the reload runs, and its resume goes to the model as a note, never as a turn', async ($, on) => {
+test("the person's turn after the reload was queued, before it ran: the reload runs, and its resume goes to the model as a note, never as a turn", async ($, on) => {
   const { commands, prompts, toasts, session, clock } = engine(on)
   await $.session.start(start)
   await $.tool.call({ tool: TOOL, resume: 'Carry on with X.' })
+  // The person types during the turn ("stop, don't do X"): it waits, and its turn runs first.
+  await $.prompt.submit({ text: "stop, don't do X", wait: false, origin: { kind: 'composer' } })
   await $.turn.complete(answered)
-  // A message typed during the turn ("stop, don't do X") was waiting: its turn runs first.
   await $.turn.start({ text: "stop, don't do X", turnId: 't2' })
   await $.turn.complete({ ...answered, turnId: 't2' })
   await clock.advance(1000)
   expect(commands).toEqual(['reload-plugins'])
-  expect(prompts).toEqual([])
+  expect(prompts.some(p => p.includes('Carry on with X.'))).toBe(false)
   expect(toasts).toContain('Resume not sent: a turn started after the reload was queued, so the model has it as a note.')
   expect(JSON.stringify(session.appended())).toContain("A turn started after the reload was queued, so its resume wasn't sent as a new message. It was: Carry on with X.")
+})
+
+test("a task's notification turn first, not the person's: the resume still goes as a new message", async ($, on) => {
+  const { commands, prompts, session, clock } = engine(on)
+  await $.session.start(start)
+  await $.tool.call({ tool: TOOL, resume: 'Run the tests.' })
+  await $.turn.complete(answered)
+  await $.turn.start({ text: '<task-notification>The tests finished: 3 failed.</task-notification>', turnId: 't2' })
+  await $.turn.complete({ ...answered, turnId: 't2' })
+  await clock.advance(1000)
+  expect(commands).toEqual(['reload-plugins'])
+  expect(prompts).toEqual(['Plugins reloaded. Resume: Run the tests.'])
+  expect(JSON.stringify(session.appended())).not.toContain("wasn't sent as a new message")
 })

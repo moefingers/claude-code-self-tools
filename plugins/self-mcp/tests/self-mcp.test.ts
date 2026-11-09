@@ -142,16 +142,17 @@ test("the owner's note: the description says to end the turn and do nothing more
   expect(registeredDescriptions.at(-1) ?? '').toContain("After calling it, end your turn and do nothing more until it has run; then carry on.")
 })
 
-test('a turn that starts after the reconnect was queued, before it ran: the reconnect runs, and its resume goes to the model as a note, never as a turn', async ($, on) => {
+test("the person's turn after the reconnect was queued, before it ran: the reconnect runs, and its resume goes to the model as a note, never as a turn", async ($, on) => {
   const { commands, prompts, toasts, session, clock } = engine(on)
   await $.session.start(start)
   await $.tool.call({ tool: TOOL, server: 'claude-in-chrome', resume: 'Carry on with X.' })
+  await $.prompt.submit({ text: "stop, don't do X", wait: false, origin: { kind: 'composer' } })
   await $.turn.complete(answered)
   await $.turn.start({ text: "stop, don't do X", turnId: 't2' })
   await $.turn.complete({ ...answered, turnId: 't2' })
   await clock.advance(1000)
   expect(commands).toEqual(['mcp reconnect claude-in-chrome'])
-  expect(prompts).toEqual([])
+  expect(prompts.some(p => p.includes('Carry on with X.'))).toBe(false)
   expect(toasts).toContain('Resume not sent: a turn started after the reconnect was queued, so the model has it as a note.')
   expect(JSON.stringify(session.appended())).toContain("A turn started after the reconnect was queued, so its resume wasn't sent as a new message. It was: Carry on with X.")
 })
@@ -163,4 +164,31 @@ test('no turn after the arm: the resume is sent as before', async ($, on) => {
   await $.turn.complete(answered)
   await clock.advance(1000)
   expect(prompts).toHaveLength(1)
+})
+
+test("a task's notification turn first, not the person's: the resume still goes as a new message", async ($, on) => {
+  const { prompts, clock } = engine(on)
+  await $.session.start(start)
+  await $.tool.call({ tool: TOOL, server: 'claude-in-chrome', resume: 'Run the tests.' })
+  await $.turn.complete(answered)
+  await $.turn.start({ text: '<task-notification>The tests finished: 3 failed.</task-notification>', turnId: 't2' })
+  await $.turn.complete({ ...answered, turnId: 't2' })
+  await clock.advance(1000)
+  expect(prompts.filter(p => p.includes('Run the tests.'))).toHaveLength(1)
+})
+
+test("two reconnects armed one after the other, the person's turn between them: the first's resume is a note, the second's a new message", async ($, on) => {
+  const { prompts, session, clock } = engine(on)
+  await $.session.start(start)
+  await $.tool.call({ tool: TOOL, server: 'claude-in-chrome', resume: 'First resume.' })
+  await $.prompt.submit({ text: "stop, don't do X", wait: false, origin: { kind: 'composer' } })
+  await $.turn.complete(answered)
+  // The person's turn runs before the first reconnect, and arms a second one.
+  await $.turn.start({ text: "stop, don't do X", turnId: 't2' })
+  await $.tool.call({ tool: TOOL, server: 'claude-in-chrome', resume: 'Second resume.' })
+  await $.turn.complete({ ...answered, turnId: 't2' })
+  await clock.advance(1000)
+  expect(prompts.some(p => p.includes('First resume.'))).toBe(false)
+  expect(JSON.stringify(session.appended())).toContain('It was: First resume.')
+  expect(prompts.filter(p => p.includes('Second resume.'))).toHaveLength(1)
 })

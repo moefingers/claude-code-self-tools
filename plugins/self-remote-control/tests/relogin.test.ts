@@ -57,6 +57,9 @@ type Options = {
   submitThrows?: boolean
   /** No %LOCALAPPDATA% and no %SystemRoot%: the claim and the lock are the session's own. */
   offWindows?: boolean
+  /** The plugin's state, answered by the test: seeded before the start; a set with ifVersion on `conflictOn` loses. */
+  state?: Map<string, { value: unknown; version: number }>
+  conflictOn?: string
 }
 
 /**
@@ -66,7 +69,20 @@ type Options = {
  * the account-switch tool does; Remote Control then stops `stopsAfterMs` later, as Claude Code's
  * own owner check does. `refresh` rewrites the login alone, as a token refresh does.
  */
-function machine(on: On, { description = CONNECTED, remoteControl = 'false', stopsAfterMs = 12_000, record, runTakesMs = 0, chrome = false, coordinator = false, mcp = 'answers', drops, claimTakesMs = 0, submitTakesMs = 0, submitThrows = false, offWindows = false }: Options = {}) {
+function machine(on: On, { description = CONNECTED, remoteControl = 'false', stopsAfterMs = 12_000, record, runTakesMs = 0, chrome = false, coordinator = false, mcp = 'answers', drops, claimTakesMs = 0, submitTakesMs = 0, submitThrows = false, offWindows = false, state, conflictOn }: Options = {}) {
+  if (state !== undefined) {
+    on('state.get', (_, e) => ({ value: state.get(`${e.plugin}/${e.key}`) ?? { value: undefined, version: 0 } }))
+    on('state.set', (_, e) => {
+      const key = `${e.plugin}/${e.key}`
+      const held = state.get(key) ?? { value: undefined, version: 0 }
+      // Another writer got there first.
+      if (e.key === conflictOn && e.ifVersion !== undefined) return { value: { isSet: false, version: held.version + 1 } }
+      if (e.ifVersion !== undefined && e.ifVersion !== held.version) return { value: { isSet: false, version: held.version } }
+      const next = { value: JSON.parse(JSON.stringify(e.value ?? null)), version: held.version + 1 }
+      state.set(key, next)
+      return { value: { isSet: true, version: next.version } }
+    })
+  }
   /** The session's tools, as the test changes them: Claude in Chrome's, the coordinator's, or a list that fails. */
   const tools = { chrome, coordinator, fails: false, looks: 0 }
   on('tool.list', () => {
@@ -1249,4 +1265,83 @@ test("Claude in Chrome's reconnect has Remote Control's cap: a flapping login re
   }
   expect(w.commands.filter(c => c.startsWith('mcp'))).toHaveLength(3)
   expect(w.toasts.at(-1)).toContain("Claude in Chrome not reconnected: it already reconnected 3 times in 10 minutes, so it waits for the login to settle (run /mcp reconnect claude-in-chrome yourself to reconnect now)")
+})
+
+/** The account record's fingerprint for an account the machine names: what the login watch keeps. */
+const fingerprint = (account: string) => fingerprintOf({ oauthAccount: { accountUuid: account, organizationUuid: 'org-1' } }) ?? ''
+
+test('a turn that starts and ends on the limit again while the resume is being claimed: another stop, so the old claim is given back and nothing is sent', async ($, on) => {
+  const w = machine(on, { claimTakesMs: 5000 })
+  await begin($, w)
+  await cutOff($, w)
+  w.switchTo('account-b')
+  for (let i = 0; i < 240 && w.claims.length === 0; i += 1) await w.clock.advance(1000)
+  expect(w.claims).toEqual([CLAIM_FILE])
+  // The person types, and that turn too ends on the limit, while the claim script runs.
+  await $.turn.start({ text: 'one more thing', turnId: T2 })
+  await $.classic.StopFailure({ error: 'rate_limit' })
+  await $.turn.complete({ ...failed, turnId: T2 })
+  await w.clock.advance(10_000)
+  expect(w.prompts).toEqual([])
+  expect(w.files.has(CLAIM_FILE)).toBe(false)
+  expect(w.toasts[0]).toContain('no resume: a turn started while the resume was being claimed')
+})
+
+test("a flapping login in a session the coordinator runs in: one toast while the cap holds, though Claude in Chrome's part is never empty", async ($, on) => {
+  // Remote Control for all sessions: each change after the cap is capped again, not left off.
+  const w = machine(on, { chrome: true, coordinator: true, remoteControl: 'true' })
+  await begin($, w)
+  for (const account of ['account-b', 'account-c', 'account-d', 'account-e', 'account-f']) {
+    w.switchTo(account)
+    await w.clock.advance(FLOW)
+  }
+  // Three reconnects, then the cap's one toast, then nothing for the fifth.
+  expect(w.commands.filter(c => c.startsWith('remote-control'))).toHaveLength(3)
+  expect(w.toasts).toHaveLength(4)
+  expect(w.toasts[3]).toContain('it already reconnected 3 times in 10 minutes')
+})
+
+test('after a burst the cap held back, the last login is reconnected once the oldest run leaves the window', async ($, on) => {
+  const w = machine(on, { chrome: true })
+  await begin($, w)
+  for (const account of ['account-b', 'account-c', 'account-d', 'account-e']) {
+    w.switchTo(account)
+    await w.clock.advance(CHROME_FLOW)
+  }
+  expect(w.commands.filter(c => c.startsWith('remote-control'))).toHaveLength(3)
+  expect(w.commands.filter(c => c.startsWith('mcp'))).toHaveLength(3)
+  // The window passes: Remote Control and Claude in Chrome, once each, for account-e.
+  await w.clock.advance(10 * 60_000)
+  expect(w.commands.filter(c => c.startsWith('remote-control'))).toHaveLength(4)
+  expect(w.commands.filter(c => c.startsWith('mcp'))).toHaveLength(4)
+  expect(w.toasts.at(-1)).toBe(`Login settled after the reconnect cap; Remote Control reconnected as "${TITLE}"; ${CHROME_RAN}.`)
+  // Once: nothing more after another window.
+  await w.clock.advance(15 * 60_000)
+  expect(w.commands.filter(c => c.startsWith('remote-control'))).toHaveLength(4)
+})
+
+test('a reconnect started before this plugin reloaded is not run again, and the toast says so', async ($, on) => {
+  const now = 100 * HOUR
+  const state = new Map<string, { value: unknown; version: number }>()
+  state.set('self-remote-control/login', {
+    version: 1,
+    value: { account: fingerprint('account-a'), pending: { at: now - 30_000, wasConnected: false, settingOn: false, rc: 'was-off', idleAt: now - 20_000, chromeRanAt: now - 5000 } },
+  })
+  const w = machine(on, { chrome: true, state })
+  await begin($, w)
+  await w.clock.advance(10_000)
+  expect(w.commands.filter(c => c.startsWith('mcp'))).toEqual([])
+  expect(w.toasts).toEqual([
+    "Login changed; Remote Control was off, and is left off; Claude in Chrome: /mcp reconnect was started before this plugin reloaded, so it isn't run again (its tab group starts over if it ran); no turn was cut off.",
+  ])
+})
+
+test("off Windows, another writer that takes the session's own claim first: this one sends nothing", async ($, on) => {
+  const w = machine(on, { offWindows: true, state: new Map(), conflictOn: 'resumeClaims' })
+  await begin($, w)
+  await cutOff($, w)
+  w.switchTo('account-b')
+  await w.clock.advance(FLOW)
+  expect(w.prompts).toEqual([])
+  expect(w.toasts[0]).toContain('no resume: another run of this plugin claimed the resume of the interrupted turn')
 })

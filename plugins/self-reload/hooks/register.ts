@@ -20,11 +20,34 @@ const pending = { plugin: 'self-reload', key: 'pending' } as const
  * When the reload starts after the turn's end: at once, the moment the turn's end returns (the owner's A). Input
  * already waiting when the turn ended still runs first, since Claude Code queues a plugin's command behind it, and the
  * reload then runs after that input's turn. The reload itself does no harm late, but its resume would: a person who
- * typed "stop" meanwhile would be answered by the old "go on". So a main-loop turn that starts after the arm is marked on the pending resume (in $.state, which the reload keeps),
- * and the resume goes to the model as a note instead of starting a turn. (self-clear, self-exit, self-restart and
- * self-switch wait half a second instead, so that their step stands down when something is waiting.)
+ * typed "stop" meanwhile would be answered by the old "go on". So a turn the person's own prompt starts after the arm
+ * (matched at prompt.submit, composer or bridge) is marked on the pending resume (in $.state, which the reload keeps), and the resume goes to the model as a note instead of
+ * starting a turn. Any other turn (a task's notification, a plugin's prompt) leaves the resume as it was. (self-clear,
+ * self-exit, self-restart and self-switch wait half a second instead, so that their step stands down when something is
+ * waiting.)
  */
 const TURN_END_MS = 0
+
+/**
+ * The person's prompts not yet matched to a turn: their text, from prompt.submit (the composer, or the app's bridge).
+ * A main-loop turn whose text holds one is the person's. Any other turn (a task's notification, a plugin's prompt, a
+ * wake-up) is not, and leaves a queued resume alone: turning it into a note there would leave the session idle.
+ */
+let personTexts: string[] = []
+
+/** Notes a person's prompt. */
+function notePerson(text: string): void {
+  const said = text.trim()
+  if (said !== '') personTexts = [...personTexts, said].slice(-20)
+}
+
+/** Whether the main-loop turn that starts with `text` is the person's: one of their prompts, matched once. */
+function isPersonTurn(text: string): boolean {
+  const at = personTexts.findIndex(said => text.includes(said))
+  if (at === -1) return false
+  personTexts = personTexts.slice(at + 1)
+  return true
+}
 
 /** A pending resume older than this is dropped, not sent: the turn that asked for it is long gone. */
 const STALE_MS = 10 * 60 * 1000
@@ -182,10 +205,17 @@ export const register: Register = (on, options) => {
     return { result: `Queued. Plugins reload once this turn ends, and the session ${then}` }
   }).catch(($, e, next) => (next.called ? next(e) : { deny: 'self-reload: queuing the reload failed; nothing is queued.' }))
 
-  // A main-loop turn after the reload was queued, before it ran: its resume goes to the model as a note.
+  // A person's prompt, at the terminal or from the app: the turn it starts makes a queued resume a note.
+  on('prompt.submit', async ($, e, next) => {
+    const done = await next(e)
+    if (done.drop === undefined && (e.origin.kind === 'composer' || e.origin.kind === 'bridge')) notePerson(done.text)
+    return done
+  }).catch(($, e, next) => next(e))
+
+  // A turn the person's prompt starts after the reload was queued, before it ran: its resume goes to the model as a note.
   on('turn.start', async ($, e, next) => {
     const started = await next(e)
-    if (e.agentId !== undefined) return started
+    if (e.agentId !== undefined || !isPersonTurn(e.text)) return started
     const held = await $.state.get(pending)
     if (held.value && held.value.turnSince !== true) await $.state.set(pending, { ...held.value, turnSince: true }, { ifVersion: held.version })
     return started

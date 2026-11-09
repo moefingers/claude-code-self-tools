@@ -61,9 +61,10 @@ export type RcOutcome =
  * plugin runs in this session and reconnects it itself. `unread`: the session's tools couldn't be listed, so it was
  * left alone. `unsure`: the coordinator's tools were listed before and not at three looks (a reload, or turned off),
  * so it was left alone rather than reconnected twice. `capped`: it was reconnected RECONNECT_CAP times in the window
- * already, so a flapping login doesn't start its tab group over each time.
+ * already, so a flapping login doesn't start its tab group over each time. `reloaded`: its reconnect was started
+ * before this plugin reloaded, and isn't run a second time.
  */
-export type ChromeOutcome = 'ran' | 'queued' | 'failed' | 'none' | 'coordinator' | 'unread' | 'unsure' | 'capped'
+export type ChromeOutcome = 'ran' | 'queued' | 'reloaded' | 'failed' | 'none' | 'coordinator' | 'unread' | 'unsure' | 'capped'
 
 /** The MCP servers this session has listed tools of, at any look: one the login change dropped lists none. */
 export type Servers = { chrome?: true; coordinator?: true }
@@ -109,6 +110,11 @@ export type Pending = {
   resumeAt?: number
   /** Set right before the resume message is sent, so it is never sent twice. */
   resumed?: true
+  /**
+   * A reconnect the cap held back, tried again once the oldest run has left the window, for the login as it is
+   * now: no resume, and its own toast.
+   */
+  retry?: true
 }
 
 /**
@@ -134,6 +140,13 @@ export type Login = {
   cappedAt?: number
   /** When Claude in Chrome's reconnect ran, within the last RECONNECT_WINDOW_MS (ms): the same cap as Remote Control's. */
   chromeRuns?: number[]
+  /** When the Chrome cap's toast was shown (ms): once while that cap holds. */
+  chromeCappedAt?: number
+  /** The account (fingerprint) each reconnect last ran under: a retry after the cap runs only for another one. */
+  rcAccount?: string | null
+  chromeAccount?: string | null
+  /** When a reconnect the cap held back may be tried again (ms): the oldest run's leaving the window. */
+  owedAt?: number
 }
 
 /** The main conversation's latest turn, as turn.start, turn.complete and StopFailure told it. */

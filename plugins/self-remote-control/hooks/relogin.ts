@@ -351,7 +351,9 @@ async function noteAccount($: EngineInterface, held: Login | null, account: stri
     pending = { at: now, wasConnected: held.candidateRc === 'connected', settingOn: await isSettingOn($) }
   } else {
     if (held.pending.lock !== undefined) await releaseLock($, held.pending.lock)
-    pending = without({ ...held.pending, at: now }, 'idleAt', 'readAt', 'sawDown', 'rc', 'detail', 'name', 'ranAt', 'lock', 'resumeAt', 'chrome', 'chromeLooks', 'chromeFirstAt', 'chromeAt', 'chromeRanAt')
+    // A retry after the cap that a real change folds into becomes that change: it may resume.
+    const folded = held.pending.retry === true ? without(held.pending, 'retry', 'resumed') : held.pending
+    pending = without({ ...folded, at: now }, 'idleAt', 'readAt', 'sawDown', 'rc', 'detail', 'name', 'ranAt', 'lock', 'resumeAt', 'chrome', 'chromeLooks', 'chromeFirstAt', 'chromeAt', 'chromeRanAt')
   }
   return { ...without(held, 'candidate', 'candidateRc'), account, pending }
 }
@@ -401,6 +403,7 @@ export async function watch($: EngineInterface): Promise<void> {
         next = await noteAccount($, held, account, now)
       }
     }
+    if (next !== null && next.pending === undefined && next.owedAt !== undefined && now >= next.owedAt) next = owedRetry(next, now)
     if (next !== held) await $.state.set(loginRef, next)
     if (next?.pending !== undefined) startMoving($)
   } catch {
@@ -408,6 +411,19 @@ export async function watch($: EngineInterface): Promise<void> {
   } finally {
     busy = false
   }
+}
+
+/**
+ * Once the cap's window has passed after a burst of changes, the reconnects it held back, once, for the login as it
+ * is now: Remote Control when it last reconnected under another account, Claude in Chrome likewise. Nothing is owed
+ * when both last ran under this account.
+ */
+function owedRetry(held: Login, now: number): Login {
+  const base = without(held, 'owedAt')
+  const rc = held.rcAccount !== undefined && held.rcAccount !== held.account
+  const chrome = held.chromeAccount !== undefined && held.chromeAccount !== held.account
+  if (!rc && !chrome) return base
+  return { ...base, pending: { at: now, wasConnected: rc, settingOn: false, retry: true, resumed: true, ...(chrome ? {} : { chrome: 'none' as const }) } }
 }
 
 /**
@@ -527,7 +543,7 @@ async function reconnect($: EngineInterface, held: Login, p: Pending, now: numbe
       }
       const after = await $.clock.now()
       const ran: Pending = { ...q, rc: 'ran', ranAt: after, readAt: after + CHECK_MS, lock: taken.held, ...(name === undefined ? {} : { name }) }
-      return { p: ran, held: { ...held, runs: [...runs, now] } }
+      return { p: ran, held: { ...held, runs: [...runs, now], rcAccount: held.account } }
     }
     await releaseLock($, taken.held)
     if (reading.state === 'unavailable') return { p: { ...q, rc: 'unavailable' }, held }
@@ -591,8 +607,11 @@ async function resume($: EngineInterface, held: Login, p: Pending, now: number):
     return claim.lost
   }
   // The claim can take a while (one PowerShell run): a turn that started meanwhile, a person typing, means
-  // nothing is cut off any more. It is given back, and nothing is sent.
-  if (!isCutOff(await getTurn($), await $.clock.now())) {
+  // nothing is cut off any more, and so does one that started and ended on the limit again (another stop, with
+  // a claim of its own). Either way it is given back, and nothing is sent. A turn that starts between this look
+  // and the submit below can't be ruled out (the submit is queued behind it then); the window is one state read.
+  const again = await getTurn($)
+  if (!isCutOff(again, await $.clock.now()) || again?.turnId !== turn?.turnId || again?.at !== turn?.at) {
     await claim.giveBack()
     const said = 'no resume: a turn started while the resume was being claimed'
     $.ui.log(`self-remote-control: ${said}`, { to: 'debug' })
@@ -601,11 +620,25 @@ async function resume($: EngineInterface, held: Login, p: Pending, now: number):
   await $.state.set(resumesRef, { ...((await getResumes($)) ?? {}), sentAt: now })
   const said = resumedSaid(turn?.error, now - (turn?.at ?? now))
   const submitting = $.prompt.submit({ text: RESUME })
-  // However the submit ends, even after the wait below has given up on it: a drop or a refusal gives the claim back.
-  submitting.then(sent => (sent.drop === undefined ? undefined : claim.giveBack()), () => claim.giveBack()).catch(() => undefined)
+  let wasLate = false
+  // However the submit ends, even after the wait below has given up on it: a drop or a refusal gives the claim
+  // back, and one after the toast said it was queued is told.
+  submitting
+    .then(
+      async sent => {
+        if (sent.drop === undefined) return
+        await claim.giveBack()
+        if (!wasLate) return
+        $.ui.log(`self-remote-control: the queued resume was dropped: ${sent.drop}`, { to: 'debug' })
+        $.ui.toast(`The queued resume was dropped: ${sent.drop}`)
+      },
+      () => claim.giveBack(),
+    )
+    .catch(() => undefined)
   let outcome: string
   try {
     const sent = await within($, submitting, SUBMIT_WAIT_MS)
+    wasLate = sent === 'late'
     outcome = sent === 'late' ? `${said} (queued, to run once the session is idle)` : sent.drop === undefined ? said : `resume not sent: ${sent.drop}`
   } catch (err) {
     outcome = `resume not sent: ${why(err)}`
@@ -652,14 +685,14 @@ const recentChromeRuns = (held: Login, now: number): number[] => (held.chromeRun
  */
 async function chromeStep($: EngineInterface, held: Login, p: Pending, now: number): Promise<{ p: Pending; held: Login }> {
   // Started before a reload of this plugin, and maybe still running: never a second run.
-  if (p.chromeRanAt !== undefined) return { p: { ...p, chrome: 'queued' }, held }
+  if (p.chromeRanAt !== undefined) return { p: { ...without(p, 'chromeRanAt'), chrome: 'reloaded' }, held }
   if (p.chromeAt !== undefined && now < p.chromeAt) return { p, held }
   const q = await chromeLook($, p, now)
   if (q.chrome !== 'reconnect') return { p: q.p, held }
   const runs = recentChromeRuns(held, now)
   if (runs.length >= RECONNECT_CAP) return { p: { ...q.p, chrome: 'capped' }, held: { ...held, chromeRuns: runs } }
   const marked: Pending = { ...q.p, chromeRanAt: now }
-  const next: Login = { ...held, chromeRuns: [...runs, now] }
+  const next: Login = { ...held, chromeRuns: [...runs, now], chromeAccount: held.account }
   await $.state.set(loginRef, { ...next, pending: marked })
   try {
     const ran = await within($, $.command.run({ command: 'mcp', args: `reconnect ${CHROME}` }), RUN_WAIT_MS)
@@ -696,6 +729,9 @@ async function chromeLook($: EngineInterface, p: Pending, now: number): Promise<
   return { p, chrome: 'reconnect' }
 }
 
+/** Claude in Chrome's outcomes that are told even while a reconnect cap's toast holds. */
+const CHROME_TELLS: ReadonlySet<string> = new Set(['ran', 'queued', 'reloaded', 'failed', 'unread', 'unsure'])
+
 /** What the toast says of Claude in Chrome: nothing when this session has none. */
 function chromeSaid(p: Pending): string {
   switch (p.chrome) {
@@ -703,6 +739,8 @@ function chromeSaid(p: Pending): string {
       return "; Claude in Chrome: /mcp reconnect ran, so its tab group starts over (Claude Code's own line says whether it reconnected)"
     case 'queued':
       return `; Claude in Chrome: /mcp reconnect hadn't finished within ${RUN_WAIT_MS / 1000} s (queued or still running; its tab group starts over when it runs)`
+    case 'reloaded':
+      return `; Claude in Chrome: /mcp reconnect was started before this plugin reloaded, so it isn't run again (its tab group starts over if it ran)`
     case 'failed':
       return `; Claude in Chrome didn't reconnect: run /mcp reconnect ${CHROME}`
     case 'unread':
@@ -776,15 +814,27 @@ export async function move($: EngineInterface): Promise<void> {
     const runs = recentRuns(latest, now)
     const chromeRuns = recentChromeRuns(latest, now)
     const isCapToldAlready = p.rc === 'capped' && latest.cappedAt !== undefined && now - latest.cappedAt < RECONNECT_WINDOW_MS
+    const isChromeCapToldAlready = p.chrome === 'capped' && latest.chromeCappedAt !== undefined && now - latest.chromeCappedAt < RECONNECT_WINDOW_MS
+    // A reconnect the cap held back is tried again, once, when the oldest run leaves the window (owedRetry).
+    const owed = [p.rc === 'capped' ? runs[0] : undefined, p.chrome === 'capped' ? chromeRuns[0] : undefined].filter((at): at is number => at !== undefined)
     const settled: Login = {
-      ...without(latest, 'pending', 'runs', 'cappedAt', 'chromeRuns'),
+      ...without(latest, 'pending', 'runs', 'cappedAt', 'chromeRuns', 'chromeCappedAt', 'owedAt'),
       ...(runs.length === 0 ? {} : { runs }),
       ...(chromeRuns.length === 0 ? {} : { chromeRuns }),
       ...(p.rc === 'capped' ? { cappedAt: isCapToldAlready ? (latest.cappedAt as number) : now } : latest.cappedAt === undefined ? {} : { cappedAt: latest.cappedAt }),
+      ...(p.chrome === 'capped' ? { chromeCappedAt: isChromeCapToldAlready ? (latest.chromeCappedAt as number) : now } : latest.chromeCappedAt === undefined ? {} : { chromeCappedAt: latest.chromeCappedAt }),
+      ...(owed.length === 0 ? {} : { owedAt: Math.max(...owed) + RECONNECT_WINDOW_MS }),
     }
     await $.state.set(loginRef, settled)
-    // While the cap's toast holds, one only for a resume or for anything Claude in Chrome's step did.
-    if (isCapToldAlready && !resumed.startsWith('resumed:') && chromeSaid(p) === '') return
+    if (p.retry === true) {
+      // Only what was owed: Remote Control when it was (wasConnected), Claude in Chrome when it was.
+      const parts = [p.wasConnected ? rcSaid(p) : '', chromeSaid(p).replace(/^; /, '')].filter(part => part !== '')
+      if (parts.length > 0) $.ui.toast(`Login settled after the reconnect cap; ${parts.join('; ')}.`)
+      return
+    }
+    // While the cap's toast holds, one only for a resume, or for what Claude in Chrome's step did that is news.
+    const isChromeNews = CHROME_TELLS.has(p.chrome ?? 'none') || (p.chrome === 'capped' && !isChromeCapToldAlready)
+    if (isCapToldAlready && !resumed.startsWith('resumed:') && !isChromeNews) return
     $.ui.toast(`Login changed; ${rcSaid(p)}${chromeSaid(p)}; ${resumed}.`)
   } catch {
     // The next tick tries again.
