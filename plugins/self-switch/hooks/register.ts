@@ -88,7 +88,14 @@
 // SessionStart of the resume `$.session.id()` and `$.state` may still be the conversation that left
 // (seen live on 2.1.318). So the start folder is read from the module first, where session.start keeps
 // it for the life of the process, and the resume beats the resumed conversation by the id its event
-// names, never by `$.session.id()`.
+// names, never by `$.session.id()`. Claude Code empties `$.state` at an in-process /clear or /resume, with
+// no session.start after, and a reload of the plugin would then set the start folder again from wherever
+// the session is: so the module writes its copy back to `$.state`, with a plain set, at each main-loop
+// SessionStart of a clear or a resume, and whenever the heartbeat finds it empty there (the wipe may land
+// after that SessionStart). A session.start that finds no start folder kept anywhere holds its own folder
+// as provisional, and takes it as the start folder only once it is known to be: the SessionStart of this
+// process's own startup named the conversation, or the folder holds the conversation's transcript (checked
+// at every read until then). Meanwhile the heartbeat goes on, without a folder.
 import type { EngineInterface, Register, Timer } from 'claude-code'
 import type { Heartbeat, Queued, Ticket } from '../types'
 import { go } from './go'
@@ -155,6 +162,7 @@ import {
   SYSTEM_ROOT,
   wakeHold,
 } from './machine'
+import { checkTranscript, findTranscript } from './start-folder'
 import { configureUpdateCheck, loadUpdateCheck, withUpdateNotice } from './update-check'
 
 const TOOL = 'mcp__self-switch__switch_after_turn'
@@ -251,6 +259,15 @@ let beat: Timer | undefined
  * is read first (startFolderOf). A reload of the module sets it again from `$.state`.
  */
 let startFolder: string | undefined
+/**
+ * The folder a session.start found the session in when no start folder was kept anywhere (a first start, or
+ * a reload after Claude Code emptied `$.state`): the start folder only once it is known to be (settleFolder).
+ */
+let provisional: string | undefined
+/** The conversation the main loop's SessionStart of a startup named: this process's first. */
+let startupOf: string | undefined
+/** Whether the log has said why the provisional folder isn't taken: once per load. */
+let toldFolder = false
 /**
  * The conversation this process holds now: from each main-loop classic SessionStart's own id (the
  * event's: `$.session.id()` may still read the one before) of a startup, a resume or a clear, never a
@@ -666,11 +683,69 @@ async function pruneTickets($: EngineInterface, now: number): Promise<void> {
   }
 }
 
-/** The folder this process started in: the module's, else the one `$.state` kept; undefined when neither knows it. */
+/**
+ * The folder this process started in: the module's, else a provisional one once known to be it
+ * (settleFolder), else the one `$.state` kept; undefined when none knows it.
+ */
 async function startFolderOf($: EngineInterface): Promise<string | undefined> {
+  if (startFolder !== undefined && startFolder !== '') return startFolder
+  await settleFolder($)
   if (startFolder !== undefined && startFolder !== '') return startFolder
   const { value } = await $.state.get(folderKey)
   return typeof value === 'string' && value !== '' ? value : undefined
+}
+
+/**
+ * The module's start folder back in `$.state`, with a plain set: at a /clear's or a /resume's SessionStart
+ * (`always`), which may come before Claude Code empties `$.state` or after it; else only when `$.state` reads
+ * it empty (the heartbeat's look). Safe to repeat: it writes the one value this process started with.
+ */
+async function restoreFolder($: EngineInterface, always: boolean): Promise<void> {
+  if (startFolder === undefined || startFolder === '') return
+  if (!always) {
+    const { value } = await $.state.get(folderKey)
+    if (typeof value === 'string' && value !== '') return
+  }
+  await $.state.set(folderKey, startFolder)
+}
+
+/**
+ * The provisional folder taken as the start folder, once it is known to be: the SessionStart of this
+ * process's own startup named this conversation (a `/clear`'s conversation has no prompt yet either, so no
+ * prompt is no proof), or the folder holds the conversation's transcript. Until then the start folder is
+ * unknown, and a switch refuses. A check that finds it isn't (once the conversation has prompts, so a
+ * transcript is written to find), or can't look, is said in the log once, naming which. Never throws.
+ */
+async function settleFolder($: EngineInterface): Promise<void> {
+  const cwd = provisional
+  if (cwd === undefined || (startFolder !== undefined && startFolder !== '')) return
+  try {
+    const id = current ?? (await sessionId($))
+    if (id === undefined || !SESSION_ID.test(id)) return
+    let isIt = startupOf === id
+    if (!isIt) {
+      const dirs = await configDirsOf($)
+      if ('refusal' in dirs) return
+      const checked = await checkTranscript($, cwd, id, dirs.configDirs)
+      isIt = 'holds' in checked && checked.holds
+      if (!isIt && !toldFolder && (await $.session.turns()) > 0) {
+        toldFolder = true
+        const project = await findTranscript($, id, dirs.configDirs)
+        const kept = project === undefined ? '' : `; Claude Code keeps it in ${project}`
+        $.ui.log(
+          'error' in checked
+            ? `self-switch: whether ${cwd}, where the plugin started again, is the folder this session started in can't be checked: ${checked.error}. It isn't taken as the start folder until it can be, and a switch here refuses meanwhile.`
+            : `self-switch: the folder this session started in isn't known (Claude Code empties plugin state at a /clear or /resume, and nothing kept it), and ${cwd}, where the plugin started again, doesn't hold this conversation's transcript${kept}. It isn't taken as the start folder, and a switch here refuses until the session restarts.`,
+        )
+      }
+    }
+    if (!isIt || provisional !== cwd) return
+    startFolder = cwd
+    provisional = undefined
+    await $.state.set(folderKey, cwd)
+  } catch {
+    // Looked at again at the next read.
+  }
 }
 
 /**
@@ -679,11 +754,16 @@ async function startFolderOf($: EngineInterface): Promise<string | undefined> {
  */
 async function heartbeat($: EngineInterface, resumed?: string): Promise<void> {
   try {
+    // A /clear or a /resume emptied `$.state` since: the start folder goes back.
+    await restoreFolder($, false)
     const id = resumed ?? (await sessionId($))
     if (id === undefined || !SESSION_ID.test(id)) return
+    // With the start folder unknown, still a beat (liveness reads its time), its folder and project the last
+    // beat's for this conversation, carried forward (empty when there was none).
     const folder = await startFolderOf($)
-    if (folder === undefined) return
-    const value: Heartbeat = { at: await $.clock.now(), folder, project: projectName(folder) ?? '' }
+    const last = folder === undefined ? await readHeartbeat($, id) : undefined
+    const at = await $.clock.now()
+    const value: Heartbeat = folder !== undefined ? { at, folder, project: projectName(folder) ?? '' } : { at, folder: last?.folder ?? '', project: last?.project ?? '' }
     await $.store.set(`${ALIVE}${id}`, value)
     await touchBaseline($, id, value.at)
   } catch {
@@ -1132,7 +1212,7 @@ async function switchNow($: EngineInterface, value: Queued): Promise<void> {
   // PowerShell is this claude.exe's own parent, on the probe that judged, and its last look reads every
   // config folder this switch reads (a wrapper of pane file version 2 reads its own alone).
   const tab = await tabOf($, ctx.state)
-  const picked = pickTransport(found, ctx.own, to, beat?.folder, tab !== undefined && 'pane' in tab ? tab : undefined, ctx.configDirs.length)
+  const picked = pickTransport(found, ctx.own, to, beat?.folder === '' ? undefined : beat?.folder, tab !== undefined && 'pane' in tab ? tab : undefined, ctx.configDirs.length)
   if ('refusal' in picked) return held(picked.refusal)
   // A left record waives L3 and L5 only where the last look checks the transcript against it: in place,
   // in a slot (a verified runner is version 2), in a tab or the window, and in a tab whose claude wrapper
@@ -1426,10 +1506,15 @@ export const register: Register = (on, options) => {
     startedAt ??= await $.clock.now()
     const started = await next(e)
     isTerminal = e.isInteractive && e.surface === 'terminal'
-    // The first start's folder only: a reload starts the plugin again from wherever the session is now.
+    // The first start's folder only: a reload starts the plugin again from wherever the session is now, so
+    // it takes the one `$.state` kept; with none kept anywhere, its own, provisional until known (settleFolder).
     const { value: first } = await $.state.get(folderKey)
-    if (typeof first !== 'string' || first === '') await $.state.set(folderKey, e.cwd)
-    startFolder = typeof first === 'string' && first !== '' ? first : e.cwd
+    const kept = typeof first === 'string' && first !== '' ? first : undefined
+    if ((startFolder === undefined || startFolder === '') && kept !== undefined) startFolder = kept
+    if (startFolder === undefined || startFolder === '') {
+      provisional = e.cwd
+      await settleFolder($)
+    } else if (kept === undefined) await $.state.set(folderKey, startFolder)
     // Unknown, or known only from an earlier start: a new session in the same load (a /clear, a
     // resume) starts with its own id. One a SessionStart named stands: `$.session.id()` may lag it.
     if (current === undefined || !currentFromEvent) {
@@ -1494,6 +1579,14 @@ export const register: Register = (on, options) => {
       $.ui.toast('Switch cancelled: this session became another conversation before it ran.')
     }
     const id = e.session_id
+    // A /clear or a /resume empties `$.state`, now or a moment after: the start folder goes back in.
+    if (e.agent_id === undefined && (e.source === 'clear' || e.source === 'resume')) {
+      try {
+        await restoreFolder($, true)
+      } catch {
+        // The heartbeat puts it back when it finds it empty.
+      }
+    }
     // Only the main loop's startup, resume and clear move this process to a conversation: a fork's
     // SessionStart (the /fork background copy, a conversation moved to the background) leaves the
     // foreground where it was, and a source this plugin doesn't know moves nothing.
@@ -1509,6 +1602,11 @@ export const register: Register = (on, options) => {
     current = id
     currentFromEvent = true
     currentAt = now
+    // This process's own startup: a folder held provisional at its session.start is where it started.
+    if (e.source === 'startup') {
+      startupOf = id
+      await settleFolder($)
+    }
     // In place (a /resume or /clear, this plugin's switch or one the person typed): this process left
     // the conversation it held. The arriving side writes its left record, keyed by this event's id,
     // LEFT_SETTLE_MS after it, so the engine's last write to the conversation left is inside the stat.

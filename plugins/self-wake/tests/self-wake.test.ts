@@ -236,8 +236,8 @@ describe("the wake marker (S10w's read): wake\\<conversation>.json, { v: 1, arme
     expect(markers(W).at(-1)?.armed).toBe(false)
   })
 
-  test('each conversation this process comes to, by its event\'s id: an in-place move leaves the one left armed only while the timer still holds its wake-up', async ($, on) => {
-    const { markers, world, clock } = marked(on)
+  test("each conversation this process comes to, by its event's id: an in-place /resume to another drops the wake-up, so the one left's marker says none at once, and nothing fires", async ($, on) => {
+    const { markers, world, clock, prompts } = marked(on)
     await $.session.start(start)
     await $.classic.SessionStart({ source: 'startup', session_id: W })
     await $.tool.call({ tool: WAKE, minutes: 5, note: 'check W' })
@@ -249,13 +249,12 @@ describe("the wake marker (S10w's read): wake\\<conversation>.json, { v: 1, arme
     await $.classic.SessionStart({ source: 'resume', session_id: T })
     await clock.settle()
     expect(markers(T).at(-1)?.armed).toBe(false)
-    // W's wake-up is still this process's timer's: W's marker says so.
-    expect(markers(W).at(-1)?.armed).toBe(true)
+    // W's wake-up was dropped by the move: no timer holds it, and W's marker says so.
+    expect(markers(W).at(-1)?.armed).toBe(false)
     world.id = T
 
-    // The timer runs out: W's marker says not armed.
     await clock.advance(6 * MINUTE)
-    expect(markers(W).at(-1)?.armed).toBe(false)
+    expect(prompts).toEqual([])
   })
 
   test("a fork's SessionStart moves nothing: its own marker says none, a wake-up stays armed under W, and one set after it is W's too, so a switch from W holds (D-6)", async ($, on) => {
@@ -304,8 +303,8 @@ describe("the wake marker (S10w's read): wake\\<conversation>.json, { v: 1, arme
     expect(markers(W).at(-1)?.armed).toBe(false)
   })
 
-  test('a wake-up keeps the conversation it was armed in: after a reload, a move to another and back finds its marker armed, never handed to the other (S1-1)', async ($, on) => {
-    const { markers, clock } = marked(on)
+  test('a wake-up keeps the conversation it was armed in: after a reload, a move to another drops it, never handing it to the other, and a move back finds none (S1-1)', async ($, on) => {
+    const { markers, clock, prompts } = marked(on)
     await $.session.start(start)
     await $.tool.call({ tool: WAKE, minutes: 10, note: 'check W' })
     await $.turn.complete({ ...answered, turnId: 't1' })
@@ -316,15 +315,18 @@ describe("the wake marker (S10w's read): wake\\<conversation>.json, { v: 1, arme
     await $.session.start(start)
     await clock.settle()
     expect(markers(W).at(-1)?.armed).toBe(true)
-    // /resume T in place: the first SessionStart after the reload. T is not the wake-up's.
+    // /resume T in place: the first SessionStart after the reload. T is not the wake-up's: it is dropped.
     await $.classic.SessionStart({ source: 'resume', session_id: T })
     await clock.settle()
     expect(markers(T).at(-1)?.armed).toBe(false)
-    // And back to W: its marker says armed, so a switch from W holds on it.
+    expect(markers(W).at(-1)?.armed).toBe(false)
+    // And back to W: none waits there.
     await $.classic.SessionStart({ source: 'resume', session_id: W })
     await clock.settle()
-    expect(markers(W).at(-1)?.armed).toBe(true)
+    expect(markers(W).at(-1)?.armed).toBe(false)
     expect(markers(T).at(-1)?.armed).toBe(false)
+    await clock.advance(20 * MINUTE)
+    expect(prompts).toEqual([])
   })
 
   test('an armed marker whose first write fails is written again, before the turn\'s end returns (S1-2)', async ($, on) => {

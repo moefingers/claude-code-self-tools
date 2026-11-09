@@ -70,12 +70,26 @@
 // exit would start a turn the exit then cuts off. A main-loop turn that starts before the exit has
 // started cancels the restart, as an interrupted turn does. If the window has opened by then, it is
 // left waiting, and the person and the model are told so.
+//
+// The start folder: where `claude --resume <id>` finds the conversation. Claude Code empties a plugin's
+// `$.state` at an in-process /clear or /resume, and no session.start follows; a reload of the plugin then
+// sets it again from wherever the session is. So the module keeps the first session.start's folder for the
+// life of the process, `$.state` only the copy that outlives a reload; the module puts it back with a
+// plain set at each main-loop classic SessionStart of a clear or a resume, and at a read that finds it
+// empty (the wipe may land after that SessionStart). Before anything exits, and at the call, the folder is
+// checked against the conversation's transcript (checkTranscript, start-folder.ts, which matches a long
+// folder's shortened project folder as Claude Code names it); one that fails it gives way to
+// `$.session.root()`, then `$.session.cwd()`, each only when it passes. When none does, the call is refused,
+// saying why (nothing known; folders known, none holding the transcript; or the check couldn't run) and
+// what to tell the person, who restarts by hand. Every refusal of what the launch needs comes at the call,
+// and so does one while `$.session.id()` lags the move a SessionStart named (the id would be the left one's).
 import type { EngineInterface, Register } from 'claude-code'
 import type { Queued, Restart } from '../types'
 import { go } from './go'
 import { launch as buildLaunch, parseLaunch, powershellPath, RELEASED, releaseScript, SESSION_ID, stateFolder, SYSTEM_ROOT } from './launcher'
 import type { AgentLike, LaunchInput, LaunchWhere, PendingKind, Placement, Probe } from './machine'
-import { goAnswer, goRun, agentsHeld, agentsWayOut, blockersText, claimOf, exitBlockers, isBusyAgent, isSafeFolder, isWindowName, LAUNCH_DEADLINE_MS, LAUNCH_RETRY_MS, LAUNCH_RUN_MS, launchFolderFault, launchFolderSaid, loadPlacement, markPending, oneLine, paneFallback, paneTicketPath, pickLaunchTransport, plainOutput, powershellCall, quoted, readExit, readGit, readPane, resumeTitle, runProbe, safePoint, SLOT_SCRIPT_SHA256, idPathOrNone, TAB_LABEL } from './machine'
+import { goAnswer, goRun, agentsHeld, agentsWayOut, blockersText, claimOf, exitBlockers, idLag, isBusyAgent, isSafeFolder, isWindowName, LAUNCH_DEADLINE_MS, LAUNCH_RETRY_MS, LAUNCH_RUN_MS, launchFolderFault, launchFolderSaid, loadPlacement, markPending, movesConversation, oneLine, paneFallback, paneTicketPath, pickLaunchTransport, plainOutput, powershellCall, quoted, readExit, readGit, readPane, resumeTitle, runProbe, safePoint, SLOT_SCRIPT_SHA256, idPathOrNone, TAB_LABEL } from './machine'
+import { checkTranscript, findTranscript, isProjectOf, type Transcript, transcriptFolder } from './start-folder'
 import { configureUpdateCheck, loadUpdateCheck, withUpdateNotice } from './update-check'
 
 const queued = { plugin: 'self-restart', key: 'queued' } as const
@@ -136,11 +150,34 @@ let isTerminal = true
 let armed: Queued | undefined
 
 /**
- * The conversation this process holds, from each main-loop classic SessionStart's own id: the one a
- * ticket for the claude wrapper's tab resumes. Unknown after a reload of the plugin (no start since),
- * when `$.session.id()` is read alone.
+ * The conversation this process holds, from each main-loop classic SessionStart's own id of a startup, a
+ * resume or a clear (movesConversation; a fork's names another, and the foreground stays): the one a
+ * ticket for the claude wrapper's tab resumes, and what `$.session.id()` is checked against while it lags
+ * the move. Unknown after a reload of the plugin (no start since), when `$.session.id()` is read alone.
  */
 let current: string | undefined
+/** When the SessionStart that named `current` came, by the engine's clock; undefined once it was read from `$.session.id()`. */
+let currentAt: number | undefined
+
+/**
+ * The folder this process started in, as the first session.start of this module found it (in `$.state`
+ * after a reload, else the session's own): the copy that outlives a /clear or a /resume, which empty
+ * `$.state`. Read first (startFolderOf).
+ */
+let startFolder: string | undefined
+/**
+ * Where the start folder came from: `$.state` (kept since an earlier start), this process's own startup
+ * (its SessionStart of a startup seen in this module), or `reset`: a session.start that found `$.state`
+ * empty and saw no startup, a reload after Claude Code emptied it, which sets it from wherever the session is.
+ */
+let startFolderFrom: 'state' | 'startup' | 'reset' | undefined
+/** Whether this module saw the main loop's SessionStart of a startup: this process's first start. */
+let sawStartup = false
+/** Whether this module saw the main loop's SessionStart of a clear or a resume: Claude Code emptied `$.state` then. */
+let sawMove = false
+
+/** The transcript the last main-loop classic SessionStart of a startup, a resume, a clear or a compact named: what the start folder is checked against. */
+let transcript: Transcript | undefined
 
 /** Whether the log has said this tab's claude wrapper is an older one: once per process. */
 let toldOldWrapper = false
@@ -231,13 +268,13 @@ async function env($: EngineInterface, read: () => Promise<string | undefined>):
 }
 
 /**
- * What stands in the exit's way now (the pre-check: crons, the probe's S6 when the launch can be
- * planned, subagents, a wake-up pending), each with how to stop it, as one
- * line; undefined when nothing does. Off Windows, or where the launch can't be planned, the probe isn't
- * run: the restart is refused when armed, saying why, and nothing exits.
+ * What stands in the exit's way now (the pre-check: crons, the probe's S6, subagents, a wake-up
+ * pending), each with how to stop it, as one line; undefined when nothing does. Only for a launch that
+ * could be planned: where it can't be (off Windows, an id claude --resume doesn't take, no folder that
+ * holds the transcript), the call is refused before this.
  */
-async function blockers($: EngineInterface, launch: { powershell: string; id: string } | undefined): Promise<string | undefined> {
-  const found = exitBlockers(await readExit($, launch, await exitMore($, launch?.id)))
+async function blockers($: EngineInterface, launch: { powershell: string; id: string }): Promise<string | undefined> {
+  const found = exitBlockers(await readExit($, launch, await exitMore($, launch.id)))
   return found.length === 0 ? undefined : blockersText(found)
 }
 
@@ -322,11 +359,126 @@ async function stampOf($: EngineInterface): Promise<{ readonly window?: string; 
 async function places($: EngineInterface): Promise<{ readonly state: string; readonly configDirs: readonly string[] } | { readonly refusal: string }> {
   const local = await env($, () => $.env.get('LOCALAPPDATA'))
   if (!isSafeFolder(local)) return { refusal: `%LOCALAPPDATA% reads ${JSON.stringify(local ?? '')}, not an absolute folder without quotes, so the claim lock can't be kept` }
+  const own = await configDirOf($)
+  if ('refusal' in own) return own
+  return { state: stateFolder(local), configDirs: [own.dir] }
+}
+
+/** This session's own config folder (CLAUDE_CONFIG_DIR, or %USERPROFILE%\.claude), whose projects hold its transcript; `refusal` when it isn't an absolute folder. */
+async function configDirOf($: EngineInterface): Promise<{ readonly dir: string } | { readonly refusal: string }> {
   const configured = await env($, () => $.env.get('CLAUDE_CONFIG_DIR'))
   const profile = await env($, () => $.env.get('USERPROFILE'))
   const own = configured !== undefined && configured !== '' ? configured : profile === undefined ? undefined : `${profile}\\.claude`
   if (!isSafeFolder(own)) return { refusal: `this session's config folder (CLAUDE_CONFIG_DIR, or %USERPROFILE%\\.claude) reads ${JSON.stringify(own ?? '')}, not an absolute folder without quotes` }
-  return { state: stateFolder(local), configDirs: [own.replace(/\\+$/, '')] }
+  return { dir: own.replace(/\\+$/, '') }
+}
+
+/**
+ * The folder this process started in: the module's copy, else the one `$.state` kept (after a reload, which
+ * the module takes as its copy); undefined when neither knows it. A `$.state` read empty while the module
+ * knows it is written back, with a plain set: Claude Code emptied it at a /clear or a /resume.
+ */
+async function startFolderOf($: EngineInterface): Promise<string | undefined> {
+  const { value } = await $.state.get(folder)
+  const kept = typeof value === 'string' && value !== '' ? value : undefined
+  if (startFolder === undefined && kept !== undefined) {
+    startFolder = kept
+    startFolderFrom = 'state'
+  }
+  else if (kept === undefined && startFolder !== undefined) await $.state.set(folder, startFolder)
+  return startFolder
+}
+
+/** The start folder back in `$.state` from the module's copy, with a plain set: at a /clear's or a /resume's SessionStart, which may come before the wipe or after it. */
+async function restoreFolder($: EngineInterface): Promise<void> {
+  if (startFolder !== undefined) await $.state.set(folder, startFolder)
+}
+
+/** A folder this session is known by, and what it is to the session. */
+type Known = { readonly role: 'the folder it started in' | 'where the plugin started again' | 'its project root' | 'its folder'; readonly folder: string }
+
+/** `folder`'s parent, or undefined at a drive's root. */
+function parentOf(folder: string): string | undefined {
+  const trimmed = folder.replace(/\\+$/, '')
+  const at = trimmed.lastIndexOf('\\')
+  if (at < 0 || /^[A-Za-z]:$/.test(trimmed)) return undefined
+  return at === 2 && /^[A-Za-z]:/.test(trimmed) ? `${trimmed.slice(0, 2)}\\` : trimmed.slice(0, at)
+}
+
+/** Of the known folders and their parents, the first whose project folder is named `name`; undefined when none is. */
+function folderNamed(known: readonly Known[], name: string): string | undefined {
+  for (const { folder } of known) {
+    for (let up: string | undefined = folder; up !== undefined; up = parentOf(up)) {
+      if (isProjectOf(name, up)) return up
+    }
+  }
+  return undefined
+}
+
+/** The known folders as one phrase, each named once with every role it has: "C:\a (the folder it started in, its project root)". */
+function knownText(known: readonly Known[]): string {
+  const byFolder = new Map<string, { folder: string; roles: string[] }>()
+  for (const { role, folder } of known) {
+    const key = folder.toLowerCase()
+    const seen = byFolder.get(key) ?? { folder, roles: [] }
+    seen.roles.push(role)
+    byFolder.set(key, seen)
+  }
+  return [...byFolder.values()].map(({ folder, roles }) => `${folder} (${roles.join(', ')})`).join(', nor ')
+}
+
+/**
+ * Where `claude --resume <id>` finds this conversation, checked against its transcript before anything
+ * exits (checkTranscript): the folder this process started in; else `$.session.root()`, then
+ * `$.session.cwd()`, each only when it passes (a reload after the wipe set the start folder again from
+ * wherever the session was, or it was lost). When none passes, why, in one of three words, each ending with
+ * what to tell the person (the model can't exit by itself): no folder known at all; folders known, none of
+ * them holding the transcript (named, with the project folder that does hold it when it can be found); or
+ * the check couldn't run.
+ */
+async function resumeFolder($: EngineInterface, id: string): Promise<{ readonly folder: string } | { readonly refusal: string }> {
+  const config = await configDirOf($)
+  if ('refusal' in config) return config
+  // Why the start folder isn't known, when it isn't: a cause only when it is the known one.
+  let unread: string | undefined
+  const reads: readonly [() => Known['role'], () => Promise<string | undefined>][] = [
+    [() => (startFolderFrom === 'reset' ? 'where the plugin started again' : 'the folder it started in'), () => startFolderOf($)],
+    [() => 'its project root', () => $.session.root()],
+    [() => 'its folder', () => $.session.cwd()],
+  ]
+  const known: Known[] = []
+  let unchecked: { readonly known: Known; readonly error: string } | undefined
+  for (const [n, [roleOf, read]] of reads.entries()) {
+    let found: string | undefined
+    try {
+      found = await read()
+    } catch (err) {
+      if (n === 0) unread = why(err)
+      continue
+    }
+    const role = roleOf()
+    if (typeof found !== 'string' || found === '') continue
+    known.push({ role, folder: found })
+    const checked = await checkTranscript($, found, id, [config.dir], transcript)
+    if ('error' in checked) unchecked ??= { known: { role, folder: found }, error: checked.error }
+    else if (checked.holds) return { folder: found }
+  }
+  const byHand = (where: string) => `Tell the person to restart by hand: exit (/exit), then run \`claude --resume ${id}\` in ${where}`
+  if (unchecked !== undefined) {
+    return { refusal: `whether ${unchecked.known.folder} (${unchecked.known.role}) holds this conversation's transcript can't be checked: ${unchecked.error}. ${byHand(`${unchecked.known.folder}, if that is the folder the session started in`)}` }
+  }
+  const project = transcriptFolder(transcript, id) ?? (await findTranscript($, id, [config.dir]))
+  const kept = project === undefined ? '' : `; Claude Code keeps its transcript in ${project}`
+  // The folder that project folder is named for, when a known folder or one of its parents is.
+  const name = project === undefined ? undefined : project.slice(Math.max(project.lastIndexOf('\\'), project.lastIndexOf('/')) + 1)
+  const named = name === undefined ? undefined : folderNamed(known, name)
+  const where = name === undefined ? 'the folder the session started in' : named === undefined ? `the folder ${name} is named for` : `${named} (the folder ${name} is named for)`
+  const cause = unread !== undefined ? `the plugin's session state can't be read (${unread})` : sawMove ? 'Claude Code emptied plugin state at a /clear or /resume' : "the plugin's session state holds none"
+  if (known.length === 0) {
+    return { refusal: `no folder of this session is known, not even the one it started in: ${cause}, and the session's folders can't be read${kept}. ${byHand(where)}` }
+  }
+  const lost = known.some(k => k.role === 'the folder it started in' || k.role === 'where the plugin started again') ? '' : `the folder it started in isn't known (${cause}), and `
+  return { refusal: `${lost}none of this session's folders holds its transcript: not ${knownText(known)}${kept}. ${byHand(where)}` }
 }
 
 /** The pending marker: `kind` while the restart is queued or armed, null once it ran or was cancelled. */
@@ -350,10 +502,21 @@ async function plan($: EngineInterface): Promise<{ powershell: string; id: strin
     return { refusal: `this session's id can't be read: ${why(err)}` }
   }
   if (!SESSION_ID.test(id)) return { refusal: `this session's id (${JSON.stringify(id)}) is not one claude --resume takes` }
+  // Right after a move, `$.session.id()` may still read the conversation left: the SessionStart's id stands
+  // for ID_LAG_MS, and a restart then would resume the wrong one. Past that, the id is the conversation.
+  if (current !== undefined && current !== id) {
+    const now = await $.clock.now()
+    if (idLag(current, currentAt, id, now) === 'lags') {
+      const since = currentAt === undefined ? 1 : Math.max(1, Math.round((now - currentAt) / 1000))
+      return { refusal: `this session's id reads ${id}, but its last SessionStart named ${current} ${secondsText(since)} ago: it is moving between conversations, so which one a restart would resume is unclear. Try again in a moment` }
+    }
+    current = id
+    currentAt = undefined
+  }
   // Where it started, not where it is now: `--resume <id>` looks the session up under the folder's project.
-  const { value: cwd } = await $.state.get(folder)
-  if (typeof cwd !== 'string' || cwd === '') return { refusal: "the folder this session started in isn't known" }
-  return { powershell: powershellPath(root), id, cwd }
+  const found = await resumeFolder($, id)
+  if ('refusal' in found) return found
+  return { powershell: powershellPath(root), id, cwd: found.folder }
 }
 
 /** The restarts under way in the store, each one checked; dropped: anything else, and those gone stale. */
@@ -405,9 +568,12 @@ async function noteRestart($: EngineInterface, id: string): Promise<void> {
 }
 
 /** Why a restart this soon after the last is refused. */
+/** A count of seconds, as words: "1 second", "5 seconds". */
+const secondsText = (n: number): string => `${n} second${n === 1 ? '' : 's'}`
+
 async function loop($: EngineInterface, at: number): Promise<string> {
   const seconds = Math.max(1, Math.round(((await $.clock.now()) - at) / 1000))
-  return `this session restarted ${seconds} seconds ago, and a second restart within 2 minutes is refused, so that restarts can't loop unattended`
+  return `this session restarted ${secondsText(seconds)} ago, and a second restart within 2 minutes is refused, so that restarts can't loop unattended`
 }
 
 /** Says an armed restart didn't go ahead: the pending marker done, a toast for the person, a note for the model. */
@@ -784,9 +950,15 @@ export const register: Register = (on, options) => {
   on('session.start', async ($, e, next) => {
     const started = await next(e)
     isTerminal = e.isInteractive && e.surface === 'terminal'
-    // The first start's folder only: a reload starts the plugin again from wherever the session is now.
+    // The first start's folder only: a reload starts the plugin again from wherever the session is now,
+    // so it takes the one `$.state` kept. Kept in the module too: a /clear or a /resume empties `$.state`.
     const { value: first } = await $.state.get(folder)
-    if (typeof first !== 'string' || first === '') await $.state.set(folder, e.cwd)
+    const kept = typeof first === 'string' && first !== '' ? first : undefined
+    if (startFolder === undefined) {
+      startFolder = kept ?? e.cwd
+      startFolderFrom = kept !== undefined ? 'state' : sawStartup ? 'startup' : 'reset'
+    }
+    if (kept === undefined) await $.state.set(folder, startFolder)
     // The trampoline's command: registered whichever way GO_VIA says, so its hook answers a person's
     // typing or a stale entry, and validate sees it as a hook that answers its own command.
     try {
@@ -822,8 +994,29 @@ export const register: Register = (on, options) => {
   // The process that resumed a session this plugin restarted: send that restart's first prompt.
   on('classic.SessionStart', async ($, e, next) => {
     const done = await next(e)
-    // The conversation this process holds from here, by the event's own id.
-    if (e.agent_id === undefined && typeof e.session_id === 'string' && SESSION_ID.test(e.session_id)) current = e.session_id
+    // The conversation this process holds from here, by the event's own id: a startup's, a resume's or a clear's.
+    if (e.agent_id === undefined && movesConversation(e.source) && typeof e.session_id === 'string' && SESSION_ID.test(e.session_id)) {
+      current = e.session_id
+      currentAt = await $.clock.now()
+    }
+    // Its transcript, which the start folder is checked against; a fork's names another conversation.
+    if (e.agent_id === undefined && (movesConversation(e.source) || e.source === 'compact') && typeof e.session_id === 'string' && SESSION_ID.test(e.session_id) && typeof e.transcript_path === 'string' && e.transcript_path !== '') {
+      transcript = { id: e.session_id, path: e.transcript_path }
+    }
+    // A /clear or a /resume empties `$.state`, now or a moment after: the start folder goes back in.
+    // This process's own startup: a start folder set from its session.start is where it started.
+    if (e.agent_id === undefined && e.source === 'startup') {
+      sawStartup = true
+      if (startFolderFrom === 'reset') startFolderFrom = 'startup'
+    }
+    if (e.agent_id === undefined && (e.source === 'clear' || e.source === 'resume')) {
+      sawMove = true
+      try {
+        await restoreFolder($)
+      } catch {
+        // The next read that finds it empty puts it back.
+      }
+    }
     if (e.agent_id !== undefined || e.source !== 'resume') return done
     try {
       await welcome($, e.session_id)
@@ -841,13 +1034,12 @@ export const register: Register = (on, options) => {
     if (!isTerminal) {
       return { deny: 'A restart opens a terminal window for a session run in a terminal with a person at its prompt; this one is not (a -p run, an SDK host, or an app).' }
     }
-    // What the launch needs: where it can't be planned (off Windows, an id claude --resume doesn't
-    // take), the restart is refused when armed, saying why; the probe is run only where it can be.
-    const planned = await plan($)
-    const launch = 'refusal' in planned ? undefined : planned
+    // What the launch needs (Windows, an id claude --resume takes, the folder that holds its transcript):
+    // where it can't be planned, nothing is queued, and the call says why.
+    const launch = await plan($)
+    if ('refusal' in launch) return { deny: `Not queued: ${launch.refusal}.` }
     // No restart loop: a session that restarted less than 2 minutes ago is refused another.
-    const id = launch?.id ?? (await $.session.id().catch(() => undefined))
-    const lately = id !== undefined && SESSION_ID.test(id) ? await lastRestart($, id) : undefined
+    const lately = await lastRestart($, launch.id)
     if (lately !== undefined) return { deny: `Not queued: ${await loop($, lately)}. If a restart is still the fix, tell the person, who can restart by hand.` }
     // The pre-check at the call: nothing is queued while anything stands.
     const stop = await blockers($, launch)
@@ -860,7 +1052,7 @@ export const register: Register = (on, options) => {
     $.ui.status('restart queued for when this turn ends')
     const then = resume === undefined ? 'then waits for the next message' : `then resumes with: ${resume}`
     return {
-      result: `Queued. Once this turn ends, a new terminal window opens in the folder this session started in, this session exits, and the window resumes it once this process has gone; the reason is recorded in the transcript: ${reason}. The restarted session ${then}. When Claude Code was started through the claude wrapper, this same tab resumes it instead, with no new window; in a pane running self-switch's slot runner, the pane does. When the tab or the slot can't be used, the restart says why. On anything but Windows nothing runs, and you are told on your next turn.`,
+      result: `Queued. Once this turn ends, a new terminal window opens in the folder this session started in, this session exits, and the window resumes it once this process has gone; the reason is recorded in the transcript: ${reason}. The restarted session ${then}. When Claude Code was started through the claude wrapper, this same tab resumes it instead, with no new window; in a pane running self-switch's slot runner, the pane does. When the tab or the slot can't be used, the restart says why.`,
     }
   }).catch(($, e, next) => (next.called ? next(e) : { deny: 'self-restart: queuing the restart failed; nothing is queued.' }))
 

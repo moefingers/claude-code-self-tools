@@ -29,7 +29,8 @@ export type Ticket = {
  * A conversation's heartbeat, kept in the plugin's own store under `alive:<session id>`: when this
  * plugin last saw it running (at each turn's start and end, and every 2 minutes), the folder its
  * process started in, and that folder's project name. Liveness (L5) reads `at`; a switch to it reads
- * `folder`.
+ * `folder`. Both are empty while the start folder isn't known (Claude Code emptied plugin state at a
+ * /clear or /resume, and the folder the plugin started again in isn't known to be it): the beat goes on.
  */
 export type Heartbeat = { at: number; folder: string; project: string }
 

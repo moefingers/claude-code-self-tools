@@ -9,6 +9,8 @@ import { launchScriptText } from '../hooks/launcher'
 import { checkPaneTicket, type LaunchInput, panePath, paneTicketPath, quoted, SLOT_SCRIPT_SHA256, slotRecordPath } from '../hooks/machine'
 
 const TOOL = 'mcp__self-restart__restart_after_turn'
+/** A transcript under the repo's project folder, in any config folder: where `claude --resume` finds the session. */
+const TRANSCRIPT = /\\projects\\C--work-repo\\[0-9a-f-]{36}\.jsonl$/
 const HOUR = 60 * 60 * 1000
 const ID = '00000000-0000-4000-a000-000000000001'
 const OTHER = '00000000-0000-4000-a000-000000000002'
@@ -106,7 +108,8 @@ function engine(on: On, { token = TOKEN, pane = PANE, probe = probeOf(), paneScr
   on('session.start', (_, e) => ({ cwd: e.cwd }))
   on('session.id', () => ({ value: ID }))
   on('tool.list', () => ({ value: [] }))
-  on('fs.exists', (_, e) => ({ value: files.has(e.path) }))
+  // This conversation's transcript, under the repo's project folder: the start folder holds it.
+  on('fs.exists', (_, e) => ({ value: files.has(e.path) || TRANSCRIPT.test(e.path) }))
   on('command.register', (_, e) => ({ value: { command: e.name } }))
   on('session.cwd', () => ({ value: REPO }))
   on('tool.register', (_, e) => {
@@ -274,15 +277,17 @@ for (const [name, options, why] of [
   })
 }
 
-test("a conversation whose start named another id than $.session.id() reads: the window, saying why", async ($, on) => {
-  const { kinds, logs, clock } = engine(on)
+test("a conversation whose start named another id than $.session.id() reads: refused at the call while the id may lag it; past that, the id stands, and the tab resumes it", async ($, on) => {
+  const { kinds, clock } = engine(on)
   await $.session.start(start)
   await $.classic.SessionStart({ source: 'startup', session_id: OTHER })
-  await $.tool.call({ tool: TOOL, reason: 'Switched accounts.' })
+  const refused = await $.tool.call({ tool: TOOL, reason: 'Switched accounts.' })
+  expect(refused.deny).toMatch(new RegExp(`^Not queued: this session's id reads ${ID}, but its last SessionStart named ${OTHER} \\d+ seconds? ago: it is moving between conversations`))
+  await clock.advance(16_000)
+  expect((await $.tool.call({ tool: TOOL, reason: 'Switched accounts.' })).deny).toBeUndefined()
   await $.turn.complete(answered)
   await clock.advance(1000)
-  expect(kinds).toEqual(['launcher'])
-  expect(logs).toContain(`this tab's claude wrapper isn't used: this session's id reads ${ID}, but the start of this conversation named ${OTHER}. A new window resumes the session.`)
+  expect(kinds).toEqual(['pane'])
 })
 
 test('the claim held by another switch or restart: no ticket, nothing exits, and the model is told', async ($, on) => {

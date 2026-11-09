@@ -5,10 +5,12 @@
 //
 // The protocol, the same in both plugins (the README, "The resume claim"):
 //   - the file <state>\resumed\<session id>.<turn id>.json, where <state> is
-//     %LOCALAPPDATA%\claude-self-tools (the shared machine code's stateFolder), the session id is
-//     `$.session.id()`, and the turn id is the `turnId` of the main-loop turn.complete that ended on the error,
-//     which every plugin's hook is handed alike (2.1.319 makes one per turn with crypto.randomUUID). Both must be
-//     UUIDs; anything else claims nothing and resumes nothing;
+//     %LOCALAPPDATA%\claude-self-tools (the shared machine code's stateFolder), the session id is the
+//     conversation the stop is recorded in (the turn's own `session`, from the last main-loop SessionStart of a
+//     startup, a resume or a clear: right after a move `$.session.id()` may name the conversation left for up to
+//     about 15 s, so it is never read at claim time), and the turn id is the `turnId` of the main-loop
+//     turn.complete that ended on the error, which every plugin's hook is handed alike (2.1.319 makes one per turn
+//     with crypto.randomUUID). Both must be UUIDs; anything else claims nothing and resumes nothing;
 //   - holding {"v":1,"by":"<name>","at":<ms>} (UTF-8, no BOM): by is self-remote-control, coordinator (its
 //     auto-resume) or coordinator:owner (the page's Resume);
 //   - taken ONLY by the canonical CLAIM script below, run byte for byte (its SHA-256 pinned here and in the
@@ -67,14 +69,16 @@ async function claimMemory($: EngineInterface, key: string): Promise<Claim> {
 }
 
 /**
- * Claims the resume of the stop that turn `turnId` ended on, at `now`: one CLAIM. Never throws: a claim that
- * can't be taken, for any reason, is lost, saying why, and nothing is sent.
+ * Claims the resume of the stop that turn `turnId` ended on, in conversation `session` (the one the turn was
+ * recorded in), at `now`: one CLAIM. Never throws: a claim that can't be taken, for any reason, is lost,
+ * saying why, and nothing is sent.
  */
-export async function claimResume($: EngineInterface, turnId: string | undefined, now: number): Promise<Claim> {
+export async function claimResume($: EngineInterface, turnId: string | undefined, session: string | undefined, now: number): Promise<Claim> {
   try {
     if (turnId === undefined || !SESSION_ID.test(turnId)) return { lost: "no resume: the interrupted turn's id isn't known, so the resume can't be claimed" }
-    const [local, root, session] = await Promise.all([$.env.get('LOCALAPPDATA'), $.env.get('SystemRoot'), $.session.id()])
-    if (!SESSION_ID.test(session)) return { lost: "no resume: this session's id isn't one, so the resume can't be claimed" }
+    if (session === undefined) return { lost: "no resume: the conversation the interrupted turn ran in isn't known, so the resume can't be claimed" }
+    if (!SESSION_ID.test(session)) return { lost: "no resume: the conversation the interrupted turn ran in isn't named by a session id, so the resume can't be claimed" }
+    const [local, root] = await Promise.all([$.env.get('LOCALAPPDATA'), $.env.get('SystemRoot')])
     if (local === undefined && root === undefined) return await claimMemory($, `${session}.${turnId}`)
     if (!isSafeFolder(local) || typeof root !== 'string' || !/^[A-Za-z]:\\[^\\/:*?"<>|]+\\?$/.test(root)) return { lost: "no resume: the resume claim can't be placed (no usable %LOCALAPPDATA% or %SystemRoot%)" }
     const powershell = `${root.replace(/\\+$/, '')}\\System32\\WindowsPowerShell\\v1.0\\powershell.exe`

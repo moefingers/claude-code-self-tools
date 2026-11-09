@@ -9,6 +9,12 @@
 // comes first sends it, once: session.start in the module the reload started, or this module when
 // the command returns and it is still running (the reload left it in place, or failed). Each takes
 // it with a compare-and-set on its version, so the two can't both send it.
+//
+// A /clear or a /resume that runs before the queued reload makes the session another conversation, and
+// Claude Code empties $.state then (now or a moment after), with no session.start. The reload still runs,
+// but its resume was the conversation left's: so at that classic SessionStart, while a reload this module
+// armed waits, the resume is dropped, from the module's copy of the record and from $.state if it is still
+// there, and a toast and a note to the model say so. It is never sent into the conversation arrived at.
 import type { EngineInterface, Register } from 'claude-code'
 import type { Pending, Queued } from '../types'
 import { configureUpdateCheck, loadUpdateCheck, withUpdateNotice } from './update-check'
@@ -110,6 +116,12 @@ function closeArm(arm: Arm): void {
   arm.marks.clear()
 }
 
+/**
+ * The pending record this module wrote at a turn's end and hasn't taken back: the copy a /clear or a /resume
+ * doesn't empty, so the resume can be dropped, and said to be, after Claude Code emptied $.state.
+ */
+let written: Pending | undefined
+
 /** The state steps on the pending record, one at a time: its writing, a mark and the claim never interleave. */
 let chain: Promise<unknown> = Promise.resolve()
 function serial<T>(work: () => Promise<T>): Promise<T> {
@@ -199,6 +211,7 @@ function claim($: EngineInterface): Promise<Pending | undefined> {
       const value = held.value
       if (!value) return undefined
       if ((await $.state.set(pending, null, { ifVersion: held.version })).isSet) {
+        if (written?.at === value.at) written = undefined
         const isMarked = [...openArms].some(arm => arm.at === value.at && isStale(arm))
         for (const arm of openArms) if (arm.at === value.at) closeArm(arm)
         return isMarked && value.turnSince !== true ? { ...value, turnSince: true } : value
@@ -226,6 +239,42 @@ async function resumeOrNote($: EngineInterface, said: string, value: Pending): P
   if (value.turnSince !== true) return await sendResume($, said, value.resume)
   $.ui.toast('Resume not sent: your message came after the reload was queued, so the model has it as a note.')
   await tellModel($, `${said} The person's message came after the reload was queued, so its resume wasn't sent as a new message. It was: ${value.resume}`)
+}
+
+/** A pending record with its resume left out. */
+function withoutResume(value: Pending): Pending {
+  const copy: Pending = { ...value }
+  delete copy.resume
+  return copy
+}
+
+/**
+ * At a /clear's or a /resume's classic SessionStart, while a reload this module armed still waits: its resume
+ * is dropped (the conversation it was for was left), from the module's copy and from $.state when the record
+ * is still there (read fresh, so the compare-and-set's version is from after the move); when the wipe came
+ * first, the record goes back without it, so the reload's end still reports. The person and the model are
+ * told. The reload itself still runs. Nothing when the waiting reload has no resume.
+ */
+function dropResume($: EngineInterface, source: 'clear' | 'resume'): Promise<void> {
+  return serial(async () => {
+    const mine = written
+    if (mine === undefined || mine.resume === undefined) return
+    const kept = withoutResume(mine)
+    written = kept
+    for (let tries = 0; tries < 3; tries += 1) {
+      const held = await $.state.get(pending)
+      // The wipe came first: the record goes back without its resume, so the reload's end still says how it went.
+      if (!held.value) {
+        await $.state.set(pending, kept)
+        break
+      }
+      if (held.value.at !== mine.at || held.value.resume === undefined) break
+      if ((await $.state.set(pending, withoutResume(held.value), { ifVersion: held.version })).isSet) break
+    }
+    const move = source === 'clear' ? '/clear' : '/resume'
+    $.ui.toast(`Resume dropped: a ${move} ran before the queued plugin reload, so its resume, which was for the conversation left, isn't sent. The reload still runs.`)
+    await tellModel($, `self-reload: a plugin reload queued before this ${move} still runs, but its resume was dropped: it was for the conversation the ${move} left, not this one.`)
+  })
 }
 
 /** Runs the reload; then, if this module is still the one running, sends what is pending. */
@@ -334,7 +383,9 @@ export const register: Register = (on, options) => {
       const at = await $.clock.now()
       await serial(async () => {
         arm.at = at
-        await $.state.set(pending, { ...value, at, ...(arm.sure ? { turnSince: true as const } : {}) })
+        const record: Pending = { ...value, at, ...(arm.sure ? { turnSince: true as const } : {}) }
+        written = record
+        await $.state.set(pending, record)
       })
       isArmed = true
       // An arm of a record this one replaced stands for nothing now.
@@ -345,6 +396,13 @@ export const register: Register = (on, options) => {
       if (!isArmed) closeArm(arm)
     }
   })
+
+  // A /clear or a /resume before the queued reload ran: the resume was the conversation's it left, and is dropped.
+  on('classic.SessionStart', async ($, e, next) => {
+    const done = await next(e)
+    if (e.agent_id === undefined && (e.source === 'clear' || e.source === 'resume')) await dropResume($, e.source).catch(() => undefined)
+    return done
+  }).catch(($, e, next) => next(e))
 
   // A main-loop turn's start: a mark the prompt's own hook couldn't write into the record (see Typed) is written now,
   // before the turn can end and the reload run. Only a mark; nothing of the turn's text is read.
