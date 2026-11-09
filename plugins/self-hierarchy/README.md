@@ -12,7 +12,7 @@ It covers:
 - **Who answers what.** A lane's "ship or hold?" goes to the merger alone. Work outside a session's area is flagged and routed, and another area's finding goes whole to the lane that owns it.
 - **The review loop.** An independent reviewer gets the code and the questions, never the builder's conclusions. Blockers, Highs and Mediums go to the merger; Lows and Infos are filed and named in the PR body. A confirming read covers only the delta. Every push is asked for with its head sha, and pushes are bundled.
 - **The owner's decisions**, one per question with a recommended option, each answer recorded where it was asked.
-- **Messaging between sessions, heavy work and waiting**: name-addressed messages with a self-contained first line, one heavy job at a time above a free-memory floor, and an exit for every wait and every watch.
+- **Messaging between sessions, heavy work and waiting**: name-addressed messages with a self-contained first line; builds and checks through a shared slot script with a free-memory floor, and dev servers run directly and stopped by PID; and an exit for every wait and every watch.
 - **The self tools in a hierarchy**: what [compacting](../self-compact), [restarting](../self-restart), [clearing](../self-clear), [switching](../self-switch), [exiting](../self-exit), [waking](../self-wake), [reloading](../self-reload) and [checking tools](../self-check) cost, and when to use which; what an in-process `/clear` or `/resume` does to plugin state; same-tab restarts and launching sessions through the [claude wrapper](../../tools/claude-wrapper/claude-wrapper.ps1); names, Remote Control and optional role colours.
 - **Pause and resume**, and what to write down before any break.
 

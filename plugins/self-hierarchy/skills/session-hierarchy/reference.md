@@ -147,7 +147,8 @@ The builder:
 - works in its own worktree and branch, never the main checkout or another session's worktree;
 - proves a fix with a test that fails before the change and passes after, and breaks the fix once to watch the test fail;
 - fixes the class, not the instance: a defect is a sample, so it looks for the rest of its family;
-- runs heavy commands through the slot script;
+- runs builds and checks through the slot script, and a dev server directly, stopping it by its PID on every exit path;
+- commits nothing while another builder edits the same tree: a commit hook that lints and fixes staged files can sweep the other builder's edits into the commit;
 - never skips hooks and never force-pushes; a bad push is fixed by a commit on top;
 - stops and reports when a gate refuses it, and never routes around a refusal;
 - says what it verified by reading, what by running, and what only the running system can settle;
@@ -159,6 +160,7 @@ Give it the diff or the head, the acceptance criteria and your questions. Never 
 
 The reviewer:
 - is read-only; any test or type check it runs goes through the slot script;
+- runs none of the head's code when the head may come from an author you don't control (another developer, or an automated run): it reads, and takes test results from CI, because the head's tests could read credentials on this machine;
 - verifies by reading, the way a proof is checked, and names what reading can't settle and whether the PR showed it;
 - looks hardest for what would break production or lock a person out; then for names that don't keep their promise, features that look done but aren't, and an instance fixed where a class exists;
 - reports concrete findings only, ranked: file and line, the failure scenario, and a severity (Blocker, High, Medium, Low or Info);

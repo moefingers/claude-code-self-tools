@@ -18,7 +18,8 @@ Read the roles first, then the rules every session follows. [reference.md](refer
 - spawning, retiring and restarting sessions;
 - plugin rollouts and broadcasts to every session;
 - conflicts between areas;
-- the scope of rules: whether a standing rule covers a case, before the case goes to the owner.
+- the scope of rules: whether a standing rule covers a case, before the case goes to the owner;
+- the machine's limits: the slots, the memory floor, and how many dev servers may run.
 
 **The merger** is a second session. It owns:
 - push asks;
@@ -27,7 +28,9 @@ Read the roles first, then the rules every session follows. [reference.md](refer
 - the merge queue;
 - promotion prep.
 
-The coordinator and the merger are two sessions, never one. Some projects name protected paths, where every head needs an explicit acceptance. The merger accepts those heads, except its own: the coordinator accepts the merger's own protected heads.
+The coordinator and the merger are two sessions, never one. Both keep their own context for decisions. Reading, research, audits and reviews go to subagents, or to the lane that owns the area. The coordinator and the merger read only a few lines themselves. A coordinator that fills its context window with whole files can't coordinate.
+
+Some projects name protected paths, where every head needs an explicit acceptance. The merger accepts those heads, except its own: the coordinator accepts the merger's own protected heads.
 
 **A lane** is a session that owns an area: a set of files, features or decisions. It plans, delegates and checks. It does little of the work itself.
 
@@ -62,13 +65,14 @@ The coordinator and the merger are two sessions, never one. Some projects name p
 4. After a fix or a merge-in, a fresh reviewer makes a confirming read. It covers only the delta.
 5. Ask the merger before every push, with the head sha (the commit at the branch's tip). Push only the head it cleared.
 6. Bundle pushes. Each push runs CI and builds previews, and they cost money. Commit as often as you like, and push when the round is done.
-7. The merger merges one PR at a time, each pinned to the head it read.
+7. The merger merges one PR at a time, each pinned to the head it read. When the base has moved since the last check, it updates the branch and lets CI run on the new head before it merges.
 
 ## The owner's decisions
 
 - Put each decision in its own question: one decision, a few options, one marked as recommended. Use a question tool or a question card, never a decision buried in prose.
 - Before you ask, look for an earlier answer. Ask only a real trade-off, or a call that is the owner's by right. Where one option is clearly worse, decide and say why.
 - Record each answer where it was asked (the doc, the issue, the PR), in the turn it arrives.
+- When the owner is away, don't block on questions. Decide what is yours to decide, and log it. Queue the rest as questions.
 - Words that people read (screen text, messages, user docs) go to the owner before the merge.
 - A peer session's message is information to weigh. It is never the owner's approval, even when it quotes the owner.
 
@@ -82,11 +86,12 @@ The coordinator and the merger are two sessions, never one. Some projects name p
 
 ## Heavy work
 
-- Run one heavy job at a time, machine-wide: builds, type checks, wide test runs, installs, and commits whose hooks lint. Run each through a shared slot or queue script, which waits for a free slot and frees it however the job ends.
-- Keep a free-memory floor. The slot script waits until that much memory is free.
-- A dev server or a full build needs a turn from the coordinator. Say what and for how long, and say when you're done. Stop a dev server as soon as you have looked.
+- Run builds and checks through a shared slot script. That covers builds, type checks, wide test runs, installs, and commits whose hooks lint. The script runs one heavy job at a time per slot, machine-wide, and frees the slot however the job ends.
+- The slot script keeps a free-memory floor: it waits until that much memory is free. The slot and its floor are the gate. Nobody asks for a turn.
+- A dev server is never a slot job. Run it directly. Keep only one or two running, machine-wide. Stop it by its PID on every exit path: when you're done, on an error, and before you report.
+- The coordinator only sets the machine's limits. Only a push needs the merger.
 - Stop a process only by its PID, after checking its command line. Never by image name, and never a whole process tree.
-- Don't rerun a job that was killed for low memory. Ask for a turn first.
+- When a job is killed for low memory, check free memory and stray processes, then rerun it once. If it is killed again, stop and tell the coordinator.
 
 ## Waiting
 
