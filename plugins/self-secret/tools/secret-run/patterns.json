@@ -1,0 +1,39 @@
+{
+  "$comment": "secret-run's patterns: a kind of value, as its vendor documents it (each entry's doc). No secrets here: each names a shape (a regular expression over the trimmed value, and the words the form finishes \"it should ...\" with), whether spaces may sit inside it, an optional live check (an https request that must answer one of its statuses; {value} where the value goes) and redaction patterns for output. A profile names one with \"pattern\"; the self-secret README, Profiles, says how.",
+  "github": {
+    "title": "GitHub token",
+    "doc": "https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/about-authentication-to-github#githubs-token-formats",
+    "shape": {
+      "pattern": "^(?:gh[pousr]_|github_pat_)\\S+$",
+      "says": "start with ghp_, gho_, ghu_, ghs_, ghr_ or github_pat_ and have no spaces"
+    },
+    "spacesInside": false,
+    "check": null,
+    "redact": ["gh[pousr]_[A-Za-z0-9_.-]{16,}", "github_pat_[A-Za-z0-9_]{16,}"]
+  },
+  "neon": {
+    "title": "Neon API key",
+    "doc": "https://neon.com/docs/manage/api-keys",
+    "shape": {
+      "pattern": "^napi_\\S+$",
+      "says": "start with napi_ and have no spaces"
+    },
+    "spacesInside": false,
+    "check": null,
+    "redact": ["napi_[A-Za-z0-9]+", "postgres(ql)?://\\S+"]
+  },
+  "vercel-ai-gateway": {
+    "title": "Vercel AI Gateway API key",
+    "doc": "https://vercel.com/docs/ai-gateway/sdks-and-apis/rest-api",
+    "shape": null,
+    "spacesInside": false,
+    "check": {
+      "type": "http",
+      "method": "GET",
+      "url": "https://ai-gateway.vercel.sh/v1/credits",
+      "headers": { "Authorization": "Bearer {value}" },
+      "expectStatus": [200]
+    },
+    "redact": []
+  }
+}

@@ -1,5 +1,6 @@
 #!/usr/bin/env node
-// Every check the repository has, in one run: the shared-copies test, the tools' tests, then for each plugin
+// Every check the repository has, in one run: the shared-copies test, the tools' tests (self-secret's secret-run
+// among them), then for each plugin
 // `claude plugin validate --strict` and, for each mod, `claude plugin test`, then the marketplace file. Exits 1
 // when any of them fails. A plugin of skills alone (no hooks/ folder) has no hooks module for `test` to
 // load, and `test` refuses one, so it is validated only. A plugin with a hooks/ folder but no
@@ -20,6 +21,8 @@ export function steps(root = ROOT) {
   return [
     ['node', ['--test', 'scripts/*.test.mjs']],
     ['node', ['--test', 'tools/dev-run/dev-run.test.mjs']],
+    // self-secret's secret-run is a Node script beside its hooks module: its tests run under Node, not `claude plugin test`.
+    ['node', ['--test', 'plugins/self-secret/tools/secret-run/*.test.mjs']],
     ...plugins(root).flatMap(plugin => [
       ['claude', ['plugin', 'validate', join('plugins', plugin), '--strict']],
       ...(tested.has(plugin) ? [['claude', ['plugin', 'test', join('plugins', plugin)]]] : []),
