@@ -1,0 +1,49 @@
+{
+  "$comment": "An example of secret-profiles.json, the profiles file that is your own. Copy what fits into the profiles file in the state folder (on Windows %LOCALAPPDATA%\\claude-self-tools\\secret-profiles.json; secret-run --list names it) and make each entry yours. A profile holds no secret: it names the variable a command reads the secret from, what the form says, where the key is made, the check the value must pass before anything runs, and what else to redact from what the command prints. Keys that start with $ are notes. The self-secret README, Profiles, says what each field does.",
+  "github-token": {
+    "title": "GitHub token",
+    "envVar": "GH_TOKEN",
+    "prompt": "Paste a GitHub token for the gh command that asked for it.",
+    "url": "https://github.com/settings/personal-access-tokens",
+    "pattern": "github",
+    "check": {
+      "type": "http",
+      "method": "GET",
+      "url": "https://api.github.com/user",
+      "headers": { "Authorization": "Bearer {value}", "User-Agent": "secret-run" },
+      "expectStatus": [200],
+      "reached": "the account {login}"
+    }
+  },
+  "example-service": {
+    "title": "Example service API key",
+    "envVar": "EXAMPLE_API_KEY",
+    "prompt": "Paste an API key for the example service.",
+    "url": "https://console.example.com/keys",
+    "shape": {
+      "pattern": "^ex_[A-Za-z0-9]{20,}$",
+      "says": "start with ex_ and have at least 20 letters or digits after it"
+    },
+    "check": {
+      "type": "http",
+      "method": "GET",
+      "url": "https://api.example.com/v1/whoami",
+      "headers": { "Authorization": "Bearer {value}" },
+      "expectStatus": [200],
+      "reached": "{account.name}",
+      "timeoutSeconds": 15
+    },
+    "redact": ["ex_[A-Za-z0-9]{20,}"]
+  },
+  "signing-passphrase": {
+    "title": "Signing key passphrase",
+    "envVar": "SIGNING_PASSPHRASE",
+    "prompt": "Paste the passphrase of the release signing key.",
+    "spacesInside": true,
+    "check": {
+      "type": "command",
+      "argv": ["node", "C:/path/to/check-passphrase.mjs"],
+      "timeoutSeconds": 30
+    }
+  }
+}

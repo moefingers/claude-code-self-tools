@@ -307,7 +307,8 @@ test('the opt-out stops it: no request, no store, no notice, no toast', { option
   expect(requests).toEqual([])
   // Nothing under the update check's own keys; a plugin keeps others of its own (self-switch's heartbeat).
   expect(writes.filter(w => w.key === 'updateCheck' || w.key === 'updateSeen')).toEqual([])
-  expect(reads).toEqual([])
+  // No read of the installed manifest; a plugin reads files of its own (self-secret's shim).
+  expect(reads.filter(path => /[\\/]\.claude-plugin[\\/]plugin\.json$/.test(path))).toEqual([])
   expect(toasts).toEqual([])
 })
 

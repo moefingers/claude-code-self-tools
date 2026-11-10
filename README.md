@@ -1,6 +1,6 @@
 # claude-code-self-tools
 
-Small [Claude Code](https://code.claude.com/docs) plugins that let a session act on itself. Each one gives Claude a tool or two for something you would otherwise do by hand from the prompt: compact or clear the conversation, reload plugins, reconnect an MCP server, check the context window, check that its own tools answer, come back to a task later, turn on Remote Control under a title, set its prompt bar color, exit or restart, or switch to another conversation. One more, self-hierarchy, is a skill: how several sessions on one machine run together as a hierarchy, on these tools.
+Small [Claude Code](https://code.claude.com/docs) plugins that let a session act on itself. Each one gives Claude a tool or two for something you would otherwise do by hand from the prompt: compact or clear the conversation, reload plugins, reconnect an MCP server, check the context window, check that its own tools answer, come back to a task later, turn on Remote Control under a title, set its prompt bar color, exit or restart, switch to another conversation, or run a command with a secret you paste at the machine and it never sees. One more, self-hierarchy, is a skill: how several sessions on one machine run together as a hierarchy, on these tools.
 
 Each plugin is separate. Install only the ones you want.
 
@@ -20,6 +20,7 @@ Each plugin is separate. Install only the ones you want.
 | [self-exit](plugins/self-exit) | `exit_after_turn` | Runs `/exit` once the turn ends, its reason (and a note for whoever resumes it) recorded in the transcript first. Refuses while a session cron, a background job or a subagent would make `/exit` ask, saying how to stop each. | When you asked it to end the session, or its instructions say to close once its work is done or handed off. Only at a finished break, never mid-merge, mid-push or mid-task. |
 | [self-restart](plugins/self-restart) | `restart_after_turn` | On Windows: exits, and the same conversation resumes once the old process has gone, then can resume on its own: in the same tab when Claude Code was started through the [claude wrapper](tools/claude-wrapper/claude-wrapper.ps1), in a slot pane's slot, or else in a new terminal window. | After an account switch, a setting that takes effect at startup, or a plugin that won't reload. Only at a finished break, never mid-merge, mid-push or mid-task. |
 | [self-switch](plugins/self-switch) | `switch_after_turn` | On Windows: switches the terminal to another conversation, only when that one is open nowhere on this machine and nothing runs under this session: in place, in the pane's slot, in the same tab through the claude wrapper, or in a new window. For your own use; it refuses where the coordinator runs switches. | When you ask it to switch to another conversation, at a finished break, its notes written first. |
+| [self-secret](plugins/self-secret) | `secret_run_command` | Answers with the exact line that runs a command with a secret: secret-run opens a form on 127.0.0.1 in your browser, checks what you paste before anything runs, hands it to that one command in an environment variable, and masks it in everything the command prints; a hold keeps it for later commands, up to 120 minutes. The plugin runs nothing itself, and keeps a stable path to secret-run in the state folder. | When a command needs an API key, a token or a password that the session must not see: never pasted into the chat. |
 | [self-hierarchy](plugins/self-hierarchy) | none: a skill, `session-hierarchy` | Says how several sessions on one machine run as a hierarchy: the owner, a coordinator, a merger and lanes, with builder and reviewer subagents; who answers what; the review loop; and what each tool above costs in a hierarchy, and when to use which. No hooks, no tools, no network. | When a session is told it is the coordinator, the merger or a lane in a group of sessions, or asks how to run or join one. Never in ordinary single-session work. |
 
 Claude sees each tool as `mcp__<plugin>__<tool>`, for example `mcp__self-wake__wake_after`.
@@ -49,6 +50,7 @@ Then install each plugin you want by name:
 /plugin install self-exit@claude-code-self-tools
 /plugin install self-restart@claude-code-self-tools
 /plugin install self-switch@claude-code-self-tools
+/plugin install self-secret@claude-code-self-tools
 /plugin install self-hierarchy@claude-code-self-tools
 ```
 
@@ -70,6 +72,7 @@ claude plugin install self-clear@claude-code-self-tools
 claude plugin install self-exit@claude-code-self-tools
 claude plugin install self-restart@claude-code-self-tools
 claude plugin install self-switch@claude-code-self-tools
+claude plugin install self-secret@claude-code-self-tools
 claude plugin install self-hierarchy@claude-code-self-tools
 ```
 
@@ -81,10 +84,10 @@ A mod runs inside Claude Code with your permissions. To see what one hooks and c
 
 What they have in common:
 
-- **Actions wait for the turn to end.** A compaction, a clear, a reload, an MCP reconnect, a wake-up, a Remote Control connect, a prompt bar color change, an exit and a restart are all queued by the tool call and run once the turn ends with Claude's answer. Claude Code can't run them while the turn is running. Claude should end its turn after calling one of these tools; after a color change it needn't, since nothing waits on it.
+- **Actions wait for the turn to end.** A compaction, a clear, a reload, an MCP reconnect, a wake-up, a Remote Control connect, a prompt bar color change, an exit and a restart are all queued by the tool call and run once the turn ends with Claude's answer. Claude Code can't run them while the turn is running. Claude should end its turn after calling one of these tools; after a color change it needn't, since nothing waits on it. self-secret's tool queues nothing: it answers at once with a command line, which Claude then runs with Bash.
 - **An interrupted turn cancels what it queued.** If you stop the turn (Esc or **Stop**), or it ends any way other than with Claude's answer, what that turn queued is dropped, and a notice says so. Something set in an earlier turn, such as an armed wake-up, stands.
 - **Subagents are refused.** These tools act on the main conversation. A subagent that calls one is told why it can't, and to finish its piece and return its result so the main session can act. `context_usage` and `tools_check` refuse a subagent too, because what they report is the main session's.
-- **Each change is announced.** A toast tells you what ran, and the tool result tells Claude. When Claude Code refuses an action (a command a plugin may not run), a toast says why, and Claude is told on its next turn.
+- **Each change is announced.** (self-secret's tool only answers with a command line, so its answer is all it says.) A toast tells you what ran, and the tool result tells Claude. When Claude Code refuses an action (a command a plugin may not run), a toast says why, and Claude is told on its next turn.
 - **Built-in commands run as if you typed them.** self-reload runs `/reload-plugins`, self-mcp runs `/mcp reconnect <server>`, self-remote-control runs `/remote-control` and `/rename`, self-color runs `/color <color>`, self-clear runs `/clear`, self-exit and self-restart run `/exit`, and self-switch runs `/resume <id>` or `/exit`. Their lines show in the transcript, as yours would. A command that asks for confirmation shows you its dialog and waits for your answer, as it would if you had typed it.
 - **What can't be undone needs a reason.** A clear keeps nothing of the conversation but its `handoff`, and an exit, a restart or a switch ends the process or the conversation, so each of those tools requires its `handoff` or `reason` (and a switch its `notes`). A clear also needs its `why`: the work is `complete`, or the context is `contaminated`; anything else should compact or restart instead. Each refuses while a subagent is still running, whose result or work would be lost. They act only on the session itself: none changes a setting, a permission, CLAUDE.md or any other configuration.
 - **An exit never stops at a dialog it could have seen coming.** Before queuing `/exit`, self-exit and self-restart check for what would make it ask, or end work still running: a session cron (read with `CronList`, only after the permission check says `allow`), a background job under the session, a subagent. They refuse while any stands, naming each with how to stop it, at the call and again right before the exit; anything they can't read refuses too. While an exit or restart is queued, a pending marker tells a coordinator to hold its deliveries, so that none starts a turn that cancels it.
@@ -277,6 +280,7 @@ The tool descriptions say when to call each tool and when not to. To make it a h
 > - **A fresh start, rarely:** keep the context healthy by compacting; restart into the same conversation for a fresh process. Clear only when the work is complete and its notes are written (`why: 'complete'`), or the context is contaminated (`why: 'contaminated'`): write your notes, then call `clear_after_turn` with the `why` and a `handoff` naming the next piece and where its notes are.
 > - **A tool seems dead:** when Bash or PowerShell answers with nothing, or a call never answers, call `tools_check` before working around it; if it says a tool failed, follow the repair it gives: for a dead Bash whose env is too long, move the PowerShell tool's directory and back in two calls, then try Bash again; for any other dead tool, restart (`restart_after_turn`) at the next finished break.
 > - **Ending, restarting or switching:** only at a finished break, never mid-merge, mid-push or mid-task. Call `exit_after_turn` only when I ask you to end the session or your brief says to close it when done, with the `reason`. After I switch accounts or change a setting that needs a restart, call `restart_after_turn` with the `reason` and a `resume` naming the next step. Call `switch_after_turn` only when I ask you to switch to another conversation, with `to`, the `reason` and where your `notes` are, written first; where the coordinator runs, it starts switches, and the tool refuses.
+> - **A command that needs a secret:** never ask me to paste a secret into the chat, and never put one in a command. Call `secret_run_command` for the line, tell me what to paste and why, then run the line with Bash (timeout 600000); I paste it into the form that opens on this machine.
 > - **In a group of sessions:** when I say this session is the coordinator, the merger or a lane, follow the `session-hierarchy` skill (self-hierarchy) for who answers what, the review loop and when to use each tool.
 
 ## Develop
@@ -299,7 +303,7 @@ node --test "scripts/*.test.mjs"
 
 The test fails when a copy differs from `shared/`, or is left over from a file removed from it or kept in a plugin its `Copies:` line leaves out. `scripts/slot-runner.test.mjs` checks the slot runner against the hash the plugins ship. `scripts/claude-wrapper.test.mjs` runs the claude wrapper in Windows PowerShell 5.1 and PowerShell 7 against a stub `claude.exe` (`scripts/claude-wrapper-stub.cs`, compiled into a temporary folder), never a real Claude Code, then plants faults in copies of it and checks each is caught; it takes about five minutes, most of it the 10-resume cap. Each plugin's `tests/update-check.fixture.ts` gives the shared test that plugin's name and a call of one of its tools.
 
-To run every check at once (the copies, then each plugin's `validate --strict` and each mod's `test`, then the marketplace file):
+To run every check at once (the copies, the tools' tests and self-secret's secret-run tests, then each plugin's `validate --strict` and each mod's `test`, then the marketplace file):
 
 ```
 node scripts/test-all.mjs
