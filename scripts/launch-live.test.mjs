@@ -485,21 +485,24 @@ const SYSTEM_ROOT = process.env.SystemRoot ?? 'C:\\Windows'
 const PLACEHOLDER = '00000000-0000-4000-8000-000000000000'
 /** Where the launch script reads the Program Files folder: Windows' own name for it, never a variable. */
 const PROGRAM_FILES = "[Environment]::GetFolderPath('ProgramFiles')"
-/** The line of the interpreter rule that holds pwsh.exe's path to its shape. */
+/** The part of the interpreter rule that holds pwsh.exe's path to its shape. */
 const SHAPE = `$pwsh -cmatch '${machine.PWSH_PATH.source.replace(/\$$/, '\\z')}'`
+/** The line of the interpreter rule that holds pwsh.exe to version 7 or later. */
+const VERSION = 'if ($pwshOk) { try { $pwshOk = [Diagnostics.FileVersionInfo]::GetVersionInfo($pwsh).FileMajorPart -ge 7 } catch { $pwshOk = $false } }'
 
 /**
  * A launch script whose Program Files folder is `folder` (a test can't change Windows' own): the one place
- * the interpreter rule reads it, made a literal. With `anyShape`, the shape check too, so the version check
- * is all that stands.
+ * the interpreter rule reads it, made a literal. With `aside` ('shape' or 'version'), that check of the
+ * rule is set aside too, so the other is all that stands.
  */
-function withProgramFiles(script, folder, anyShape = false) {
+function withProgramFiles(script, folder, aside = undefined) {
   assert.equal(script.split(PROGRAM_FILES).length, 2, 'the interpreter rule reads the Program Files folder once')
   assert.ok(!/['"]/.test(folder))
   const placed = script.split(PROGRAM_FILES).join(`'${folder}'`)
-  if (!anyShape) return placed
-  assert.equal(placed.split(SHAPE).length, 2, 'the shape check is there once')
-  return placed.split(SHAPE).join("$pwsh -cmatch '.'")
+  if (aside === undefined) return placed
+  const [check, instead] = aside === 'shape' ? [SHAPE, "$pwsh -cmatch '.'"] : [VERSION, '']
+  assert.equal(placed.split(check).length, 2, `the ${aside} check is there once`)
+  return placed.split(check).join(instead)
 }
 
 /** The launch of a window that resumes `id` in its folder, run under the stub, its Start-Process recorded: the answer, the input, and what the window was given. */
@@ -681,14 +684,15 @@ describe("a window's launch, end to end: the interpreter it chose, the wrapper's
     assert.deepEqual(second.args, ['--resume', r.id])
   })
 
-  test("a pwsh.exe under a Program Files folder not of the standard shape (a drive and one folder) is never the window's interpreter", async () => {
+  test("a pwsh.exe under a Program Files folder not of the standard shape (a drive and one folder) is never the window's interpreter (the version check set aside, so the shape check stands alone)", async () => {
     const dirs = lab()
     // A file named pwsh.exe, where a folder deep in the temporary folder would put PowerShell 7: never run (the window is only recorded).
+    // Not a program, so the version check would turn it away too: set aside, the shape check alone has to.
     const odd = mkdtempSync(join(work, 'odd-pf-'))
     mkdirSync(join(odd, 'PowerShell', '7'), { recursive: true })
     writeFileSync(join(odd, 'PowerShell', '7', 'pwsh.exe'), 'not a program')
     assert.ok(!machine.PWSH_PATH.test(machine.pwshPath(odd)))
-    const launched = await launchWindow(dirs, randomUUID(), {}, script => withProgramFiles(script, odd))
+    const launched = await launchWindow(dirs, randomUUID(), {}, script => withProgramFiles(script, odd, 'version'))
     assert.equal(launched.answer.launched?.transport, 'window', launched.ran.stdout + launched.ran.stderr)
     assert.equal(launched.window.file.toLowerCase(), WINDOWS_POWERSHELL.toLowerCase())
   })
@@ -699,7 +703,7 @@ describe("a window's launch, end to end: the interpreter it chose, the wrapper's
     const old = mkdtempSync(join(work, 'old-pf-'))
     mkdirSync(join(old, 'PowerShell', '7'), { recursive: true })
     copyFileSync(stub, join(old, 'PowerShell', '7', 'pwsh.exe'))
-    const launched = await launchWindow(dirs, randomUUID(), {}, script => withProgramFiles(script, old, true))
+    const launched = await launchWindow(dirs, randomUUID(), {}, script => withProgramFiles(script, old, 'shape'))
     assert.equal(launched.answer.launched?.transport, 'window', launched.ran.stdout + launched.ran.stderr)
     assert.equal(launched.window.file.toLowerCase(), WINDOWS_POWERSHELL.toLowerCase())
   })
