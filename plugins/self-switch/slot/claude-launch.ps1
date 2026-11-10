@@ -1,7 +1,7 @@
 # claude-launch.ps1: starts Claude Code as a top-level session. The one script in
 # claude-code-self-tools that runs claude: every launch (a restart's or a switch's window, the
 # coordinator's go, a steward's launch, a slot runner's every start, and you by hand) comes through it.
-# claude-launch version 2
+# claude-launch version 4
 #
 # Part of self-switch (claude-code-self-tools, plugins/self-switch/slot/claude-launch.ps1). Nobody
 # copies it: a launch that opens a window puts the copy it carries in %LOCALAPPDATA%\claude-self-tools,
@@ -22,6 +22,11 @@
 # session registries the last look reads too (a launch's window names every one it read). With -Resume,
 # -LeftSize <bytes> -LeftMtime <ms>, or -LeftExitAt <ms>, is a left record's stat, which the last look
 # checks the transcript against (a window passes it when its move rests on a left record).
+# -Wrapper runs claude through the claude wrapper's verified copy (below), so that a restart or a switch
+# out of the session comes back in this same window or tab. A launch's window always gives it; a slot
+# runner never does (it has its own loop). -Hosted, with -Wrapper, says this run hosts a window a launch
+# opened, and only that window's script passes it: the wrapper's pane file then says hosted, and it
+# resumes up to 30 times an hour instead of 10 in all. Run by hand, -Wrapper alone keeps a profile's ways.
 #
 # What it does, in order:
 # 1. It checks its arguments: a session id is a lowercase UUID; a name is lowercase letters, digits and
@@ -34,7 +39,16 @@
 # 2. In Windows PowerShell 5.1, it sets PSModulePath to 5.1's own module folders: in a tab whose
 #    environment puts PowerShell 7's first, 5.1 loads 7's modules and loses cmdlets.
 # 3. It goes to the folder, and finds claude: %USERPROFILE%\.local\bin\claude.exe when it is there,
-#    else the first claude application on PATH.
+#    else the first claude application on PATH. With -Wrapper, it loads the claude wrapper's verified
+#    copy (tools/claude-wrapper/claude-wrapper.ps1 in claude-code-self-tools, its `claude` function):
+#    %LOCALAPPDATA%\claude-self-tools\claude-wrapper-<the first 8 hex digits of its SHA-256>.ps1, which
+#    every launch that opens a window puts there, as it puts this script. It reads the file's bytes once,
+#    checks their SHA-256 against $WrapperSha256 below (WRAPPER_SCRIPT_SHA256 in the plugins' machine
+#    code), and defines the function from those same bytes, so what runs is what was checked; execution
+#    policy is not asked (a script block made from text), so it works under any policy, Restricted too.
+#    The copy in your profile (claude-wrapper.ps1, unpinned) is never read here. A copy that is missing,
+#    has another SHA-256 or doesn't load is said in one line, and claude starts directly, as without
+#    -Wrapper: a restart from that session then opens in a new window or tab.
 # 4. The last look, for -Resume, -Lane and -Start, as a launch's window and the claude wrapper take it
 #    (RECHECK and LEFT_RECHECK in the plugins' machine code, line for line): no running Claude Code holds
 #    the conversation, read again from the session registry of the config folder and of each -ConfigDir,
@@ -50,11 +64,30 @@
 #    touches WT_SESSION or WT_PROFILE_ID: Claude Code reads WT_SESSION to draw its prompt and its links.
 # 6. It runs claude with --resume <id>, or --session-id <id> --name <name>, or nothing else: never a
 #    permission flag, so the session starts in the mode a new one would. Its exit code is claude's.
+#    With the wrapper loaded, it calls the wrapper's `claude` function, the one it just made (never by
+#    the name, which an alias would take), with those arguments, in this process: the wrapper gives
+#    claude a fresh CLAUDE_PANE_TOKEN and a pane file naming this PowerShell, claude.exe's own parent,
+#    marked hosted with -Hosted (30 moves an hour here, not 10 in all; placement.json, when it names a
+#    place, comes first for the next move), and when claude exits it resumes the ticket a restart or a
+#    switch left it, here. A
+#    ticket the wrapper doesn't use ends this script with exit 3, the reason left for the window that
+#    ran it ($ClaudeLaunchUnused), which records it and stays open; $ClaudeLaunchLast names the
+#    conversation the wrapper resumed last, for the window's closing lines.
+#
+# The threat model: this script is pinned by its SHA-256 (the plugins' LAUNCH_SCRIPT_SHA256), and the
+# wrapper's copy it loads by $WrapperSha256, inside this pinned text; the bytes it hashes are the bytes
+# it runs. Both sit in %LOCALAPPDATA%\claude-self-tools, which only the same user writes, who can as
+# well replace %USERPROFILE%\.local\bin\claude.exe (this script runs it unpinned) or edit the profile:
+# the pins stop a stale or edited copy, not that user. The wrapper's copy runs at this process's own
+# level, as claude.exe does; it adds a function, not a power.
 
-param([string]$Resume, [string]$Start, [string]$Name, [string]$Dir, [string]$Lane, [string[]]$ConfigDir, [string]$LeftSize, [string]$LeftMtime, [string]$LeftExitAt)
+param([string]$Resume, [string]$Start, [string]$Name, [string]$Dir, [string]$Lane, [string[]]$ConfigDir, [string]$LeftSize, [string]$LeftMtime, [string]$LeftExitAt, [switch]$Wrapper, [switch]$Hosted)
 
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
+# A native program's exit code is never an error here (PowerShell 7.3 and later can make one an error): a
+# claude that ends with 1 has run, and the wrapper's loop goes on after it.
+$PSNativeCommandUseErrorActionPreference = $false
 
 $SessionId = '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\z'
 $AreaName = '^[a-z0-9][a-z0-9-]{0,39}\z'
@@ -63,6 +96,8 @@ $Whole = '^\d{1,16}\z'
 $Clear = 'CLAUDE_CODE_CHILD_SESSION', 'CLAUDECODE', 'CLAUDE_CODE_SESSION_ID', 'CLAUDE_PID', 'CLAUDE_EFFORT', 'CLAUDE_CODE_BRIDGE_SESSION_ID', 'CLAUDE_CODE_MESSAGING_SOCKET', 'CLAUDE_CODE_MESSAGING_TOKEN', 'CLAUDE_CODE_REMOTE', 'CLAUDE_CODE_REMOTE_SESSION_ID', 'CLAUDE_JOB_DIR', 'AI_AGENT', 'CLAUDE_CODE_ENTRYPOINT', 'CLAUDE_CODE_EXECPATH', 'CLAUDE_CODE_SESSION_ATTENDED', 'CLAUDE_CODE_SSE_PORT', 'NO_COLOR'
 $Drop = 'PSExecutionPolicyPreference', 'CLAUDE_PANE_TOKEN'
 $Set = [ordered]@{ CLAUDE_CODE_FORCE_SESSION_PERSISTENCE = '1'; CLAUDE_CODE_DISABLE_BG_SHELL_PRESSURE_REAP = '1' }
+# The claude wrapper's copy -Wrapper loads, by its SHA-256: WRAPPER_SCRIPT_SHA256 in the plugins' machine code.
+$WrapperSha256 = '255d8dc23c944b917fa541ae04fee908012927e77d8a85bb27bca06a70980293'
 
 function Stop-Launch($why) {
   Write-Host ('claude-launch: ' + $why + ' Nothing was started.')
@@ -148,6 +183,19 @@ function Test-Left($id, $configDirs, $leftSize, $leftMtime, $leftExitAt) {
   return $live
 }
 
+# Why $path is not a folder of that shape, naming the class at fault (folderFault in the plugins'
+# machine code); $null when it is one.
+function Get-ShapeFault($path) {
+  if (Test-Shape $path) { return $null }
+  if ($path -isnot [string] -or $path -eq '') { return 'is not set' }
+  if ($path.Length -gt 240) { return 'is longer than 240 characters' }
+  if ($path.Length -lt 3 -or $path -cnotmatch '^[A-Za-z]:\\') { return 'is not an absolute folder (a drive letter, a colon and a backslash first)' }
+  if ($path -match '[\x00-\x1f\x7f-\x9f]') { return 'holds a control character' }
+  if ($path -match '[\x22\x27\u2018-\u201e]') { return 'holds a quote (straight or typographic)' }
+  if ($path -match '[<>|?*/]' -or $path.IndexOf(':', 2) -ge 0) { return 'holds a character Windows does not take in a folder name (< > | ? * / or a second colon)' }
+  return "has a '.' or '..' part, an empty part, or a part with spaces at either end"
+}
+
 # 1. The arguments, each checked before anything changes.
 foreach ($k in 'Resume', 'Start', 'Name', 'Dir', 'Lane', 'LeftSize', 'LeftMtime', 'LeftExitAt') {
   if ($PSBoundParameters.ContainsKey($k) -and [string]::IsNullOrEmpty($PSBoundParameters[$k])) { Stop-Launch ('-' + $k + ' was given empty.') }
@@ -207,7 +255,8 @@ if ($Resume -or $Start) {
 
 # 2. Windows PowerShell 5.1's own module folders.
 if ($PSVersionTable.PSEdition -ne 'Core') {
-  $env:PSModulePath = @([Environment]::GetFolderPath('MyDocuments') + '\WindowsPowerShell\Modules', [Environment]::GetFolderPath('ProgramFiles') + '\WindowsPowerShell\Modules', [Environment]::GetFolderPath('System') + '\WindowsPowerShell\v1.0\Modules') -join ';'
+  # Each element in parentheses: PowerShell's comma binds tighter than +, and would make one path of three.
+  $env:PSModulePath = @(([Environment]::GetFolderPath('MyDocuments') + '\WindowsPowerShell\Modules'), ([Environment]::GetFolderPath('ProgramFiles') + '\WindowsPowerShell\Modules'), ([Environment]::GetFolderPath('System') + '\WindowsPowerShell\v1.0\Modules')) -join ';'
 }
 
 # 3. The folder, and claude.
@@ -222,6 +271,34 @@ if ($null -eq $exe) {
   if ($found.Count -gt 0) { $exe = $found[0].Source }
 }
 if ($null -eq $exe) { Stop-Launch 'no claude.exe was found (in %USERPROFILE%\.local\bin, or on PATH).' }
+# With -Wrapper, the claude wrapper's verified copy: its bytes read once, their SHA-256 checked, and its
+# function defined from those same bytes, here at the script's own level (it defines `claude` and does
+# nothing else). $wrapperWhy says why it isn't used, when it isn't.
+$wrapperWhy = $null
+$wrapperClaude = $null
+if ($Wrapper) {
+  $wrapperPath = $null
+  $localFault = Get-ShapeFault $env:LOCALAPPDATA
+  if ($null -eq $localFault) { $wrapperPath = Join-Path $env:LOCALAPPDATA ('claude-self-tools\claude-wrapper-' + $WrapperSha256.Substring(0, 8) + '.ps1') }
+  $wrapperBytes = $null
+  if ($null -eq $wrapperPath) { $wrapperWhy = 'the claude wrapper is not used: %LOCALAPPDATA% ' + $localFault }
+  elseif (-not (Test-Path -LiteralPath $wrapperPath -PathType Leaf)) { $wrapperWhy = 'the claude wrapper is not used: its verified copy is not at ' + $wrapperPath + ' (a launch that opens a window puts it there)' }
+  else {
+    try { $wrapperBytes = [IO.File]::ReadAllBytes($wrapperPath) } catch { $wrapperWhy = 'the claude wrapper is not used: its copy at ' + $wrapperPath + ' could not be read (' + $_.Exception.Message + ')' }
+  }
+  if ($null -eq $wrapperWhy) {
+    $hasher = [Security.Cryptography.SHA256]::Create()
+    try { $wrapperGot = [BitConverter]::ToString($hasher.ComputeHash($wrapperBytes)).Replace('-', '').ToLowerInvariant() } finally { $hasher.Dispose() }
+    if ($wrapperGot -cne $WrapperSha256) { $wrapperWhy = 'the claude wrapper is not used: the file at ' + $wrapperPath + ' is not the copy this launcher pins (another SHA-256)' }
+  }
+  if ($null -eq $wrapperWhy) {
+    try { . ([scriptblock]::Create([Text.Encoding]::UTF8.GetString($wrapperBytes))) } catch { $wrapperWhy = 'the claude wrapper is not used: its copy at ' + $wrapperPath + ' did not load (' + $_.Exception.Message + ')' }
+  }
+  # The function just made, kept to be called by itself: by its name, an alias or a function named claude
+  # in the session that ran this script would come first.
+  if ($null -eq $wrapperWhy) { $wrapperClaude = ${function:claude} }
+  if ($null -eq $wrapperWhy -and $null -eq $wrapperClaude) { $wrapperWhy = 'the claude wrapper is not used: its copy at ' + $wrapperPath + ' made no claude function' }
+}
 
 # 4. The last look, right before the environment and claude.
 if ($Resume -or $Start) {
@@ -242,7 +319,35 @@ foreach ($n in $Clear) { [Environment]::SetEnvironmentVariable($n, [NullString]:
 foreach ($n in $Drop) { [Environment]::SetEnvironmentVariable($n, [NullString]::Value, [EnvironmentVariableTarget]::Process) }
 foreach ($n in $Set.Keys) { [Environment]::SetEnvironmentVariable($n, $Set[$n], [EnvironmentVariableTarget]::Process) }
 
-# 6. claude, and its exit code.
+# 6. claude, and its exit code: through the wrapper's `claude` when -Wrapper loaded it, run as from a
+# prompt (its own preferences, not this script's), else claude.exe itself.
+if ($Wrapper -and $null -eq $wrapperWhy) {
+  $ErrorActionPreference = 'Continue'
+  # Read by the wrapper in the script scope it runs under (this script's, run as a file; the session's, run
+  # as a script block), as $script: names it on both sides: hosted (-Hosted, a launch's window), it resumes
+  # up to 30 times an hour, not 10 in all, and its pane file says hosted. And left by it there: the
+  # conversation it resumed last, and a ticket it didn't use. The flag is taken away again once it
+  # returns, so a session that ran this script by hand never keeps it for a `claude` typed later.
+  $script:ClaudeWrapperHosted = [bool]$Hosted
+  $script:ClaudeWrapperLast = $null
+  $script:ClaudeWrapperUnused = $null
+  $global:ClaudeLaunchLast = $null
+  $global:ClaudeLaunchUnused = $null
+  try {
+    if ($Resume) { & $wrapperClaude --resume $Resume }
+    elseif ($Start) { & $wrapperClaude --session-id $Start --name $Name }
+    else { & $wrapperClaude }
+  } finally { $script:ClaudeWrapperHosted = $null }
+  $code = $LASTEXITCODE
+  # For the window that ran this script, in the same process: what the wrapper left. A ticket it didn't
+  # use ends this script with exit 3 (WRAPPER_UNUSED_EXIT), which the window takes, with
+  # $ClaudeLaunchUnused, as that move's refusal: recorded, and the window kept open.
+  $global:ClaudeLaunchLast = $script:ClaudeWrapperLast
+  $global:ClaudeLaunchUnused = $script:ClaudeWrapperUnused
+  if ($null -ne $script:ClaudeWrapperUnused) { exit 3 }
+  exit $code
+}
+if ($Wrapper) { Write-Host ('claude-launch: ' + $wrapperWhy + '. Claude starts directly, so a restart from this session opens in a new window or tab.') }
 if ($Resume) { & $exe --resume $Resume }
 elseif ($Start) { & $exe --session-id $Start --name $Name }
 else { & $exe }

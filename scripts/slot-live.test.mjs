@@ -898,6 +898,33 @@ describe("the probe's slots mode, and the launch's own run, against a running ru
     assert.equal(machine.parseLaunch(plain.stdout).refused?.code, 'place', plain.stdout + plain.stderr)
     assert.match(plain.stdout, /a test never opens a window/)
   })
+
+  test("F6: a named window with a better place after it (noPlainFallback: a hosted window's own ticket next): with no Windows Terminal there, or the slot runner away, it refuses before it takes the claim, never the plain window", async () => {
+    const dirs = lab()
+    const by = `launch:${randomUUID()}`
+    const lineFile = join(dirs.root, 'wt-line.txt')
+    const input = id => ({ powershell: WINDOWS_POWERSHELL, kind: 'resume', id, folder: dirs.folder, claim: by, configDirs: [dirs.config], stateDir: dirs.state, where: { window: { name: 'claude-overflow' } }, checks: { floor: true, input: true, live: true }, maxSessions: 40, heavySlotRoot: null, tool: 'self-restart', noPlainFallback: true })
+    const placed = id => underStub({ stub, work, env: envOf(dirs), script: () => noWindow(fakeWt(steady(machine.launchScriptText(input(id))), lineFile)) })
+    // The slot runner away (not at its one place): refused for it, as a tab is.
+    const away = randomUUID()
+    transcript(dirs, away)
+    rmSync(join(dirs.state, 'claude-slot.ps1'))
+    const noSlot = await placed(away)
+    assert.equal(machine.parseLaunch(noSlot.stdout).refused?.code, 'slotscript', noSlot.stdout + noSlot.stderr)
+    assert.ok(!existsSync(machine.claimPath(dirs.state, away)), 'no claim taken')
+    copyFileSync(RUNNER, join(dirs.state, 'claude-slot.ps1'))
+    // No Windows Terminal at its path: refused for it, nothing opened, no fallback.
+    rmSync(join(dirs.local, 'Microsoft', 'WindowsApps', 'wt.exe'))
+    const old = randomUUID()
+    transcript(dirs, old)
+    const noWt = await placed(old)
+    const answer = machine.parseLaunch(noWt.stdout)
+    assert.equal(answer.refused?.code, 'wt', noWt.stdout + noWt.stderr)
+    assert.match(answer.refused?.why ?? '', /^self-restart: a named window needs Windows Terminal \d+\.\d+ or later$/)
+    assert.ok(!/a test never opens a window|^fallback /m.test(noWt.stdout), noWt.stdout)
+    assert.ok(!existsSync(machine.claimPath(dirs.state, old)), 'no claim taken')
+    assert.ok(!existsSync(lineFile), 'wt was never handed a line')
+  })
   test('every runner found, by its id and hash; a closed tab\'s beacon never read; an edited copy reads another hash; heavy-slot from its folders; a lock holder accounted as holding its id only; nothing but what the type names', async () => {
     const dirs = lab()
     const runner = startRunner(dirs, ['-Idle'])

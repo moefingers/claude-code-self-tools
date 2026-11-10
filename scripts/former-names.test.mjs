@@ -15,7 +15,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { after, before, describe, test } from 'node:test'
 import { pathToFileURL } from 'node:url'
-import { compileStub, holder, stubWork } from './stub.mjs'
+import { compileStub, holder, stubWork, withoutClaude } from './stub.mjs'
 import { ROOT } from './sync-shared.mjs'
 
 const machine = await import(pathToFileURL(join(ROOT, 'shared', 'hooks', 'machine.ts')).href)
@@ -38,7 +38,7 @@ let other
 before(async () => {
   if (!isWindows) return
   work = stubWork('former-names-')
-  env = { ...process.env, LOCALAPPDATA: join(work, 'local'), USERPROFILE: join(work, 'home') }
+  env = withoutClaude({ ...process.env, LOCALAPPDATA: join(work, 'local'), USERPROFILE: join(work, 'home') })
   const stub = compileStub(work)
   // Two running claude.exe: this process (the one that goes back), and another.
   self = await holder({ stub, work, env, ms: 600_000 })

@@ -41,6 +41,14 @@ import {
   SLOT_SCRIPT_SHA256,
   STDIN_BOOTSTRAP,
   wakePath,
+  PWSH_PATH,
+  pwshPath,
+  parsePane,
+  readPlacement,
+  WRAPPER_UNUSED_EXIT,
+  WRAPPER_SCRIPT_SHA256,
+  WRAPPER_SCRIPT_TEXT,
+  wrapperScriptPath,
 } from '../hooks/machine'
 import { decode, ELSEWHERE, ft, inSlot, LAUNCH, machine, NOW, PERMISSION_FLAGS, type RawProbe, REPO, T, W } from './fixtures'
 
@@ -129,8 +137,9 @@ describe('launch(): one powershellCall, the script on standard input', () => {
   })
 
   test('every script resets PSModulePath to Windows PowerShell 5.1\'s own folders before anything else runs', () => {
+    // Each element in parentheses: PowerShell's comma binds tighter than +, and would make one path of the three.
     expect(PSMODULEPATH_RESET).toBe(
-      '$env:PSModulePath = @([Environment]::GetFolderPath("MyDocuments") + "\\WindowsPowerShell\\Modules", [Environment]::GetFolderPath("ProgramFiles") + "\\WindowsPowerShell\\Modules", [Environment]::GetFolderPath("System") + "\\WindowsPowerShell\\v1.0\\Modules") -join ";"',
+      '$env:PSModulePath = @(([Environment]::GetFolderPath("MyDocuments") + "\\WindowsPowerShell\\Modules"), ([Environment]::GetFolderPath("ProgramFiles") + "\\WindowsPowerShell\\Modules"), ([Environment]::GetFolderPath("System") + "\\WindowsPowerShell\\v1.0\\Modules")) -join ";"',
     )
     const others = [
       probeScript({ ids: [T], configDirs: [CONFIG], stateDir: STATE, left: true }),
@@ -144,8 +153,9 @@ describe('launch(): one powershellCall, the script on standard input', () => {
       expect(lines.indexOf(PSMODULEPATH_RESET)).toBe(2)
       expect(lines.slice(0, 2)).toEqual(["$ErrorActionPreference = 'Stop'", "$ProgressPreference = 'SilentlyContinue'"])
     }
-    // The window's own script too, first thing.
-    expect(innerOf(SCRIPTS[0]?.[1] ?? '').split('\r\n')[2]).toBe(PSMODULEPATH_RESET)
+    // The window's own script too, first thing, in Windows PowerShell alone: in PowerShell 7, 5.1's folders
+    // alone would load 5.1's copies of 7's own modules through a hidden Windows PowerShell, for the window's life.
+    expect(innerOf(SCRIPTS[0]?.[1] ?? '').split('\r\n')[2]).toBe(`if ($PSVersionTable.PSEdition -ne "Core") { ${PSMODULEPATH_RESET} }`)
   })
 
   test('nothing but claude-launch.ps1 is ever started as claude: no claude.exe, no Get-Command claude, no call but & $launchPath', () => {
@@ -163,10 +173,10 @@ describe('launch(): one powershellCall, the script on standard input', () => {
   })
 
   test('the window hands claude-launch.ps1 every config folder it read and the left record\'s stat, so its own last look is the same (F1)', () => {
-    expect(innerOf(launchScriptText(input()))).toContain('  & $launchPath -Resume $id -Dir $folder -ConfigDir $configDirs\r\n')
-    expect(innerOf(launchScriptText(input({ left: { exitAt: NOW - 60_000 } })))).toContain(`  & $launchPath -Resume $id -Dir $folder -ConfigDir $configDirs -LeftExitAt '${NOW - 60_000}'\r\n`)
-    expect(innerOf(launchScriptText(input({ left: { size: 4096, mtime: NOW - 1000 } })))).toContain(`  & $launchPath -Resume $id -Dir $folder -ConfigDir $configDirs -LeftSize '4096' -LeftMtime '${NOW - 1000}'\r\n`)
-    expect(innerOf(launchScriptText(START))).toContain('  & $launchPath -Start $id -Name $name -Dir $folder -ConfigDir $configDirs\r\n')
+    expect(innerOf(launchScriptText(input()))).toContain('  & $launchPath -Resume $id -Dir $folder -ConfigDir $configDirs -Wrapper -Hosted\r\n')
+    expect(innerOf(launchScriptText(input({ left: { exitAt: NOW - 60_000 } })))).toContain(`  & $launchPath -Resume $id -Dir $folder -ConfigDir $configDirs -LeftExitAt '${NOW - 60_000}' -Wrapper -Hosted\r\n`)
+    expect(innerOf(launchScriptText(input({ left: { size: 4096, mtime: NOW - 1000 } })))).toContain(`  & $launchPath -Resume $id -Dir $folder -ConfigDir $configDirs -LeftSize '4096' -LeftMtime '${NOW - 1000}' -Wrapper -Hosted\r\n`)
+    expect(innerOf(launchScriptText(START))).toContain('  & $launchPath -Start $id -Name $name -Dir $folder -ConfigDir $configDirs -Wrapper -Hosted\r\n')
     expect(innerOf(launchScriptText(input()))).toContain(`$configDirs = @('${CONFIG}', '${OTHER_CONFIG}')`)
   })
 
@@ -233,9 +243,77 @@ describe('launch(): one powershellCall, the script on standard input', () => {
     }
   })
 
+  test('the window\'s interpreter: PowerShell 7 at its standard path, of version 7 or later, when it is there, else Windows PowerShell by its known path, chosen right before Start-Process', () => {
+    const script = SCRIPTS[0]?.[1] ?? ''
+    const lines = script.split('\r\n').map(line => line.trim())
+    const shell = lines.indexOf(`$windowShell = '${POWERSHELL}'`)
+    // The Program Files folder as Windows names it, never the ProgramFiles variable a process can set.
+    const path = lines.indexOf("try { $pwsh = [Environment]::GetFolderPath('ProgramFiles').TrimEnd([char]92) + '\\PowerShell\\7\\pwsh.exe' } catch { $pwsh = $null }")
+    const rule = lines.indexOf("$pwshOk = $null -ne $pwsh -and $pwsh -cmatch '^[A-Za-z]:\\\\[A-Za-z0-9_ -]{1,64}\\\\PowerShell\\\\7\\\\pwsh\\.exe\\z' -and (Test-Path -LiteralPath $pwsh -PathType Leaf)")
+    const version = lines.indexOf('if ($pwshOk) { try { $pwshOk = [Diagnostics.FileVersionInfo]::GetVersionInfo($pwsh).FileMajorPart -ge 7 } catch { $pwshOk = $false } }')
+    const chosen = lines.indexOf('if ($pwshOk) { $windowShell = $pwsh }')
+    const start = lines.indexOf("$window = Start-Process -FilePath $windowShell -ArgumentList '-NoProfile', '-ExecutionPolicy', 'Bypass', '-EncodedCommand', $encoded -PassThru")
+    expect([shell > 0, path > shell, rule > path, version > rule, chosen > version, start > chosen]).toEqual([true, true, true, true, true, true])
+    expect(script).not.toContain('$env:ProgramFiles')
+    // The rule's pattern is the machine code's PWSH_PATH, as POWERSHELL_PATH holds Windows PowerShell to its path.
+    expect(script).toContain(PWSH_PATH.source.replace(/\$$/, '\\z'))
+    expect(PWSH_PATH.test('C:\\Program Files\\PowerShell\\7\\pwsh.exe')).toBe(true)
+    expect(pwshPath('C:\\Program Files\\')).toBe('C:\\Program Files\\PowerShell\\7\\pwsh.exe')
+    for (const other of ['C:\\Program Files (x86)\\PowerShell\\7\\pwsh.exe', 'C:\\Program Files\\PowerShell\\6\\pwsh.exe', 'C:\\Program Files\\PowerShell\\7-preview\\pwsh.exe', 'pwsh.exe', 'C:\\a\\b\\PowerShell\\7\\pwsh.exe', "C:\\o'brien\\PowerShell\\7\\pwsh.exe", 'C:\\Program Files\\PowerShell\\7\\pwsh.exe.bak']) {
+      expect([other, PWSH_PATH.test(other)]).toEqual([other, false])
+    }
+    // Only a window chooses: this tab and a slot open nothing.
+    for (const script of [SCRIPTS[4]?.[1] ?? '', SCRIPTS[5]?.[1] ?? '']) expect(script).not.toContain('$windowShell')
+  })
+
+  test("a window's launch puts the claude wrapper's copy in place at its hash's name, never refused on; this tab and a slot don't", () => {
+    for (const where of [{ window: true } as const, 'auto' as const]) {
+      const script = launchScriptText(input({ where, waitForExit: { pid: 100, created: ft(1) }, now: NOW }))
+      expect(script).toContain(`$wrapperPath = '${wrapperScriptPath(STATE)}'`)
+      expect(script).toContain(`$wrapperCopy = '${asciiBase64(WRAPPER_SCRIPT_TEXT)}'`)
+      // Whatever it throws, caught: a copy it can't put in place never refuses the launch.
+      expect(script).toContain(`try { [void](Install-Launcher $wrapperPath $wrapperCopy '${WRAPPER_SCRIPT_SHA256}') } catch { }`)
+      // After the launcher's own install, before the claim.
+      expect(script.indexOf('[void](Install-Launcher $wrapperPath')).toBeGreaterThan(script.indexOf('$installWhy = Install-Launcher $launchPath'))
+      expect(script.indexOf('[void](Install-Launcher $wrapperPath')).toBeLessThan(script.indexOf('"claim " + $by'))
+    }
+    expect(wrapperScriptPath(STATE)).toBe(`${STATE}\\claude-wrapper-${WRAPPER_SCRIPT_SHA256.slice(0, 8)}.ps1`)
+    expect(wrapperScriptPath(STATE)).not.toBe(`${STATE}\\claude-wrapper.ps1`)
+    expect(() => wrapperScriptPath(STATE, 'abc')).toThrow()
+    for (const script of [SCRIPTS[4]?.[1] ?? '', SCRIPTS[5]?.[1] ?? '']) expect(script).not.toContain('$wrapperCopy')
+  })
+
+  test("the window after claude-launch.ps1: a ticket its wrapper didn't use is recorded for that ticket's conversation, its claim given back, said, and the window waits; the closing lines name the conversation resumed last", () => {
+    for (const script of [SCRIPTS[0]?.[1] ?? '', SCRIPTS[3]?.[1] ?? '']) {
+      const inner = innerOf(script)
+      const lines = inner.split('\r\n')
+      const emptied = lines.indexOf('$global:ClaudeLaunchUnused = $null')
+      const run = lines.findIndex(line => line.startsWith('  & $launchPath'))
+      const unused = lines.indexOf(`if ($code -eq ${WRAPPER_UNUSED_EXIT} -and $null -ne $global:ClaudeLaunchUnused) {`)
+      const ended = lines.findIndex(line => line.startsWith('if ($code -ne 0 -or ((Get-Date) - $started).TotalSeconds -lt'))
+      expect([emptied > 0, run > emptied, unused > run, ended > unused]).toEqual([true, true, true, true])
+      const branch = lines.slice(unused, ended).join('\n')
+      // The ticket's conversation, its claim and folder, each checked before it names a path.
+      expect(branch).toContain('$refusedPath = Join-Path $stateDir ("refused\\" + $id + ".json")')
+      expect(branch).toContain('$claimPath = Join-Path $stateDir ("claims\\" + $id + ".lock")')
+      expect(branch.indexOf('Write-Refused $unusedWhy')).toBeGreaterThan(branch.indexOf('$by = if ($unused.by -is [string] -and $unused.by -cmatch'))
+      expect(branch).toContain('if ($by -ne "") { Release-Claim }')
+      expect(branch).toContain('Read-Host "Press Enter to close this window" | Out-Null')
+      expect(branch.trimEnd().endsWith('exit $code\n}')).toBe(true)
+      // After a move resumed here, the lines name the last conversation, and the exit-2 record is never the first one's.
+      expect(inner).toContain('if ($null -ne $last -and $last.resume -is [string]')
+      expect(inner).toContain('{ $id = $last.resume; $folder = $last.dir; $resumedHere = $true }')
+      expect(inner).toContain('if ($code -eq 2 -and -not $resumedHere -and')
+    }
+    // A start's window: once it resumed a conversation, the line says to resume that one, not to start it again.
+    expect(innerOf(SCRIPTS[3]?.[1] ?? '')).toContain(`Write-Host ("If the session did not " + $(if ($resumedHere) { "resume" } else { "start" }) + " here, do it yourself: " + $(if ($resumedHere) { "& '" + $handPath + "' -Resume " + $id + " -Dir '" + $folder + "'" } else { "& '" + $handPath + "' -Start " + $id + " -Name " + $name + " -Dir '" + $folder + "'" }))`)
+    expect(WRAPPER_UNUSED_EXIT).toBe(3)
+  })
+
   test('Windows PowerShell by its known path, -ExecutionPolicy Bypass for the window alone (it pins claude-launch.ps1 by its hash), the window script compressed into a fixed bootstrap', () => {
     const script = SCRIPTS[0]?.[1] ?? ''
-    expect(script).toContain(`$window = Start-Process -FilePath '${POWERSHELL}' -ArgumentList '-NoProfile', '-ExecutionPolicy', 'Bypass', '-EncodedCommand', $encoded -PassThru`)
+    expect(script).toContain(`$windowShell = '${POWERSHELL}'`)
+    expect(script).toContain("$window = Start-Process -FilePath $windowShell -ArgumentList '-NoProfile', '-ExecutionPolicy', 'Bypass', '-EncodedCommand', $encoded -PassThru")
     expect(script).not.toContain('RemoteSigned')
     expect(script).not.toContain('$PSHOME')
     expect(script).toContain('$gzip = [IO.Compression.GZipStream]::new($packed, [IO.Compression.CompressionMode]::Compress)')
@@ -479,6 +557,30 @@ describe('pickLaunchTransport: the coordinating note\'s order, for a launch that
     expect(pickLaunchTransport(probeOf(p => inSlot(p)), null, { replacing: true, configCount: 1, needsLeft: true })).toEqual({ where: { slot: SLOT } })
     expect(paneNoLeft(older.pane)).toMatch(/pane file is version 2/)
     expect(paneNoLeft(PANE.pane)).toBeUndefined()
+  })
+
+  test("a window a launch opened (its wrapper hosted): placement.json's places first when it names any, then this window; with none, this window; a tab typed in keeps its session", () => {
+    const HOSTED = { token: TOKEN, pane: { ...PANE.pane, hosted: true as const } }
+    const read = readPlacement(JSON.stringify({ v: 1, layout: [], restart: { prefer: ['slot', 'window'] }, launch: { prefer: ['window'], window: { name: 'claude-overflow' } } }))
+    if (!('placement' in read)) throw new Error(read.errors.join('; '))
+    const placed = read.placement
+    // Hosted, with a placed window: that window first, then this one.
+    for (const using of ['restart', 'launch'] as const) {
+      expect(pickLaunchTransport(probeOf(), placed, { replacing: true, using, pane: HOSTED, configCount: 1, needsLeft: false, folder: ELSEWHERE, title: 'lane-x' })).toEqual({ where: { window: { name: 'claude-overflow' } }, then: [{ pane: { token: TOKEN } }] })
+    }
+    // Hosted, with no placement, or one that names no place: this window, as before.
+    expect(pickLaunchTransport(probeOf(), null, { replacing: true, using: 'restart', pane: HOSTED, configCount: 1, needsLeft: false })).toEqual({ where: { pane: { token: TOKEN } } })
+    const bare = readPlacement(JSON.stringify({ v: 1, layout: [] }))
+    if (!('placement' in bare)) throw new Error(bare.errors.join('; '))
+    expect(pickLaunchTransport(probeOf(), bare.placement, { replacing: true, using: 'restart', pane: HOSTED, configCount: 1, needsLeft: false })).toEqual({ where: { pane: { token: TOKEN } } })
+    // Typed at a prompt (not hosted): this tab, whatever the placement.
+    expect(pickLaunchTransport(probeOf(), placed, { replacing: true, using: 'restart', pane: PANE, configCount: 1, needsLeft: false, folder: ELSEWHERE, title: 'lane-x' })).toEqual({ where: { pane: { token: TOKEN } } })
+    // A hosted pane file another PowerShell wrote: no pane at all, the placement's place, then a new window.
+    expect(pickLaunchTransport(probeOf(), placed, { replacing: true, using: 'restart', pane: { token: TOKEN, pane: { pid: 21, started: ft(1), v: 3, hosted: true } }, configCount: 1, needsLeft: false, folder: ELSEWHERE, title: 'lane-x' })).toEqual({ where: { window: { name: 'claude-overflow' } }, then: [{ window: true }] })
+    // The pane file says hosted only as "hosted": true.
+    expect(parsePane(JSON.stringify({ v: 3, pid: 20, started: ft(1), hosted: true }))).toEqual({ pid: 20, started: ft(1), v: 3, hosted: true })
+    expect(parsePane(JSON.stringify({ v: 3, pid: 20, started: ft(1), hosted: 'yes' }))).toEqual({ pid: 20, started: ft(1), v: 3 })
+    expect(parsePane(JSON.stringify({ v: 3, pid: 20, started: ft(1) }))).toEqual({ pid: 20, started: ft(1), v: 3 })
   })
 
   test('configCount and needsLeft are required, never defaulted: a caller that leaves either out is refused, not given a weaker tab (F4)', () => {

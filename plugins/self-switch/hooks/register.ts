@@ -113,6 +113,7 @@ import {
   resumeTitle,
   runProbe,
   readCrons,
+  paneAfter,
   paneFallback,
   paneNoLeft,
   paneReads,
@@ -1220,11 +1221,21 @@ async function switchNow($: EngineInterface, value: Queued): Promise<void> {
   // window, saying why.
   const restsOnLeft = live.waived !== undefined && plain.verdict !== 'not-live'
   const tabNoLeft = restsOnLeft && picked.transport === 'pane' && tab !== undefined && 'pane' in tab ? paneNoLeft(tab.pane) : undefined
-  const pick: Transport = tabNoLeft !== undefined && picked.transport === 'pane' ? { transport: 'window', folder: picked.folder } : picked
+  // A window a launch opened (its wrapper hosted, the pane file says): placement.json's places for a
+  // launch come first when it names any, then this window's ticket, so a session in a plain window only
+  // because its tab or named window was refused goes back to one. A tab you typed `claude` in keeps it.
+  const hostedLegs: readonly LaunchWhere[] | undefined = (() => {
+    if (picked.transport !== 'pane' || tabNoLeft !== undefined || tab === undefined || !('pane' in tab) || tab.pane.hosted !== true || ctx.placement === null) return undefined
+    const placed = pickLaunchTransport(found, ctx.placement, { replacing: true, using: 'launch', configCount: ctx.configDirs.length, needsLeft: restsOnLeft, title: resumeTitle(to), folder: picked.folder, pane: tab })
+    if (!('where' in placed) || (typeof placed.where === 'object' && 'pane' in placed.where)) return undefined
+    return [placed.where, ...(placed.then ?? [])]
+  })()
+  const pick: Transport = (tabNoLeft !== undefined || hostedLegs !== undefined) && picked.transport === 'pane' ? { transport: 'window', folder: picked.folder } : picked
   if (picked.transport === 'slot' && by !== `slot:${picked.slot}`) return held("the claim lock doesn't name this pane's slot")
   // The window: where placement.json puts it (launch.prefer), each place tried in turn while it is refused
-  // for want of Windows Terminal or the slot runner, the plain window last.
+  // for want of Windows Terminal or the slot runner, the plain window last (a hosted window's own ticket last).
   const legs: readonly LaunchWhere[] = (() => {
+    if (hostedLegs !== undefined) return hostedLegs
     if (pick.transport !== 'window' || ctx.placement === null) return [{ window: true } as const]
     const placed = pickLaunchTransport(found, ctx.placement, { replacing: true, using: 'launch', configCount: ctx.configDirs.length, needsLeft: false, title: resumeTitle(to), folder: pick.folder })
     return 'where' in placed ? [placed.where, ...(placed.then ?? [])] : [{ window: true } as const]
@@ -1378,6 +1389,8 @@ async function switchNow($: EngineInterface, value: Queued): Promise<void> {
   let placedAt: string | undefined
   /** Why a named window fell back to the plain one. */
   let placedFallback: string | undefined
+  /** A hosted window's own ticket was the place taken, after placement.json's: this window resumes it. */
+  let placedHere = false
   if (pick.transport === 'slot') {
     record = slotRecordPath(ctx.state, pick.slot)
     const failed = await placeLaunch($, { ...base, where: { slot: pick.slot }, ...(left === undefined ? {} : { left }) }, pick.folder)
@@ -1392,11 +1405,17 @@ async function switchNow($: EngineInterface, value: Queued): Promise<void> {
   } else {
     // Each place in turn; only for want of Windows Terminal, the slot runner or a build does the next go.
     let placed = false
-    for (const leg of legs) {
-      const tried = await placeLaunch($, { ...base, where: leg, ...(left === undefined ? {} : { left }) }, pick.folder)
+    for (const [n, leg] of legs.entries()) {
+      // A hosted window's own ticket, its last place: written as the tab's is, at its time. A named window
+      // before it is refused for want of Windows Terminal or the slot runner, rather than a plain window.
+      const isTab = typeof leg === 'object' && 'pane' in leg
+      const tried = await placeLaunch($, { ...base, where: leg, ...(isTab ? { now: await $.clock.now() } : {}), ...(paneAfter(legs, n) ? { noPlainFallback: true } : {}), ...(left === undefined ? {} : { left }) }, pick.folder)
       if ('placed' in tried) {
         placed = true
-        if (tried.placed === 'tab') placedAt = `a new tab in window ${tried.label}`
+        if (tried.placed === 'pane' && isTab) {
+          record = paneTicketPath(ctx.state, leg.pane.token)
+          placedHere = true
+        } else if (tried.placed === 'tab') placedAt = `a new tab in window ${tried.label}`
         else if (tried.label !== '-') placedAt = `a new window, ${tried.label},`
         placedFallback = tried.fallback
         break
@@ -1427,7 +1446,7 @@ async function switchNow($: EngineInterface, value: Queued): Promise<void> {
   const where =
     pick.transport === 'slot'
       ? "this pane's slot resumes it here"
-      : pick.transport === 'pane'
+      : pick.transport === 'pane' || placedHere
         ? 'this tab resumes it here'
         : placedAt !== undefined
           ? `${placedAt} resumes it`
@@ -1465,7 +1484,7 @@ async function switchNow($: EngineInterface, value: Queued): Promise<void> {
         const waits =
           pick.transport === 'slot'
             ? 'The slot honours its record for 2 minutes, then gives up'
-            : pick.transport === 'pane'
+            : pick.transport === 'pane' || placedHere
               ? "This tab's claude wrapper honours its ticket for 2 minutes, then gives up"
               : `${opened} resumes the conversation if this session exits within about 15 minutes of the switch; then the switch's claim is released, and it gives up`
         $.ui.toast(`The exit ran, but the session is still open. ${waits}.`)

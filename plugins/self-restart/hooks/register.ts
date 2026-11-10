@@ -87,8 +87,8 @@ import type { EngineInterface, Register } from 'claude-code'
 import type { Queued, Restart } from '../types'
 import { go } from './go'
 import { launch as buildLaunch, parseLaunch, powershellPath, RELEASED, releaseScript, SESSION_ID, stateFolder, SYSTEM_ROOT } from './launcher'
-import type { AgentLike, LaunchInput, LaunchWhere, PendingKind, Placement, Probe } from './machine'
-import { goAnswer, goRun, agentsHeld, agentsWayOut, blockersText, claimOf, exitBlockers, idLag, isBusyAgent, isSafeFolder, isWindowName, LAUNCH_DEADLINE_MS, LAUNCH_RETRY_MS, LAUNCH_RUN_MS, launchFolderFault, launchFolderSaid, loadPlacement, markPending, movesConversation, oneLine, paneFallback, paneTicketPath, pickLaunchTransport, plainOutput, powershellCall, quoted, readExit, readGit, readPane, resumeTitle, runProbe, safePoint, SLOT_SCRIPT_SHA256, idPathOrNone, TAB_LABEL } from './machine'
+import type { AgentLike, LaunchInput, LaunchWhere, Pane, PendingKind, Placement, Probe } from './machine'
+import { goAnswer, goRun, agentsHeld, agentsWayOut, blockersText, claimOf, exitBlockers, idLag, isBusyAgent, isSafeFolder, isWindowName, LAUNCH_DEADLINE_MS, LAUNCH_RETRY_MS, LAUNCH_RUN_MS, launchFolderFault, launchFolderSaid, loadPlacement, markPending, movesConversation, oneLine, paneAfter, paneFallback, paneTicketPath, pickLaunchTransport, plainOutput, powershellCall, quoted, readExit, readGit, readPane, resumeTitle, runProbe, safePoint, SLOT_SCRIPT_SHA256, idPathOrNone, TAB_LABEL } from './machine'
 import { checkTranscript, findTranscript, isProjectOf, type Transcript, transcriptFolder } from './start-folder'
 import { configureUpdateCheck, loadUpdateCheck, withUpdateNotice } from './update-check'
 
@@ -316,7 +316,7 @@ async function notSafe($: EngineInterface, launch: { powershell: string; id: str
  * `probe`, the one the safe point was judged on (paneFallback). `fallback` says why a session with a
  * token can't use its tab; undefined when it has none (it wasn't started through the wrapper).
  */
-async function paneOf($: EngineInterface, launch: { id: string; cwd: string }, probe: Probe): Promise<{ readonly token: string; readonly state: string } | { readonly fallback: string } | undefined> {
+async function paneOf($: EngineInterface, launch: { id: string; cwd: string }, probe: Probe): Promise<{ readonly token: string; readonly state: string; readonly pane: Pane } | { readonly fallback: string } | undefined> {
   const token = await env($, () => $.env.get('CLAUDE_PANE_TOKEN'))
   if (token === undefined || token === '') return undefined
   const local = await env($, () => $.env.get('LOCALAPPDATA'))
@@ -331,7 +331,7 @@ async function paneOf($: EngineInterface, launch: { id: string; cwd: string }, p
     $.ui.log("this tab's claude wrapper is an older one (its pane file is version 2): a session it resumes gets no CLAUDE_CODE_DISABLE_BG_SHELL_PRESSURE_REAP, and its last look reads less. Copy the current claude-wrapper.ps1 into place.")
   }
   const passed = paneFallback(probe, pane)
-  return passed === undefined ? { token, state } : { fallback: passed }
+  return passed === undefined ? { token, state, pane } : { fallback: passed }
 }
 
 /** placement.json, or null: a bad file means no placement, said in the log once. */
@@ -661,6 +661,8 @@ async function restartNow($: EngineInterface, value: Queued): Promise<void> {
   let slot: string | undefined
   let fallback: string | undefined
   let tab = false
+  /** The place tried last was this tab's ticket (a hosted window tries placement.json's places first). */
+  let triedTab = pane !== undefined && 'token' in pane
   /** Where the placement put it: a new tab, or a named window. */
   let placedAt: string | undefined
   /** The claim the ticket, the slot's record or the window holds, once it is in place. */
@@ -688,6 +690,7 @@ async function restartNow($: EngineInterface, value: Queued): Promise<void> {
     // Terminal or the slot runner.
     const legs = await restartLegs($, site.state, judged.probe, launch, pane)
     for (const [n, where] of legs.entries()) {
+      triedTab = typeof where === 'object' && 'pane' in where
       ours = claimOf(where) ?? `launch:${crypto.randomUUID()}`
       claim = undefined
       unclean = false
@@ -708,6 +711,8 @@ async function restartNow($: EngineInterface, value: Queued): Promise<void> {
           now,
           tool: 'self-restart',
           deadline: now + LAUNCH_DEADLINE_MS,
+          // A named window with this tab's ticket after it (a hosted window): refused rather than a plain window.
+          ...(paneAfter(legs, n) ? { noPlainFallback: true } : {}),
         }
         let call: ReturnType<typeof buildLaunch>
         try {
@@ -731,7 +736,7 @@ async function restartNow($: EngineInterface, value: Queued): Promise<void> {
           refusedFor = 'refused' in answer ? answer.refused.code : undefined
           if (run.stderr.trim() !== '') $.ui.log(`the launcher's error output: ${oneLine(run.stderr, 2000)}`, { to: 'debug' })
           const said = 'refused' in answer ? answer.refused.why : plainOutput(`${run.stdout} ${run.stderr}`)
-          const nothing = pane !== undefined && 'token' in pane ? "the ticket for this tab wasn't written" : "the launcher didn't place the restart"
+          const nothing = triedTab ? "the ticket for this tab wasn't written" : "the launcher didn't place the restart"
           opened = `${nothing} (${run.exitCode !== 0 ? `exit ${run.exitCode}` : 'refused'}${said === '' ? '' : `: ${said}`})`
         } else {
           const placed = answer.launched
@@ -785,7 +790,7 @@ async function restartNow($: EngineInterface, value: Queued): Promise<void> {
   if (opened !== undefined) {
     if (armed === value) armed = undefined
     await keep($, launch.id, null)
-    const nothing = pane !== undefined && 'token' in pane ? 'nothing was left for this tab' : 'no window opened'
+    const nothing = triedTab ? 'nothing was left for this tab' : 'no window opened'
     await refuse($, `Restart didn't run: ${opened}`, `The restart you queued didn't run, and ${nothing} (${opened}). The session goes on.`)
     return
   }
@@ -887,10 +892,20 @@ async function restartNow($: EngineInterface, value: Queued): Promise<void> {
  * The places a restart tries, in turn: this tab's claude wrapper, when it runs this claude.exe; else this
  * pane's slot, verified on the probe that judged ('auto' decides it in the script); else placement.json's
  * `restart.prefer` (a tab in this tab's own window, by its stamp, or the placement's window), then 'auto',
- * today's window. A hand-started tab has no stamp, and falls through.
+ * today's window. A hand-started tab has no stamp, and falls through. In a window a launch opened (its
+ * wrapper hosted), placement.json's places come first when it names any, then that window again
+ * (pickLaunchTransport): a session there only because its tab was refused goes back to it.
  */
-async function restartLegs($: EngineInterface, state: string, probe: Probe, launch: { readonly id: string; readonly cwd: string }, pane: { readonly token: string } | { readonly fallback: string } | undefined): Promise<readonly LaunchWhere[]> {
-  if (pane !== undefined && 'token' in pane) return [{ pane: { token: pane.token } }]
+async function restartLegs($: EngineInterface, state: string, probe: Probe, launch: { readonly id: string; readonly cwd: string }, pane: { readonly token: string; readonly pane: Pane } | { readonly fallback: string } | undefined): Promise<readonly LaunchWhere[]> {
+  if (pane !== undefined && 'token' in pane) {
+    const here: LaunchWhere = { pane: { token: pane.token } }
+    if (pane.pane.hosted !== true) return [here]
+    const placement = await placementOf($, state)
+    if (placement === null) return [here]
+    const stamp = await stampOf($)
+    const placed = pickLaunchTransport(probe, placement, { replacing: true, using: 'restart', configCount: 1, needsLeft: false, stamp, title: stamp.tab ?? resumeTitle(launch.id), folder: launch.cwd, pane: { token: pane.token, pane: pane.pane } })
+    return 'wait' in placed ? [here] : [placed.where, ...(placed.then ?? [])]
+  }
   if (probe.slot !== null && probe.slot.sha256 === SLOT_SCRIPT_SHA256) return ['auto']
   const placement = await placementOf($, state)
   if (placement === null) return ['auto']

@@ -5,6 +5,13 @@
 #
 #   . "$env:LOCALAPPDATA\claude-self-tools\claude-wrapper.ps1"
 #
+# That is for the `claude` you type. A window that self-restart or self-switch opens needs none of it:
+# the plugins carry this same file, pinned by its SHA-256 (WRAPPER_SCRIPT_SHA256), put it beside
+# claude-launch.ps1 as claude-wrapper-<the first 8 hex digits of that SHA-256>.ps1, and the window's
+# claude-launch.ps1 -Wrapper runs claude through that copy, checked byte for byte, whatever the execution
+# policy. Your copy here is never read by a launch. Both write the pane file of version 3 (the window's
+# adds "hosted": true) and read the same ticket (version 1).
+#
 # What it does:
 # - It runs the real claude.exe with your arguments, in this tab, and waits for it, as before.
 # - It gives this run a fresh token, CLAUDE_PANE_TOKEN, which claude inherits, and writes a pane file,
@@ -24,6 +31,14 @@
 #   claude --resume <id> in that folder, in this tab, and loops: a resumed session can restart again.
 #   At most 10 resumes, and never a fourth within 30 seconds. A ticket it doesn't use is said in one
 #   line, and you are back at the prompt.
+# - In a window claude-launch.ps1 opened (claude-launch.ps1 -Wrapper -Hosted, which only that window's
+#   script passes, sets $ClaudeWrapperHosted in its own scope first), there is no cap of 10: that window
+#   exists to host this session's moves, so the cap is 30 within any hour, and the 30-second guard still
+#   stops a loop. Its pane file says so ("hosted": true), so a move out of it goes to the place
+#   placement.json names first, when it names one. And it leaves the script that called it two values:
+#   $ClaudeWrapperLast, the conversation it resumed last and its folder, and $ClaudeWrapperUnused, a
+#   ticket it didn't use and why, so that window can name the right conversation, record the refusal and
+#   stay open for you to read it. In your profile they are two harmless variables of your session.
 # - A resumed claude gets no argument but --resume <id>, and the environment a new session would:
 #   the variables Claude Code sets in the processes it starts are cleared, NO_COLOR among them, and
 #   CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1 and CLAUDE_CODE_DISABLE_BG_SHELL_PRESSURE_REAP=1 are set (the
@@ -51,6 +66,10 @@ function claude {
   }
   $state = Join-Path $env:LOCALAPPDATA 'claude-self-tools'
   $panes = Join-Path $state 'panes'
+  # Hosted by claude-launch.ps1 -Wrapper (set in the calling script's own scope), or typed at a prompt.
+  $hosted = $script:ClaudeWrapperHosted -eq $true
+  # Hosted, a window exists for this session's moves: at most this many within any hour, not 10 in all.
+  $hourCap = 30
   $uuid = '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\z'
   $claim = '^launch:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\z'
   # Set by Claude Code in the processes it starts, and NO_COLOR: a resumed claude must not inherit them.
@@ -148,7 +167,9 @@ function claude {
       if (-not ((& $isNumber $owner.pid) -and (Get-Process -Id $owner.pid -ErrorAction SilentlyContinue))) { Remove-Item -LiteralPath $old.FullName -Force -ErrorAction SilentlyContinue }
     }
     $started = [string](Get-Process -Id $PID).StartTime.ToFileTimeUtc()
-    [IO.File]::WriteAllText($paneFile, (ConvertTo-Json -Compress -InputObject ([ordered]@{ v = 3; pid = $PID; started = $started })))
+    $paneText = [ordered]@{ v = 3; pid = $PID; started = $started }
+    if ($hosted) { $paneText['hosted'] = $true }
+    [IO.File]::WriteAllText($paneFile, (ConvertTo-Json -Compress -InputObject $paneText))
     $env:CLAUDE_PANE_TOKEN = $token
   } catch {
     Write-Host "claude: this tab's pane file was not written ($($_.Exception.Message)), so a restart opens a new window."
@@ -185,7 +206,8 @@ function claude {
         elseif ($null -ne $t.left -and -not (& $isLeft $t.left)) { 'its left record''s stat is not a size and a time, or an exit time' }
         elseif (-not (Test-Path -LiteralPath (Join-Path $config ('projects\' + ($t.dir -replace '[^A-Za-z0-9]', '-') + '\' + $t.resume + '.jsonl')) -PathType Leaf)) { "no transcript of it is under its folder's project" }
         elseif ($null -eq $lock -or $lock.by -cne $t.by) { 'the claim lock on that conversation does not name this ticket' }
-        elseif ($resumes.Count -ge 10) { 'this tab has resumed 10 times already' }
+        elseif (-not $hosted -and $resumes.Count -ge 10) { 'this tab has resumed 10 times already' }
+        elseif ($hosted -and @($resumes | Where-Object { ([datetime]::UtcNow - $_).TotalMinutes -lt 60 }).Count -ge $hourCap) { "this window resumed $hourCap times within the last hour" }
         elseif (@($resumes | Where-Object { ([datetime]::UtcNow - $_).TotalSeconds -lt 30 }).Count -ge 3) { 'this tab resumed 3 times within 30 seconds' }
       # The last look, right before claude runs: is the conversation open anywhere now? In this tab's own
       # config folder and every one the ticket names, as the switch read them: reading more registries
@@ -200,9 +222,13 @@ function claude {
       if ($null -ne $why) {
         $hint = if ($t.resume -is [string] -and $t.resume -cmatch $uuid) { " Once it is safe, resume it yourself: claude --resume $($t.resume)" } else { '' }
         Write-Host "claude: the ticket to resume a session in this tab was not used: $why.$hint"
+        # For the script that called this function (claude-launch.ps1 in a window): the ticket not used, and why.
+        $script:ClaudeWrapperUnused = [pscustomobject]@{ why = $why; resume = $(if ($t.resume -is [string] -and $t.resume -cmatch $uuid) { $t.resume } else { $null }); by = $(if ($t.by -is [string] -and $t.by -cmatch $claim) { $t.by } else { $null }); dir = $(if ($t.dir -is [string]) { $t.dir } else { $null }) }
         break
       }
       $resumes += [datetime]::UtcNow
+      # For the script that called this function: the conversation resumed last, and its folder.
+      $script:ClaudeWrapperLast = [pscustomobject]@{ resume = $t.resume; dir = $t.dir }
       # The environment a new session gets: Claude Code's markers and NO_COLOR removed (not set to empty,
       # which PowerShell 7 keeps), then the launch environment's set: transcripts on, shells not reaped.
       foreach ($name in $markers) { Remove-Item -LiteralPath "Env:$name" -ErrorAction SilentlyContinue }

@@ -23,6 +23,14 @@ test("the hash the plugins check is the runner's own, and the runner is plain AS
   assert.ok(bytes.length < 65536)
 })
 
+/**
+ * The module path line claude-slot.ps1 and claude-layout.ps1 keep this release, their pins unchanged
+ * since 5b4f138: one path made of three, harmless in Windows PowerShell 5.1, which loads its core modules
+ * from $PSHOME whatever the path. PSMODULEPATH_RESET is the fixed line; these two take it in a release that
+ * re-vendors the coordinator.
+ */
+const KEPT_RESET = '$env:PSModulePath = @([Environment]::GetFolderPath("MyDocuments") + "\\WindowsPowerShell\\Modules", [Environment]::GetFolderPath("ProgramFiles") + "\\WindowsPowerShell\\Modules", [Environment]::GetFolderPath("System") + "\\WindowsPowerShell\\v1.0\\Modules") -join ";"'
+
 /** Every check of the runner, each problem found. */
 function runnerProblems(text) {
   const problems = []
@@ -33,7 +41,7 @@ function runnerProblems(text) {
   const code = text.split('\n').filter(line => !line.trimStart().startsWith('#')).join('\n')
 
   need(has('param([switch]$Idle, [string]$Start, [string]$Name, [string]$Resume, [string]$WaitFor, [string]$ConfigDirs, [string]$LeftSize, [string]$LeftMtime, [string]$LeftExitAt, [string]$Launcher, [string]$Claim)'), 'its parameters')
-  need(text.indexOf(machine.PSMODULEPATH_RESET) > 0 && text.indexOf(machine.PSMODULEPATH_RESET) < text.indexOf('$me = Get-CimInstance'), 'PSModulePath reset at the top')
+  need(text.indexOf(KEPT_RESET) > 0 && text.indexOf(KEPT_RESET) < text.indexOf('$me = Get-CimInstance'), 'PSModulePath reset at the top')
   need(!code.includes('Get-FileHash') && !/\bbash\b|\bmsys\b|\/proc\//i.test(code), 'no Get-FileHash, no bash')
   for (const flag of ['--permission-mode', '--dangerously-skip-permissions', 'bypassPermissions', '--allow-dangerously', 'acceptEdits']) need(!has(flag), `no ${flag}`)
   need(has('$slotId = \'{0}-{1}\' -f $PID, $me.CreationDate.ToFileTimeUtc()'), 'its id')

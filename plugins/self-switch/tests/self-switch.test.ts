@@ -349,7 +349,12 @@ function engine(
     // The launch takes again the claim its script names, and says what it placed.
     const by = /^\$by = '((?:launch|slot):[0-9a-f-]{1,40})'$/m.exec(script)?.[1] ?? 'none'
     // A tab or a named window, by placement.json: wt.exe by its one string.
-    if (kind === 'launcher' && script.includes('Start-Process $wtExe') && launcher === 'no-wt') return ok('refused wt self-switch: a tab needs Windows Terminal 1.19 or later\r\n')
+    // No Windows Terminal: a tab, or a named window with a better place after it, refuses; a named window alone opens a plain one, saying so, as the launch script does.
+    if (kind === 'launcher' && script.includes('Start-Process $wtExe') && launcher === 'no-wt') {
+      return script.includes("Refuse 'wt'")
+        ? ok('refused wt self-switch: a tab needs Windows Terminal 1.19 or later\r\n')
+        : ok(`claim ${by}\r\nfallback Windows Terminal 1.19 or later is not here, so a plain window, not the one named\r\nlaunched window - 100\r\n`)
+    }
     if (kind === 'launcher' && script.includes('Start-Process $wtExe') && !script.includes('Start-Process -FilePath')) return ok(`claim ${by}\r\nlaunched tab ${/^\s*\$env:CLAUDE_SELF_TOOLS_WT_WINDOW = '([^']*)'$/m.exec(script)?.[1] ?? '-'}\r\n`)
     if (kind === 'launcher' && launcher === 'refuses') return ok('refused launcher self-switch: claude-launch.ps1 is not where it must be\r\n')
     if (kind === 'launcher') return launcher === 'opens' || launcher === 'no-wt' ? ok(`claim ${by}\r\nlaunched window - 100\r\n`) : ok('self-switch: no claude on PATH\r\n', 4)
@@ -2413,6 +2418,41 @@ describe('placement.json: where the new window goes', () => {
     // In the probe that judged: the slots, for whether the window has room.
     expect(runs.find(r => r.kind === 'probe')?.script ?? '').toContain('$result["slots"]')
     expect(commands).toEqual([{ command: 'exit' }])
+  })
+
+  test("from a window a launch opened (its wrapper hosted): placement.json's tab first, not this window's ticket", async ($, on) => {
+    const HOSTED = JSON.stringify({ v: 3, pid: 20, started: ft(1), hosted: true })
+    const { runs, files, commands, toasts, clock } = engine(on, { env: { ...WINDOWS, CLAUDE_PANE_TOKEN: TOKEN }, pane: HOSTED, probe: machine(noSlots), store: THERE })
+    files.set(placementPath(STATE), FILE)
+    await $.session.start(start)
+    await switchNow($, clock)
+    expect(runs.filter(r => r.kind === 'pane')).toEqual([])
+    expect(runs.find(r => r.kind === 'launcher')?.script ?? '').toContain('Start-Process $wtExe -ArgumentList $wtLine')
+    expect(commands).toEqual([{ command: 'exit' }])
+    expect(toasts).toContain(`Switching to ${T}: this session exits, and a new tab in window claude-4 resumes it once this process has gone.`)
+  })
+
+  test("from a hosted window, the placed tab refused for want of Windows Terminal: this window's own ticket, before a new window", async ($, on) => {
+    const HOSTED = JSON.stringify({ v: 3, pid: 20, started: ft(1), hosted: true })
+    const { runs, files, commands, toasts, clock } = engine(on, { env: { ...WINDOWS, CLAUDE_PANE_TOKEN: TOKEN }, pane: HOSTED, probe: machine(noSlots), store: THERE, launcher: 'no-wt' })
+    files.set(placementPath(STATE), JSON.stringify({ v: 1, layout: [], launch: { prefer: ['tab'], tab: { window: 'claude-4', maxTabs: 2 } } }))
+    await $.session.start(start)
+    await switchNow($, clock)
+    expect(runs.filter(r => r.kind === 'launcher' || r.kind === 'pane').map(r => r.kind)).toEqual(['launcher', 'pane'])
+    expect(commands).toEqual([{ command: 'exit' }])
+    expect(toasts).toContain(`Switching to ${T}: this session exits, and this tab resumes it here once this process has gone.`)
+  })
+
+  test("from a hosted window, the placed named window and no Windows Terminal: refused, then this window's own ticket, never a new plain window", async ($, on) => {
+    const HOSTED = JSON.stringify({ v: 3, pid: 20, started: ft(1), hosted: true })
+    const { runs, files, commands, toasts, clock } = engine(on, { env: { ...WINDOWS, CLAUDE_PANE_TOKEN: TOKEN }, pane: HOSTED, probe: machine(noSlots), store: THERE, launcher: 'no-wt' })
+    files.set(placementPath(STATE), JSON.stringify({ v: 1, layout: [], launch: { prefer: ['window'], window: { name: 'claude-overflow' } } }))
+    await $.session.start(start)
+    await switchNow($, clock)
+    expect(runs.filter(r => r.kind === 'launcher' || r.kind === 'pane').map(r => r.kind)).toEqual(['launcher', 'pane'])
+    expect(runs.find(r => r.kind === 'launcher')?.script ?? '').toContain("Refuse 'wt' ($tool + ': a named window needs Windows Terminal")
+    expect(commands).toEqual([{ command: 'exit' }])
+    expect(toasts).toContain(`Switching to ${T}: this session exits, and this tab resumes it here once this process has gone.`)
   })
 
   test('refused for want of Windows Terminal: the next place, then the plain window', async ($, on) => {
