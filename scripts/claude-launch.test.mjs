@@ -199,8 +199,10 @@ test("-Wrapper: the copy's bytes read once, their SHA-256 checked, the function 
   const runs = code.filter(line => /\$wrapperClaude( |\s*\})/.test(line) && line.includes('&'))
   assert.deepEqual(runs.map(line => line.trim()), ['if ($Resume) { & $wrapperClaude --resume $Resume }', 'elseif ($Start) { & $wrapperClaude --session-id $Start --name $Name }', 'else { & $wrapperClaude }'])
   assert.deepEqual(code.filter(line => /\{ claude( |\s*\})/.test(line)), [], 'claude is never called by its name')
-  // Hosted: the wrapper reads $ClaudeWrapperHosted in this script's scope, set right before the call; what it leaves goes to the window.
-  const host = script.indexOf('  $script:ClaudeWrapperHosted = $true\n')
+  // Hosted when -Hosted says so (a launch's window, alone): the wrapper reads $ClaudeWrapperHosted in this
+  // script's scope, set right before the call; what it leaves goes to the window.
+  assert.match(script, /^param\(.*\[switch\]\$Wrapper, \[switch\]\$Hosted\)$/m)
+  const host = script.indexOf('  $script:ClaudeWrapperHosted = [bool]$Hosted\n')
   assert.ok(host > via && host < script.indexOf('if ($Resume) { & $wrapperClaude --resume $Resume }'))
   assert.ok(script.includes('  $global:ClaudeLaunchLast = $script:ClaudeWrapperLast\n  $global:ClaudeLaunchUnused = $script:ClaudeWrapperUnused\n'))
   // The flag taken away once the wrapper returns, whatever it threw: a session that ran this by hand doesn't keep it.
@@ -225,9 +227,11 @@ test("every PSModulePath reset sets Windows PowerShell 5.1's three module folder
   const resets = [
     ['the machine code (PSMODULEPATH_RESET)', machine.PSMODULEPATH_RESET],
     ['claude-launch.ps1', lineOf(script, 'claude-launch.ps1')],
-    ['claude-slot.ps1', lineOf(readFileSync(join(slot, 'claude-slot.ps1'), 'utf8'), 'claude-slot.ps1')],
-    ['claude-layout.ps1', lineOf(readFileSync(join(slot, 'claude-layout.ps1'), 'utf8'), 'claude-layout.ps1')],
   ]
+  // claude-slot.ps1 and claude-layout.ps1 keep their line this release, and so their pins (SLOT_SCRIPT_SHA256,
+  // LAYOUT_SCRIPT_SHA256, as at 5b4f138): one path made of three, harmless in 5.1, which loads its core
+  // modules from $PSHOME. The fix waits for a release that re-vendors the coordinator.
+  for (const name of ['claude-slot.ps1', 'claude-layout.ps1']) assert.ok(!lineOf(readFileSync(join(slot, name), 'utf8'), name).startsWith('$env:PSModulePath = @(('), `${name} keeps its line this release`)
   for (const [name, line] of resets) {
     const ran = spawnSync(join(process.env.SystemRoot ?? 'C:\\Windows', 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe'), ['-NoProfile', '-NonInteractive', '-Command', `${line}; $env:PSModulePath`], { encoding: 'utf8', windowsHide: true })
     const folders = ran.stdout.trim().split(';')
@@ -396,7 +400,7 @@ const near = (a, b) => {
  * CLAUDE_PANE_TOKEN, not the one inherited, and the wrapper's pane file (version 3) naming that PowerShell
  * by its id and start; everything else of the launch environment as without it.
  */
-function throughWrapper(result, args, cwd, shell) {
+function throughWrapper(result, args, cwd, shell, { hosted = false } = {}) {
   const found = launched({ ...result, runs: result.runs.map(r => ({ ...r, env: r.env.filter(name => name !== 'CLAUDE_PANE_TOKEN') })) }, args, cwd)
   const check = (ok, what) => {
     if (!ok) found.push(what)
@@ -407,7 +411,7 @@ function throughWrapper(result, args, cwd, shell) {
   check(only.parent?.path?.toLowerCase() === shell.toLowerCase(), `that PowerShell is ${shell} (${only.parent?.path})`)
   check(only.env.includes('CLAUDE_PANE_TOKEN') && typeof only.token === 'string' && only.token !== '00000000-0000-4000-a000-0000000000ff', `claude carries a fresh CLAUDE_PANE_TOKEN (${only.token})`)
   const pane = only.pane === null ? undefined : machine.parsePane(only.pane)
-  check(pane !== undefined && !('why' in pane) && pane.v === 3 && pane.hosted === true, `the pane file is written, version 3, hosted (${only.pane})`)
+  check(pane !== undefined && !('why' in pane) && pane.v === 3 && pane.hosted === (hosted ? true : undefined), `the pane file is written, version 3, ${hosted ? 'hosted' : 'not hosted'} (${only.pane})`)
   if (pane !== undefined && !('why' in pane) && only.parent) {
     check(pane.pid === only.parent.pid, `the pane file names claude.exe's parent (${pane.pid})`)
     check(near(pane.started, only.parent.created), `the pane file's start is that process's (${pane.started}, ${only.parent.created})`)
@@ -439,20 +443,29 @@ function ticketLab(dirs, tickets, at = '{NOW}') {
   return { id, by, plan }
 }
 
-/** A ticket too old for the wrapper, in a run hosted by the script at `path`: its result. */
+/** A ticket too old for the wrapper, in a run hosted by the script at `path` (-Hosted, as a launch's window runs it): its result. */
 async function unusedTicket(shell, path = LAUNCH) {
   const dirs = lab()
   placeWrapper(dirs)
   const t = ticketLab(dirs, 1, '{OLD}')
-  return run(shell, dirs, ['-Resume', t.id, '-Dir', dirs.work, '-Wrapper'], { script: path, extra: { STUB_PLAN: t.plan } })
+  return run(shell, dirs, ['-Resume', t.id, '-Dir', dirs.work, '-Wrapper', '-Hosted'], { script: path, extra: { STUB_PLAN: t.plan } })
 }
 
-/** Eleven moves out of one hosted run, 10.5 seconds apart (past the 30-second guard): its result. */
-async function manyMoves(shell, path = LAUNCH) {
+/** Eleven moves out of one run, 10.5 seconds apart (past the 30-second guard), hosted (-Hosted) or by hand: its result. */
+async function manyMoves(shell, path = LAUNCH, { hosted = true } = {}) {
   const dirs = lab()
   placeWrapper(dirs)
   const t = ticketLab(dirs, 11)
-  return run(shell, dirs, ['-Resume', t.id, '-Dir', dirs.work, '-Wrapper'], { script: path, extra: { STUB_PLAN: t.plan, STUB_SLEEP_MS: '10500' }, timeoutMs: 240_000 })
+  return run(shell, dirs, ['-Resume', t.id, '-Dir', dirs.work, '-Wrapper', ...(hosted ? ['-Hosted'] : [])], { script: path, extra: { STUB_PLAN: t.plan, STUB_SLEEP_MS: '10500' }, timeoutMs: 240_000 })
+}
+
+/** The claude wrapper's copy with its hosted cap made `cap` within the hour, and a launcher that pins it as its own (a test needs no hour). */
+function cappedAt(cap) {
+  const CAP = '  $hourCap = 30\n'
+  assert.ok(machine.WRAPPER_SCRIPT_TEXT.includes(CAP), 'the hosted cap is 30 within the hour')
+  const text = machine.WRAPPER_SCRIPT_TEXT.replace(CAP, `  $hourCap = ${cap}\n`)
+  const sha = sha256(text)
+  return { text, sha, launcher: planted(`$WrapperSha256 = '${machine.WRAPPER_SCRIPT_SHA256}'`, `$WrapperSha256 = '${sha}'`) }
 }
 
 /** A direct start with -Wrapper: claude.exe as without it (no token, no pane file), and one line saying why. */
@@ -686,18 +699,19 @@ describe('claude-launch.ps1, run for real against the stub', { skip: !isWindows 
         const dirs = lab()
         placeWrapper(dirs)
         const id = randomUUID()
-        assert.deepEqual(throughWrapper(await run(shell, dirs, ['-Resume', id, '-Dir', dirs.work, '-Wrapper']), ['--resume', id], dirs.work, shell), [])
+        assert.deepEqual(throughWrapper(await run(shell, dirs, ['-Resume', id, '-Dir', dirs.work, '-Wrapper', '-Hosted']), ['--resume', id], dirs.work, shell, { hosted: true }), [])
       })
 
       test('-Start -Wrapper and -Lane -Wrapper: every mode a window or a person runs goes through it', async () => {
         const dirs = lab()
         placeWrapper(dirs)
         const id = randomUUID()
-        assert.deepEqual(throughWrapper(await run(shell, dirs, ['-Start', id, '-Name', 'lane-x', '-Dir', dirs.work, '-Wrapper']), ['--session-id', id, '--name', 'lane-x'], dirs.work, shell), [])
+        assert.deepEqual(throughWrapper(await run(shell, dirs, ['-Start', id, '-Name', 'lane-x', '-Dir', dirs.work, '-Wrapper', '-Hosted']), ['--session-id', id, '--name', 'lane-x'], dirs.work, shell, { hosted: true }), [])
         const lane = lab()
         placeWrapper(lane)
         const other = randomUUID()
         writeFileSync(join(lane.config, 'lanes.json'), JSON.stringify({ v: 1, at: Date.now(), lanes: { 'lane-w': { session: other, folder: lane.work, ws: 'default', at: Date.now() } } }))
+        // By hand, as a person runs it: -Wrapper alone, a profile's wrapper (its pane file not hosted).
         assert.deepEqual(throughWrapper(await run(shell, lane, ['-Lane', 'lane-w', '-Wrapper']), ['--resume', other], lane.work, shell), [])
       })
 
@@ -741,6 +755,32 @@ describe('claude-launch.ps1, run for real against the stub', { skip: !isWindows 
         assert.equal(r.runs.length, 12, r.stdout.slice(-600))
         assert.ok(!r.stdout.includes('resumed 10 times'), r.stdout.slice(-600))
         assert.equal(r.code, 7)
+      })
+
+      test('eleven moves out of a -Wrapper run by hand (no -Hosted): a profile\'s wrapper, its pane file not hosted, the cap of 10 kept (about two minutes)', { skip: shell !== SHELLS.at(-1)?.[1] && 'one shell is enough for the long run' }, async () => {
+        const r = await manyMoves(shell, LAUNCH, { hosted: false })
+        assert.equal(r.runs.length, 11, r.stdout.slice(-600))
+        assert.ok(r.runs.every(one => one.pane !== null && machine.parsePane(one.pane).hosted === undefined), 'no pane file says hosted')
+        assert.match(r.stdout, /claude: the ticket to resume a session in this tab was not used: this tab has resumed 10 times already\./)
+        assert.equal(r.code, machine.WRAPPER_UNUSED_EXIT)
+      })
+
+      test(`a hosted run past its cap within the hour (30; made 2 in a copy pinned as its own, so the test needs no hour): the next ticket is not used, said, and the launcher ends with ${machine.WRAPPER_UNUSED_EXIT} for the window to record it`, async () => {
+        const dirs = lab()
+        const capped = cappedAt(2)
+        placeWrapper(dirs, capped.text, capped.sha)
+        const t = ticketLab(dirs, 3)
+        const r = await run(shell, dirs, ['-Resume', t.id, '-Dir', dirs.work, '-Wrapper', '-Hosted'], { script: capped.launcher, extra: { STUB_PLAN: t.plan } })
+        assert.equal(r.runs.length, 3, r.stdout.slice(-600))
+        assert.match(r.stdout, /claude: the ticket to resume a session in this tab was not used: this window resumed 2 times within the last hour\./)
+        assert.equal(r.code, machine.WRAPPER_UNUSED_EXIT)
+        // By hand (no -Hosted), the same copy has no hourly cap: its cap is 10 in all.
+        const hand = lab()
+        placeWrapper(hand, capped.text, capped.sha)
+        const h = ticketLab(hand, 2)
+        const byHand = await run(shell, hand, ['-Resume', h.id, '-Dir', hand.work, '-Wrapper'], { script: capped.launcher, extra: { STUB_PLAN: h.plan } })
+        assert.equal(byHand.runs.length, 3, byHand.stdout.slice(-600))
+        assert.equal(byHand.code, 7)
       })
 
       test('-Wrapper under a Restricted execution policy, set for this process alone: the copy loads all the same (its bytes, never a script file)', async () => {
@@ -832,7 +872,7 @@ describe('planted faults in claude-launch.ps1, each caught', { skip: !isWindows 
     assert.notEqual(r.code, machine.WRAPPER_UNUSED_EXIT)
   })
   test('the cap of 10 kept in a window: the eleventh move out of it is refused (about two minutes)', async () => {
-    const path = planted("$script:ClaudeWrapperHosted = $true\n", "$script:ClaudeWrapperHosted = $false\n")
+    const path = planted("$script:ClaudeWrapperHosted = [bool]$Hosted\n", "$script:ClaudeWrapperHosted = $false\n")
     const r = await manyMoves(shell, path)
     assert.notEqual(r.runs.length, 12)
   })

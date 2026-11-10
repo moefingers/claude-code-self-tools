@@ -651,6 +651,9 @@ describe("a window's launch, end to end: the interpreter it chose, the wrapper's
     for (const name of [...machine.LAUNCH_ENV_CLEAR, 'PSExecutionPolicyPreference']) assert.ok(!first.env.includes(name), `${name} is cleared`)
     assert.ok(first.forceIsOne && first.reapIsOne)
     assert.ok(first.env.includes('CLAUDE_PANE_TOKEN'))
+    // In PowerShell 7, the window leaves the module path as 7 makes it: no Windows PowerShell under the
+    // window beside claude (5.1's folders alone would load 5.1's copies of 7's modules through one, all its life).
+    if (hasPwsh) assert.deepEqual(first.shellSiblings, [], 'no powershell.exe under the PowerShell 7 window')
     // (e) The probe the restart would take, run under that claude.exe: this tab, by pickLaunchTransport and pickTransport alike.
     const probe = r.probeOf(1)
     assert.ok(!('error' in probe), JSON.stringify(probe))

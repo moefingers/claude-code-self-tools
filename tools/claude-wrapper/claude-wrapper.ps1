@@ -31,9 +31,10 @@
 #   claude --resume <id> in that folder, in this tab, and loops: a resumed session can restart again.
 #   At most 10 resumes, and never a fourth within 30 seconds. A ticket it doesn't use is said in one
 #   line, and you are back at the prompt.
-# - In a window claude-launch.ps1 opened (it sets $ClaudeWrapperHosted in its own scope first), there is
-#   no cap of 10: that window exists to host this session's moves, however many, and the 30-second guard
-#   still stops a loop. Its pane file says so ("hosted": true), so a move out of it goes to the place
+# - In a window claude-launch.ps1 opened (claude-launch.ps1 -Wrapper -Hosted, which only that window's
+#   script passes, sets $ClaudeWrapperHosted in its own scope first), there is no cap of 10: that window
+#   exists to host this session's moves, so the cap is 30 within any hour, and the 30-second guard still
+#   stops a loop. Its pane file says so ("hosted": true), so a move out of it goes to the place
 #   placement.json names first, when it names one. And it leaves the script that called it two values:
 #   $ClaudeWrapperLast, the conversation it resumed last and its folder, and $ClaudeWrapperUnused, a
 #   ticket it didn't use and why, so that window can name the right conversation, record the refusal and
@@ -67,6 +68,8 @@ function claude {
   $panes = Join-Path $state 'panes'
   # Hosted by claude-launch.ps1 -Wrapper (set in the calling script's own scope), or typed at a prompt.
   $hosted = $script:ClaudeWrapperHosted -eq $true
+  # Hosted, a window exists for this session's moves: at most this many within any hour, not 10 in all.
+  $hourCap = 30
   $uuid = '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\z'
   $claim = '^launch:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\z'
   # Set by Claude Code in the processes it starts, and NO_COLOR: a resumed claude must not inherit them.
@@ -204,6 +207,7 @@ function claude {
         elseif (-not (Test-Path -LiteralPath (Join-Path $config ('projects\' + ($t.dir -replace '[^A-Za-z0-9]', '-') + '\' + $t.resume + '.jsonl')) -PathType Leaf)) { "no transcript of it is under its folder's project" }
         elseif ($null -eq $lock -or $lock.by -cne $t.by) { 'the claim lock on that conversation does not name this ticket' }
         elseif (-not $hosted -and $resumes.Count -ge 10) { 'this tab has resumed 10 times already' }
+        elseif ($hosted -and @($resumes | Where-Object { ([datetime]::UtcNow - $_).TotalMinutes -lt 60 }).Count -ge $hourCap) { "this window resumed $hourCap times within the last hour" }
         elseif (@($resumes | Where-Object { ([datetime]::UtcNow - $_).TotalSeconds -lt 30 }).Count -ge 3) { 'this tab resumed 3 times within 30 seconds' }
       # The last look, right before claude runs: is the conversation open anywhere now? In this tab's own
       # config folder and every one the ticket names, as the switch read them: reading more registries

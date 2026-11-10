@@ -144,6 +144,14 @@ describe('-WhatIf, the default, for the design\'s example', { skip: !isWindows &
   })
 })
 
+/**
+ * The module path line claude-slot.ps1 and claude-layout.ps1 keep this release, their pins unchanged
+ * since 5b4f138: one path made of three, harmless in Windows PowerShell 5.1, which loads its core modules
+ * from $PSHOME whatever the path. PSMODULEPATH_RESET is the fixed line; these two take it in a release that
+ * re-vendors the coordinator.
+ */
+const KEPT_RESET = '$env:PSModulePath = @([Environment]::GetFolderPath("MyDocuments") + "\\WindowsPowerShell\\Modules", [Environment]::GetFolderPath("ProgramFiles") + "\\WindowsPowerShell\\Modules", [Environment]::GetFolderPath("System") + "\\WindowsPowerShell\\v1.0\\Modules") -join ";"'
+
 /** What the layout script must be, as text: each problem found. A fault planted in a copy must show up here. */
 function layoutProblems(text) {
   const problems = []
@@ -151,7 +159,7 @@ function layoutProblems(text) {
     if (!ok) problems.push(what)
   }
   const code = text.split('\n').filter(line => !line.trimStart().startsWith('#')).join('\n')
-  const reset = code.indexOf(machine.PSMODULEPATH_RESET)
+  const reset = code.indexOf(KEPT_RESET)
   need(reset > 0 && reset < code.indexOf('Get-AppxPackage'), 'PSModulePath is reset before Windows Terminal\'s version is read')
   const gate = code.indexOf('if (-not $Apply) {')
   const launch = code.indexOf('Start-Process $wtExe -ArgumentList $c.line')
@@ -203,7 +211,7 @@ describe('planted faults in the layout script and the validators, each caught', 
   })
 
   test('the PSModulePath reset removed', () => {
-    const { text } = copyWith('reset', machine.PSMODULEPATH_RESET, '')
+    const { text } = copyWith('reset', KEPT_RESET, '')
     assert.ok(layoutProblems(text).some(p => p.includes('PSModulePath')))
   })
 

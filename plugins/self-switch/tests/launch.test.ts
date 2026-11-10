@@ -153,8 +153,9 @@ describe('launch(): one powershellCall, the script on standard input', () => {
       expect(lines.indexOf(PSMODULEPATH_RESET)).toBe(2)
       expect(lines.slice(0, 2)).toEqual(["$ErrorActionPreference = 'Stop'", "$ProgressPreference = 'SilentlyContinue'"])
     }
-    // The window's own script too, first thing.
-    expect(innerOf(SCRIPTS[0]?.[1] ?? '').split('\r\n')[2]).toBe(PSMODULEPATH_RESET)
+    // The window's own script too, first thing, in Windows PowerShell alone: in PowerShell 7, 5.1's folders
+    // alone would load 5.1's copies of 7's own modules through a hidden Windows PowerShell, for the window's life.
+    expect(innerOf(SCRIPTS[0]?.[1] ?? '').split('\r\n')[2]).toBe(`if ($PSVersionTable.PSEdition -ne "Core") { ${PSMODULEPATH_RESET} }`)
   })
 
   test('nothing but claude-launch.ps1 is ever started as claude: no claude.exe, no Get-Command claude, no call but & $launchPath', () => {
@@ -172,10 +173,10 @@ describe('launch(): one powershellCall, the script on standard input', () => {
   })
 
   test('the window hands claude-launch.ps1 every config folder it read and the left record\'s stat, so its own last look is the same (F1)', () => {
-    expect(innerOf(launchScriptText(input()))).toContain('  & $launchPath -Resume $id -Dir $folder -ConfigDir $configDirs -Wrapper\r\n')
-    expect(innerOf(launchScriptText(input({ left: { exitAt: NOW - 60_000 } })))).toContain(`  & $launchPath -Resume $id -Dir $folder -ConfigDir $configDirs -LeftExitAt '${NOW - 60_000}' -Wrapper\r\n`)
-    expect(innerOf(launchScriptText(input({ left: { size: 4096, mtime: NOW - 1000 } })))).toContain(`  & $launchPath -Resume $id -Dir $folder -ConfigDir $configDirs -LeftSize '4096' -LeftMtime '${NOW - 1000}' -Wrapper\r\n`)
-    expect(innerOf(launchScriptText(START))).toContain('  & $launchPath -Start $id -Name $name -Dir $folder -ConfigDir $configDirs -Wrapper\r\n')
+    expect(innerOf(launchScriptText(input()))).toContain('  & $launchPath -Resume $id -Dir $folder -ConfigDir $configDirs -Wrapper -Hosted\r\n')
+    expect(innerOf(launchScriptText(input({ left: { exitAt: NOW - 60_000 } })))).toContain(`  & $launchPath -Resume $id -Dir $folder -ConfigDir $configDirs -LeftExitAt '${NOW - 60_000}' -Wrapper -Hosted\r\n`)
+    expect(innerOf(launchScriptText(input({ left: { size: 4096, mtime: NOW - 1000 } })))).toContain(`  & $launchPath -Resume $id -Dir $folder -ConfigDir $configDirs -LeftSize '4096' -LeftMtime '${NOW - 1000}' -Wrapper -Hosted\r\n`)
+    expect(innerOf(launchScriptText(START))).toContain('  & $launchPath -Start $id -Name $name -Dir $folder -ConfigDir $configDirs -Wrapper -Hosted\r\n')
     expect(innerOf(launchScriptText(input()))).toContain(`$configDirs = @('${CONFIG}', '${OTHER_CONFIG}')`)
   })
 

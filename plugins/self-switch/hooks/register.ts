@@ -113,6 +113,7 @@ import {
   resumeTitle,
   runProbe,
   readCrons,
+  paneAfter,
   paneFallback,
   paneNoLeft,
   paneReads,
@@ -1404,10 +1405,11 @@ async function switchNow($: EngineInterface, value: Queued): Promise<void> {
   } else {
     // Each place in turn; only for want of Windows Terminal, the slot runner or a build does the next go.
     let placed = false
-    for (const leg of legs) {
-      // A hosted window's own ticket, its last place: written as the tab's is, at its time.
+    for (const [n, leg] of legs.entries()) {
+      // A hosted window's own ticket, its last place: written as the tab's is, at its time. A named window
+      // before it is refused for want of Windows Terminal or the slot runner, rather than a plain window.
       const isTab = typeof leg === 'object' && 'pane' in leg
-      const tried = await placeLaunch($, { ...base, where: leg, ...(isTab ? { now: await $.clock.now() } : {}), ...(left === undefined ? {} : { left }) }, pick.folder)
+      const tried = await placeLaunch($, { ...base, where: leg, ...(isTab ? { now: await $.clock.now() } : {}), ...(paneAfter(legs, n) ? { noPlainFallback: true } : {}), ...(left === undefined ? {} : { left }) }, pick.folder)
       if ('placed' in tried) {
         placed = true
         if (tried.placed === 'pane' && isTab) {

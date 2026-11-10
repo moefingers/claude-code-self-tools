@@ -5,7 +5,8 @@
 // CLAUDE_CODE_DISABLE_BG_SHELL_PRESSURE_REAP are "1", whether the wrapper's ticket was still there when it
 // started, the wrapper's pane file, CLAUDE_PANE_TOKEN when it is a lowercase UUID (the claude wrapper's
 // token, no secret: it names the pane file), and its parent process: its id, its start (a FILETIME) and
-// its program's path, as the probe and the pane file name it. Then, as self-restart or self-switch would, it writes the
+// its program's path, as the probe and the pane file name it; and the ids of the Windows PowerShell
+// processes under that same parent (shellSiblings). Then, as self-restart or self-switch would, it writes the
 // ticket for its run from %STUB_PLAN%\<run>.json, if there is one, with {TOKEN} replaced by its
 // CLAUDE_PANE_TOKEN and "{NOW}", "{OLD}" and "{AHEAD}" by the time now, 200 s ago and 60 s ahead, in
 // milliseconds. It sleeps %STUB_SLEEP_MS% and exits with %STUB_EXIT%, when they are set.
@@ -35,13 +36,34 @@ public static class ClaudeStub {
   [DllImport("ntdll.dll")]
   static extern int NtQueryInformationProcess(IntPtr process, int infoClass, ref BasicInfo info, int size, out int returned);
 
-  // This process's parent, as JSON: its id, its start (a FILETIME, as the probe reads one) and its program's path; null when it can't be read.
-  static string Parent() {
+  // A process's parent's id; -1 when it can't be read.
+  static int ParentId(Process process) {
     try {
       BasicInfo info = new BasicInfo();
       int returned;
-      if (NtQueryInformationProcess(Process.GetCurrentProcess().Handle, 0, ref info, Marshal.SizeOf(info), out returned) != 0) return "null";
-      using (Process parent = Process.GetProcessById(info.InheritedFromUniqueProcessId.ToInt32())) {
+      if (NtQueryInformationProcess(process.Handle, 0, ref info, Marshal.SizeOf(info), out returned) != 0) return -1;
+      return info.InheritedFromUniqueProcessId.ToInt32();
+    } catch { return -1; }
+  }
+
+  // The Windows PowerShell processes beside this one, under the same parent, by id: a PowerShell 7 window
+  // that loaded a module through Windows PowerShell's compatibility keeps one such child all its life.
+  static string ShellSiblings() {
+    int parent = ParentId(Process.GetCurrentProcess());
+    List<string> found = new List<string>();
+    if (parent < 0) return "null";
+    foreach (Process p in Process.GetProcessesByName("powershell")) {
+      try { if (ParentId(p) == parent) found.Add(p.Id.ToString()); } finally { p.Dispose(); }
+    }
+    return "[" + string.Join(",", found.ToArray()) + "]";
+  }
+
+  // This process's parent, as JSON: its id, its start (a FILETIME, as the probe reads one) and its program's path; null when it can't be read.
+  static string Parent() {
+    try {
+      int parentId = ParentId(Process.GetCurrentProcess());
+      if (parentId < 0) return "null";
+      using (Process parent = Process.GetProcessById(parentId)) {
         string path = null;
         try { path = parent.MainModule.FileName; } catch { path = null; }
         return "{\"pid\":" + parent.Id + ",\"created\":\"" + parent.StartTime.ToFileTimeUtc() + "\",\"path\":" + Q(path) + "}";
@@ -121,6 +143,7 @@ public static class ClaudeStub {
     line.Append(",\"pane\":" + (pane != null && File.Exists(pane) ? Q(File.ReadAllText(pane)) : "null"));
     line.Append(",\"token\":" + (token != null && Regex.IsMatch(token, "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$") ? Q(token) : "null"));
     line.Append(",\"parent\":" + Parent());
+    line.Append(",\"shellSiblings\":" + ShellSiblings());
     line.Append("}");
     File.AppendAllText(log, line.ToString() + "\n");
     string next = plan == null ? null : Path.Combine(plan, run + ".json");

@@ -24,7 +24,9 @@
 # checks the transcript against (a window passes it when its move rests on a left record).
 # -Wrapper runs claude through the claude wrapper's verified copy (below), so that a restart or a switch
 # out of the session comes back in this same window or tab. A launch's window always gives it; a slot
-# runner never does (it has its own loop).
+# runner never does (it has its own loop). -Hosted, with -Wrapper, says this run hosts a window a launch
+# opened, and only that window's script passes it: the wrapper's pane file then says hosted, and it
+# resumes up to 30 times an hour instead of 10 in all. Run by hand, -Wrapper alone keeps a profile's ways.
 #
 # What it does, in order:
 # 1. It checks its arguments: a session id is a lowercase UUID; a name is lowercase letters, digits and
@@ -65,8 +67,9 @@
 #    With the wrapper loaded, it calls the wrapper's `claude` function, the one it just made (never by
 #    the name, which an alias would take), with those arguments, in this process: the wrapper gives
 #    claude a fresh CLAUDE_PANE_TOKEN and a pane file naming this PowerShell, claude.exe's own parent,
-#    marked hosted (no cap of 10 moves here; placement.json, when it names a place, comes first for the
-#    next move), and when claude exits it resumes the ticket a restart or a switch left it, here. A
+#    marked hosted with -Hosted (30 moves an hour here, not 10 in all; placement.json, when it names a
+#    place, comes first for the next move), and when claude exits it resumes the ticket a restart or a
+#    switch left it, here. A
 #    ticket the wrapper doesn't use ends this script with exit 3, the reason left for the window that
 #    ran it ($ClaudeLaunchUnused), which records it and stays open; $ClaudeLaunchLast names the
 #    conversation the wrapper resumed last, for the window's closing lines.
@@ -78,7 +81,7 @@
 # the pins stop a stale or edited copy, not that user. The wrapper's copy runs at this process's own
 # level, as claude.exe does; it adds a function, not a power.
 
-param([string]$Resume, [string]$Start, [string]$Name, [string]$Dir, [string]$Lane, [string[]]$ConfigDir, [string]$LeftSize, [string]$LeftMtime, [string]$LeftExitAt, [switch]$Wrapper)
+param([string]$Resume, [string]$Start, [string]$Name, [string]$Dir, [string]$Lane, [string[]]$ConfigDir, [string]$LeftSize, [string]$LeftMtime, [string]$LeftExitAt, [switch]$Wrapper, [switch]$Hosted)
 
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
@@ -94,7 +97,7 @@ $Clear = 'CLAUDE_CODE_CHILD_SESSION', 'CLAUDECODE', 'CLAUDE_CODE_SESSION_ID', 'C
 $Drop = 'PSExecutionPolicyPreference', 'CLAUDE_PANE_TOKEN'
 $Set = [ordered]@{ CLAUDE_CODE_FORCE_SESSION_PERSISTENCE = '1'; CLAUDE_CODE_DISABLE_BG_SHELL_PRESSURE_REAP = '1' }
 # The claude wrapper's copy -Wrapper loads, by its SHA-256: WRAPPER_SCRIPT_SHA256 in the plugins' machine code.
-$WrapperSha256 = '81e31cd41b84430b397ff4f2931e6f8411e33d4298cf3e4545493da03cf02c5f'
+$WrapperSha256 = '255d8dc23c944b917fa541ae04fee908012927e77d8a85bb27bca06a70980293'
 
 function Stop-Launch($why) {
   Write-Host ('claude-launch: ' + $why + ' Nothing was started.')
@@ -321,11 +324,11 @@ foreach ($n in $Set.Keys) { [Environment]::SetEnvironmentVariable($n, $Set[$n], 
 if ($Wrapper -and $null -eq $wrapperWhy) {
   $ErrorActionPreference = 'Continue'
   # Read by the wrapper in the script scope it runs under (this script's, run as a file; the session's, run
-  # as a script block), as $script: names it on both sides: hosted here, it has no cap of 10 moves, and its
-  # pane file says hosted. And left by it there: the conversation it resumed last, and a ticket it didn't
-  # use. The flag is taken away again once it returns, so a session that ran this script by hand never
-  # keeps it for a `claude` typed later.
-  $script:ClaudeWrapperHosted = $true
+  # as a script block), as $script: names it on both sides: hosted (-Hosted, a launch's window), it resumes
+  # up to 30 times an hour, not 10 in all, and its pane file says hosted. And left by it there: the
+  # conversation it resumed last, and a ticket it didn't use. The flag is taken away again once it
+  # returns, so a session that ran this script by hand never keeps it for a `claude` typed later.
+  $script:ClaudeWrapperHosted = [bool]$Hosted
   $script:ClaudeWrapperLast = $null
   $script:ClaudeWrapperUnused = $null
   $global:ClaudeLaunchLast = $null
