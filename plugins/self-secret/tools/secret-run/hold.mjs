@@ -40,19 +40,26 @@ import {
   jsonOrNull,
 } from "./frames.mjs";
 import { PROFILE_NAME, UsageError } from "./profiles.mjs";
-import { stateFolder } from "./where.mjs";
+import { assertOwn, stateFolder, system32 } from "./where.mjs";
+
+export { system32 };
 
 export const MAX_HOLD_MINUTES = 120;
 
 const BROKER = join(dirname(fileURLToPath(import.meta.url)), "broker.mjs");
 
-/** Where holds are kept: secret-run in the state folder. */
+/** Where holds are kept: secret-run in the state folder, which must be the person's own to change (where.mjs). */
 export function holdHome() {
   const state = stateFolder();
   if (state === null)
     throw new UsageError(
       "%LOCALAPPDATA% is not set, so there is no state folder to keep holds in",
     );
+  try {
+    assertOwn([{ path: state, what: "the state folder" }]);
+  } catch (err) {
+    throw new UsageError(err.message);
+  }
   return join(state, "secret-run");
 }
 export const holdsDir = (home) => join(home, "holds");
@@ -61,13 +68,6 @@ export function holdFile(home, profile) {
     throw new Error(`${profile} is not a profile's name`);
   return join(holdsDir(home), `${profile}.json`);
 }
-
-/**
- * A Windows tool by its own path: on PATH, Git Bash's coreutils come
- * first, and its whoami is not Windows' whoami.
- */
-export const system32 = (exe) =>
-  join(process.env.SystemRoot ?? "C:\\Windows", "System32", exe);
 
 /** This user's security identifier, as Windows names it (whoami /user). */
 function userSid() {

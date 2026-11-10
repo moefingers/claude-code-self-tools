@@ -3,7 +3,8 @@
 //
 // Every form of the value an ordinary tool prints is a needle: the value,
 // each of its lines, its URL and form encodings (either case of hex), its
-// JSON, string-literal and HTML escapes, base64 (padded and not),
+// JSON escapes (\uXXXX past ASCII or for < > &, and \/, as encoders print
+// them), its string-literal and HTML escapes, base64 (padded and not),
 // base64url and hex, and its stretch of any longer base64 blob it sits in,
 // at each of the three alignments (an HTTP Basic header, a JSON body); its
 // upper and lower case, its UTF-16LE, and a long value's lines as base64
@@ -23,7 +24,9 @@
 // stopped by it: the self-secret README, Threat model. Nor are these,
 // printed by accident or not: hex with spaces between its bytes, a value
 // with a colour code inside it or wrapped at some other width, the first
-// part of a value alone, rot13.
+// part of a value alone, rot13, and its letters in a case of their own
+// mixing (all upper and all lower are caught; matching every case would
+// need a held-back start that ignores case too).
 
 import { isUtf8 } from "node:buffer";
 
@@ -47,6 +50,34 @@ const wrapped = (s, width) =>
     : (s.match(new RegExp(`.{1,${width}}`, "g")) ?? []).filter(
         (line) => line.length >= MIN_WRAPPED,
       );
+
+/**
+ * The value's JSON string escapes as encoders print them, between the
+ * quotes: JSON.stringify's own; with every character past ASCII as \uXXXX
+ * (Python's json.dumps, PHP's json_encode); with < > & escaped the same
+ * way (Go's encoding/json); with / as \/ (PHP); and each mix of those, the
+ * escapes' hex in either case.
+ */
+function jsonForms(value) {
+  const base = JSON.stringify(value).slice(1, -1);
+  const u = (c, upper) => {
+    const hex = c.charCodeAt(0).toString(16).padStart(4, "0");
+    return `\\u${upper ? hex.toUpperCase() : hex}`;
+  };
+  const out = new Set();
+  for (const ascii of [false, true])
+    for (const html of [false, true])
+      for (const slash of [false, true])
+        for (const upper of [false, true]) {
+          let s = base;
+          // Each UTF-16 unit past ASCII (a surrogate pair is two escapes).
+          if (ascii) s = s.replace(/[^\x00-\x7f]/g, (c) => u(c, upper));
+          if (html) s = s.replace(/[<>&\u2028\u2029]/g, (c) => u(c, upper));
+          if (slash) s = s.replace(/\//g, "\\/");
+          out.add(s);
+        }
+  return [...out];
+}
 
 /** The value's stretch of a longer base64 blob, at each alignment. */
 function base64Stretches(bytes) {
@@ -80,7 +111,7 @@ export function needlesOf(value, minDerived = MIN_DERIVED) {
     lowerHex(url),
     form,
     lowerHex(form),
-    JSON.stringify(value).slice(1, -1),
+    ...jsonForms(value),
     value.replace(/\\/g, "\\\\"),
     value
       .replace(/&/g, "&amp;")

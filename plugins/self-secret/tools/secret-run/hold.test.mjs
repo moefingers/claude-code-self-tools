@@ -15,9 +15,10 @@ import {
   statSync,
 } from "node:fs";
 import { userInfo } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { after, before, test } from "node:test";
 import { setTimeout as sleep } from "node:timers/promises";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { exchange, holdFile, holdsDir, system32, writeHold } from "./hold.mjs";
 import {
   FAKE,
@@ -518,6 +519,51 @@ test("--hold is limited to 120 minutes", async () => {
     // -1 reads as an option, and the parser refuses it first.
     assert.match(r.stderr, bad === "-1" ? /ambiguous/ : /at most 120/, bad);
   }
+});
+
+test("the broker itself holds for at most 120 minutes, whatever its caller asks", () => {
+  // The broker's beginHold, run in a process of its own (it ends its process when its hold ends),
+  // with no form: the caller's own checks are passed over.
+  const clampHome = join(tmp.dir, "clamp-home");
+  const broker = pathToFileURL(join(dirname(fileURLToPath(import.meta.url)), "broker.mjs")).href;
+  const harness = tmp.file(
+    "clamp.mjs",
+    `import { beginHold } from ${JSON.stringify(broker)};
+const started = Date.now();
+const r = await beginHold({
+  profile: { name: "clamp", envVar: "CLAMP", fingerprint: "f", redact: [] },
+  minutes: Number(process.argv[2]),
+  value: "made-up-for-the-clamp",
+  home: process.argv[3],
+});
+const held = r.status === "ok" ? (Date.parse(r.expiresAt) - started) / 60000 : null;
+console.log(JSON.stringify({ status: r.status, message: r.message ?? null, held }));
+if (r.status === "ok") r.end();
+else process.exit(0);
+`,
+  );
+  for (const [asked, status, low, high] of [
+    ["100000", "ok", 119.9, 120.05],
+    ["121", "ok", 119.9, 120.05],
+    ["120", "ok", 119.9, 120.05],
+    ["30", "ok", 29.9, 30.05],
+    ["0", "broker-error"],
+    ["-5", "broker-error"],
+    ["NaN", "broker-error"],
+  ]) {
+    const r = spawnSync(process.execPath, [harness, asked, clampHome], {
+      encoding: "utf8",
+      timeout: 30_000,
+      windowsHide: true,
+    });
+    const got = JSON.parse(r.stdout.trim().split("\n").at(-1) ?? "null");
+    assert.equal(got?.status, status, `${asked}: ${r.stdout}${r.stderr}`);
+    if (status === "ok")
+      assert.ok(got.held > low && got.held <= high, `${asked} held ${got.held} minutes`);
+    else assert.match(got.message, /a hold lasts more than 0 minutes/, asked);
+  }
+  const left = existsSync(holdsDir(clampHome)) ? readdirSync(holdsDir(clampHome)) : [];
+  assert.deepEqual(left, [], "each hold ended, its record cleared");
 });
 
 test("a hold's form links to its profile's url, and a profile that differs by its url alone uses the hold", async () => {

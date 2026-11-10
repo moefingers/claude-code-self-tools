@@ -12,16 +12,26 @@
 // (MDN, Turning off form autocompletion). The CSS is non-standard; MDN allows
 // such a feature where no standard option exists (MDN, -webkit-text-security).
 //
-// Only this machine reaches it, and only through the address it printed.
-// It listens on 127.0.0.1, and the address it hands out is the one the socket
-// says it listens on. Every request carries the nonce or is not found. A
-// request whose Host is not that address is refused (another name that
-// resolves here, as a DNS rebinding page's would). A POST a browser marks as
-// sent from another page is refused before its nonce is looked at: an Origin
-// other than the form's own, or "null", which the form's own no-referrer
-// policy makes a browser send; or a Sec-Fetch-Site other than same-origin, or
-// none, the person's own navigation. A client that sends neither header, a
-// script on this machine, is judged by the Host and the nonce.
+// Only this machine reaches it, and only through the address it printed,
+// once. It listens on 127.0.0.1, and the address it hands out is the one the
+// socket says it listens on. The nonce in that address opens the form once:
+// the first GET trades it for the form's cookie (HttpOnly, SameSite=Strict,
+// named for the form's port) and sends the browser to the form's own address,
+// "/", with no nonce in it. Every later request needs that cookie or is not
+// found, so a copy of the address that leaked (the printed line, the
+// browser's command line or history) is dead once the person's browser has
+// opened it; the same browser, cookie and all, is only sent back to the form.
+// Both the nonce and the cookie are compared in constant time.
+//
+// A request whose Host is not the form's address is refused (another name
+// that resolves here, as a DNS rebinding page's would). A POST a browser
+// marks as sent from another page is refused before anything else is looked
+// at: an Origin other than the form's own, "null" included (a sandboxed
+// frame, a data: or file: page, or a page that sends no referrer; the form's
+// own same-origin referrer policy has the browser send its real origin), or a
+// Sec-Fetch-Site other than same-origin, or none, the person's own
+// navigation. A client that sends neither header, a script on this machine,
+// is judged by the Host and the cookie.
 //
 // What the person pastes is trimmed at both ends, and a key with a space or
 // line break inside it is refused. A profile can also give the key's shape:
@@ -129,7 +139,9 @@ field.addEventListener("input", () => tell(field.value, false));
 
 const HEADERS = {
   "Cache-Control": "no-store",
-  "Referrer-Policy": "no-referrer",
+  // The form's own POST then carries its real Origin, so "null" can be refused; its address holds no
+  // nonce by then, and its one link (rel=noreferrer) sends none anyway.
+  "Referrer-Policy": "same-origin",
   "X-Content-Type-Options": "nosniff",
   "X-Frame-Options": "DENY",
   "Content-Security-Policy": `default-src 'none'; script-src 'sha256-${createHash("sha256").update(SCRIPT).digest("base64")}'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'`,
@@ -210,15 +222,24 @@ export const hostOf = ({ address, family, port }) =>
 
 /**
  * Whether a browser marks the request as sent from another page than the
- * form at `here` (its host and port): an Origin other than the form's own or
- * "null", or a Sec-Fetch-Site other than same-origin or none.
+ * form at `here` (its host and port): an Origin other than the form's own,
+ * "null" included, or a Sec-Fetch-Site other than same-origin or none.
  */
 export function fromAnotherPage(headers, here) {
   const origin = headers.origin;
-  if (origin !== undefined && origin !== "null" && origin !== `http://${here}`)
-    return true;
+  if (origin !== undefined && origin !== `http://${here}`) return true;
   const site = headers["sec-fetch-site"];
   return site !== undefined && site !== "same-origin" && site !== "none";
+}
+
+/** The values a Cookie header gives the cookie `name`, each as sent. */
+export function cookiesNamed(header, name) {
+  if (typeof header !== "string") return [];
+  return header
+    .split(";")
+    .map((pair) => pair.trim())
+    .filter((pair) => pair.startsWith(`${name}=`))
+    .map((pair) => pair.slice(name.length + 1));
 }
 
 /**
@@ -254,9 +275,15 @@ export function captureSecret({
 }) {
   return new Promise((resolve) => {
     const nonce = randomBytes(24).toString("base64url");
+    /** The form's cookie's value, what the nonce is traded for: never in an address. */
+    const pass = randomBytes(24).toString("base64url");
     const server = createServer();
     /** The host and port it listens on, set once it listens: the only Host it answers. */
     let here = null;
+    /** The form's cookie's name, set once it listens: one per port, as a browser keeps cookies by host alone. */
+    let cookie = null;
+    /** Whether the printed address has been opened: its nonce is then spent. */
+    let traded = false;
     let finished = false;
     let checking = false;
     let lastError = null;
@@ -282,10 +309,12 @@ export function captureSecret({
       });
       res.end(html);
     };
-    const backToForm = (res) => {
-      res.writeHead(303, { ...HEADERS, Location: `/?n=${nonce}` });
+    const backToForm = (res, set = {}) => {
+      res.writeHead(303, { ...HEADERS, ...set, Location: "/" });
       res.end();
     };
+    const withPass = (req) =>
+      cookiesNamed(req.headers.cookie, cookie).some((v) => sameNonce(v, pass));
     const formPage = () =>
       page(
         title,
@@ -293,10 +322,10 @@ export function captureSecret({
 <p>${htmlEscape(prompt)}</p>
 ${url ? `<p><a href="${htmlEscape(url)}" target=_blank rel="noopener noreferrer">Make one at ${htmlEscape(new URL(url).host)}</a> (opens in a new tab)</p>` : ""}
 ${lastError ? `<p class=error role=alert>${htmlEscape(lastError)}</p>` : ""}
-<form method=post action="/?n=${nonce}">
+<form method=post action="/">
 <input name=v type=text aria-label="${htmlEscape(title)}" autocomplete=off autocapitalize=off autocorrect=off spellcheck=false autofocus required${trim ? ` aria-describedby=status${shape ? ` data-pattern="${htmlEscape(shape.pattern)}" data-says="${htmlEscape(shape.says)}"` : ""}${spacesInside ? " data-spaces=1" : ""}` : ""}>
 ${trim ? `<p id=status class=status role=status aria-live=polite></p>` : ""}
-<div class=row><button type=submit>Submit</button><button type=submit class=secondary formaction="/cancel?n=${nonce}" formnovalidate>Cancel</button></div>
+<div class=row><button type=submit>Submit</button><button type=submit class=secondary formaction="/cancel" formnovalidate>Cancel</button></div>
 </form>
 ${note ? `<p class=note>${htmlEscape(note)}</p>` : ""}
 ${trim ? `<script>${SCRIPT}</script>` : ""}`,
@@ -318,7 +347,37 @@ ${trim ? `<script>${SCRIPT}</script>` : ""}`,
         return;
       }
       const url = new URL(req.url, `http://${here}`);
-      if (finished || !sameNonce(url.searchParams.get("n"), nonce)) {
+      if (finished) {
+        res.writeHead(404, HEADERS).end();
+        return;
+      }
+      // The printed address. Its first GET trades the nonce for the cookie; after that, only the
+      // browser holding the cookie is sent on to the form, and anything else is not found.
+      if (url.searchParams.has("n")) {
+        if (req.method !== "GET" || url.pathname !== "/") {
+          res.writeHead(404, HEADERS).end();
+          return;
+        }
+        if (traded) {
+          if (withPass(req)) return backToForm(res);
+          return send(
+            res,
+            404,
+            endPage(
+              "This address opens the form once, and it has been opened: the form is in the tab that opened it first.",
+            ),
+          );
+        }
+        if (!sameNonce(url.searchParams.get("n"), nonce)) {
+          res.writeHead(404, HEADERS).end();
+          return;
+        }
+        traded = true;
+        return backToForm(res, {
+          "Set-Cookie": `${cookie}=${pass}; Path=/; HttpOnly; SameSite=Strict; Max-Age=${Math.ceil(timeoutSec)}`,
+        });
+      }
+      if (!withPass(req)) {
         res.writeHead(404, HEADERS).end();
         return;
       }
@@ -408,6 +467,7 @@ ${trim ? `<script>${SCRIPT}</script>` : ""}`,
 
     server.listen(0, "127.0.0.1", () => {
       here = hostOf(server.address());
+      cookie = `secret-run-${server.address().port}`;
       onListening(`http://${here}/?n=${nonce}`);
     });
   });

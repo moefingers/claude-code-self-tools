@@ -52,18 +52,75 @@ export function fileUrl(path: string): string {
 }
 
 /**
- * The shim: a file that only starts the plugin's own copy of the command at `target`, so a path to the
- * shim stays the same across the plugin's updates. Nothing secret is in it.
+ * The shim: a file for use by hand that only starts an installed copy of the command, at `target`, so a
+ * path to it stays the same across the plugin's updates. Its version line says which version wrote it.
+ * Nothing secret is in it. The tool's own lines never name it: each names the copy its session loaded.
  */
-export function shimText(target: string): string {
+export function shimText(target: string, version: string): string {
   return [
     '#!/usr/bin/env node',
-    "// secret-run, as the self-secret plugin installs it. This file only starts the plugin's own copy,",
-    "// so a path to it stays the same across the plugin's updates: self-secret writes it again when a",
-    '// session starts, naming the copy that session loaded. Nothing secret is in it; removing it is safe.',
+    '// secret-run, as the self-secret plugin installs it, for use by hand. This file only starts an',
+    "// installed copy of the plugin's command, so a path to it stays the same across the plugin's updates:",
+    '// a session of a higher version writes it again. Nothing secret is in it; removing it is safe.',
+    `// self-secret version ${version}`,
     `import ${JSON.stringify(fileUrl(target))};`,
     '',
   ].join('\n')
+}
+
+/** A plain version, three numbers: what a plugin.json says, and a cache folder is named. */
+const VERSION = /^\d{1,6}\.\d{1,6}\.\d{1,6}$/
+
+/** The version a shim's text says wrote it; undefined when it says none (one written before the line). */
+export function shimVersion(text: string): string | undefined {
+  return /^\/\/ self-secret version (\d{1,6}\.\d{1,6}\.\d{1,6})\r?$/m.exec(text)?.[1]
+}
+
+/** Whether version `a` is higher than `b`, number by number. */
+export function isHigher(a: string, b: string): boolean {
+  const x = a.split('.').map(Number)
+  const y = b.split('.').map(Number)
+  for (let i = 0; i < 3; i += 1) {
+    const d = (x[i] ?? 0) - (y[i] ?? 0)
+    if (d !== 0) return d > 0
+  }
+  return false
+}
+
+/**
+ * The version an installed copy of plugin `name` at `root` is, by its folder: Claude Code installs a
+ * plugin at <config>/plugins/cache/<marketplace>/<name>/<version>. Undefined for any other folder: a
+ * `--plugin-dir` folder, a worktree, a checkout.
+ */
+export function installedVersion(root: string, name: string): string | undefined {
+  const parts = root.split(/[\\/]+/).filter(part => part !== '')
+  const n = parts.length
+  if (n < 5 || parts[n - 5] !== 'plugins' || parts[n - 4] !== 'cache' || parts[n - 2] !== name) return undefined
+  const version = parts[n - 1] ?? ''
+  return VERSION.test(version) ? version : undefined
+}
+
+/**
+ * Whether a session writes the shim, and why not when it doesn't: only from an installed copy whose
+ * manifest says the version its folder is named for (never a `--plugin-dir` folder or a worktree, whose
+ * code is no release), and only over no shim, one that says no version, or one of a lower version. One
+ * of the same or a higher version is left as it is, so sessions of two versions never trade it back and
+ * forth, and a session still on an older version never takes it back (self-switch's rule for the copy of
+ * its launcher kept for use by hand). `now` is the shim's text, undefined when there is none.
+ */
+export function shimWrite(
+  root: string,
+  name: string,
+  manifestVersion: string | undefined,
+  now: string | undefined,
+): { write: true } | { write: false; why: string } {
+  const version = installedVersion(root, name)
+  if (version === undefined) return { write: false, why: `this copy, at ${root}, is not an installed one` }
+  if (manifestVersion !== version) return { write: false, why: `this copy's plugin.json doesn't say ${version}, the version its folder is named for` }
+  if (now === undefined) return { write: true }
+  const theirs = shimVersion(now)
+  if (theirs === undefined || isHigher(version, theirs)) return { write: true }
+  return { write: false, why: `it was written by version ${theirs}, not lower than this one's ${version}` }
 }
 
 /** What a call can ask for. */
@@ -84,6 +141,12 @@ const MAX_WORD = 8192
 export type Asked = { mode: Mode; profile?: string; minutes?: number; args: string[] }
 
 const isWords = (v: unknown): v is string[] => Array.isArray(v) && v.every(w => typeof w === 'string')
+
+/** secret-run's flags that choose what a run does, which `mode` alone chooses: in `options` they'd make the line do other than its answer says. */
+const MODE_FLAGS = ['--hold', '--use-hold', '--end-hold', '--hold-status', '--list', '--help', '-h'] as const
+
+/** The flag a word is, alone or as `--flag=value`, among `flags`. */
+const flagOf = (word: string, flags: readonly string[]): string | undefined => flags.find(f => word === f || word.startsWith(`${f}=`))
 
 /**
  * The words secret-run takes for a call's input, or why the call is refused. The words themselves
@@ -107,6 +170,11 @@ export function askedOf(input: Readonly<Record<string, unknown>>): Asked | { ref
   } else if (minutes !== undefined) return { refusal: '`minutes` goes with mode hold only.' }
   if (!isWords(options)) return { refusal: '`options` is a list of words.' }
   if (options.includes('--')) return { refusal: '`options` holds no `--`: the line puts it before the command.' }
+  for (const word of options) {
+    const moded = flagOf(word, MODE_FLAGS)
+    if (moded !== undefined) return { refusal: `\`options\` holds no \`${moded}\`: \`mode\` says what the line does.` }
+    if (flagOf(word, ['--profiles']) !== undefined) return { refusal: "`options` holds no `--profiles`: the line reads the person's own profiles file." }
+  }
   if ((m === 'hold-status' || m === 'end-hold') && options.length > 0) return { refusal: `mode ${m} takes no \`options\`.` }
   if (runs) {
     if (!isWords(command) || command.length === 0 || command[0] === '') return { refusal: '`command` is the command to run, one word each: ["gh", "secret", "set", "NAME"].' }
@@ -150,7 +218,16 @@ export function bashLine(program: string, args: readonly string[], isWindows: bo
   return [...(isWindows ? ['MSYS_NO_PATHCONV=1'] : []), 'node', shQuote(path), ...args.map(shQuote)].join(' ')
 }
 
-/** The PowerShell line (PowerShell 7.3 or later passes an empty word, and a double quote, as written). */
-export function powershellLine(program: string, args: readonly string[]): string {
-  return ['node', psQuote(program), ...args.map(psQuote)].join(' ')
+/**
+ * The PowerShell line, or why there is none. It is exact in PowerShell 7.3 or later with Standard (or
+ * Windows) argument passing, which hands a program an empty word and a double quote as written. Windows
+ * PowerShell 5.1, or Legacy passing, splits a word holding a double quote into several, so a word the
+ * person reads as one could reach secret-run as more options than the line shows: such a line is
+ * refused, and the Bash line is the one to run. On Windows it calls node.exe by that name, so that a
+ * node.cmd earlier on PATH, which would hand the words to cmd.exe, is never what runs.
+ */
+export function powershellLine(program: string, args: readonly string[], isWindows: boolean): { line: string } | { refusal: string } {
+  if ([program, ...args].some(word => word.includes('"')))
+    return { refusal: 'a word holds a double quote ("), which Windows PowerShell 5.1 or Legacy argument passing would split into several words; use the Bash line' }
+  return { line: [isWindows ? 'node.exe' : 'node', psQuote(program), ...args.map(psQuote)].join(' ') }
 }

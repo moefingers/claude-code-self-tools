@@ -16,7 +16,7 @@ import { join } from "node:path";
 import { assertCheckable } from "./check.mjs";
 import { assertShape, resolvePattern } from "./patterns.mjs";
 import { redactor } from "./redact.mjs";
-import { PROFILES_NAME, nativePath, stateFolder } from "./where.mjs";
+import { PROFILES_NAME, assertOwn, nativePath, stateFolder } from "./where.mjs";
 
 export { nativePath };
 
@@ -54,10 +54,22 @@ export function profilesPath(file) {
 /**
  * Every profile, by name: the built-in generic, then the file's. The
  * person's own file, before they make it, holds none; a file named with
- * --profiles must be there.
+ * --profiles must be there. A profile says where a paste goes and what
+ * runs, so the file, and the state folder it is in, must be the person's
+ * own to change (where.mjs, trustRefusal), or none is read.
  */
 export function loadProfiles(file) {
   const path = profilesPath(file);
+  try {
+    assertOwn([
+      ...(file === undefined
+        ? [{ path: stateFolder(), what: "the state folder" }]
+        : []),
+      { path, what: "the profiles file" },
+    ]);
+  } catch (err) {
+    throw new UsageError(err.message);
+  }
   let raw = {};
   try {
     raw = JSON.parse(readFileSync(path, "utf8"));

@@ -32,14 +32,18 @@ export const NAPI = ["napi", "_FAKE", "notreal0123"].join("");
 export const dbUrl = (user = "u", pass = "p", host = "db.example/x") =>
   `${"postgres"}ql://${user}:${pass}${"@"}${host}`;
 
-/** A folder of its own for one test file, removed when it is done. */
+/**
+ * A folder of its own for one test file, removed when it is done. Its files
+ * are this user's alone to change (mode 600, whatever the umask), as
+ * secret-run asks of a profiles file (where.mjs).
+ */
 export function scratch() {
   const dir = mkdtempSync(join(tmpdir(), "self-secret-test-"));
   return {
     dir,
     file(name, text) {
       const path = join(dir, name);
-      writeFileSync(path, text);
+      writeFileSync(path, text, { mode: 0o600 });
       return path;
     },
     cleanup() {
@@ -251,12 +255,52 @@ export function watch(child) {
   };
 }
 
+/** What the tests' browser keeps: the cookie each printed address was traded for, by its nonce, with its origin. */
+const jar = new Map();
+
+/**
+ * A request as the person's browser makes it. The first request for a
+ * printed address (`/?n=<nonce>`) opens it, trading the nonce for the form's
+ * cookie and following the redirect to the form, as a browser's first visit
+ * does; when that is refused, a GET answers the refusal. After that the
+ * address stands for the form the browser was sent to: the same path with
+ * no nonce, carrying the cookie. An address with no nonce carries the cookie
+ * of the last form opened at its origin, if any. Its own answer's redirects
+ * are not followed. raw() is the client with no cookies at all.
+ */
+export async function browse(url, init = {}) {
+  const u = new URL(url);
+  const n = u.searchParams.get("n");
+  if (n !== null && !jar.has(n)) {
+    const opened = await fetch(`${u.origin}/?n=${encodeURIComponent(n)}`, {
+      redirect: "manual",
+    });
+    const set = opened.headers.getSetCookie()[0];
+    if (opened.status !== 303 || !set) {
+      if ((init.method ?? "GET") === "GET") return opened;
+      await opened.arrayBuffer();
+      return fetch(u, { ...init, redirect: "manual" });
+    }
+    await opened.arrayBuffer();
+    jar.set(n, { origin: u.origin, cookie: set.split(";")[0] });
+  }
+  const kept =
+    n !== null
+      ? jar.get(n)
+      : [...jar.values()].reverse().find((k) => k.origin === u.origin);
+  u.searchParams.delete("n");
+  return fetch(u, {
+    ...init,
+    redirect: "manual",
+    headers: { ...(kept ? { cookie: kept.cookie } : {}), ...(init.headers ?? {}) },
+  });
+}
+
 /** Posts form fields the way the browser does, without following a redirect. */
 export async function post(url, fields) {
-  const res = await fetch(url, {
+  const res = await browse(url, {
     method: "POST",
     body: new URLSearchParams(fields),
-    redirect: "manual",
   });
   return {
     status: res.status,
@@ -302,9 +346,9 @@ export function raw(url, { method = "GET", headers = {}, fields } = {}) {
   });
 }
 
-/** The page at a URL, as text. */
+/** The page at a URL, as the person's browser shows it (browse), as text. */
 export async function page(url) {
-  const res = await fetch(url);
+  const res = await browse(url);
   return { status: res.status, body: await res.text() };
 }
 
@@ -340,6 +384,7 @@ export function profilesFile(
         ...extra,
       },
     }),
+    { mode: 0o600 },
   );
   return path;
 }

@@ -26,6 +26,7 @@ import {
   jsonOrNull,
 } from "./frames.mjs";
 import {
+  MAX_HOLD_MINUTES,
   clearHold,
   holdFile,
   proof,
@@ -241,11 +242,19 @@ function watch() {
 
 /**
  * Holds a value that passed: listens on 127.0.0.1, writes the hold's
- * record and keeps the value for `minutes`. Resolves { status: "ok",
- * expiresAt, end, server } once the hold is live (end ends it), or
- * { status: "bind-error" | "broker-error", message } when it couldn't begin.
+ * record and keeps the value for `minutes`, at most MAX_HOLD_MINUTES
+ * whatever its caller asked (the caller checks it too). Resolves
+ * { status: "ok", expiresAt, end, server } once the hold is live (end ends
+ * it), or { status: "bind-error" | "broker-error", message } when it
+ * couldn't begin.
  */
-export function beginHold({ profile, minutes, value: passed, home: at }) {
+export function beginHold({ profile, minutes: asked, value: passed, home: at }) {
+  if (!(Number(asked) > 0))
+    return Promise.resolve({
+      status: "broker-error",
+      message: `a hold lasts more than 0 minutes, not ${asked}`,
+    });
+  const minutes = Math.min(Number(asked), MAX_HOLD_MINUTES);
   home = at;
   value = passed;
   patterns = profile.redact;
@@ -318,7 +327,7 @@ export function serveBroker() {
       onListening: (url) => tell({ type: "url", url }),
       onRejected: (reason) => tell({ type: "rejected", reason }),
       successText: (reached) =>
-        `Received.${reached ? ` The key reached ${reached}.` : ""} Held until ${clock(Date.now() + minutes * 60_000)}. Running the command — you can close this tab.`,
+        `Received.${reached ? ` The key reached ${reached}.` : ""} Held until ${clock(Date.now() + Math.min(minutes, MAX_HOLD_MINUTES) * 60_000)}. Running the command — you can close this tab.`,
     });
     if (result.status !== "ok") {
       await tell({

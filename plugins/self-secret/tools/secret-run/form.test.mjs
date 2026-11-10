@@ -16,7 +16,7 @@ import { connect } from "node:net";
 import { networkInterfaces } from "node:os";
 import { join } from "node:path";
 import { after, before, test } from "node:test";
-import { fromAnotherPage, shapeVerdict, trimNotes } from "./form.mjs";
+import { cookiesNamed, fromAnotherPage, shapeVerdict, trimNotes } from "./form.mjs";
 import { resolveProfile } from "./profiles.mjs";
 import {
   FAKE,
@@ -26,6 +26,7 @@ import {
   WHERE,
   WRONG,
   assertNoLeak,
+  browse,
   cancelUrl,
   fakeCheck,
   launch,
@@ -98,7 +99,11 @@ test("a wrong value is refused on the same page, and nothing runs until a right 
 
   const refused = await post(url, { v: WRONG });
   assert.equal(refused.status, 303, "it sends the browser back to the form");
-  assert.equal(new URL(refused.location, url).href, url, "the same address");
+  assert.equal(
+    new URL(refused.location, url).href,
+    `${new URL(url).origin}/`,
+    "the form's own address, with no nonce in it",
+  );
   const again = await page(url);
   assert.match(again.body, /That key didn&#39;t work: .*401/);
   assert.doesNotMatch(
@@ -257,20 +262,111 @@ test("a request without the nonce, or with another, is not found", async () => {
     ran,
   ]);
   const url = new URL(await cli.formUrl());
-  assert.equal((await page(`${url.origin}/`)).status, 404);
-  assert.equal((await page(`${url.origin}/?n=wrong`)).status, 404);
+  assert.equal((await raw(`${url.origin}/`)).status, 404);
+  assert.equal((await raw(`${url.origin}/?n=wrong`)).status, 404);
   const nearly = `${url.origin}/?n=${url.searchParams.get("n").slice(0, -1)}x`;
-  assert.equal((await page(nearly)).status, 404);
-  assert.equal((await post(`${url.origin}/?n=wrong`, { v: FAKE })).status, 404);
-  assert.equal(
-    (await post(`${url.origin}/cancel?n=wrong`, {})).status,
-    404,
-    "nor can a page without it cancel",
-  );
+  assert.equal((await raw(nearly)).status, 404);
+  for (const where of [`${url.origin}/?n=wrong`, `${url.origin}/`, url.href])
+    assert.equal(
+      (await raw(where, { method: "POST", fields: { v: FAKE } })).status,
+      404,
+      `a POST to ${new URL(where).pathname}${new URL(where).search ? "?n=…" : ""} without the cookie`,
+    );
+  for (const where of [`${url.origin}/cancel?n=wrong`, `${url.origin}/cancel`])
+    assert.equal(
+      (await raw(where, { method: "POST", fields: {} })).status,
+      404,
+      "nor can a page without it cancel",
+    );
   assert.equal(existsSync(ran), false, "nothing ran on a post without it");
+  // A wrong nonce spends nothing: the printed address still opens the form.
   assert.equal((await post(url.href, { v: FAKE })).status, 200);
   assert.equal((await cli.done).code, 0);
   assert.equal(existsSync(ran), true);
+});
+
+test("the printed address opens the form once: its nonce is traded for the form's cookie, and a copy of it is dead after", async () => {
+  const ran = join(tmp.dir, "ran-once");
+  const cli = launch(SECRET_RUN, [
+    ...generic("--timeout", "20"),
+    "--",
+    process.execPath,
+    marker,
+    ran,
+  ]);
+  const url = await cli.formUrl();
+  const { origin, port } = new URL(url);
+  const nonce = new URL(url).searchParams.get("n");
+
+  // The first visit: a cookie for the form, and on to the form's own address.
+  const first = await raw(url);
+  assert.equal(first.status, 303);
+  assert.equal(first.headers.location, "/");
+  const set = first.headers["set-cookie"] ?? [];
+  assert.equal(set.length, 1);
+  assert.match(
+    set[0],
+    new RegExp(`^secret-run-${port}=[\\w-]{32}; Path=/; HttpOnly; SameSite=Strict; Max-Age=20$`),
+  );
+  assert.ok(!set[0].includes(nonce), "the cookie is not the nonce");
+  const cookie = set[0].split(";")[0];
+  const [name] = cookie.split("=");
+
+  // A copy of the address, used after: not found, by GET or POST, and nothing else opens the form.
+  const again = await raw(url);
+  assert.equal(again.status, 404, "the printed address, a second time");
+  assert.equal(again.headers["set-cookie"], undefined, "and no cookie for it");
+  assert.match(again.body, /opens the form once, and it has been opened/);
+  assert.equal(
+    (await raw(url, { method: "POST", fields: { v: FAKE } })).status,
+    404,
+  );
+  for (const headers of [
+    {},
+    { Cookie: `${name}=${"x".repeat(32)}` },
+    { Cookie: `${name}=${cookie.slice(name.length + 1, -1)}` },
+    { Cookie: `${name}-other=${cookie.slice(name.length + 1)}` },
+    { Cookie: `secret-run-${Number(port) + 1}=${cookie.slice(name.length + 1)}` },
+  ]) {
+    assert.equal((await raw(`${origin}/`, { headers })).status, 404, JSON.stringify(headers));
+    assert.equal(
+      (await raw(`${origin}/`, { method: "POST", headers, fields: { v: FAKE } })).status,
+      404,
+      JSON.stringify(headers),
+    );
+    assert.equal(
+      (await raw(`${origin}/cancel`, { method: "POST", headers, fields: {} })).status,
+      404,
+      JSON.stringify(headers),
+    );
+  }
+  assert.equal(existsSync(ran), false, "nothing ran");
+
+  // The browser that opened it: the form, with no nonce in it; the printed address only sends it back there.
+  const form = await raw(`${origin}/`, { headers: { Cookie: `other=1; ${cookie}` } });
+  assert.equal(form.status, 200);
+  assert.match(form.body, /<form method=post action="\/">/);
+  assert.match(form.body, /formaction="\/cancel"/);
+  assert.ok(!form.body.includes(nonce), "the page holds no nonce");
+  const back = await raw(url, { headers: { Cookie: cookie } });
+  assert.equal(back.status, 303);
+  assert.equal(back.headers.location, "/");
+  assert.equal(back.headers["set-cookie"], undefined, "no second cookie");
+  const accepted = await raw(`${origin}/`, {
+    method: "POST",
+    headers: { Cookie: cookie },
+    fields: { v: FAKE },
+  });
+  assert.equal(accepted.status, 200);
+  assert.equal((await cli.done).code, 0);
+  assert.equal(existsSync(ran), true);
+});
+
+test("a Cookie header is read pair by pair", () => {
+  assert.deepEqual(cookiesNamed(undefined, "a"), []);
+  assert.deepEqual(cookiesNamed("a=1; b=2;a=3", "a"), ["1", "3"]);
+  assert.deepEqual(cookiesNamed("ab=1; xa=2", "a"), []);
+  assert.deepEqual(cookiesNamed("a=x=y", "a"), ["x=y"]);
 });
 
 test("a request for another Host is refused (DNS rebinding), whatever it carries", async () => {
@@ -301,7 +397,7 @@ test("a request for another Host is refused (DNS rebinding), whatever it carries
     assert.equal(posted.status, 403, `POST with Host ${host}`);
   }
   assert.equal(existsSync(ran), false, "nothing ran");
-  assert.equal((await raw(url)).status, 200, "its own Host is answered");
+  assert.equal((await page(url)).status, 200, "its own Host is answered");
   assert.equal((await post(url, { v: FAKE })).status, 200);
   assert.equal((await cli.done).code, 0);
   assert.equal(existsSync(ran), true);
@@ -319,36 +415,37 @@ test("a POST a browser marks as from another page is refused before its nonce or
   ]);
   const url = await cli.formUrl();
   const own = new URL(url).origin;
+  // The person's browser has opened the form: the POSTs below carry its cookie, and are refused all the same.
+  const cookie = (await raw(url)).headers["set-cookie"][0].split(";")[0];
   for (const headers of [
     { Origin: "https://attacker.example" },
     { Origin: "http://127.0.0.1:1" },
     { Origin: "http://localhost" },
     { "Sec-Fetch-Site": "cross-site" },
     { "Sec-Fetch-Site": "same-site" },
+    // A sandboxed frame, a data: or file: page, or a page that sends no referrer.
+    { Origin: "null" },
+    { Origin: "null", "Sec-Fetch-Site": "same-origin" },
     { Origin: "null", "Sec-Fetch-Site": "cross-site" },
   ]) {
-    for (const where of [url, cancelUrl(url)]) {
-      const r = await raw(where, { method: "POST", headers, fields: { v: FAKE } });
+    for (const where of [`${own}/`, `${own}/cancel`, url, cancelUrl(url)]) {
+      const r = await raw(where, {
+        method: "POST",
+        headers: { ...headers, Cookie: cookie },
+        fields: { v: FAKE },
+      });
       assert.equal(r.status, 403, `${JSON.stringify(headers)} to ${new URL(where).pathname}`);
     }
   }
   assert.equal(existsSync(ran), false, "nothing ran");
   assert.equal(check.hits.length, asked, "the check was never asked");
-  // What a browser sends from the form itself: its own origin, or null under
-  // its no-referrer policy, and same-origin.
-  for (const headers of [
-    { Origin: own, "Sec-Fetch-Site": "same-origin" },
-    { Origin: "null", "Sec-Fetch-Site": "same-origin" },
-  ]) {
-    const r = await raw(url, { method: "POST", headers, fields: { v: WRONG } });
-    assert.equal(r.status, 303, `${JSON.stringify(headers)} reaches the check`);
-  }
-  assert.equal(check.hits.length, asked + 2);
-  const r = await raw(url, {
-    method: "POST",
-    headers: { Origin: "null", "Sec-Fetch-Site": "same-origin" },
-    fields: { v: FAKE },
-  });
+  // What a browser sends from the form itself, under its same-origin referrer
+  // policy: its own origin, same-origin, and the form's cookie.
+  const fromForm = { Origin: own, "Sec-Fetch-Site": "same-origin", Cookie: cookie };
+  const wrong = await raw(`${own}/`, { method: "POST", headers: fromForm, fields: { v: WRONG } });
+  assert.equal(wrong.status, 303, "the form's own POST reaches the check");
+  assert.equal(check.hits.length, asked + 1);
+  const r = await raw(`${own}/`, { method: "POST", headers: fromForm, fields: { v: FAKE } });
   assert.equal(r.status, 200);
   assert.equal((await cli.done).code, 0);
   assert.equal(existsSync(ran), true);
@@ -358,7 +455,8 @@ test("which requests count as from another page", () => {
   const here = "127.0.0.1:5000";
   assert.equal(fromAnotherPage({}, here), false, "no header: the nonce decides");
   assert.equal(fromAnotherPage({ origin: "http://127.0.0.1:5000" }, here), false);
-  assert.equal(fromAnotherPage({ origin: "null" }, here), false);
+  assert.equal(fromAnotherPage({ origin: "null" }, here), true, "null is another page");
+  assert.equal(fromAnotherPage({ origin: "null", "sec-fetch-site": "same-origin" }, here), true);
   assert.equal(fromAnotherPage({ "sec-fetch-site": "same-origin" }, here), false);
   assert.equal(fromAnotherPage({ "sec-fetch-site": "none" }, here), false);
   assert.equal(fromAnotherPage({ origin: "http://127.0.0.1:5001" }, here), true);
@@ -604,7 +702,10 @@ test("a paste's whitespace and shape are said in words that never quote it", () 
 test("a value without its shape, or with a space inside, is refused before its check is asked", async () => {
   const asked = check.hits.length;
   const cli = launch(SECRET_RUN, [
+    // --timeout 20: a failed assertion before the paste leaves the form waiting no longer.
     ...generic(
+      "--timeout",
+      "20",
       "--shape",
       "^fake\\+\\S+$",
       "--shape-says",
@@ -618,7 +719,7 @@ test("a value without its shape, or with a space inside, is refused before its c
   const url = await cli.formUrl();
 
   // LOAD-BEARING: the page's one script runs because the policy names its hash, and nothing else can.
-  const res = await fetch(url);
+  const res = await browse(url);
   const html = await res.text();
   const script = /<script>([\s\S]*?)<\/script>/.exec(html)?.[1];
   assert.ok(script, "the form has its script");
@@ -635,7 +736,7 @@ test("a value without its shape, or with a space inside, is refused before its c
   assert.match(csp, /form-action 'self'/);
   assert.match(csp, /frame-ancestors 'none'/);
   assert.doesNotMatch(csp, /connect-src/, "the page can send nothing anywhere");
-  assert.equal(res.headers.get("referrer-policy"), "no-referrer");
+  assert.equal(res.headers.get("referrer-policy"), "same-origin");
   assert.equal(res.headers.get("x-frame-options"), "DENY");
   assert.equal(res.headers.get("cache-control"), "no-store");
   assert.match(html, /data-says="start with fake\+ and have no spaces"/);
@@ -698,7 +799,7 @@ test("a url is a link under the prompt, escaped, to a new tab that gets no opene
     "",
   ]);
   const url = await cli.formUrl();
-  const res = await fetch(url);
+  const res = await browse(url);
   const html = await res.text();
   assert.match(
     html,

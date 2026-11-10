@@ -3,17 +3,19 @@
 // a form on 127.0.0.1 in the person's browser, a check before anything runs, the value handed to the
 // one command in its variable and masked in everything it prints, and holds for later commands.
 //
-// The plugin runs none of it. It keeps a stable copy of the command in the state folder (the shim,
-// secret-run.mjs, written at each session start and before each answer, naming the copy this load of
-// the plugin carries), and its one tool hands the session the exact line to run through Bash, where the
-// person's permission rules and the transcript see it. No value passes through the plugin: it reads no
+// The plugin runs none of it. Its one tool hands the session the exact line to run through Bash, where
+// the person's permission rules and the transcript see it, naming the copy of the command this session
+// loaded, so a session runs the version it has. For use by hand it keeps a stable copy in the state
+// folder (the shim, secret-run.mjs), written at a session's start only from an installed copy and only
+// over one of a lower version (shim.ts, shimWrite). No value passes through the plugin: it reads no
 // secret and no variable but the five that place the state folder (and the update check's own), starts
 // no process, and its answers hold only paths, the words the session gave, and fixed text.
 import type { EngineInterface, Register } from 'claude-code'
-import { askedOf, BASH_TIMEOUT_MS, bashLine, inFolder, powershellLine, PROFILES_NAME, SHIM_NAME, shimText, stateFolder } from './shim'
+import { askedOf, BASH_TIMEOUT_MS, bashLine, inFolder, installedVersion, powershellLine, PROFILES_NAME, SHIM_NAME, shimText, shimWrite, stateFolder } from './shim'
 import type { Asked } from './shim'
-import { configureUpdateCheck, loadUpdateCheck, withUpdateNotice } from './update-check'
+import { configureUpdateCheck, isVersion, loadUpdateCheck, withUpdateNotice } from './update-check'
 
+const NAME = 'self-secret'
 const TOOL = 'mcp__self-secret__secret_run_command'
 
 const DESCRIPTION = [
@@ -51,16 +53,32 @@ async function where($: EngineInterface): Promise<Where | { refusal: string }> {
 
 const why = (err: unknown): string => (err instanceof Error ? err.message : String(err)).replace(/\s+/g, ' ').trim().slice(0, 300)
 
-/** Writes the shim unless it already names this copy. Says why when it can't. */
-async function placeShim($: EngineInterface, at: Where): Promise<{ isPlaced: true } | { isPlaced: false; why: string }> {
-  const text = shimText(at.target)
-  const now = await $.fs.read(at.shim).catch(() => undefined)
-  if (now === text) return { isPlaced: true }
+/** The version this copy's plugin.json says, or undefined. */
+async function manifestVersion($: EngineInterface): Promise<string | undefined> {
   try {
-    await $.fs.write(at.shim, text)
-    return { isPlaced: true }
+    const manifest: unknown = JSON.parse(await $.fs.read(`${$.plugin.root.replace(/[\\/]+$/, '')}/.claude-plugin/plugin.json`))
+    const version = typeof manifest === 'object' && manifest !== null ? (manifest as { version?: unknown }).version : undefined
+    return isVersion(version) ? version : undefined
+  } catch {
+    return undefined
+  }
+}
+
+/**
+ * Writes the shim, for use by hand, when this session may (shim.ts, shimWrite: from an installed copy,
+ * over none or a lower version). The debug log's line when it doesn't, or undefined.
+ */
+async function placeShim($: EngineInterface, at: Where): Promise<string | undefined> {
+  const root = $.plugin.root
+  const manifest = installedVersion(root, NAME) === undefined ? undefined : await manifestVersion($)
+  const now = manifest === undefined ? undefined : await $.fs.read(at.shim).catch(() => undefined)
+  const decided = shimWrite(root, NAME, manifest, now)
+  if (!decided.write) return `self-secret: the stable command at ${at.shim} is left as it is: ${decided.why}.`
+  try {
+    await $.fs.write(at.shim, shimText(at.target, manifest ?? ''))
+    return undefined
   } catch (err) {
-    return { isPlaced: false, why: why(err) }
+    return `self-secret: couldn't write ${at.shim}: ${why(err)}`
   }
 }
 
@@ -88,24 +106,21 @@ function whatHappens(asked: Asked): string {
   }
 }
 
-/** The tool's answer: the lines, where they come from, and what happens. */
-function answer(asked: Asked, at: Where, shim: { isPlaced: true } | { isPlaced: false; why: string }): string {
-  const program = shim.isPlaced ? at.shim : at.target
+/** The tool's answer: the lines, on the copy this session loaded, and what happens. */
+function answer(asked: Asked, at: Where): string {
   const waits = asked.mode === 'once' || asked.mode === 'hold'
   const how = waits ? `Run it with the Bash tool, in the foreground, with timeout ${BASH_TIMEOUT_MS}:` : 'Run it with the Bash tool:'
-  const stale = shim.isPlaced
-    ? ''
-    : `\n\n(The stable copy at ${at.shim} couldn't be written: ${shim.why}. These lines name the plugin's own copy, whose path changes with its version.)`
+  const ps = powershellLine(at.target, asked.args, at.isWindows)
   return [
     how,
     '',
-    bashLine(program, asked.args, at.isWindows),
+    bashLine(at.target, asked.args, at.isWindows),
     '',
-    `From PowerShell 7.3 or later: ${powershellLine(program, asked.args)}`,
+    'line' in ps ? `From PowerShell 7.3 or later (Standard argument passing): ${ps.line}` : `No PowerShell line: ${ps.refusal}.`,
     '',
     whatHappens(asked),
     '',
-    `The person's profiles are in ${at.profiles} (mode list shows them); generic is built in.${stale}`,
+    `The person's profiles are in ${at.profiles} (mode list shows them); generic is built in.`,
   ].join('\n')
 }
 
@@ -139,7 +154,7 @@ export const register: Register = (on, options) => {
             type: 'array',
             items: { type: 'string' },
             description:
-              'More options for secret-run, one word each, before the command. For generic: --prompt <text>, and one of --check-url <https url> (with --check-header "Authorization: Bearer {value}" and --check-status <code> as it needs), --check-cmd <shell command that reads the value on stdin> or --no-check; and as it fits --shape <regex> --shape-says <words>, --url <https page where the key is made>, --env-var <NAME> (SECRET by default), --spaces-inside. For any: --redact <regex>, --timeout <seconds>, --profiles <file>.',
+              'More options for secret-run, one word each, before the command. For generic: --prompt <text>, and one of --check-url <https url> (with --check-header "Authorization: Bearer {value}" and --check-status <code> as it needs), --check-cmd <shell command that reads the value on stdin> or --no-check; and as it fits --shape <regex> --shape-says <words>, --url <https page where the key is made>, --env-var <NAME> (SECRET by default), --spaces-inside. For any: --redact <regex>, --timeout <seconds>. Never --, a flag `mode` chooses (--hold, --use-hold, --end-hold, --hold-status, --list, --help) or --profiles.',
           },
           command: {
             type: 'array',
@@ -154,8 +169,8 @@ export const register: Register = (on, options) => {
     loadUpdateCheck($)
     const at = await where($).catch(() => undefined)
     if (at !== undefined && !('refusal' in at)) {
-      const shim = await placeShim($, at)
-      if (!shim.isPlaced) $.ui.log(`self-secret: couldn't write ${at.shim}: ${shim.why}`, { to: 'debug' })
+      const unplaced = await placeShim($, at).catch((err: unknown) => `self-secret: couldn't place ${at.shim}: ${why(err)}`)
+      if (unplaced !== undefined) $.ui.log(unplaced, { to: 'debug' })
     }
     return started
   })
@@ -166,6 +181,6 @@ export const register: Register = (on, options) => {
     if ('refusal' in asked) return { deny: asked.refusal }
     const at = await where($)
     if ('refusal' in at) return { deny: at.refusal }
-    return { result: answer(asked, at, await placeShim($, at)) }
+    return { result: answer(asked, at) }
   }).catch(($, e, next) => (next.called ? next(e) : { deny: 'self-secret: working out the command line failed; nothing ran.' }))
 }

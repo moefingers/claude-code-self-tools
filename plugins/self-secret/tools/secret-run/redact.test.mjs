@@ -168,6 +168,35 @@ test("the value's JSON, string-literal and HTML escapes, and lowercase percent-e
   }
 });
 
+test("the value's JSON as other encoders print it: \\uXXXX past ASCII or for < > &, and \\/, in either case of hex", () => {
+  const q = `fake/päss<&>wörd-${FAKE.slice(-16)}-ü😀`;
+  const { scrub, lines } = redactor(q);
+  const esc = (c, upper) => {
+    const hex = c.charCodeAt(0).toString(16).padStart(4, "0");
+    return `\\u${upper ? hex.toUpperCase() : hex}`;
+  };
+  const inner = JSON.stringify(q).slice(1, -1);
+  const forms = {
+    // Python's json.dumps: ensure_ascii, the escapes' hex in lower case.
+    python: inner.replace(/[^\x00-\x7f]/g, (c) => esc(c, false)),
+    // PHP's json_encode: unicode escaped and / as \/ (here in upper case hex).
+    php: inner.replace(/[^\x00-\x7f]/g, (c) => esc(c, true)).replace(/\//g, "\\/"),
+    // Go's encoding/json: < > & escaped, the rest as is.
+    go: inner.replace(/[<>&]/g, (c) => esc(c, false)),
+    "slash alone": inner.replace(/\//g, "\\/"),
+  };
+  for (const [name, form] of Object.entries(forms)) {
+    assert.notEqual(form, inner, `${name} is a form of its own`);
+    assert.equal(scrub(`{"v":"${form}"}`), `{"v":"${MASK}"}`, name);
+    // Fed a byte at a time, the held-back start covers these too.
+    let out = "";
+    const s = lines((b) => (out += b.toString("utf8")));
+    for (const byte of Buffer.from(`k ${form} end\n`)) s.push(Buffer.from([byte]));
+    s.end();
+    assert.equal(out, `k ${MASK} end\n`, `${name}, a byte at a time`);
+  }
+});
+
 test("a pattern reads characters, not bytes: a non-ASCII URL is masked whole", () => {
   const red = redactor("unrelated-value-123", ["postgres(ql)?://\\S+"]);
   const line = `url ${"postgres"}://user:pàssword-fake${"@"}host/db`;
