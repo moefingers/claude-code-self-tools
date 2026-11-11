@@ -264,7 +264,9 @@ test("a request without the nonce, or with another, is not found", async () => {
   const url = new URL(await cli.formUrl());
   assert.equal((await raw(`${url.origin}/`)).status, 404);
   assert.equal((await raw(`${url.origin}/?n=wrong`)).status, 404);
-  const nearly = `${url.origin}/?n=${url.searchParams.get("n").slice(0, -1)}x`;
+  // One character off: the last, changed to another (a base64url nonce can end in x itself, 1 run in 64).
+  const n = url.searchParams.get("n");
+  const nearly = `${url.origin}/?n=${n.slice(0, -1)}${n.endsWith("x") ? "y" : "x"}`;
   assert.equal((await raw(nearly)).status, 404);
   for (const where of [`${url.origin}/?n=wrong`, `${url.origin}/`, url.href])
     assert.equal(
