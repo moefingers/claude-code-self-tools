@@ -1,7 +1,7 @@
 // The launch scripts the machine code builds (launchScriptText), run for real on Windows (review F5):
 // the whole script under the stub claude.exe (scripts/stub.mjs), so that it finds its caller's
 // claude.exe by walking up as it does under Claude Code; and the new window's own script, run here in a
-// hidden Windows PowerShell exactly as the window runs it (the same bootstrap, -ExecutionPolicy Bypass),
+// hidden Windows PowerShell exactly as the window runs it (from its file, by -File, -ExecutionPolicy Bypass),
 // against claude-launch.ps1 and the stub. Temporary folders only (USERPROFILE, LOCALAPPDATA and the
 // config folder), and never a window: no test lets a script reach Start-Process, and each script run
 // here has it replaced by a throw besides, or by a function that only records what the window would
@@ -12,12 +12,11 @@
 import assert from 'node:assert/strict'
 import { spawn } from 'node:child_process'
 import { createHash, randomUUID } from 'node:crypto'
-import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import { after, before, describe, test } from 'node:test'
 import { pathToFileURL } from 'node:url'
-import { gzipSync } from 'node:zlib'
 import { compileStub, fence, holder, noWindow, recordWindow, underStub, WINDOWS_POWERSHELL, stubWork } from './stub.mjs'
 import { ROOT } from './sync-shared.mjs'
 
@@ -242,19 +241,27 @@ function innerOf(script) {
   return script.slice(from, end).split("''").join("'")
 }
 
+/** The file a window's script deletes first: its own, as the launch named it (windowScriptPath). */
+function fileOf(inner) {
+  const path = /^try \{ \[IO\.File\]::Delete\('([^']+)'\) \} catch \{ \}\r\n/.exec(inner)?.[1]
+  assert.ok(path !== undefined, "the window's script deletes its own file first")
+  return path
+}
+
 /**
- * The window's script, run as Start-Process runs it, but hidden and here: the same unpacking bootstrap
- * (gzip, base64), Windows PowerShell with -NoProfile -ExecutionPolicy Bypass -EncodedCommand. Its Enter
- * prompts are answered on standard input. Its output, its exit code, and the claude runs it made.
- * `onOut`, when given, sees the output so far each time more comes.
+ * The window's script, run as Start-Process runs it, but hidden and here: written where the launch writes
+ * it (UTF-8 with its byte order mark), then Windows PowerShell with -NoProfile -ExecutionPolicy Bypass
+ * -File. Its Enter prompts are answered on standard input. Its output, its exit code, the claude runs it
+ * made, and whether its file is still there once it has ended (`fileLeft`). `onOut`, when given, sees the
+ * output so far each time more comes.
  */
 function runWindow(inner, dirs, extra = {}, onOut = undefined) {
-  const payload = gzipSync(Buffer.from(inner, 'utf8')).toString('base64')
-  const unpack = `& ([scriptblock]::Create([IO.StreamReader]::new([IO.Compression.GZipStream]::new([IO.MemoryStream]::new([Convert]::FromBase64String('${payload}')), [IO.Compression.CompressionMode]::Decompress), [Text.Encoding]::UTF8).ReadToEnd()))`
-  const encoded = Buffer.from(unpack, 'utf16le').toString('base64')
+  const file = fileOf(inner)
+  mkdirSync(dirname(file), { recursive: true })
+  writeFileSync(file, '\ufeff' + inner, 'utf8')
   const env = envOf(dirs, extra)
   return new Promise(resolve => {
-    const child = spawn(WINDOWS_POWERSHELL, ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-EncodedCommand', encoded], { env, cwd: dirs.root, windowsHide: true })
+    const child = spawn(WINDOWS_POWERSHELL, ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', file], { env, cwd: dirs.root, windowsHide: true })
     let out = ''
     const more = chunk => {
       out += chunk
@@ -265,7 +272,7 @@ function runWindow(inner, dirs, extra = {}, onOut = undefined) {
     const timer = setTimeout(() => child.kill(), 90_000)
     child.on('close', code => {
       clearTimeout(timer)
-      resolve({ code, out, runs: runsOf(dirs) })
+      resolve({ code, out, runs: runsOf(dirs), fileLeft: existsSync(file) })
     })
     child.stdin.end('\r\n\r\n\r\n')
   })
@@ -301,6 +308,9 @@ describe("the window's own script, run as the window runs it (hidden, here)", { 
     // The run ended within seconds: the window says how to resume by hand, and waits for Enter.
     assert.match(ran.out, /Claude Code ended \(exit code 0\)\./)
     assert.equal(ran.code, 0)
+    // Its own file, the launch's alone, named by its claim: gone once it ran.
+    assert.equal(fileOf(inner), machine.windowScriptPath(dirs.state, input.claim.slice('launch:'.length)))
+    assert.equal(ran.fileLeft, false, 'the window deletes its own file')
   })
 
   test('a launcher whose hash changed after the launch put it there: not run, and the window says so', async () => {
@@ -312,6 +322,17 @@ describe("the window's own script, run as the window runs it (hidden, here)", { 
     assert.ok(!existsSync(machine.claimPath(dirs.state, input.id)), 'a window that refuses gives the claim back (N5)')
     assert.match(ran.out, /Once it is safe, resume it yourself: & '.+claude-launch\.ps1' -Resume [0-9a-f-]{36} -Dir '.+'/)
     assert.equal(ran.code, 1)
+    assert.equal(ran.fileLeft, false, 'a refusing window deletes its own file too')
+  })
+
+  test("a folder with a name past ASCII: read whole from the window's file (its byte order mark), and resumed there", async () => {
+    const dirs = lab()
+    const folder = join(dirs.root, 'café über 中')
+    mkdirSync(folder)
+    const { input, inner } = windowLab({ folder })
+    const ran = await runWindow(inner, windowLabDirs(input))
+    assert.equal(ran.runs.length, 1, ran.out)
+    assert.equal(ran.runs[0].cwd, folder)
   })
 
   test('a claim that names another launch: not run', async () => {
@@ -493,16 +514,22 @@ const VERSION = 'if ($pwshOk) { try { $pwshOk = [Diagnostics.FileVersionInfo]::G
 /**
  * A launch script whose Program Files folder is `folder` (a test can't change Windows' own): the one place
  * the interpreter rule reads it, made a literal. With `aside` ('shape' or 'version'), that check of the
- * rule is set aside too, so the other is all that stands.
+ * rule is set aside too, so the other is all that stands; with 'both', both are, so a pwsh.exe that is
+ * there passes (a test's own file, never run: the window is only recorded).
  */
 function withProgramFiles(script, folder, aside = undefined) {
   assert.equal(script.split(PROGRAM_FILES).length, 2, 'the interpreter rule reads the Program Files folder once')
   assert.ok(!/['"]/.test(folder))
-  const placed = script.split(PROGRAM_FILES).join(`'${folder}'`)
-  if (aside === undefined) return placed
-  const [check, instead] = aside === 'shape' ? [SHAPE, "$pwsh -cmatch '.'"] : [VERSION, '']
-  assert.equal(placed.split(check).length, 2, `the ${aside} check is there once`)
-  return placed.split(check).join(instead)
+  let placed = script.split(PROGRAM_FILES).join(`'${folder}'`)
+  for (const [name, check, instead] of [
+    ['shape', SHAPE, "$pwsh -cmatch '.'"],
+    ['version', VERSION, ''],
+  ]) {
+    if (aside !== name && aside !== 'both') continue
+    assert.equal(placed.split(check).length, 2, `the ${name} check is there once`)
+    placed = placed.split(check).join(instead)
+  }
+  return placed
 }
 
 /** The launch of a window that resumes `id` in its folder, run under the stub, its Start-Process recorded: the answer, the input, and what the window was given. */
@@ -529,7 +556,10 @@ async function launchWindow(dirs, id, extra, change = script => script) {
 function openRecorded(window, dirs, extra, enterAfter = undefined) {
   const env = envOf(dirs, extra)
   return new Promise(resolve => {
-    const child = spawn(window.file, window.args, { env, cwd: dirs.root, windowsHide: true })
+    // Windows PowerShell's Start-Process joins its arguments into one command line as they are, so the quotes
+    // around the script's path are the command line's: spawn quotes for itself.
+    const args = window.args.map(arg => (/^".*"$/.test(arg) ? arg.slice(1, -1) : arg))
+    const child = spawn(window.file, args, { env, cwd: dirs.root, windowsHide: true })
     let out = ''
     let waited = false
     let answered = false
@@ -586,6 +616,9 @@ async function windowRun({ programFiles = 'real', restricted = false, copy = 'ok
   // it, so only the check that pwsh.exe is there turns the window to Windows PowerShell.
   if (programFiles !== 'real') assert.ok(machine.PWSH_PATH.test(machine.pwshPath(SYSTEM_ROOT)) && !existsSync(machine.pwshPath(SYSTEM_ROOT)), `${SYSTEM_ROOT} is of the shape, with no PowerShell 7 in it`)
   const launched = await launchWindow(dirs, id, extra, programFiles === 'real' ? undefined : script => withProgramFiles(script, SYSTEM_ROOT))
+  // The window's own script, as the launch wrote it for the window to run.
+  const windowFile = machine.windowScriptPath(dirs.state, launched.input.claim.slice('launch:'.length))
+  const written = existsSync(windowFile) ? readFileSync(windowFile) : undefined
   const wrapperCopy = machine.wrapperScriptPath(dirs.state)
   const installed = existsSync(wrapperCopy) ? readFileSync(wrapperCopy) : undefined
   if (copy === 'missing') rmSync(wrapperCopy, { force: true })
@@ -609,7 +642,7 @@ async function windowRun({ programFiles = 'real', restricted = false, copy = 'ok
       const path = join(dirs.root, `probe-${n}.out`)
       return existsSync(path) ? machine.parseProbe(readFileSync(path, 'utf8')) : { error: 'no probe output' }
     }
-    return { dirs, id, other, otherFolder, launched, installed, opened, probeOf, held }
+    return { dirs, id, other, otherFolder, launched, installed, opened, probeOf, held, windowFile, written, windowFileLeft: existsSync(windowFile) }
   } finally {
     held?.stop()
   }
@@ -629,9 +662,13 @@ describe("a window's launch, end to end: the interpreter it chose, the wrapper's
     const r = await windowRun()
     const shell = hasPwsh ? PWSH : WINDOWS_POWERSHELL
     assert.equal(r.launched.answer.launched?.transport, 'window', r.launched.ran.stdout + r.launched.ran.stderr)
-    // (c) The interpreter rule, and the command as ever: -NoProfile, Bypass for the window's scripts, the fixed bootstrap.
+    // (c) The interpreter rule, and the command: -NoProfile, Bypass for the window's scripts, -File and the window's own file, quoted.
     assert.equal(r.launched.window.file.toLowerCase(), shell.toLowerCase())
-    assert.deepEqual(r.launched.window.args.slice(0, 4), ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-EncodedCommand'])
+    assert.deepEqual(r.launched.window.args, ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', `"${r.windowFile}"`])
+    // Written whole by the launch: UTF-8 with its byte order mark, the window's script and nothing else; gone once the window ran.
+    assert.deepEqual([...(r.written ?? Buffer.alloc(0)).subarray(0, 3)], [0xef, 0xbb, 0xbf])
+    assert.equal(r.written?.subarray(3).toString('utf8'), innerOf(machine.launchScriptText(r.launched.input)))
+    assert.equal(r.windowFileLeft, false, 'the window deletes its own file')
     // The wrapper's copy put in place by the launch, at its hash's name, byte for byte.
     assert.equal(r.installed?.toString('utf8'), machine.WRAPPER_SCRIPT_TEXT)
     assert.equal(createHash('sha256').update(r.installed).digest('hex'), machine.WRAPPER_SCRIPT_SHA256)
@@ -807,4 +844,225 @@ describe("a window's launch, end to end: the interpreter it chose, the wrapper's
       assert.match(said[0], /\. Claude starts directly, so a restart from this session opens in a new window or tab\.$/)
     })
   }
+})
+
+describe("the window's own script file: left ones swept by a later launch", { skip: !isWindows && 'Windows only' }, () => {
+  test('a later launch deletes only window scripts of the shape older than a stale claim, and writes its own whole', async () => {
+    const dirs = lab()
+    const folder = join(dirs.state, 'windows')
+    mkdirSync(folder, { recursive: true })
+    const old = (Date.now() - machine.CLAIM_STALE_MS - 60_000) / 1000
+    const seed = (name, stale) => {
+      const path = join(folder, name)
+      writeFileSync(path, 'exit 9')
+      if (stale) utimesSync(path, old, old)
+      return path
+    }
+    const staleScript = seed(`${randomUUID()}.ps1`, true)
+    const staleTemp = seed(`${randomUUID()}.ps1.${randomUUID().replaceAll('-', '')}.tmp`, true)
+    const fresh = seed(`${randomUUID()}.ps1`, false)
+    const otherName = seed('notes.ps1', true)
+    const upper = seed(`${randomUUID().toUpperCase()}.ps1`, true)
+    const launched = await launchWindow(dirs, randomUUID(), {})
+    assert.equal(launched.answer.launched?.transport, 'window', launched.ran.stdout + launched.ran.stderr)
+    assert.deepEqual([existsSync(staleScript), existsSync(staleTemp)], [false, false], 'stale ones of the shape are gone')
+    assert.deepEqual([existsSync(fresh), existsSync(otherName), existsSync(upper)], [true, true, true], 'a fresh one, and any other name, are left')
+    // Its own: the window was only recorded here, so its file is still there, whole, with the byte order mark.
+    const own = machine.windowScriptPath(dirs.state, launched.input.claim.slice('launch:'.length))
+    const bytes = readFileSync(own)
+    assert.deepEqual([...bytes.subarray(0, 3)], [0xef, 0xbb, 0xbf])
+    assert.equal(bytes.subarray(3).toString('utf8'), innerOf(machine.launchScriptText(launched.input)))
+    assert.deepEqual(launched.window.args, ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', `"${own}"`])
+  })
+})
+
+// ---------------------------------------------------------------------------------------------
+// A Group Policy execution policy, read as the launch reads it but from hives of the test's own (never the
+// registry, which a test may not write and whose real policy would change the answers), and a window's file
+// the window never read. The window is only recorded, or its Start-Process throws: nothing opens.
+
+/** Where Group Policy sets each PowerShell's execution policy, as the launch reads it. */
+const CORE_KEY = 'Software\\Policies\\Microsoft\\PowerShellCore'
+const WINDOWS_KEY = 'Software\\Policies\\Microsoft\\Windows\\PowerShell'
+/** The one line of a launch script naming the hives it reads Group Policy from. */
+const HIVES = '$policyRoots = @([Microsoft.Win32.Registry]::LocalMachine, [Microsoft.Win32.Registry]::CurrentUser)'
+
+/**
+ * A launch script whose Group Policy comes from `machine` (HKLM) and `user` (HKCU) as given, not the registry:
+ * each a key's path to its values ({ [WINDOWS_KEY]: { EnableScripts: 1, ExecutionPolicy: 'AllSigned' } }), or a
+ * string, a hive whose every read throws it. Each fake answers OpenSubKey, GetValue and Dispose as a
+ * RegistryKey does: $null for a key or a value that isn't there.
+ */
+function withPolicy(script, { machine = {}, user = {} } = {}) {
+  assert.equal(script.split(HIVES).length, 2, 'the hives are named on one line, once')
+  const ps = value => (typeof value === 'number' ? String(value) : `'${String(value).split("'").join("''")}'`)
+  const hive = keys => (typeof keys === 'string' ? ps(keys) : `@{ ${Object.entries(keys).map(([path, values]) => `${ps(path)} = @{ ${Object.entries(values).map(([name, value]) => `${ps(name)} = ${ps(value)}`).join('; ')} }`).join('; ')} }`)
+  const fake = [
+    'function New-PolicyHive($keys) {',
+    '  $hive = [pscustomobject]@{ Keys = $keys }',
+    '  $hive | Add-Member -MemberType ScriptMethod -Name OpenSubKey -Value { param($path) if ($this.Keys -is [string]) { throw $this.Keys }; if (-not $this.Keys.ContainsKey($path)) { return $null }; $key = [pscustomobject]@{ Values = $this.Keys[$path] }; $key | Add-Member -MemberType ScriptMethod -Name GetValue -Value { param($name) $this.Values[$name] }; $key | Add-Member -MemberType ScriptMethod -Name Dispose -Value { }; return $key }',
+    '  return $hive',
+    '}',
+    `$policyRoots = @((New-PolicyHive ${hive(machine)}), (New-PolicyHive ${hive(user)}))`,
+  ].join('\r\n')
+  return script.split(HIVES).join(fake)
+}
+
+/** No PowerShell 7 (the Windows folder, of the standard shape and with none in it), and the hives given. */
+const windowsOnly = hives => script => withPolicy(withProgramFiles(script, SYSTEM_ROOT), hives)
+
+/** Nothing of the launch's in the state folder: no claim, no launcher or its hand copy, no wrapper's copy, no window script. */
+function nothingWritten(dirs, input) {
+  assert.deepEqual(
+    [machine.claimPath(dirs.state, input.id), machine.launchScriptPath(dirs.state), machine.launchHandPath(dirs.state), machine.wrapperScriptPath(dirs.state), join(dirs.state, 'windows')].filter(path => existsSync(path)),
+    [],
+    'nothing written or claimed',
+  )
+}
+
+describe('a Group Policy execution policy: read for the PowerShell the window would run in, refused before anything is written or claimed', { skip: !isWindows && 'Windows only', concurrency: 2 }, () => {
+  test("Windows PowerShell's policy AllSigned (MachinePolicy) or Restricted (UserPolicy, EnableScripts 0): refused policy, with the old process still running, and nothing written", async () => {
+    for (const [hives, said] of [
+      [{ machine: { [WINDOWS_KEY]: { EnableScripts: 1, ExecutionPolicy: 'AllSigned' } } }, /\(Windows PowerShell AllSigned\)/],
+      [{ user: { [WINDOWS_KEY]: { EnableScripts: 0 } } }, /\(Windows PowerShell Restricted\)/],
+    ]) {
+      const dirs = lab()
+      const launched = await launchWindow(dirs, randomUUID(), {}, windowsOnly(hives))
+      assert.equal(launched.answer.refused?.code, 'policy', launched.ran.stdout + launched.ran.stderr)
+      assert.match(launched.answer.refused.why, /^self-restart: a Group Policy execution policy runs no unsigned script file /)
+      assert.match(launched.answer.refused.why, said)
+      assert.equal(launched.answer.claim, undefined, 'no claim taken')
+      assert.equal(launched.window, undefined, 'no window')
+      nothingWritten(dirs, launched.input)
+    }
+  })
+
+  test('MachinePolicy wins over UserPolicy; an Undefined one, RemoteSigned, or hives that cannot be read: the window opens in Windows PowerShell', async () => {
+    for (const hives of [
+      { machine: { [WINDOWS_KEY]: { EnableScripts: 1, ExecutionPolicy: 'Unrestricted' } }, user: { [WINDOWS_KEY]: { EnableScripts: 1, ExecutionPolicy: 'AllSigned' } } },
+      { user: { [WINDOWS_KEY]: { EnableScripts: 1, ExecutionPolicy: 'RemoteSigned' } } },
+      // EnableScripts 1 with no policy beside it, and a key of PowerShell 7 alone: Undefined for Windows PowerShell.
+      { machine: { [WINDOWS_KEY]: { EnableScripts: 1 } }, user: { [CORE_KEY]: { EnableScripts: 0 } } },
+      { machine: 'Requested registry access is not allowed.', user: 'Requested registry access is not allowed.' },
+    ]) {
+      const dirs = lab()
+      const launched = await launchWindow(dirs, randomUUID(), {}, windowsOnly(hives))
+      assert.equal(launched.answer.launched?.transport, 'window', `${JSON.stringify(hives)}\n${launched.ran.stdout}${launched.ran.stderr}`)
+      assert.equal(launched.window.file.toLowerCase(), WINDOWS_POWERSHELL.toLowerCase())
+    }
+  })
+
+  test("PowerShell 7 at hand: its own policy, or Windows PowerShell's where it defers, decides; one that stops the file falls back to Windows PowerShell, and both stopping it refuses", async () => {
+    // A pwsh.exe of the test's own where PowerShell 7 would be, its path's shape and its version set aside: never run.
+    const pf = mkdtempSync(join(work, 'pf-'))
+    mkdirSync(join(pf, 'PowerShell', '7'), { recursive: true })
+    const pwsh = join(pf, 'PowerShell', '7', 'pwsh.exe')
+    writeFileSync(pwsh, 'not a program')
+    const AllSigned = { EnableScripts: 1, ExecutionPolicy: 'AllSigned' }
+    for (const [name, hives, expected] of [
+      ['no policy', {}, pwsh],
+      ["PowerShell 7's own RemoteSigned", { machine: { [CORE_KEY]: { EnableScripts: 1, ExecutionPolicy: 'RemoteSigned' } } }, pwsh],
+      ["Windows PowerShell's AllSigned alone, which PowerShell 7 doesn't read", { machine: { [WINDOWS_KEY]: AllSigned } }, pwsh],
+      ["PowerShell 7's own AllSigned", { machine: { [CORE_KEY]: AllSigned } }, WINDOWS_POWERSHELL],
+      ["PowerShell 7's own Restricted (UserPolicy, EnableScripts 0), Windows PowerShell's RemoteSigned", { machine: { [WINDOWS_KEY]: { EnableScripts: 1, ExecutionPolicy: 'RemoteSigned' } }, user: { [CORE_KEY]: { EnableScripts: 0 } } }, WINDOWS_POWERSHELL],
+      ['PowerShell 7 deferring to an Unrestricted Windows PowerShell, its own AllSigned passed over', { machine: { [CORE_KEY]: { ...AllSigned, UseWindowsPowerShellPolicySetting: 1 }, [WINDOWS_KEY]: { EnableScripts: 1, ExecutionPolicy: 'Unrestricted' } } }, pwsh],
+      ['PowerShell 7 deferring to an AllSigned Windows PowerShell', { machine: { [CORE_KEY]: { EnableScripts: 1, ExecutionPolicy: 'Unrestricted', UseWindowsPowerShellPolicySetting: 1 }, [WINDOWS_KEY]: AllSigned } }, 'refused'],
+      ["both AllSigned by their own keys", { machine: { [CORE_KEY]: AllSigned }, user: { [WINDOWS_KEY]: AllSigned } }, 'refused'],
+    ]) {
+      const dirs = lab()
+      const launched = await launchWindow(dirs, randomUUID(), {}, script => withPolicy(withProgramFiles(script, pf, 'both'), hives))
+      if (expected === 'refused') {
+        assert.equal(launched.answer.refused?.code, 'policy', `${name}\n${launched.ran.stdout}${launched.ran.stderr}`)
+        assert.match(launched.answer.refused.why, /\(PowerShell 7 AllSigned, Windows PowerShell AllSigned\)/, name)
+        nothingWritten(dirs, launched.input)
+        continue
+      }
+      assert.equal(launched.answer.launched?.transport, 'window', `${name}\n${launched.ran.stdout}${launched.ran.stderr}`)
+      assert.equal(launched.window.file.toLowerCase(), expected.toLowerCase(), name)
+    }
+  })
+
+  test("'auto': refused for the policy when it would open the window; never when it goes to this pane's slot, which opens none", async () => {
+    const hives = { machine: { [WINDOWS_KEY]: { EnableScripts: 1, ExecutionPolicy: 'AllSigned' } } }
+    const decide = 'if ($slotOk) { $by = "slot:" + $slot["id"]; $transport = "slot" } else { $transport = "window" }'
+    for (const slot of [false, true]) {
+      const dirs = lab()
+      let input
+      const ran = await underStub({
+        stub,
+        work,
+        env: envOf(dirs),
+        script: self => {
+          input = launchInput(dirs, { where: 'auto', waitForExit: { pid: self.pid, created: self.created }, now: Date.now(), deadline: Date.now() + 60_000 })
+          const script = noWindow(withPolicy(withProgramFiles(machine.launchScriptText(input), SYSTEM_ROOT), hives))
+          assert.equal(script.split(decide).length, 2, "'auto' decides once")
+          // This pane's slot taken as verified (the lab runs none): what the script does once it has decided on it.
+          return slot ? script.split(decide).join(`$slot = @{ id = '1-2' }; $by = "slot:" + $slot["id"]; $transport = "slot"`) : script
+        },
+      })
+      const answer = machine.parseLaunch(ran.stdout)
+      if (!slot) {
+        assert.equal(answer.refused?.code, 'policy', ran.stdout + ran.stderr)
+        nothingWritten(dirs, input)
+        continue
+      }
+      assert.deepEqual(answer.launched, { transport: 'slot', label: '1-2' }, ran.stdout + ran.stderr)
+      assert.ok(existsSync(join(dirs.state, 'slots', '1-2.next.json')), "the slot's record")
+      assert.ok(!existsSync(join(dirs.state, 'windows')), 'no window script')
+    }
+  })
+})
+
+describe("a window's file the window never read: deleted by the launch", { skip: !isWindows && 'Windows only', concurrency: 2 }, () => {
+  test('Start-Process throwing once the file is in place: refused place, the claim given back, and the file gone', async () => {
+    const dirs = lab()
+    let input
+    const ran = await underStub({
+      stub,
+      work,
+      env: envOf(dirs),
+      script: self => {
+        input = launchInput(dirs, { waitForExit: { pid: self.pid, created: self.created }, now: Date.now(), deadline: Date.now() + 60_000 })
+        // noWindow: a throw right before Start-Process, as one that fails throws, after the file was written and moved.
+        return noWindow(windowsOnly({})(machine.launchScriptText(input)))
+      },
+    })
+    const answer = machine.parseLaunch(ran.stdout)
+    assert.equal(answer.refused?.code, 'place', ran.stdout + ran.stderr)
+    assert.match(answer.refused.why, /a test never opens a window/)
+    assert.equal(answer.claim, input.claim)
+    assert.ok(!existsSync(machine.claimPath(dirs.state, input.id)), 'the claim given back')
+    assert.ok(existsSync(join(dirs.state, 'windows')), 'the file was written')
+    assert.ok(!existsSync(machine.windowScriptPath(dirs.state, input.claim.slice('launch:'.length))), 'and is gone')
+  })
+
+  test('a window withdrawn once placed (its claim taken back meanwhile): killed, refused late, and its file gone', async () => {
+    const dirs = lab()
+    const killed = join(dirs.root, 'killed')
+    let input
+    const ran = await underStub({
+      stub,
+      work,
+      env: envOf(dirs),
+      script: self => {
+        input = launchInput(dirs, { waitForExit: { pid: self.pid, created: self.created }, now: Date.now(), deadline: Date.now() + 60_000 })
+        const script = windowsOnly({})(machine.launchScriptText(input))
+        assert.ok(!/\\Start-Process|Diagnostics\.Process\]::Start|ProcessStartInfo/.test(script), 'nothing reaches a process start past the function below')
+        // A Start-Process of the test's own, defined first: it opens nothing, and the claim is taken back meanwhile (its
+        // lock deleted), so the launch withdraws the window: its Kill recorded; it has no WaitForExit, which throws.
+        return [
+          'function Start-Process { param([string]$FilePath, [string[]]$ArgumentList, [switch]$PassThru)',
+          `  [IO.File]::Delete('${machine.claimPath(dirs.state, input.id)}')`,
+          `  [pscustomobject]@{ Id = 0 } | Add-Member -MemberType ScriptMethod -Name Kill -Value { [IO.File]::WriteAllText('${killed}', 'killed') } -PassThru`,
+          '}',
+          script,
+        ].join('\r\n')
+      },
+    })
+    const answer = machine.parseLaunch(ran.stdout)
+    assert.equal(answer.refused?.code, 'late', ran.stdout + ran.stderr)
+    assert.ok(existsSync(killed), 'the window killed')
+    assert.ok(existsSync(join(dirs.state, 'windows')), 'the file was written')
+    assert.ok(!existsSync(machine.windowScriptPath(dirs.state, input.claim.slice('launch:'.length))), 'and is gone')
+  })
 })

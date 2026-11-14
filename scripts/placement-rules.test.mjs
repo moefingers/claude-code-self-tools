@@ -435,7 +435,7 @@ const CHECKS = {
     assert.ok(inner.includes('      for ($try = 0; $try -lt 3; $try++) {\r\n        if ($try -gt 0) { Start-Sleep -Milliseconds 250 }\r\n        try { [IO.File]::Delete($claimPath); break } catch { }\r\n'), 'D4: tried three times')
     assert.ok(inner.includes('  } catch { } finally { $stream.Dispose() }\r\n'), 'D4: never throws')
     const late = m.launchScriptText(launchInput({ deadline: NOW }))
-    assert.ok(late.includes('if ($transport -eq "window" -and $null -ne $window) { try { $window.Kill() } catch { } }'), 'N6')
+    assert.ok(late.includes('if ($transport -eq "window" -and $null -ne $window) { try { $window.Kill() } catch { };'), 'N6')
   },
   async trampoline(m) {
     assert.equal(m.GO_VIA, 'direct', 'it ships as direct: the flip is one commit after M17a-d')
@@ -639,6 +639,44 @@ const CHECKS = {
     assert.ok(s.includes("if ($held) { $answer = 'held' } else {"))
     assert.equal(m.RELOCKED.exec('held\r\n')?.[1], 'held')
   },
+  windowFile(m) {
+    // The window's own script: a file of its own, named by the launch's claim, written whole with a byte order
+    // mark, run by -File, and deleted by the window first. Never a self-unpacking -EncodedCommand (GZip, base64,
+    // [scriptblock]::Create), which an antivirus hooked into AMSI blocks before a line of it runs.
+    const s = scriptsOf(m).plain
+    const file = m.windowScriptPath(STATE, FRESH)
+    assert.ok(s.includes(`$windowFile = '${file}'`), "the launch's own file")
+    assert.ok(s.includes(`$window = Start-Process -FilePath $windowShell -ArgumentList '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', ('"' + $windowFile + '"') -PassThru`), '-File, the path quoted')
+    assert.ok(!/GZipStream|\$unpack|\$encoded|'-EncodedCommand'|\[scriptblock\]::Create/.test(s), 'no self-unpacking bootstrap')
+    assert.ok(s.includes('[IO.File]::WriteAllText($windowTemp, $inner, [Text.UTF8Encoding]::new($true))'), 'with a byte order mark')
+    const move = s.indexOf('try { [IO.File]::Move($windowTemp, $windowFile) } catch { [IO.File]::Delete($windowTemp); throw }')
+    assert.ok(move > s.indexOf('[IO.File]::WriteAllText($windowTemp') && move < s.indexOf('$window = Start-Process'), 'written whole, then moved to its name, before the window starts')
+    assert.ok(s.includes(`$inner = 'try { [IO.File]::Delete(''${file}'') } catch { }\r\n`), 'the window deletes its own file first')
+    assert.ok(s.includes(`.TotalMilliseconds -gt ${m.CLAIM_STALE_MS}) { try { [IO.File]::Delete($staleFile) } catch { } }`), 'only a file older than a stale claim is swept')
+    assert.ok(s.includes(`-cmatch '${m.LAUNCH_ID.source.replace(/\$$/, '')}\\.ps1(\\.[0-9a-f]{32}\\.tmp)?\\z'`), "only names of LAUNCH_ID's shape are swept")
+    // A file the window never read: deleted with a place that failed, and with a window withdrawn once it has gone.
+    assert.ok(s.includes("} catch { $placeWhy = $_.Exception.Message; if ($null -ne $windowFile) { try { [IO.File]::Delete($windowFile) } catch { } }; Refuse 'place'"), 'a place that failed deletes the file')
+    const late = m.launchScriptText(launchInput({ claim: `launch:${FRESH}`, deadline: NOW }))
+    assert.ok(late.includes('try { $window.Kill() } catch { }; if ($null -ne $windowFile) { try { [void]$window.WaitForExit(2000) } catch { }; try { [IO.File]::Delete($windowFile) } catch { } } }'), 'a withdrawn window deletes the file')
+  },
+  windowPolicy(m) {
+    // A Group Policy execution policy that runs no unsigned script file: read for whichever PowerShell the window
+    // would run in (PowerShell 7's own key, or Windows PowerShell's where it defers), before anything is written or
+    // claimed, refused as `policy`; and only where a window opens ('auto' going to the window, a named window
+    // falling back to the plain one).
+    const s = scriptsOf(m).plain
+    const pwsh = s.indexOf("if ($pwshOk) { $pwshPolicy = Read-GroupPolicy 'Software\\Policies\\Microsoft\\PowerShellCore' $true; if ($pwshPolicy -eq 'AllSigned' -or $pwshPolicy -eq 'Restricted') { $pwshOk = $false } }")
+    assert.ok(pwsh > 0, "PowerShell 7's own policy read, and it passed over when it runs no unsigned file")
+    const refused = s.indexOf("if (-not $pwshOk) { $windowsPolicy = Read-GroupPolicy 'Software\\Policies\\Microsoft\\Windows\\PowerShell' $false; if ($windowsPolicy -eq 'AllSigned' -or $windowsPolicy -eq 'Restricted') {")
+    assert.ok(refused > pwsh && s.indexOf("Refuse 'policy'", refused) > refused, "Windows PowerShell's policy read when PowerShell 7 isn't the window's, and refused on")
+    assert.ok(s.indexOf("Refuse 'policy'") < s.indexOf('$installWhy = Install-Launcher') && s.indexOf("Refuse 'policy'") < s.indexOf('$taken = New-Claim'), 'refused before anything is written or claimed')
+    assert.ok(s.includes("if ($defer -is [int] -and $defer -eq 1) { $key.Dispose(); $key = $null; $key = $root.OpenSubKey('Software\\Policies\\Microsoft\\Windows\\PowerShell') }"), "PowerShell 7's key defers to Windows PowerShell's")
+    assert.ok(s.includes("} catch { $policy = 'Undefined' } finally {"), 'a read that fails is Undefined, never refused on')
+    const auto = m.launchScriptText(launchInput({ claim: `launch:${FRESH}`, where: 'auto' }))
+    assert.ok(auto.includes("\r\nif ($transport -eq 'window') {\r\n  try { $pwsh = "), "'auto' reads it only when it goes to the window")
+    assert.ok(scriptsOf(m).named.includes('\r\nif ($null -ne $slotFallback) {\r\n  try { $pwsh = '), 'a named window reads it only when it falls back to the plain one')
+    for (const [name, script] of Object.entries(scriptsOf(m)).filter(([name]) => name.startsWith('slot') || name.startsWith('tab'))) assert.ok(!script.includes("Refuse 'policy'"), `${name} opens no window and is never refused for it`)
+  },
   leftAtLastLook(m) {
     // D1: every stat a window takes, claude-launch.ps1 takes.
     assert.ok(m.LAUNCH_SCRIPT_TEXT.includes("$Whole = '^\\d{1,16}\\z'"))
@@ -709,7 +747,7 @@ const FAULTS = [
   ['S3: a refusal no one but the window hears of', 'windowRefusal', "    '  Write-Refused $refusal',\n", ''],
   ['S3: an error no one but the window hears of', 'windowRefusal', "    `  Write-Refused (\"claude-launch.ps1 stopped on an error: \" + $_.Exception.Message)`,\n", ''],
   ['a refusing window keeping the claim', 'windowRefusal', "  `  Write-Host (\"Once it is safe, resume it yourself: \" + ${byHand})`,\n    '  Release-Claim',\n".replace('  `  Write', '    `  Write'), "    `  Write-Host (\"Once it is safe, resume it yourself: \" + ${byHand})`,\n"],
-  ['a window withdrawn left waiting', 'windowRefusal', `          '  if ($transport -eq "window" -and $null -ne $window) { try { $window.Kill() } catch { } }',\n`, ''],
+  ['a window withdrawn left waiting', 'windowRefusal', '{ try { $window.Kill() } catch { }; if ($null -ne $windowFile)', '{ if ($null -ne $windowFile)'],
   ['GO_VIA shipped as the trampoline', 'trampoline', "export const GO_VIA: 'trampoline' | 'direct' = 'direct'", "export const GO_VIA: 'trampoline' | 'direct' = 'trampoline'"],
   ["the handler's epoch check removed", 'trampoline', "const fresh = (): string | undefined => (go.epoch !== at.epoch || go.running ? 'a turn came first' : undefined)", 'const fresh = (): string | undefined => undefined'],
   ['the inner command awaited', 'trampoline', '  void queueIt($, at.step)\n', '  await queueIt($, at.step)\n'],
@@ -747,7 +785,36 @@ const FAULTS = [
   ['N2: wt by its bare name', 'wtByItsPath', '$window = Start-Process $wtExe -ArgumentList', '$window = Start-Process wt.exe -ArgumentList'],
   ["N12: a live holder's lock taken", 'relockHolder', "if ($held) { $answer = 'held' } else {", "if ($false) { $answer = 'held' } else {"],
   ['the left stat left off a tab', 'leftAtLastLook', "...(input.left === undefined ? {} : { left: input.left }) }\n  const tabOf", "}\n  const tabOf"],
+  ['the window back on -EncodedCommand', 'windowFile', `'-File', ('"' + $windowFile + '"')`, "'-EncodedCommand', $encoded"],
+  ['the window script written without its byte order mark', 'windowFile', '[IO.File]::WriteAllText($windowTemp, $inner, [Text.UTF8Encoding]::new($true))', '[IO.File]::WriteAllText($windowTemp, $inner)'],
+  ['the window script written in place', 'windowFile', "    'try { [IO.File]::Move($windowTemp, $windowFile) } catch { [IO.File]::Delete($windowTemp); throw }',\n", ''],
+  ['a window keeping its script file', 'windowFile', '    `try { [IO.File]::Delete(${literal(v.file)}) } catch { }`,\n', ''],
+  ['a fresh window script swept', 'windowFile', '.TotalMilliseconds -gt ${CLAIM_STALE_MS})', '.TotalMilliseconds -gt 0)'],
+  ['a failed place leaving its window script', 'windowFile', "if ($null -ne $windowFile) { try { [IO.File]::Delete($windowFile) } catch { } }; Refuse 'place'", "Refuse 'place'"],
+  ['a withdrawn window leaving its script', 'windowFile', '; try { [IO.File]::Delete($windowFile) } catch { } } }', ' } }'],
+  ["PowerShell 7's policy left unread", 'windowPolicy', "if ($pwshPolicy -eq 'AllSigned' -or $pwshPolicy -eq 'Restricted') { $pwshOk = $false }", 'if ($false) { $pwshOk = $false }'],
+  ["Windows PowerShell's policy let through to the window", 'windowPolicy', "if ($windowsPolicy -eq 'AllSigned' -or $windowsPolicy -eq 'Restricted') {", 'if ($false) {'],
+  ['the policy read after the claim (or not at all)', 'windowPolicy', '    ...chooseShell,\n', ''],
+  ['PowerShell 7 deferring to no one', 'windowPolicy', 'if ($defer -is [int] -and $defer -eq 1)', 'if ($false)'],
+  ['a policy that could not be read refused on', 'windowPolicy', "} catch { $policy = 'Undefined' } finally {", "} catch { $policy = 'Restricted' } finally {"],
+  ["'auto' refused for the policy when it goes to this pane's slot", 'windowPolicy', `transport === 'auto' ? "$transport -eq 'window'" :`, "transport === 'auto' ? undefined :"],
+  ['a named window refused for the policy when Windows Terminal opens it', 'windowPolicy', "'$null -ne $slotFallback' : undefined", 'undefined : undefined'],
 ]
+
+describe("the window script sweep's names follow LAUNCH_ID", () => {
+  const work = mkdtempSync(join(tmpdir(), 'machine-launch-id-'))
+  after(() => rmSync(work, { recursive: true, force: true }))
+  test('a copy of the machine code with another LAUNCH_ID sweeps by that shape, never a pattern of its own', async () => {
+    const from = 'export const LAUNCH_ID = SESSION_ID'
+    assert.equal(sourceText.split(from).length, 2, 'LAUNCH_ID is defined once')
+    const path = join(work, 'machine-launch-id.ts')
+    writeFileSync(path, sourceText.split(from).join('export const LAUNCH_ID = /^[0-9a-f-]{36}$/'))
+    const copy = await import(pathToFileURL(path).href)
+    const s = copy.launchScriptText(launchInput({ claim: `launch:${FRESH}` }))
+    assert.ok(s.includes("-cmatch '^[0-9a-f-]{36}\\.ps1(\\.[0-9a-f]{32}\\.tmp)?\\z'"), 'the sweep follows LAUNCH_ID')
+    assert.ok(!s.includes("-cmatch '^[0-9a-f]{8}-"), 'no uuid pattern of its own')
+  })
+})
 
 describe('planted faults in a copy of the machine code, each caught by its check', () => {
   const work = mkdtempSync(join(tmpdir(), 'machine-faults-'))
