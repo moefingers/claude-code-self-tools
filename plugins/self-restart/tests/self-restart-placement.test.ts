@@ -213,6 +213,27 @@ test("a place the launch can't be built for (a config folder Windows Terminal wo
   expect(commands).toEqual([{ command: 'exit' }])
 })
 
+test("refused for a Group Policy execution policy: 'auto' after it is still tried (this pane's slot opens no window), and refused the same, nothing exits", async ($, on) => {
+  let n = 0
+  const POLICY = 'refused policy self-restart: a Group Policy execution policy runs no unsigned script file (Windows PowerShell AllSigned), and a new window runs its own script from one, so none is opened'
+  const { scripts, commands, toasts, clock } = engine(on, {
+    env: STAMP,
+    placement: FILE,
+    refuses: script => {
+      n += 1
+      // The tab for want of Windows Terminal; then each place that may open a plain window, for the policy.
+      return n === 1 ? 'refused wt self-restart: a tab needs Windows Terminal 1.19 or later' : script.includes("Refuse 'policy'") ? POLICY : undefined
+    },
+  })
+  await $.session.start(start)
+  await restart($, clock)
+  expect(scripts).toHaveLength(3)
+  expect(scripts[1]).toContain('-w claude-overflow')
+  expect(scripts[2]).toContain("if ($transport -eq 'window') {")
+  expect(commands).toEqual([])
+  expect(toasts.join('\n')).toContain("Restart didn't run: the launcher didn't place the restart (refused: self-restart: a Group Policy execution policy runs no unsigned script file")
+})
+
 test('any other refusal stops the restart: nothing more is tried, and nothing exits', async ($, on) => {
   const { scripts, commands, clock } = engine(on, { env: STAMP, placement: FILE, refuses: () => 'refused claim self-restart: another holds the claim' })
   await $.session.start(start)

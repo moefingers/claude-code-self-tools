@@ -88,7 +88,7 @@ import type { Queued, Restart } from '../types'
 import { go } from './go'
 import { launch as buildLaunch, parseLaunch, powershellPath, RELEASED, releaseScript, SESSION_ID, stateFolder, SYSTEM_ROOT } from './launcher'
 import type { AgentLike, LaunchInput, LaunchWhere, Pane, PendingKind, Placement, Probe } from './machine'
-import { goAnswer, goRun, agentsHeld, agentsWayOut, blockersText, claimOf, exitBlockers, idLag, isBusyAgent, isSafeFolder, isWindowName, LAUNCH_DEADLINE_MS, LAUNCH_RETRY_MS, LAUNCH_RUN_MS, launchFolderFault, launchFolderSaid, loadPlacement, markPending, movesConversation, oneLine, paneAfter, paneFallback, paneTicketPath, pickLaunchTransport, plainOutput, powershellCall, quoted, readExit, readGit, readPane, resumeTitle, runProbe, safePoint, SLOT_SCRIPT_SHA256, idPathOrNone, TAB_LABEL } from './machine'
+import { goAnswer, goRun, agentsHeld, agentsWayOut, blockersText, claimOf, exitBlockers, idLag, isBusyAgent, isSafeFolder, isWindowName, LAUNCH_DEADLINE_MS, LAUNCH_RETRY_MS, LAUNCH_RUN_MS, launchFolderFault, launchFolderSaid, loadPlacement, markPending, movesConversation, oneLine, paneAfter, paneFallback, placeAfter, paneTicketPath, pickLaunchTransport, plainOutput, powershellCall, quoted, readExit, readGit, readPane, resumeTitle, runProbe, safePoint, SLOT_SCRIPT_SHA256, idPathOrNone, TAB_LABEL } from './machine'
 import { checkTranscript, findTranscript, isProjectOf, type Transcript, transcriptFolder } from './start-folder'
 import { configureUpdateCheck, loadUpdateCheck, withUpdateNotice } from './update-check'
 
@@ -687,9 +687,13 @@ async function restartNow($: EngineInterface, value: Queued): Promise<void> {
     let unclean = false
     // The places, in turn: this tab's wrapper; or this pane's slot ('auto' decides it in the script); or
     // placement.json's tab and window, then 'auto'. The next only when one is refused for want of Windows
-    // Terminal or the slot runner.
+    // Terminal or the slot runner; past a Group Policy execution policy that stops a window's script, only
+    // a place that opens no window (placeAfter): every window after it would meet the same policy.
     const legs = await restartLegs($, site.state, judged.probe, launch, pane)
+    /** The place tried next (placeAfter): the ones before it are passed over. */
+    let from = 0
     for (const [n, where] of legs.entries()) {
+      if (n < from) continue
       triedTab = typeof where === 'object' && 'pane' in where
       ours = claimOf(where) ?? `launch:${crypto.randomUUID()}`
       claim = undefined
@@ -754,7 +758,10 @@ async function restartNow($: EngineInterface, value: Queued): Promise<void> {
         unclean = true
         opened = `the launcher didn't run: ${why(err)}`
       }
-      if (opened === undefined || n === legs.length - 1 || (refusedFor !== 'wt' && refusedFor !== 'slotscript')) break
+      if (opened === undefined) break
+      const next = placeAfter(legs, n, refusedFor)
+      if (next === undefined) break
+      from = next
       $.ui.log(`the placed restart wasn't used: ${oneLine(opened, 300)}. The next place is tried.`)
     }
     // A claim taken for a launch that isn't in place is given back at once (a clean refusal gave back

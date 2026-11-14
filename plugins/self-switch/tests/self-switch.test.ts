@@ -80,8 +80,8 @@ type Options = {
    * `git.broken` ones are listed worktrees git finds no repository in.
    */
   cwd?: string
-  /** What the launcher does. */
-  launcher?: 'opens' | 'fails' | 'refuses' | 'no-wt'
+  /** What the launcher does; `policy`: a script that would open a plain window is refused for a Group Policy execution policy, any other opens. */
+  launcher?: 'opens' | 'fails' | 'refuses' | 'no-wt' | 'policy'
   /** The claude wrapper's pane file for TOKEN, when there is one (the session carries CLAUDE_PANE_TOKEN only when `env` says so). */
   pane?: string
   /**
@@ -348,6 +348,8 @@ function engine(
     }
     // The launch takes again the claim its script names, and says what it placed.
     const by = /^\$by = '((?:launch|slot):[0-9a-f-]{1,40})'$/m.exec(script)?.[1] ?? 'none'
+    // A Group Policy execution policy that runs no unsigned script file: every place that may open a plain window is refused before its claim.
+    if (kind === 'launcher' && launcher === 'policy' && script.includes("Refuse 'policy'")) return ok('refused policy self-switch: a Group Policy execution policy runs no unsigned script file (Windows PowerShell AllSigned), and a new window runs its own script from one, so none is opened\r\n')
     // A tab or a named window, by placement.json: wt.exe by its one string.
     // No Windows Terminal: a tab, or a named window with a better place after it, refuses; a named window alone opens a plain one, saying so, as the launch script does.
     if (kind === 'launcher' && script.includes('Start-Process $wtExe') && launcher === 'no-wt') {
@@ -2464,6 +2466,33 @@ describe('placement.json: where the new window goes', () => {
     expect(launches).toHaveLength(2)
     expect(launches[0]).toContain('Start-Process $wtExe')
     expect(launches[1]).not.toContain('Start-Process $wtExe')
+    expect(commands).toEqual([{ command: 'exit' }])
+  })
+
+  test('refused for a Group Policy execution policy: no window after it is tried, and nothing switches', async ($, on) => {
+    const { runs, files, commands, toasts, clock } = engine(on, { probe: machine(noSlots), store: THERE, launcher: 'policy' })
+    // The named window, then the plain window: the policy that stops the one stops the other.
+    files.set(placementPath(STATE), JSON.stringify({ v: 1, layout: [], launch: { prefer: ['window'], window: { name: 'claude-overflow' } } }))
+    await $.session.start(start)
+    await switchNow($, clock)
+    const launches = runs.filter(r => r.kind === 'launcher').map(r => r.script)
+    expect(launches).toHaveLength(1)
+    expect(launches[0]).toContain("$wtLine = '")
+    expect(commands).toEqual([])
+    expect(toasts.join('\n')).toContain("Switch didn't run: no window opened (the launcher refused: self-switch: a Group Policy execution policy runs no unsigned script file")
+  })
+
+  test('refused for a Group Policy execution policy: a later place that opens no window (a tab) is still tried', async ($, on) => {
+    const { runs, files, commands, clock } = engine(on, { probe: machine(noSlots), store: THERE, launcher: 'policy' })
+    files.set(placementPath(STATE), JSON.stringify({ v: 1, layout: [], launch: { prefer: ['window', 'tab'], tab: { window: 'claude-4', maxTabs: 2 }, window: { name: 'claude-overflow' } } }))
+    await $.session.start(start)
+    await switchNow($, clock)
+    const launches = runs.filter(r => r.kind === 'launcher').map(r => r.script)
+    // The named window refused, the tab placed; the plain window after them never tried.
+    expect(launches).toHaveLength(2)
+    expect(launches[0]).toContain("Refuse 'policy'")
+    expect(launches[1]).not.toContain("Refuse 'policy'")
+    expect(launches[1]).toContain("$env:CLAUDE_SELF_TOOLS_WT_WINDOW = 'claude-4'")
     expect(commands).toEqual([{ command: 'exit' }])
   })
 

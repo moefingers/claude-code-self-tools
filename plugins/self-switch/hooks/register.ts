@@ -115,6 +115,7 @@ import {
   readCrons,
   paneAfter,
   paneFallback,
+  placeAfter,
   paneNoLeft,
   paneReads,
   paneTicketPath,
@@ -1403,9 +1404,14 @@ async function switchNow($: EngineInterface, value: Queued): Promise<void> {
     const failed = await placeLaunch($, { ...base, where: { pane: { token: pick.token } }, now: await $.clock.now(), ...(left === undefined ? {} : { left }) }, pick.folder)
     if ('said' in failed) return undo(`this tab's ticket wasn't written (${failed.said})`, record, failed.unclean)
   } else {
-    // Each place in turn; only for want of Windows Terminal, the slot runner or a build does the next go.
+    // Each place in turn; only for want of Windows Terminal, the slot runner or a build does the next go; past
+    // a Group Policy execution policy that stops a window's script, only a place that opens no window
+    // (placeAfter): every window after it would meet the same policy.
     let placed = false
+    /** The place tried next (placeAfter): the ones before it are passed over. */
+    let from = 0
     for (const [n, leg] of legs.entries()) {
+      if (n < from) continue
       // A hosted window's own ticket, its last place: written as the tab's is, at its time. A named window
       // before it is refused for want of Windows Terminal or the slot runner, rather than a plain window.
       const isTab = typeof leg === 'object' && 'pane' in leg
@@ -1420,8 +1426,9 @@ async function switchNow($: EngineInterface, value: Queued): Promise<void> {
         placedFallback = tried.fallback
         break
       }
-      const next = leg !== legs[legs.length - 1] && (tried.code === 'wt' || tried.code === 'slotscript' || tried.code === 'build')
-      if (!next) return undo(`no window opened (${tried.said})`, undefined, tried.unclean)
+      const next = placeAfter(legs, n, tried.code)
+      if (next === undefined) return undo(`no window opened (${tried.said})`, undefined, tried.unclean)
+      from = next
       $.ui.log(`the placed launch wasn't used: ${oneLine(tried.said, 300)}. The next place is tried.`)
     }
     if (!placed) return undo('no window opened', undefined, false)
