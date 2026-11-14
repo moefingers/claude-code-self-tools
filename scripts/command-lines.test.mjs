@@ -6,7 +6,6 @@ import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { test } from 'node:test'
 import { pathToFileURL } from 'node:url'
-import { gzipSync } from 'node:zlib'
 import { ROOT } from './sync-shared.mjs'
 
 const machine = await import(pathToFileURL(join(ROOT, 'shared', 'hooks', 'machine.ts')).href)
@@ -103,7 +102,7 @@ function innerOf(script) {
   return script.slice(start, i).split("''").join("'")
 }
 
-test("the window's own command line, every argument Start-Process gives it: the inner script GZip-compressed in a fixed unpacking bootstrap, under 24,000 characters", () => {
+test("the window's own command line, every argument Start-Process gives it: the inner script in a file of its own, run by -File, under 24,000 characters", () => {
   for (const [name, script, runs] of [
     ["a switch's window", window, '& $launchPath -Resume $id -Dir $folder -ConfigDir $configDirs'],
     ["self-restart's window", restart, '& $launchPath -Resume $id -Dir $folder -ConfigDir $configDirs'],
@@ -112,24 +111,19 @@ test("the window's own command line, every argument Start-Process gives it: the 
     const inner = innerOf(script)
     assert.ok(inner.includes(`$id = '${T}'`) && inner.includes(runs), `${name}: the inner script`)
     // The arguments as Start-Process passes them, read off its own line (-ExecutionPolicy among them).
-    const given = /-ArgumentList ((?:'[^']*', )+)\$encoded -PassThru/.exec(script)?.[1]
+    const given = /-ArgumentList ((?:'[^']*', )+)\('"' \+ \$windowFile \+ '"'\) -PassThru/.exec(script)?.[1]
     assert.ok(given !== undefined, `${name}: the Start-Process line`)
     const args = given.split(', ').filter(Boolean).map(arg => arg.slice(1, -1))
-    assert.deepEqual(args, ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-EncodedCommand'], name)
-    // The window is started with the unpacking bootstrap, never the inner script itself.
-    assert.ok(script.includes('$encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($unpack))'), name)
-    const unpackLine = script
-      .split('\r\n')
-      .map(line => line.trimStart())
-      .find(line => line.startsWith('$unpack = "'))
-    assert.ok(unpackLine !== undefined, `${name}: the unpacking bootstrap`)
-    const payload = gzipSync(Buffer.from(inner, 'utf8')).toString('base64')
-    const unpack = unpackLine.slice('$unpack = "'.length, -1).replace('$payload', payload)
-    const encoded = Buffer.from(unpack, 'utf16le').toString('base64')
-    const length = commandLine([POWERSHELL, ...args, encoded]).length
+    assert.deepEqual(args, ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File'], name)
+    // The file is the launch's own, named by its claim's uuid in the state folder.
+    const file = machine.windowScriptPath(state, BY.slice('launch:'.length))
+    assert.ok(script.includes(`$windowFile = '${file}'`), `${name}: the window's file`)
+    // Never a self-unpacking bootstrap: an antivirus hooked into AMSI blocks it before a line runs.
+    for (const gone of ['GZipStream', '$unpack', '$encoded', "'-EncodedCommand'", '[scriptblock]::Create']) assert.ok(!script.includes(gone), `${name}: ${gone}`)
+    const length = commandLine([POWERSHELL, ...args, `"${file}"`]).length
     assert.ok(length < LIMIT, `${name}: ${length} characters (the inner script ${inner.length})`)
-    // Left on the command line as it was, it would have been far longer.
-    assert.ok(Buffer.from(inner, 'utf16le').toString('base64').length > length, name)
+    // The inner script on the command line itself, as -EncodedCommand, is past this limit: why it is a file.
+    assert.ok(Buffer.from(inner, 'utf16le').toString('base64').length > LIMIT, `${name}: the inner script as -EncodedCommand`)
   }
 })
 

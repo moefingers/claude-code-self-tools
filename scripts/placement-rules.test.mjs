@@ -639,6 +639,22 @@ const CHECKS = {
     assert.ok(s.includes("if ($held) { $answer = 'held' } else {"))
     assert.equal(m.RELOCKED.exec('held\r\n')?.[1], 'held')
   },
+  windowFile(m) {
+    // The window's own script: a file of its own, named by the launch's claim, written whole with a byte order
+    // mark, run by -File, and deleted by the window first. Never a self-unpacking -EncodedCommand (GZip, base64,
+    // [scriptblock]::Create), which an antivirus hooked into AMSI blocks before a line of it runs.
+    const s = scriptsOf(m).plain
+    const file = m.windowScriptPath(STATE, FRESH)
+    assert.ok(s.includes(`$windowFile = '${file}'`), "the launch's own file")
+    assert.ok(s.includes(`$window = Start-Process -FilePath $windowShell -ArgumentList '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', ('"' + $windowFile + '"') -PassThru`), '-File, the path quoted')
+    assert.ok(!/GZipStream|\$unpack|\$encoded|'-EncodedCommand'|\[scriptblock\]::Create/.test(s), 'no self-unpacking bootstrap')
+    assert.ok(s.includes('[IO.File]::WriteAllText($windowTemp, $inner, [Text.UTF8Encoding]::new($true))'), 'with a byte order mark')
+    const move = s.indexOf('try { [IO.File]::Move($windowTemp, $windowFile) } catch { [IO.File]::Delete($windowTemp); throw }')
+    assert.ok(move > s.indexOf('[IO.File]::WriteAllText($windowTemp') && move < s.indexOf('$window = Start-Process'), 'written whole, then moved to its name, before the window starts')
+    assert.ok(s.includes(`$inner = 'try { [IO.File]::Delete(''${file}'') } catch { }\r\n`), 'the window deletes its own file first')
+    assert.ok(s.includes(`.TotalMilliseconds -gt ${m.CLAIM_STALE_MS}) { try { [IO.File]::Delete($staleFile) } catch { } }`), 'only a file older than a stale claim is swept')
+    assert.ok(s.includes("if ($groupPolicy -eq 'AllSigned' -or $groupPolicy -eq 'Restricted') { throw ("), 'a Group Policy that runs no unsigned file is refused before the window')
+  },
   leftAtLastLook(m) {
     // D1: every stat a window takes, claude-launch.ps1 takes.
     assert.ok(m.LAUNCH_SCRIPT_TEXT.includes("$Whole = '^\\d{1,16}\\z'"))
@@ -747,6 +763,12 @@ const FAULTS = [
   ['N2: wt by its bare name', 'wtByItsPath', '$window = Start-Process $wtExe -ArgumentList', '$window = Start-Process wt.exe -ArgumentList'],
   ["N12: a live holder's lock taken", 'relockHolder', "if ($held) { $answer = 'held' } else {", "if ($false) { $answer = 'held' } else {"],
   ['the left stat left off a tab', 'leftAtLastLook', "...(input.left === undefined ? {} : { left: input.left }) }\n  const tabOf", "}\n  const tabOf"],
+  ['the window back on -EncodedCommand', 'windowFile', `'-File', ('"' + $windowFile + '"')`, "'-EncodedCommand', $encoded"],
+  ['the window script written without its byte order mark', 'windowFile', '[IO.File]::WriteAllText($windowTemp, $inner, [Text.UTF8Encoding]::new($true))', '[IO.File]::WriteAllText($windowTemp, $inner)'],
+  ['the window script written in place', 'windowFile', "    'try { [IO.File]::Move($windowTemp, $windowFile) } catch { [IO.File]::Delete($windowTemp); throw }',\n", ''],
+  ['a window keeping its script file', 'windowFile', '    `try { [IO.File]::Delete(${literal(v.file)}) } catch { }`,\n', ''],
+  ['a fresh window script swept', 'windowFile', '.TotalMilliseconds -gt ${CLAIM_STALE_MS})', '.TotalMilliseconds -gt 0)'],
+  ['a Group Policy that runs no unsigned file let through to the window', 'windowFile', "if ($groupPolicy -eq 'AllSigned' -or $groupPolicy -eq 'Restricted') { throw (", 'if ($false) { throw ('],
 ]
 
 describe('planted faults in a copy of the machine code, each caught by its check', () => {

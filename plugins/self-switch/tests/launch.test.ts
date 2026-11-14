@@ -48,6 +48,7 @@ import {
   WRAPPER_UNUSED_EXIT,
   WRAPPER_SCRIPT_SHA256,
   WRAPPER_SCRIPT_TEXT,
+  windowScriptPath,
   wrapperScriptPath,
 } from '../hooks/machine'
 import { decode, ELSEWHERE, ft, inSlot, LAUNCH, machine, NOW, PERMISSION_FLAGS, type RawProbe, REPO, T, W } from './fixtures'
@@ -153,9 +154,12 @@ describe('launch(): one powershellCall, the script on standard input', () => {
       expect(lines.indexOf(PSMODULEPATH_RESET)).toBe(2)
       expect(lines.slice(0, 2)).toEqual(["$ErrorActionPreference = 'Stop'", "$ProgressPreference = 'SilentlyContinue'"])
     }
-    // The window's own script too, first thing, in Windows PowerShell alone: in PowerShell 7, 5.1's folders
-    // alone would load 5.1's copies of 7's own modules through a hidden Windows PowerShell, for the window's life.
-    expect(innerOf(SCRIPTS[0]?.[1] ?? '').split('\r\n')[2]).toBe(`if ($PSVersionTable.PSEdition -ne "Core") { ${PSMODULEPATH_RESET} }`)
+    // The window's own script too, first thing after it deletes its file (a .NET call: no module loads), in Windows
+    // PowerShell alone: in PowerShell 7, 5.1's folders alone would load 5.1's copies of 7's own modules through a
+    // hidden Windows PowerShell, for the window's life.
+    const window = innerOf(SCRIPTS[0]?.[1] ?? '').split('\r\n')
+    expect(window[0]).toMatch(/^try \{ \[IO\.File\]::Delete\('[^']+'\) \} catch \{ \}$/)
+    expect(window[3]).toBe(`if ($PSVersionTable.PSEdition -ne "Core") { ${PSMODULEPATH_RESET} }`)
   })
 
   test('nothing but claude-launch.ps1 is ever started as claude: no claude.exe, no Get-Command claude, no call but & $launchPath', () => {
@@ -252,7 +256,7 @@ describe('launch(): one powershellCall, the script on standard input', () => {
     const rule = lines.indexOf("$pwshOk = $null -ne $pwsh -and $pwsh -cmatch '^[A-Za-z]:\\\\[A-Za-z0-9_ -]{1,64}\\\\PowerShell\\\\7\\\\pwsh\\.exe\\z' -and (Test-Path -LiteralPath $pwsh -PathType Leaf)")
     const version = lines.indexOf('if ($pwshOk) { try { $pwshOk = [Diagnostics.FileVersionInfo]::GetVersionInfo($pwsh).FileMajorPart -ge 7 } catch { $pwshOk = $false } }')
     const chosen = lines.indexOf('if ($pwshOk) { $windowShell = $pwsh }')
-    const start = lines.indexOf("$window = Start-Process -FilePath $windowShell -ArgumentList '-NoProfile', '-ExecutionPolicy', 'Bypass', '-EncodedCommand', $encoded -PassThru")
+    const start = lines.indexOf(`$window = Start-Process -FilePath $windowShell -ArgumentList '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', ('"' + $windowFile + '"') -PassThru`)
     expect([shell > 0, path > shell, rule > path, version > rule, chosen > version, start > chosen]).toEqual([true, true, true, true, true, true])
     expect(script).not.toContain('$env:ProgramFiles')
     // The rule's pattern is the machine code's PWSH_PATH, as POWERSHELL_PATH holds Windows PowerShell to its path.
@@ -310,15 +314,51 @@ describe('launch(): one powershellCall, the script on standard input', () => {
     expect(WRAPPER_UNUSED_EXIT).toBe(3)
   })
 
-  test('Windows PowerShell by its known path, -ExecutionPolicy Bypass for the window alone (it pins claude-launch.ps1 by its hash), the window script compressed into a fixed bootstrap', () => {
+  test('Windows PowerShell by its known path, -ExecutionPolicy Bypass for the window alone (it pins claude-launch.ps1 by its hash), the window script run by -File from its own file', () => {
     const script = SCRIPTS[0]?.[1] ?? ''
     expect(script).toContain(`$windowShell = '${POWERSHELL}'`)
-    expect(script).toContain("$window = Start-Process -FilePath $windowShell -ArgumentList '-NoProfile', '-ExecutionPolicy', 'Bypass', '-EncodedCommand', $encoded -PassThru")
+    expect(script).toContain(`$window = Start-Process -FilePath $windowShell -ArgumentList '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', ('"' + $windowFile + '"') -PassThru`)
     expect(script).not.toContain('RemoteSigned')
     expect(script).not.toContain('$PSHOME')
-    expect(script).toContain('$gzip = [IO.Compression.GZipStream]::new($packed, [IO.Compression.CompressionMode]::Compress)')
     expect(() => launchScriptText(input({ powershell: 'C:\\evil\\powershell.exe' }))).toThrow()
     expect(() => launchScriptText(input({ powershell: 'powershell.exe' }))).toThrow()
+  })
+
+  test("the window's script: written whole to its own file, named by the launch's claim, with a byte order mark, then run by -File; never a self-unpacking bootstrap", () => {
+    // An antivirus hooked into AMSI blocked the old window's -EncodedCommand (GZip, base64, [scriptblock]::Create) before a line ran.
+    const windows: [string, string, string][] = [
+      ['the window', SCRIPTS[0]?.[1] ?? '', LAUNCH],
+      ['the window, a start', SCRIPTS[3]?.[1] ?? '', LAUNCH],
+      ["'auto'", SCRIPTS[6]?.[1] ?? '', LAUNCH],
+      ['a named window, its plain fallback', SCRIPTS[11]?.[1] ?? '', `launch:${T}`],
+    ]
+    for (const [name, script, claim] of windows) {
+      for (const gone of ['GZipStream', 'FromBase64String($payload', '$unpack', '$encoded', "'-EncodedCommand'", '[scriptblock]::Create']) expect([name, script.includes(gone)]).toEqual([name, false])
+      const file = windowScriptPath(STATE, claim.slice('launch:'.length))
+      expect(script).toContain(`$windowFile = '${file}'`)
+      const lines = script.split('\r\n').map(line => line.trim())
+      const shell = lines.indexOf('if ($pwshOk) { $windowShell = $pwsh }')
+      const policy = lines.findIndex(line => line.startsWith(`if ($windowShell -ceq '${POWERSHELL}') { $groupPolicy = 'Undefined';`))
+      const sweep = lines.findIndex(line => line.startsWith('try { if ([IO.Directory]::Exists($windowDir)) { foreach ($staleFile in [IO.Directory]::GetFiles($windowDir))'))
+      const temp = lines.indexOf('$windowTemp = $windowFile + "." + [guid]::NewGuid().ToString("N") + ".tmp"')
+      const write = lines.indexOf('[IO.File]::WriteAllText($windowTemp, $inner, [Text.UTF8Encoding]::new($true))')
+      const move = lines.indexOf('try { [IO.File]::Move($windowTemp, $windowFile) } catch { [IO.File]::Delete($windowTemp); throw }')
+      const start = lines.findIndex(line => line.startsWith('$window = Start-Process -FilePath $windowShell'))
+      expect([name, shell > 0, policy > shell, sweep > policy, temp > sweep, write > temp, move > write, start > move]).toEqual([name, true, true, true, true, true, true, true])
+      // Only this launch's file and its temporary: no other name, and none newer than a stale claim.
+      expect(lines[sweep]).toContain("-cmatch '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\\.ps1(\\.[0-9a-f]{32}\\.tmp)?\\z'")
+      expect(lines[sweep]).toContain('.TotalMilliseconds -gt 900000)')
+      expect(lines[policy]).toContain("if ($groupPolicy -eq 'AllSigned' -or $groupPolicy -eq 'Restricted') { throw (")
+      // The window deletes its own file before anything else, by its literal path.
+      expect(innerOf(script).split('\r\n')[0]).toBe(`try { [IO.File]::Delete('${file}') } catch { }`)
+    }
+    // Each launch its own file: the claim's uuid, checked by idPath; a slot's claim names none.
+    expect(windowScriptPath(STATE, T)).toBe(`${STATE}\\windows\\${T}.ps1`)
+    expect(() => windowScriptPath(STATE, `launch:${T}`)).toThrow()
+    expect(() => windowScriptPath(STATE, '..\\x')).toThrow()
+    expect(launchScriptText(input({ claim: `launch:${W}` }))).toContain(`$windowFile = '${STATE}\\windows\\${W}.ps1'`)
+    // This tab and a slot write no window script.
+    for (const script of [SCRIPTS[4]?.[1] ?? '', SCRIPTS[5]?.[1] ?? '']) expect(script).not.toContain('$windowFile')
   })
 })
 

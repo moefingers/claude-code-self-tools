@@ -29,7 +29,8 @@
 //   process, for a restart, a switch, the coordinator's go or a steward's launch. It builds one script
 //   that checks, takes the claim and places the launch in the same run: a ticket for the claude
 //   wrapper's tab, a record for a slot (this pane's, or an idle one elsewhere), a named tab or window of
-//   Windows Terminal running the slot runner, or a new window. The window waits for the old
+//   Windows Terminal running the slot runner, or a new window. The window runs its own script from a
+//   file the launch writes for it alone (windowScriptPath), by -File. It waits for the old
 //   process when asked, reads the registry and process table again, checks the claim, and runs
 //   claude-launch.ps1 (plugins/self-switch/slot/claude-launch.ps1, LAUNCH_SCRIPT_SHA256, installed by
 //   its hash's name: launchScriptPath), the only script that starts claude: it takes the same last look
@@ -42,8 +43,8 @@
 //   key that never leaves the scripts, that a plugin moved its own process off a conversation; it
 //   waives L3 and L5 for that conversation only, and the last look checks its transcript again.
 // - Every file named by an id (idPath): claims, left records, pokes, wake markers, the pending marker,
-//   the self-check record, the gate, the wrapper's panes and the slots' records, each id shape-checked
-//   before a path is built.
+//   the self-check record, the gate, the wrapper's panes, the slots' records and a window's own script,
+//   each id shape-checked before a path is built.
 // - The wake marker self-wake writes (wakePath, wakeMarker, readWakeMarker, readWake): S10w's read.
 // - lanes.json (lanesPath, lanesUpdateScript, readLanes): a name's current conversation and folder.
 // - The claim lock: %LOCALAPPDATA%\claude-self-tools\claims\<id>.lock, created with CreateNew by the
@@ -224,9 +225,13 @@ export const PANE_TOKEN = SESSION_ID
 /** A slot runner's id: its process id and its creation time (a FILETIME), `<pid>-<created>`. */
 export const SLOT_ID = /^\d{1,10}-\d{1,20}$/
 
+/** A launch's own id, the uuid of its claim (`launch:<uuid>`): a lowercase UUID. */
+export const LAUNCH_ID = SESSION_ID
+
 /**
  * Every file named by an id, its folder under the state folder and its ending. Each folder takes ids
- * of one shape: a conversation (SESSION_ID), a tab's token (PANE_TOKEN), or a slot runner (SLOT_ID).
+ * of one shape: a conversation (SESSION_ID), a tab's token (PANE_TOKEN), a slot runner (SLOT_ID), or a
+ * launch (LAUNCH_ID).
  */
 const ID_FILES = {
   claim: { folder: 'claims', ending: '.lock', shape: SESSION_ID },
@@ -242,6 +247,7 @@ const ID_FILES = {
   paneTicket: { folder: 'panes', ending: '.next.json', shape: PANE_TOKEN },
   slotRecord: { folder: 'slots', ending: '.next.json', shape: SLOT_ID },
   slotBeacon: { folder: 'slots', ending: '.state.json', shape: SLOT_ID },
+  window: { folder: 'windows', ending: '.ps1', shape: LAUNCH_ID },
 } as const
 
 /** The kinds of file named by an id. */
@@ -278,6 +284,12 @@ export const slotRecordPath = (state: string, slot: string): string => idPath(st
 
 /** The beacon a slot runner keeps, by the runner's id. Throws on another id. */
 export const slotBeaconPath = (state: string, slot: string): string => idPath(state, 'slotBeacon', slot)
+
+/**
+ * A new window's own script, for the launch whose claim is `launch:<launch>`: written whole by that launch
+ * and run by -File, then deleted by the window as it starts. Throws on an id that isn't a launch's.
+ */
+export const windowScriptPath = (state: string, launch: string): string => idPath(state, 'window', launch)
 
 /** The one place the slot script is run from, by a tab, a window or the layout: never a path read off a command line (review gap 10). */
 export const slotScriptPath = (state: string): string => `${state}\\claude-slot.ps1`
@@ -3318,8 +3330,9 @@ export function pickTransport(
 //   running the slot runner with -Resume or -Start, -Claim and -Launcher, by the one place and hash it is run from;
 // - `window`: a new window. With a name: as the tab, where Windows Terminal is new enough and the slot
 //   runner in place; else, or with `true`, Start-Process of PowerShell 7 by its standard path when it is
-//   there, else of Windows PowerShell by its known path, whose
-//   script waits for the caller's process when asked, then RECHECKs (and the left record's stat), checks
+//   there, else of Windows PowerShell by its known path, with -File and the window's own script, written
+//   whole for this launch alone at windowScriptPath (the uuid of its claim); that script deletes its file
+//   as it starts, waits for the caller's process when asked, then RECHECKs (and the left record's stat), checks
 //   the claim and the folder, checks claude-launch.ps1's SHA-256, and runs it, with every config folder
 //   and the stat, so that its own last look is the same, and with -Wrapper: claude-launch.ps1 is the only
 //   script that starts claude, the only place that holds the launch environment, and it runs claude
@@ -3351,6 +3364,16 @@ export function pickTransport(
 // claim, RECHECK, the left record). Hosted (-Hosted, which only the window's script passes), it has a
 // cap of 30 resumes an hour instead of 10 in all, and its pane file says so: neither is a power, and a
 // -Wrapper run by hand is a profile's, as before.
+// The window's own script (windowScriptPath) is a file for the same reason, with the same gap: the launch
+// writes it whole under another name and moves it to the name its claim's uuid gives, then starts the
+// window with -File, which reads it, and the window deletes it before its first check. It is not pinned:
+// it is made per launch, and the one writer who could swap it in that gap is that same user, who could as
+// well run claude. Its per-launch values (the id, the claim, the pid, the folders) are in it as checked
+// literals, as they were on the command line. It was a self-unpacking -EncodedCommand (GZip, base64,
+// [scriptblock]::Create) before, which an antivirus hooked into AMSI blocks as malicious content before a
+// line of it runs; the script itself on the command line is past Windows' 32,767 characters. A file left
+// behind (a window killed first, or one a policy stopped) is deleted by a later launch once it is older
+// than a stale claim.
 
 /** A launch's answer: `launched <transport> <label> [<pid>]`. */
 export const LAUNCH_ANSWER = /^launched (pane|slot|window|tab) ([A-Za-z0-9_.:-]{1,80})(?: (\d{1,10}))?\s*$/m
@@ -3982,7 +4005,8 @@ const WRITE_REFUSED = [
 
 /**
  * The new window's script, run by PowerShell 7 or Windows PowerShell 5.1 (the window's interpreter
- * rule: PWSH_PATH when it is there) after the launch script has placed it: it waits
+ * rule: PWSH_PATH when it is there) from its own file (`file`, windowScriptPath) after the launch script
+ * has placed it: it deletes that file first, then waits
  * for the caller's process when asked; then, right before claude, reads the registry and the process
  * table again (RECHECK) and the left record's stat, and for a start that no transcript appeared;
  * checks that the claim lock still names this launch and that the folder is there; checks
@@ -3993,11 +4017,11 @@ const WRITE_REFUSED = [
  * doesn't use (claude-launch.ps1's WRAPPER_UNUSED_EXIT) is recorded for its own conversation, its claim
  * given back, said, and the window waits; once it resumed anything, the closing lines name the last
  * conversation. A run that
- * throws (a Group Policy execution policy, a claude.exe an update holds) is caught and said, with the
+ * throws (a claude.exe an update holds, say) is caught and said, with the
  * way to resume by hand, never a window that closes on it. Values only as single-quoted literals or
  * checked numbers.
  */
-function windowScript(v: { id: string; kind: 'resume' | 'start'; name?: string; folder: string; state: string; configDirs: readonly string[]; by: string; waitFor?: ProcessRef; left?: LeftStat }): string {
+function windowScript(v: { id: string; kind: 'resume' | 'start'; name?: string; folder: string; state: string; configDirs: readonly string[]; by: string; file: string; waitFor?: ProcessRef; left?: LeftStat }): string {
   const resume = v.kind === 'resume'
   // A line that runs as it is printed: the script's whole path, and the folder quoted, whatever it holds
   // (neither can hold a quote). The copy kept for use by hand: the one this window pins may be what changed.
@@ -4016,6 +4040,9 @@ function windowScript(v: { id: string; kind: 'resume' | 'start'; name?: string; 
   // script passes it, so a -Wrapper run by hand keeps a profile's ways.
   const runs = resume ? `& $launchPath -Resume $id -Dir $folder -ConfigDir $configDirs${leftArgs} -Wrapper -Hosted` : '& $launchPath -Start $id -Name $name -Dir $folder -ConfigDir $configDirs -Wrapper -Hosted'
   return [
+    // -File has read this whole script before its first line runs: its file, this launch's alone, goes now,
+    // whatever follows (a later launch deletes one left behind).
+    `try { [IO.File]::Delete(${literal(v.file)}) } catch { }`,
     '$ErrorActionPreference = "Stop"',
     '$ProgressPreference = "SilentlyContinue"',
     // In Windows PowerShell alone, as claude-launch.ps1's step 2: in PowerShell 7, 5.1's module folders
@@ -4179,21 +4206,20 @@ export function launchScriptText(input: LaunchInput): string {
   /** A slot's record for a runner this launch doesn't run under: an idle slot elsewhere. */
   const elsewhere = where !== 'auto' && 'slot' in where && v.waitFor === undefined
   const usesWindow = transport === 'window' || transport === 'auto'
+  // A window or 'auto' names a launch's claim (checkLaunch): its uuid names the window's own script.
+  const windowFile = usesWindow ? windowScriptPath(v.state, input.claim.slice('launch:'.length)) : undefined
   const inner = usesWindow
-    ? windowScript({ id: v.id, kind: input.kind, ...(input.name === undefined ? {} : { name: input.name }), folder: v.folder, state: v.state, configDirs: v.configDirs, by: input.claim, ...(v.waitFor === undefined ? {} : { waitFor: v.waitFor }), ...(input.left === undefined ? {} : { left: input.left }) })
+    ? windowScript({ id: v.id, kind: input.kind, ...(input.name === undefined ? {} : { name: input.name }), folder: v.folder, state: v.state, configDirs: v.configDirs, by: input.claim, file: windowFile ?? '', ...(v.waitFor === undefined ? {} : { waitFor: v.waitFor }), ...(input.left === undefined ? {} : { left: input.left }) })
     : undefined
   const say = (line: string): string => `[Console]::Out.WriteLine(${line})`
-  /** The window, placed: its script compressed into a fixed unpacking bootstrap, started by Start-Process. */
+  /**
+   * The window, placed: its script written whole to its own file, then started by Start-Process with -File.
+   * Never a self-unpacking -EncodedCommand (GZip, base64, [scriptblock]::Create), which an antivirus hooked
+   * into AMSI blocks before a line runs; nor the script itself on the command line, which as
+   * -EncodedCommand is past Windows' 32,767 characters.
+   */
   const openWindow = [
     `$inner = ${literal(inner ?? '')}`,
-    '$packed = [IO.MemoryStream]::new()',
-    '$gzip = [IO.Compression.GZipStream]::new($packed, [IO.Compression.CompressionMode]::Compress)',
-    '$innerBytes = [Text.Encoding]::UTF8.GetBytes($inner)',
-    '$gzip.Write($innerBytes, 0, $innerBytes.Length)',
-    '$gzip.Dispose()',
-    '$payload = [Convert]::ToBase64String($packed.ToArray())',
-    `$unpack = "& ([scriptblock]::Create([IO.StreamReader]::new([IO.Compression.GZipStream]::new([IO.MemoryStream]::new([Convert]::FromBase64String('$payload')), [IO.Compression.CompressionMode]::Decompress), [Text.Encoding]::UTF8).ReadToEnd()))"`,
-    '$encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($unpack))',
     // The window's interpreter: PowerShell 7 by its standard path when it is there, else Windows PowerShell
     // by its known path, as before. Its standard path under the Program Files folder as Windows names it
     // (never the ProgramFiles variable, which a process can set to anything), of PWSH_PATH's shape, there,
@@ -4204,13 +4230,31 @@ export function launchScriptText(input: LaunchInput): string {
     `$pwshOk = $null -ne $pwsh -and $pwsh -cmatch '${PWSH_PATH.source.replace(/\$$/, '\\z')}' -and (Test-Path -LiteralPath $pwsh -PathType Leaf)`,
     'if ($pwshOk) { try { $pwshOk = [Diagnostics.FileVersionInfo]::GetVersionInfo($pwsh).FileMajorPart -ge 7 } catch { $pwshOk = $false } }',
     'if ($pwshOk) { $windowShell = $pwsh }',
+    // A Group Policy execution policy wins over -ExecutionPolicy Bypass, and one that runs no unsigned
+    // script file (AllSigned, Restricted) would close the window on PowerShell's error before its own
+    // script's first line: refused here instead, before anything is written, with the old process still
+    // running. Read for Windows PowerShell, whose policy this process shares; PowerShell 7 keeps its own.
+    `if ($windowShell -ceq ${literal(input.powershell)}) { $groupPolicy = 'Undefined'; try { $groupPolicy = [string](Get-ExecutionPolicy -Scope MachinePolicy); if ($groupPolicy -eq 'Undefined') { $groupPolicy = [string](Get-ExecutionPolicy -Scope UserPolicy) } } catch { $groupPolicy = 'Undefined' }; if ($groupPolicy -eq 'AllSigned' -or $groupPolicy -eq 'Restricted') { throw ("a Group Policy execution policy (" + $groupPolicy + ") runs no unsigned script file, and the window runs its own from one") } }`,
+    // Window scripts no window ran (one killed first, or stopped by a policy): each window deletes its own
+    // as it starts, so one older than a stale claim is no one's. Only names of this shape, never refused on.
+    `$windowFile = ${literal(windowFile ?? '')}`,
+    '$windowDir = [IO.Path]::GetDirectoryName($windowFile)',
+    String.raw`try { if ([IO.Directory]::Exists($windowDir)) { foreach ($staleFile in [IO.Directory]::GetFiles($windowDir)) { if ([IO.Path]::GetFileName($staleFile) -cmatch '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.ps1(\.[0-9a-f]{32}\.tmp)?\z' -and ([DateTime]::UtcNow - [IO.File]::GetLastWriteTimeUtc($staleFile)).TotalMilliseconds -gt ${CLAIM_STALE_MS}) { try { [IO.File]::Delete($staleFile) } catch { } } } } } catch { }`,
+    // Written whole: a temporary file beside it, then moved to its name, never over another. UTF-8 with its
+    // byte order mark: Windows PowerShell 5.1 reads a script file without one in the ANSI code page, which
+    // would garble a folder's non-ASCII name.
+    '$windowTemp = $windowFile + "." + [guid]::NewGuid().ToString("N") + ".tmp"',
+    '[void][IO.Directory]::CreateDirectory($windowDir)',
+    '[IO.File]::WriteAllText($windowTemp, $inner, [Text.UTF8Encoding]::new($true))',
+    'try { [IO.File]::Move($windowTemp, $windowFile) } catch { [IO.File]::Delete($windowTemp); throw }',
     // -ExecutionPolicy Bypass, for this window's scripts alone (claude-launch.ps1 clears it again before
     // claude): the window runs claude-launch.ps1 only with the SHA-256 it pins, checked right before, a
     // stronger check than RemoteSigned's; under RemoteSigned, a downloaded file's mark (Zone.Identifier)
-    // on the script would make the run throw after the old process has gone. A Group Policy execution
-    // policy still wins over the command line: the window's catch then says so, and how to resume by hand.
-    // The claude wrapper's copy asks no policy at all: claude-launch.ps1 checks its bytes and runs them.
-    '$window = Start-Process -FilePath $windowShell -ArgumentList \'-NoProfile\', \'-ExecutionPolicy\', \'Bypass\', \'-EncodedCommand\', $encoded -PassThru',
+    // on the script would make the run throw after the old process has gone. The claude wrapper's copy
+    // asks no policy at all: claude-launch.ps1 checks its bytes and runs them. Windows PowerShell's
+    // Start-Process joins the arguments into one command line as they are: the path goes in quotes (the
+    // state folder holds none, and the path ends in .ps1, never a backslash).
+    `$window = Start-Process -FilePath $windowShell -ArgumentList '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', ('"' + $windowFile + '"') -PassThru`,
     `$placed = "window - " + $window.Id`,
   ]
   /** A tab or a named window: its stamp set first (wt forwards it), the slot script's hash checked right before, then wt.exe with one string. */
