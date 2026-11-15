@@ -2,6 +2,12 @@
 
 Each entry names a plugin and its version, as `version` in `plugins/<name>/.claude-plugin/plugin.json` has it.
 
+## 2026-11-15: self-check 0.2.6: a resume check that only timed out runs once more before it says so (#44)
+
+- **The false alarms.** At resume, self-check probes Bash and PowerShell, each within 10 s. Under the load of a resume a probe can time out though the tool works: on one machine, 20 resume notes in a row were all timeouts, and in each the session's next Bash call answered. Each still showed the toast and added a row to the context, and one session restarted for nothing.
+- **Now** a check at resume whose every failure is a timeout says and records nothing; it runs once more 45 s later, once no turn is running, and only a second failure gives the toast, the row and the record. A retry that passes leaves a line in the debug log. Any other failure, or a timeout beside one, is said at once, as before. `tools_check` on demand is unchanged.
+- **Tests:** a timeout then an answer (nothing said, one record with no failure), two timeouts (one toast, one row, one record), a timeout beside another failure (said at once), a non-timeout failure (no retry), and the retry waiting for a running turn.
+
 ## 2026-11-10: self-secret 0.1.0, new: a command run with a secret the session never sees
 
 - **self-secret 0.1.0**, new: secret-run's local paste, shipped in self-tools so any session can use it. A session runs a command with a secret (an API key, a token, a password) that the person pastes into a form on 127.0.0.1 in their own browser: it is trimmed, held to its shape and checked before anything runs, handed to that one command in an environment variable, and masked in everything the command prints. `--hold <minutes>` (at most 120) keeps it in a broker's memory so later commands run with `--use-hold` without another paste; `--end-hold`, `--hold-status` and `--list` as before. `generic` takes its prompt and check from the command line (`--prompt`, and `--check-url`, `--check-cmd` or `--no-check`) and runs once.

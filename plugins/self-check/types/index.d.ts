@@ -9,7 +9,8 @@ export type CheckStatus = 'ok' | 'failed' | 'not-tested' | 'absent' | 'listed'
  * One line of a check: the tool as the record names it (`Bash`, `PowerShell`, `mcp:<server>`), how it
  * fared, and the line the answer shows.
  */
-export type CheckLine = { name: string; status: CheckStatus; said: string }
+/** `timedOut`: a failure that is only a timeout (the tool, or a probe, never answered within 10 s). */
+export type CheckLine = { name: string; status: CheckStatus; said: string; timedOut?: true }
 
 /**
  * How much room this session's env script leaves a Bash command, Git Bash running only the first

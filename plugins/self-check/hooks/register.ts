@@ -19,7 +19,10 @@
 //
 // At resume, quietly: on the classic SessionStart with `source: "resume"`, 10 s later and once no
 // turn is running, the same check runs, and only a failure is said: a toast, and one row the model
-// reads with the next message (it never starts a turn). The `checkAtResume` setting turns that off.
+// reads with the next message (it never starts a turn). Under the load of a resume a tool can be slow
+// to answer though it works, so a check whose every failure is a timeout runs once more, 45 s later,
+// before anything is said or recorded; only a second failure is said. Any other failure is said at
+// once. The `checkAtResume` setting turns that off.
 //
 // The env guard (the `envDedupe` setting, on by default): right after the SessionStart hooks beneath
 // this plugin have run (every source: startup, resume, clear, compact, fork), and when a check finds
@@ -49,6 +52,8 @@ const TOOL = 'mcp__self-check__tools_check'
 const CALL_MS = 10_000
 /** How long after a resume the quiet check runs, once the session is idle. */
 const RESUME_MS = 10_000
+/** How long after a check at resume that only timed out its one retry runs, once the session is idle. */
+const RETRY_MS = 45_000
 /** A beat after a turn's end, so the turn is no longer running when a waiting check starts. */
 const SETTLE_MS = 500
 
@@ -109,8 +114,8 @@ const damaged = new Map<string, Set<string>>()
 
 /** Whether a main-loop turn is running now: the quiet check waits for it to end. */
 let inTurn = false
-/** The conversation whose quiet check waits for the running turn to end. */
-let waiting: string | undefined
+/** The conversation whose quiet check waits for the running turn to end, and whether it is the retry. */
+let waiting: { readonly id: string; readonly retry: boolean } | undefined
 
 /** What an error says, as one line. */
 function why(err: unknown): string {
@@ -160,7 +165,7 @@ async function shell($: EngineInterface, tool: 'Bash' | 'PowerShell', listed: bo
     const description = 'Echo a nonce to check this tool answers'
     const call = tool === 'Bash' ? $.tool.call({ tool: 'Bash', command, description }) : $.tool.call({ tool: 'PowerShell', command, description })
     const ran = await within($, CALL_MS, call)
-    if (ran === undefined) return line('failed', `failed: timed out after ${CALL_MS / 1000} s`)
+    if (ran === undefined) return { ...line('failed', `failed: timed out after ${CALL_MS / 1000} s`), timedOut: true }
     const run = ran.value as { readonly deny?: string; readonly isError?: boolean; readonly result?: unknown; readonly text?: string }
     // Text from outside the plugin (a hook's refusal, the tool's error, its output) is quoted, one
     // line: the row at resume carries it to the model as data.
@@ -231,7 +236,7 @@ async function servers($: EngineInterface, tools: readonly ToolInfo[] | string):
       }
       try {
         const ran = await within($, CALL_MS, $.mcp.call(server, probe, {}))
-        if (ran === undefined) return line('failed', `failed: its probe ${probe} timed out after ${CALL_MS / 1000} s`)
+        if (ran === undefined) return { ...line('failed', `failed: its probe ${probe} timed out after ${CALL_MS / 1000} s`), timedOut: true }
         if (ran.value.isError) return line('failed', `failed: its probe ${probe} reported an error (${quoted(oneLine(firstText(ran.value.content) ?? '', 160))})`)
         return line('ok', `ok (probe ${probe})`)
       } catch (err) {
@@ -453,20 +458,32 @@ async function sessionId($: EngineInterface): Promise<string | undefined> {
   }
 }
 
-/** The check at resume, once no turn is running: says nothing when every tool answered. */
-async function atIdle($: EngineInterface, id: string): Promise<void> {
+/**
+ * The check at resume, once no turn is running: says nothing when every tool answered. A first check
+ * whose every failure is a timeout (`retry` false) says and records nothing yet: it runs once more,
+ * RETRY_MS later, and only that one's failures are said.
+ */
+async function atIdle($: EngineInterface, id: string, retry = false): Promise<void> {
   if (inTurn) {
-    waiting = id
+    waiting = { id, retry }
     return
   }
   // A /clear or a switch since the resume: this process runs another conversation now, and the check
   // (its env folder above all) is not this one's to make.
   if ((await sessionId($)) !== id) return
   const checked = await check($, id)
-  await record($, id, checked.lines)
   const failed = checked.lines.filter(l => l.status === 'failed')
-  if (failed.length === 0) return
   const names = failed.map(l => l.name).join(', ')
+  if (!retry && failed.length > 0 && failed.every(l => l.timedOut === true)) {
+    $.ui.log(`self-check at resume: ${names} timed out; checking once more in ${RETRY_MS / 1000} s before saying so`, { to: 'debug' })
+    $.clock.after(RETRY_MS, () => void atIdle($, id, true))
+    return
+  }
+  await record($, id, checked.lines)
+  if (failed.length === 0) {
+    if (retry) $.ui.log('self-check at resume: slow at first; every tool answered on the retry', { to: 'debug' })
+    return
+  }
   $.ui.toast(
     failed.some(l => l.name === 'Bash') && (checked.env?.damaged?.length ?? 0) > 0
       ? `self-check at resume: ${names} failed. An env file may be damaged; the note Claude reads names it.`
@@ -536,9 +553,9 @@ export const register: Register = (on, options) => {
     const done = await next(e)
     if (e.agentId !== undefined) return done
     inTurn = false
-    const id = waiting
+    const wait = waiting
     waiting = undefined
-    if (id !== undefined) $.clock.after(SETTLE_MS, () => void atIdle($, id))
+    if (wait !== undefined) $.clock.after(SETTLE_MS, () => void atIdle($, wait.id, wait.retry))
     return done
   })
 }

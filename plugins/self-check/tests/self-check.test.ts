@@ -379,6 +379,96 @@ test('at resume, a failure is said: one toast and one row read with the next mes
   expect(writes.map(w => w.text)).toEqual(['{"v":1,"at":1010000,"failed":["Bash"]}'])
 })
 
+/** The text of each row the check appended at resume. */
+const rowsOf = (session: { appended(): readonly unknown[] }) =>
+  session.appended().flatMap(row => ((row as { message?: { content?: { text?: unknown }[] } }).message?.content ?? []).map(block => String(block.text)))
+
+test("at resume, a failure that isn't a timeout is said at once, with no retry", async ($, on) => {
+  const { commands, toasts, clock } = engine(on, { bash: 'empty' })
+  await $.session.start(start)
+  await $.classic.SessionStart({ source: 'resume', session_id: ID })
+  await clock.advance(10_000)
+  expect(toasts).toHaveLength(1)
+  await clock.advance(HOUR)
+  expect(commands.map(c => c.tool)).toEqual(['Bash', 'PowerShell'])
+  expect(toasts).toHaveLength(1)
+})
+
+test('at resume, a check that only timed out runs once more 45 s later; answered then, nothing is said', async ($, on) => {
+  const { world, commands, toasts, prompts, writes, session, clock } = engine(on, { bash: 'hangs' })
+  await $.session.start(start)
+  await $.classic.SessionStart({ source: 'resume', session_id: ID })
+  await clock.advance(10_000)
+  // Bash's call is under way; its 10 s pass, and the first check ends with Bash timed out.
+  await clock.advance(10_000)
+  expect(commands.map(c => c.tool)).toEqual(['Bash', 'PowerShell'])
+  // Nothing said or recorded yet: the slow Bash may only have been the load at resume.
+  expect(toasts).toEqual([])
+  expect(rowsOf(session)).toEqual([])
+  expect(writes).toEqual([])
+  world.bash = 'echoes'
+  await clock.advance(44_999)
+  expect(commands).toHaveLength(2)
+  await clock.advance(1)
+  expect(commands.map(c => c.tool)).toEqual(['Bash', 'PowerShell', 'Bash', 'PowerShell'])
+  expect(toasts).toEqual([])
+  expect(rowsOf(session)).toEqual([])
+  expect(prompts).toEqual([])
+  expect(writes.map(w => JSON.parse(w.text).failed)).toEqual([[]])
+  await clock.advance(HOUR)
+  // One retry, never more.
+  expect(commands).toHaveLength(4)
+})
+
+test('at resume, a check that times out twice is said after the retry: one toast, one row, one record', async ($, on) => {
+  const { commands, toasts, writes, session, clock } = engine(on, { bash: 'hangs' })
+  await $.session.start(start)
+  await $.classic.SessionStart({ source: 'resume', session_id: ID })
+  await clock.advance(10_000)
+  await clock.advance(10_000)
+  expect(toasts).toEqual([])
+  // The retry, 45 s on, and its own 10 s for Bash.
+  await clock.advance(45_000)
+  await clock.advance(10_000)
+  expect(commands.map(c => c.tool)).toEqual(['Bash', 'PowerShell', 'Bash', 'PowerShell'])
+  expect(toasts).toEqual(['self-check at resume: Bash failed. A fresh process usually repairs a dead tool (restart_after_turn).'])
+  const rows = rowsOf(session)
+  expect(rows).toHaveLength(1)
+  expect(rows[0]).toContain('Bash: failed: timed out after 10 s')
+  expect(writes.map(w => JSON.parse(w.text).failed)).toEqual([['Bash']])
+  await clock.advance(HOUR)
+  expect(commands).toHaveLength(4)
+  expect(toasts).toHaveLength(1)
+})
+
+test('at resume, a timeout beside another failure is said at once, both named', async ($, on) => {
+  const { commands, toasts, clock } = engine(on, { bash: 'hangs', powershell: 'empty' })
+  await $.session.start(start)
+  await $.classic.SessionStart({ source: 'resume', session_id: ID })
+  await clock.advance(10_000)
+  await clock.advance(10_000)
+  expect(toasts).toEqual(['self-check at resume: Bash, PowerShell failed. A fresh process usually repairs a dead tool (restart_after_turn).'])
+  await clock.advance(HOUR)
+  expect(commands).toHaveLength(2)
+})
+
+test('at resume, the retry waits for a running turn to end too', async ($, on) => {
+  const { world, commands, toasts, clock } = engine(on, { bash: 'hangs' })
+  await $.session.start(start)
+  await $.classic.SessionStart({ source: 'resume', session_id: ID })
+  await clock.advance(10_000)
+  await clock.advance(10_000)
+  world.bash = 'echoes'
+  await $.turn.start({ text: 'go on', turnId: 't1' })
+  await clock.advance(60_000)
+  expect(commands).toHaveLength(2)
+  await $.turn.complete(answered)
+  await clock.advance(1000)
+  expect(commands).toHaveLength(4)
+  expect(toasts).toEqual([])
+  await clock.advance(HOUR)
+})
+
 test('at resume, it waits for a running turn to end', async ($, on) => {
   const { commands, clock } = engine(on)
   await $.session.start(start)
