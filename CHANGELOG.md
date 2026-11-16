@@ -2,6 +2,18 @@
 
 Each entry names a plugin and its version, as `version` in `plugins/<name>/.claude-plugin/plugin.json` has it.
 
+## 2026-11-16: self-check 0.2.7, self-exit 0.1.8, self-restart 0.4.4, self-switch 0.4.4, self-wake 0.3.5: a launch's floor reads heavy-slot's cap and all four of its slots (#46)
+
+- **The bug (#46).** heavy-slot keeps up to four slots (`.gate-lock`, `.gate-lock-2`, `.gate-lock-3`, `.gate-lock-4`) and a `.gate-cap` file holding how many are in use: 0 to 4, 2 when there is none, more than 4 counted as 4, and 0 holding every new job. The shared machine code read only the first two slots and never the cap. With a cap of 3 or 4, a job on the third or fourth slot wasn't counted, so a launch's floor could read the slots free while heavy jobs filled them. With a cap of 1, a launch went ahead while the one slot was busy. And S3 didn't name a session whose job held slot 3 or 4.
+- **Now** the probe and the launch's own run read `.gate-cap` as heavy-slot reads it: its digits; none, or no file, is 2; over 4 is 4. They read all four slot folders whatever the cap, as a job above a lowered cap runs on. The floor waits while as many slots are busy as the cap, and a cap of 0 holds every launch. Its refusals say "every heavy slot is busy (slots held: 3; heavy-slot's cap: 3)" and "heavy-slot holds every heavy job: its cap is 0". `floorOk` judges the same.
+- **Decided on principle:** a launch waits at heavy-slot's cap, not at 2. The cap is the machine's own word on how many heavy jobs it carries, and heavy-slot reads it on every try, so the floor does too. A launch that waits while no heavy job could start never goes ahead of one, and never goes where heavy-slot wouldn't let a job in. The memory floor still stands beside it.
+- **Shared code**: `shared/hooks/machine.ts`: `HEAVY_SLOTS`, `HEAVY_CAP_DEFAULT` and `HEAVY_CAP_MAX`. The probe's slots mode answers `heavyCap`, and `Probe.heavyCap` carries it: null with no heavy-slot folder, or none read, which a floor never takes as free. `HeavySlot.slot` takes the four names, and `heavyBusy` counts to 4. `shared/hooks/machine.ts` is now SHA-256 `a40ea402c86d26a70f97b20540147ed5460acf88b49b1337e52515aa6a006a18`; the coordinator re-vendors it.
+- **Docs**: the README's `checks.floor` and slots mode, self-switch's `heavySlotRoot`, and dev-run's heavy slots.
+- **Tests**:
+  - `scripts/placement-rules.test.mjs`: floorOk at caps of 0, 1, 2 and 4, and a cap lowered under the jobs still running; both scripts read the four slots and the cap file; the parse takes the four names and counts to 4, and refuses a fifth slot or a cap of 5.
+  - Planted faults, each caught: floorOk or the launch waiting at two again, only two slots read, the cap file unread, the cap read past its digits, the probe not answering the cap, the parse refusing slots 3 and 4, and floorOk passing a reading with no cap.
+  - `scripts/slot-live.test.mjs`, for real in Windows PowerShell with three of the four slots held: no `.gate-cap`, `3\r\n`, `0`, `12`, `none`, an empty file and `4\n`. The launch's own run refuses at a cap of 3 and at 0, and goes on at 4.
+
 ## 2026-11-15: self-check 0.2.6: a resume check that only timed out runs once more before it says so (#44)
 
 - **The false alarms.** At resume, self-check probes Bash and PowerShell, each within 10 s. Under the load of a resume a probe can time out though the tool works: on one machine, 20 resume notes in a row were all timeouts, and in each the session's next Bash call answered. Each still showed the toast and added a row to the context, and one session restarted for nothing.

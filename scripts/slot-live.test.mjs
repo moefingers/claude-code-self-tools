@@ -952,6 +952,7 @@ describe("the probe's slots mode, and the launch's own run, against a running ru
       assert.notEqual(probe.slots.find(s => s.id === edited.id()).sha256, machine.SLOT_SCRIPT_SHA256)
       assert.ok(!probe.slots.some(s => s.id === '4-1'), 'no runner, no beacon')
       assert.equal(probe.heavyBusy, 1)
+      assert.equal(probe.heavyCap, 2, 'no .gate-cap: heavy-slot\'s default')
       // A ticket counts only while a heavy-slot shell runs: this very test may run under one.
       assert.ok(probe.heavyWaiters === 0 || probe.heavyWaiters === 1, String(probe.heavyWaiters))
       assert.equal(typeof probe.room, 'number')
@@ -1032,6 +1033,48 @@ describe("the probe's slots mode, and the launch's own run, against a running ru
     const refused = await underStub({ stub, work, env: envOf(dirs), script: () => noWindow(machine.launchScriptText(input)).replace('$needBytes = [math]::Max(', '$freeKb = [long]999999999; $needBytes = [math]::Max(') })
     assert.equal(machine.parseLaunch(refused.stdout).refused?.code, 'heavy', refused.stdout + refused.stderr)
     assert.match(refused.stdout, /the heavy-slot folders could not be read: no folder at /)
+    assert.ok(!existsSync(machine.claimPath(dirs.state, id)), 'nothing taken')
+  })
+
+  test("#46: heavy-slot's cap read from .gate-cap as heavy-slot reads it, and its busy slots of all four; the launch waits at the cap, and a cap of 0 holds it", async () => {
+    const dirs = lab()
+    const id = randomUUID()
+    const heavy = join(dirs.root, 'heavy')
+    mkdirSync(join(heavy, '.gate-queue'), { recursive: true })
+    // Three slots held (folders under an hour old, no winpid), the first one free: a count of two slots would read one.
+    for (const s of ['.gate-lock-2', '.gate-lock-3', '.gate-lock-4']) mkdirSync(join(heavy, s))
+    const capFile = join(heavy, '.gate-cap')
+    const setCap = text => (text === undefined ? rmSync(capFile, { force: true }) : writeFileSync(capFile, text))
+    const read = async text => {
+      setCap(text)
+      const ran = await underStub({ stub, work, env: envOf(dirs), script: () => machine.probeScript({ ids: [id], configDirs: [dirs.config], stateDir: dirs.state, heavySlotRoot: heavy, slots: true }) })
+      const probe = machine.parseProbe(ran.stdout)
+      assert.ok(!('error' in probe), `${probe.error}\n${ran.stdout}${ran.stderr}`)
+      return probe
+    }
+    const none = await read(undefined)
+    assert.deepEqual([none.heavyCap, none.heavyBusy], [2, 3], 'no file: the default cap, and all four slots read')
+    assert.deepEqual(none.heavy.map(h => h.slot), ['.gate-lock-2', '.gate-lock-3', '.gate-lock-4'], "the probe's heavy list, for S3, reads all four too")
+    assert.equal(machine.floorOk({ ...none, freeKb: 999_999_999 }, 40), 'heavy', 'three busy over a cap of 2')
+    // As heavy-slot's `tr -dc '0-9'`: its digits; none (an empty file too), the default; over 4 is 4.
+    for (const [text, cap] of [['3\r\n', 3], ['0', 0], ['12', 4], ['none', 2], ['', 2]]) assert.equal((await read(text)).heavyCap, cap, JSON.stringify(text))
+    const four = await read('4\n')
+    assert.deepEqual([four.heavyCap, four.heavyBusy], [4, 3])
+    assert.equal(machine.floorOk({ ...four, freeKb: 999_999_999, room: 0 }, 40), 'ok', 'three busy under a cap of 4')
+    // The launch's own run: at the cap it refuses, saying so; a cap of 0 says it holds every job; under the cap it goes on (to the sessions' cap, set to refuse here).
+    const input = { powershell: WINDOWS_POWERSHELL, kind: 'start', id, name: 'lane-x', folder: dirs.folder, claim: `launch:${randomUUID()}`, configDirs: [dirs.config], stateDir: dirs.state, where: { window: true }, checks: { floor: true, input: true, fresh: true }, maxSessions: 40, heavySlotRoot: heavy, tool: 'coordinator' }
+    const run = text => {
+      setCap(text)
+      return underStub({ stub, work, env: envOf(dirs), script: () => noWindow(machine.launchScriptText(input)).replace('$needBytes = [math]::Max(', '$freeKb = [long]999999999; $needBytes = [math]::Max(').replace(/\$room -ge 40\b/, '$room -ge 0') })
+    }
+    const full = await run('3')
+    assert.equal(machine.parseLaunch(full.stdout).refused?.code, 'heavy', full.stdout + full.stderr)
+    assert.match(full.stdout, /every heavy slot is busy \(slots held: 3; heavy-slot's cap: 3\)/)
+    const held = await run('0')
+    assert.equal(machine.parseLaunch(held.stdout).refused?.code, 'heavy', held.stdout + held.stderr)
+    assert.match(held.stdout, /heavy-slot holds every heavy job: its cap is 0/)
+    const room = await run('4')
+    assert.equal(machine.parseLaunch(room.stdout).refused?.code, 'cap', room.stdout + room.stderr)
     assert.ok(!existsSync(machine.claimPath(dirs.state, id)), 'nothing taken')
   })
 
