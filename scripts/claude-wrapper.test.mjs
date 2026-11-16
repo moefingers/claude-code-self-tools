@@ -394,15 +394,37 @@ async function leftRecord(shell, how, wrapper = WRAPPER) {
   return found
 }
 
-/** Eleven tickets, 10.5 seconds apart: ten resumes, then the eleventh is refused (10 per `claude` typed). */
-async function cappedAt10(shell, wrapper = WRAPPER) {
+/** Eleven tickets, 10.5 seconds apart: all eleven resumed, as nothing caps a tab's resumes in all (#41). */
+async function pastTen(shell, wrapper = WRAPPER) {
   const dirs = lab()
   const ticket = ticketFor(dirs)
   const plan = Object.fromEntries(Array.from({ length: 11 }, (_, i) => [i + 1, ticket]))
   const result = await run(shell, dirs, { wrapper, plan, env: { STUB_SLEEP_MS: '10500' }, timeoutMs: 240_000 })
   const { found, check } = problems()
-  check(result.runs.length === 11, `ten resumes, no eleventh (${result.runs.length} runs)`)
-  check(result.stdout.includes(`${NOT_USED}this tab has resumed 10 times already.`), 'the cap is said')
+  check(result.runs.length === 12, `eleven resumes (${result.runs.length} runs)`)
+  check(!result.stdout.includes(NOT_USED), `no ticket refused (${result.stdout.slice(-600)})`)
+  leftAsItWas(check, dirs, result)
+  return found
+}
+
+/** A copy of the wrapper with its hourly cap made `cap`, so a test needs no hour; `change` is applied after. */
+function hourCapped(cap, change = text => text) {
+  const CAP = '  $hourCap = 30\n'
+  const text = readFileSync(WRAPPER, 'utf8')
+  assert.ok(text.includes(CAP), 'the cap is 30 within any hour')
+  const path = join(mkdtempSync(join(work, 'capped-')), 'claude-wrapper.ps1')
+  writeFileSync(path, change(text.replace(CAP, `  $hourCap = ${cap}\n`)))
+  return path
+}
+
+/** Three tickets in a row in a typed tab, its hourly cap made 2: two resumes, then the third is refused, said of the tab. */
+async function cappedHourly(shell, wrapper = hourCapped(2)) {
+  const dirs = lab()
+  const ticket = ticketFor(dirs)
+  const result = await run(shell, dirs, { wrapper, plan: { 1: ticket, 2: ticket, 3: ticket } })
+  const { found, check } = problems()
+  check(result.runs.length === 3, `two resumes, no third (${result.runs.length} runs)`)
+  check(result.stdout.includes(`${NOT_USED}this tab resumed 2 times within the last hour. Once it is safe, resume it yourself: claude --resume ${dirs.id}`), 'the hourly cap is said, of the tab, with the line to resume by hand')
   leftAsItWas(check, dirs, result)
   return found
 }
@@ -631,8 +653,11 @@ describe('the claude wrapper, in each PowerShell', { skip: !isWindows && 'Window
       test('three resumes within 30 seconds, then the loop stops and says so', async () => {
         assert.deepEqual(await cappedIn30s(shell), [])
       })
-      test('ten resumes, then the loop stops and says so (about two minutes)', async () => {
-        assert.deepEqual(await cappedAt10(shell), [])
+      test('eleven resumes 10.5 seconds apart: all run, as nothing caps a tab in all (#41; about two minutes)', async () => {
+        assert.deepEqual(await pastTen(shell), [])
+      })
+      test('past the hourly cap (30; made 2 in a copy, so the test needs no hour): the next ticket is not used, and said of the tab', async () => {
+        assert.deepEqual(await cappedHourly(shell), [])
       })
       test('no claude.exe: it says so, and never calls itself', async () => {
         assert.deepEqual(await noClaude(shell), [])
@@ -689,7 +714,7 @@ describe('planted faults, each caught', { skip: !isWindows && 'Windows only', co
   const DELETE = '      try { [IO.File]::Delete($ticketFile) } catch { $deleted = $false }\n'
   const RESUME = '      & $exe --resume $t.resume\n'
   const CLEAR = '      foreach ($name in $markers) { Remove-Item -LiteralPath "Env:$name" -ErrorAction SilentlyContinue }\n'
-  const CAP_10 = "        elseif (-not $hosted -and $resumes.Count -ge 10) { 'this tab has resumed 10 times already' }\n"
+  const CAP_HOUR = '        elseif (@($resumes | Where-Object { ([datetime]::UtcNow - $_).TotalMinutes -lt 60 }).Count -ge $hourCap) { "this $place resumed $hourCap times within the last hour" }\n'
   const CAP_30S = "        elseif (@($resumes | Where-Object { ([datetime]::UtcNow - $_).TotalSeconds -lt 30 }).Count -ge 3) { 'this tab resumed 3 times within 30 seconds' }\n"
 
   test('the ticket deleted only after it is used: the resumed claude still sees it', async () => {
@@ -707,14 +732,18 @@ describe('planted faults, each caught', { skip: !isWindows && 'Windows only', co
 
   test('the loop cap removed: a fourth resume within 30 seconds runs', async () => {
     const text = readFileSync(WRAPPER, 'utf8')
-    assert.ok(text.includes(CAP_10) && text.includes(CAP_30S))
+    assert.ok(text.includes(CAP_HOUR) && text.includes(CAP_30S))
     const path = join(mkdtempSync(join(work, 'fault-')), 'claude-wrapper.ps1')
-    writeFileSync(path, text.replace(CAP_10, '').replace(CAP_30S, ''))
+    writeFileSync(path, text.replace(CAP_HOUR, '').replace(CAP_30S, ''))
     assert.notDeepEqual(await cappedIn30s(shell, path), [])
   })
 
-  test('the 10-resume cap removed alone: an eleventh resume runs (about two minutes)', async () => {
-    assert.notDeepEqual(await cappedAt10(shell, planted(CAP_10, '')), [])
+  test('the hourly cap removed alone: a third resume runs past a cap of 2', async () => {
+    assert.notDeepEqual(await cappedHourly(shell, hourCapped(2, text => text.replace(CAP_HOUR, ''))), [])
+  })
+
+  test("the hourly cap kept for a hosted window only, as before #41: a typed tab's third resume runs past a cap of 2", async () => {
+    assert.notDeepEqual(await cappedHourly(shell, hourCapped(2, text => text.replace(CAP_HOUR, CAP_HOUR.replace('        elseif (@(', '        elseif ($hosted -and @(')))), [])
   })
 
   test('WT_SESSION cleared with the markers: the resumed claude lacks it', async () => {

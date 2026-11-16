@@ -2,6 +2,19 @@
 
 Each entry names a plugin and its version, as `version` in `plugins/<name>/.claude-plugin/plugin.json` has it.
 
+## 2026-11-16: self-check 0.2.7, self-exit 0.1.8, self-restart 0.4.4, self-switch 0.4.4, self-wake 0.3.5: a tab typed at a prompt is no longer stranded after 10 resumes (#41)
+
+- **The problem (#41).** The claude wrapper let a tab typed at a prompt resume at most 10 times in all; a window `claude-launch.ps1 -Wrapper -Hosted` opened got 30 within any hour. Long-lived sessions (a coordinator, a merger) run in tabs typed by hand, in a fixed place in the layout, and restart for real reasons: a plugin that won't reload, a setting read at startup, recycling. After the 10th, the wrapper refused the ticket ("this tab has resumed 10 times already"), the session didn't come back in its tab, and restarting it by hand moved its place in the layout.
+- **Now** a typed tab has the hosted window's rule: at most 30 resumes within any hour, and never a fourth within 30 seconds. Nothing caps a tab's resumes in all. Past the hourly cap the refusal names the place: "this tab resumed 30 times within the last hour" in a typed tab, and "this window resumed 30 times within the last hour" in a hosted window, as before. `-Hosted` still marks the pane file hosted, and the wrapper still leaves `$ClaudeWrapperLast` and `$ClaudeWrapperUnused` for the window's script.
+- **Decided on principle:** the 30-second guard and the hourly cap are what stop a loop; a cap in all only strands a session that restarts for real reasons. So one rule for every tab, and no setting for it: a setting would only let a tab be stranded again.
+- **`claude-launch.ps1` version 5:** it pins the wrapper (`$WrapperSha256`), so the wrapper's change is a change to the launcher. Its comments no longer say a hosted run has a different cap. `scripts/embed-launch.mjs` re-embedded both in the shared machine code (`WRAPPER_SCRIPT_TEXT`, `WRAPPER_SCRIPT_SHA256`, `LAUNCH_SCRIPT_TEXT`, `LAUNCH_SCRIPT_SHA256`, `LAUNCH_SCRIPT_VERSION`). `SLOT_SCRIPT_SHA256` and `LAYOUT_SCRIPT_SHA256` are as they were. `shared/hooks/machine.ts` is now SHA-256 `37b888f13376a6871a606568e1ee81a7666226b937ecc3e146bf60a9366e686c`; the coordinator re-vendors it.
+- **A wrapper in your profile** is your own copy: copy `tools/claude-wrapper/claude-wrapper.ps1` there again to get the new rule in tabs you type `claude` in. Windows the plugins open use their own verified copy, which this release updates.
+- **Docs**: the wrapper's header, the launcher's comments, and the README's three passages on the caps.
+- **Tests**:
+  - `scripts/claude-wrapper.test.mjs`, in each PowerShell: eleven resumes 10.5 seconds apart all run in a typed tab; past the hourly cap (made 2 in a copy) the next ticket is refused, said of the tab, with the line to resume by hand.
+  - Planted, each caught: the hourly cap removed alone, and the hourly cap kept for a hosted window only (as before this change). The loop guard's fault now removes the hourly cap with the 30-second one.
+  - `scripts/claude-launch.test.mjs`: eleven moves out of a `-Wrapper` run by hand all resume, its pane file not hosted; a copy capped at 2 an hour refuses the third move by hand too, said of the tab, and the launcher ends with 3. The planted fault of a window not marked hosted is now caught by its pane file.
+
 ## 2026-11-15: self-check 0.2.6: a resume check that only timed out runs once more before it says so (#44)
 
 - **The false alarms.** At resume, self-check probes Bash and PowerShell, each within 10 s. Under the load of a resume a probe can time out though the tool works: on one machine, 20 resume notes in a row were all timeouts, and in each the session's next Bash call answered. Each still showed the toast and added a row to the context, and one session restarted for nothing.

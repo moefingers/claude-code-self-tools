@@ -572,14 +572,14 @@ export const WT_MIN = { names: '1.8', pos: '1.17', stamps: '1.19' } as const
  * starts claude. A window runs it only from launchScriptPath, with this hash, checked by .NET just
  * before it runs. scripts/embed-launch.mjs writes it.
  */
-export const LAUNCH_SCRIPT_SHA256 = 'd6a5920844e3e34b22040cd9a51ed88f12614bb7cb26b8d7abae5fe7f500bfd1'
+export const LAUNCH_SCRIPT_SHA256 = '837bfdf9d1c7d178d00e7947920d59175f2071592132abe38063dab84e5080de'
 
 /**
  * claude-launch.ps1's version, its `# claude-launch version <n>` line: one more with every change to the
  * script. The copy kept for use by hand (launchHandPath) is replaced only by a higher one, so plugins of
  * two versions never trade it back and forth. scripts/embed-launch.mjs writes it from the script.
  */
-export const LAUNCH_SCRIPT_VERSION = 4
+export const LAUNCH_SCRIPT_VERSION = 5
 
 /**
  * Where a launch puts claude-launch.ps1 and a window runs it from: beside the slot runner, named by the
@@ -605,7 +605,7 @@ export const LAUNCH_SCRIPT_TEXT = [
   "# claude-launch.ps1: starts Claude Code as a top-level session. The one script in",
   "# claude-code-self-tools that runs claude: every launch (a restart's or a switch's window, the",
   "# coordinator's go, a steward's launch, a slot runner's every start, and you by hand) comes through it.",
-  "# claude-launch version 4",
+  "# claude-launch version 5",
   "#",
   "# Part of self-switch (claude-code-self-tools, plugins/self-switch/slot/claude-launch.ps1). Nobody",
   "# copies it: a launch that opens a window puts the copy it carries in %LOCALAPPDATA%\\claude-self-tools,",
@@ -629,8 +629,8 @@ export const LAUNCH_SCRIPT_TEXT = [
   "# -Wrapper runs claude through the claude wrapper's verified copy (below), so that a restart or a switch",
   "# out of the session comes back in this same window or tab. A launch's window always gives it; a slot",
   "# runner never does (it has its own loop). -Hosted, with -Wrapper, says this run hosts a window a launch",
-  "# opened, and only that window's script passes it: the wrapper's pane file then says hosted, and it",
-  "# resumes up to 30 times an hour instead of 10 in all. Run by hand, -Wrapper alone keeps a profile's ways.",
+  "# opened, and only that window's script passes it: the wrapper's pane file then says hosted. Hosted or",
+  "# not, it resumes up to 30 times an hour. Run by hand, -Wrapper alone keeps a profile's ways.",
   "#",
   "# What it does, in order:",
   "# 1. It checks its arguments: a session id is a lowercase UUID; a name is lowercase letters, digits and",
@@ -671,8 +671,8 @@ export const LAUNCH_SCRIPT_TEXT = [
   "#    With the wrapper loaded, it calls the wrapper's `claude` function, the one it just made (never by",
   "#    the name, which an alias would take), with those arguments, in this process: the wrapper gives",
   "#    claude a fresh CLAUDE_PANE_TOKEN and a pane file naming this PowerShell, claude.exe's own parent,",
-  "#    marked hosted with -Hosted (30 moves an hour here, not 10 in all; placement.json, when it names a",
-  "#    place, comes first for the next move), and when claude exits it resumes the ticket a restart or a",
+  "#    marked hosted with -Hosted (placement.json, when it names a place, comes first for the next move;",
+  "#    30 moves an hour, as in any tab), and when claude exits it resumes the ticket a restart or a",
   "#    switch left it, here. A",
   "#    ticket the wrapper doesn't use ends this script with exit 3, the reason left for the window that",
   "#    ran it ($ClaudeLaunchUnused), which records it and stays open; $ClaudeLaunchLast names the",
@@ -701,7 +701,7 @@ export const LAUNCH_SCRIPT_TEXT = [
   "$Drop = 'PSExecutionPolicyPreference', 'CLAUDE_PANE_TOKEN'",
   "$Set = [ordered]@{ CLAUDE_CODE_FORCE_SESSION_PERSISTENCE = '1'; CLAUDE_CODE_DISABLE_BG_SHELL_PRESSURE_REAP = '1' }",
   "# The claude wrapper's copy -Wrapper loads, by its SHA-256: WRAPPER_SCRIPT_SHA256 in the plugins' machine code.",
-  "$WrapperSha256 = '255d8dc23c944b917fa541ae04fee908012927e77d8a85bb27bca06a70980293'",
+  "$WrapperSha256 = 'e312ef2188def0b35d62145c5c2800ebc2673ae84117cf59f709f5204a06ec0f'",
   "",
   "function Stop-Launch($why) {",
   "  Write-Host ('claude-launch: ' + $why + ' Nothing was started.')",
@@ -928,8 +928,8 @@ export const LAUNCH_SCRIPT_TEXT = [
   "if ($Wrapper -and $null -eq $wrapperWhy) {",
   "  $ErrorActionPreference = 'Continue'",
   "  # Read by the wrapper in the script scope it runs under (this script's, run as a file; the session's, run",
-  "  # as a script block), as $script: names it on both sides: hosted (-Hosted, a launch's window), it resumes",
-  "  # up to 30 times an hour, not 10 in all, and its pane file says hosted. And left by it there: the",
+  "  # as a script block), as $script: names it on both sides: hosted (-Hosted, a launch's window), its pane",
+  "  # file says hosted, and its refusals name the window. And left by it there: the",
   "  # conversation it resumed last, and a ticket it didn't use. The flag is taken away again once it",
   "  # returns, so a session that ran this script by hand never keeps it for a `claude` typed later.",
   "  $script:ClaudeWrapperHosted = [bool]$Hosted",
@@ -966,7 +966,7 @@ export const LAUNCH_SCRIPT_TEXT = [
  * inside its own pinned text, and checks the copy's bytes against it before it defines the function from
  * those bytes. scripts/embed-launch.mjs writes both.
  */
-export const WRAPPER_SCRIPT_SHA256 = '255d8dc23c944b917fa541ae04fee908012927e77d8a85bb27bca06a70980293'
+export const WRAPPER_SCRIPT_SHA256 = 'e312ef2188def0b35d62145c5c2800ebc2673ae84117cf59f709f5204a06ec0f'
 
 /**
  * Where a launch puts the claude wrapper's copy, and claude-launch.ps1 -Wrapper loads it from: beside the
@@ -1012,12 +1012,12 @@ export const WRAPPER_SCRIPT_TEXT = [
   "#   same look here as in its window; and, for a switch back to a conversation left moments ago (one that",
   "#   rests on a left record), its transcript is as the record says, unchanged since. Then it runs",
   "#   claude --resume <id> in that folder, in this tab, and loops: a resumed session can restart again.",
-  "#   At most 10 resumes, and never a fourth within 30 seconds. A ticket it doesn't use is said in one",
-  "#   line, and you are back at the prompt.",
+  "#   At most 30 resumes within any hour, and never a fourth within 30 seconds: the two stop a loop, and",
+  "#   nothing caps a tab's resumes in all, so a long-lived session keeps coming back in its tab. A ticket",
+  "#   it doesn't use is said in one line, and you are back at the prompt.",
   "# - In a window claude-launch.ps1 opened (claude-launch.ps1 -Wrapper -Hosted, which only that window's",
-  "#   script passes, sets $ClaudeWrapperHosted in its own scope first), there is no cap of 10: that window",
-  "#   exists to host this session's moves, so the cap is 30 within any hour, and the 30-second guard still",
-  "#   stops a loop. Its pane file says so (\"hosted\": true), so a move out of it goes to the place",
+  "#   script passes, sets $ClaudeWrapperHosted in its own scope first), the caps are the same, said of",
+  "#   the window. Its pane file says it is hosted (\"hosted\": true), so a move out of it goes to the place",
   "#   placement.json names first, when it names one. And it leaves the script that called it two values:",
   "#   $ClaudeWrapperLast, the conversation it resumed last and its folder, and $ClaudeWrapperUnused, a",
   "#   ticket it didn't use and why, so that window can name the right conversation, record the refusal and",
@@ -1051,8 +1051,10 @@ export const WRAPPER_SCRIPT_TEXT = [
   "  $panes = Join-Path $state 'panes'",
   "  # Hosted by claude-launch.ps1 -Wrapper (set in the calling script's own scope), or typed at a prompt.",
   "  $hosted = $script:ClaudeWrapperHosted -eq $true",
-  "  # Hosted, a window exists for this session's moves: at most this many within any hour, not 10 in all.",
+  "  # At most this many resumes within any hour, typed at a prompt or hosted: with the 30-second guard it",
+  "  # stops a loop, and a long-lived session's tab, which restarts for real reasons, is never stranded.",
   "  $hourCap = 30",
+  "  $place = if ($hosted) { 'window' } else { 'tab' }",
   "  $uuid = '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\\z'",
   "  $claim = '^launch:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\\z'",
   "  # Set by Claude Code in the processes it starts, and NO_COLOR: a resumed claude must not inherit them.",
@@ -1189,8 +1191,7 @@ export const WRAPPER_SCRIPT_TEXT = [
   "        elseif ($null -ne $t.left -and -not (& $isLeft $t.left)) { 'its left record''s stat is not a size and a time, or an exit time' }",
   "        elseif (-not (Test-Path -LiteralPath (Join-Path $config ('projects\\' + ($t.dir -replace '[^A-Za-z0-9]', '-') + '\\' + $t.resume + '.jsonl')) -PathType Leaf)) { \"no transcript of it is under its folder's project\" }",
   "        elseif ($null -eq $lock -or $lock.by -cne $t.by) { 'the claim lock on that conversation does not name this ticket' }",
-  "        elseif (-not $hosted -and $resumes.Count -ge 10) { 'this tab has resumed 10 times already' }",
-  "        elseif ($hosted -and @($resumes | Where-Object { ([datetime]::UtcNow - $_).TotalMinutes -lt 60 }).Count -ge $hourCap) { \"this window resumed $hourCap times within the last hour\" }",
+  "        elseif (@($resumes | Where-Object { ([datetime]::UtcNow - $_).TotalMinutes -lt 60 }).Count -ge $hourCap) { \"this $place resumed $hourCap times within the last hour\" }",
   "        elseif (@($resumes | Where-Object { ([datetime]::UtcNow - $_).TotalSeconds -lt 30 }).Count -ge 3) { 'this tab resumed 3 times within 30 seconds' }",
   "      # The last look, right before claude runs: is the conversation open anywhere now? In this tab's own",
   "      # config folder and every one the ticket names, as the switch read them: reading more registries",
@@ -3348,9 +3349,9 @@ export function pickTransport(
 // launcher's: the pin is the stronger check. It runs at the window's own level, beside claude.exe, which
 // the window runs from %USERPROFILE%\.local\bin unpinned. What it adds is the same tab for later moves:
 // a pane file naming the window's PowerShell, and a ticket it reads by the same checks as in a tab (the
-// claim, RECHECK, the left record). Hosted (-Hosted, which only the window's script passes), it has a
-// cap of 30 resumes an hour instead of 10 in all, and its pane file says so: neither is a power, and a
-// -Wrapper run by hand is a profile's, as before.
+// claim, RECHECK, the left record), with the same caps as in a tab: 30 resumes within any hour, never a
+// fourth within 30 seconds. Hosted (-Hosted, which only the window's script passes), its pane file says
+// so: that is no power, and a -Wrapper run by hand is a profile's, as before.
 
 /** A launch's answer: `launched <transport> <label> [<pid>]`. */
 export const LAUNCH_ANSWER = /^launched (pane|slot|window|tab) ([A-Za-z0-9_.:-]{1,80})(?: (\d{1,10}))?\s*$/m
@@ -4012,7 +4013,7 @@ function windowScript(v: { id: string; kind: 'resume' | 'start'; name?: string; 
   const leftArgs = v.left === undefined ? '' : 'size' in v.left ? ` -LeftSize '${v.left.size}' -LeftMtime '${v.left.mtime}'` : ` -LeftExitAt '${v.left.exitAt}'`
   // -Wrapper: claude through the claude wrapper's verified copy, in this window's own PowerShell, so the
   // session's later restarts and switches come back in this window (the `pane` transport). -Hosted: this
-  // window exists to host them (its pane file says hosted; 30 moves an hour, not 10 in all); only this
+  // window exists to host them (its pane file says hosted, so a move out of it goes to placement.json's place first); only this
   // script passes it, so a -Wrapper run by hand keeps a profile's ways.
   const runs = resume ? `& $launchPath -Resume $id -Dir $folder -ConfigDir $configDirs${leftArgs} -Wrapper -Hosted` : '& $launchPath -Start $id -Name $name -Dir $folder -ConfigDir $configDirs -Wrapper -Hosted'
   return [
@@ -5042,8 +5043,8 @@ export function claimCheckScript(input: { readonly stateDir: string; readonly id
 // When claude exits, it looks for the ticket, paneTicketPath(state, token), deletes it before
 // anything else, and runs `claude --resume <id>` in that tab only when the ticket holds: the rules of
 // checkPaneTicket, and on disk, its folder is there, its project holds the conversation's transcript,
-// and the claim lock on the conversation names the ticket's claim (`by`); then, at most 10 resumes and
-// never a fourth within 30 seconds; and last, right before claude runs, the same last look the slot
+// and the claim lock on the conversation names the ticket's claim (`by`); then, at most 30 resumes within
+// any hour and never a fourth within 30 seconds; and last, right before claude runs, the same last look the slot
 // runner and the window take (RECHECK, line for line): no running Claude Code holds the conversation,
 // read from its own config folder and every config folder the ticket names (`configDirs`), as the
 // window's and the slot's last looks read every one the switch reads.
