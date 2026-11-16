@@ -135,6 +135,7 @@ import {
   launch as buildLaunch,
   LAUNCH_DEADLINE_MS,
   LAUNCH_RETRY_MS,
+  LAUNCH_CLAIM,
   LEFT_SETTLE_MS,
   LEFT_WRITTEN,
   leftScript,
@@ -222,6 +223,12 @@ const PRUNE_EVERY_MS = 6 * 60 * 60 * 1000
 const ARRIVAL_FALLBACK_MS = 5000
 /** The most switches under way the store keeps. */
 const MAX_KEPT = 50
+/** The plugin's store key for the launch claims given back and not confirmed released: each tried again until it is. */
+const OWED = 'owedReleases'
+/** After a release that isn't confirmed, when it is tried again; then at every heartbeat tick, a plugin start's first among them. */
+const OWED_RETRY_MS = [3000, 30_000] as const
+/** An owed release this old is no longer tried, and the log says so: the store stays bounded. */
+const OWED_KEEP_MS = DAY_MS
 
 const DESCRIPTION = [
   "Switches this terminal to another conversation once the current turn ends: this conversation ends here, its context untouched, and conversation `to` (a session id, as claude --resume takes) is resumed in its place: in this same process when both live in one project folder, else in this pane's slot (a Windows Terminal pane running self-switch's claude-slot.ps1), else in this same tab when Claude Code was started through the claude wrapper (the `claude` function from claude-code-self-tools in the person's PowerShell profile), else in a new window.",
@@ -638,19 +645,102 @@ async function keepTicket($: EngineInterface, id: string, value: Ticket | null):
   await $.store.set(SWITCHES, Object.fromEntries(value === null ? rest : [...rest, [id, value]]))
 }
 
-/** Removes the claim lock on `id` when it names `by`; says so in the log when it can't. */
-async function release($: EngineInterface, powershell: string, state: string, id: string, by: string): Promise<void> {
+/**
+ * One try at removing the claim lock on `id` when it names `by`: undefined once that is settled (the lock
+ * released, gone, or another's), else why not.
+ */
+async function releaseOnce($: EngineInterface, powershell: string, state: string, id: string, by: string): Promise<string | undefined> {
   try {
     const call = powershellCall(powershell, releaseScript({ stateDir: state, id, by }))
     const run = await $.process.run(call.argv, { stdin: call.stdin, timeoutMs: RELEASE_MS })
     const said = run.exitCode === 0 ? RELEASED.exec(run.stdout)?.[1] : undefined
-    if (said === 'released' || said === 'absent' || said === 'not-ours') return
-    // `busy`: another process had it open throughout. Left in place, it refuses every other move on
-    // that conversation until it goes stale, which is the safe side; said so, never taken as released.
-    const what = said === 'busy' ? 'another process had it open throughout' : `exit ${run.exitCode}`
-    $.ui.log(`the claim lock on ${id} wasn't released (${what}); it is left in place, and goes stale 15 minutes after its creator exits.`)
+    if (said === 'released' || said === 'absent' || said === 'not-ours') return undefined
+    // `busy`: another process had it open throughout.
+    return said === 'busy' ? 'another process had it open throughout' : `exit ${run.exitCode}`
   } catch (err) {
-    $.ui.log(`the claim lock on ${id} wasn't released (${why(err)}); it goes stale 15 minutes after its creator exits.`)
+    return why(err)
+  }
+}
+
+/**
+ * Removes the claim lock on `id` when it names `by`. One that isn't confirmed released is left in place,
+ * which refuses every other move on that conversation until it goes stale (the safe side), and is never
+ * taken as released. A launch's own claim is owed then (#40): a window that waits on it has no time cap,
+ * and would resume `id` once this session exits, outside any switch the person asked for. So it is kept
+ * in the store and tried again 3 and 30 seconds later, then at every heartbeat tick (a plugin start's
+ * first among them), until it is settled; each launch's claim is its own, so a later try can only remove
+ * that one. A slot's claim names the slot, which a later switch through it names too: never tried later.
+ */
+async function release($: EngineInterface, powershell: string, state: string, id: string, by: string): Promise<void> {
+  const failed = await releaseOnce($, powershell, state, id, by)
+  if (failed === undefined) return
+  if (!LAUNCH_CLAIM.test(by)) {
+    $.ui.log(`the claim lock on ${id} wasn't released (${failed}); it is left in place, and goes stale 15 minutes after its creator exits.`)
+    return
+  }
+  try {
+    await owe($, id, by)
+  } catch (err) {
+    $.ui.log(`the claim lock on ${id} wasn't released (${failed}), and couldn't be kept to try again (${why(err)}); it is left in place, and goes stale 15 minutes after its creator exits.`)
+    return
+  }
+  $.ui.log(`the claim lock on ${id} wasn't released (${failed}); it is left in place, and tried again in 3 and 30 seconds, then every 2 minutes until it is released.`)
+  for (const ms of OWED_RETRY_MS) $.clock.after(ms, () => void settleOwed($))
+}
+
+/** A launch's claim given back whose release isn't confirmed: the conversation, the claim, and since when it is owed. */
+type Owed = { readonly id: string; readonly by: string; readonly since: number }
+
+/** The releases owed, from the store, each checked; anything else is dropped. */
+async function owedReleases($: EngineInterface): Promise<Owed[]> {
+  const stored = await $.store.get(OWED)
+  if (!Array.isArray(stored)) return []
+  return stored.filter((o): o is Owed => isRecord(o) && typeof o.id === 'string' && SESSION_ID.test(o.id) && typeof o.by === 'string' && LAUNCH_CLAIM.test(o.by) && typeof o.since === 'number')
+}
+
+/** Keeps the release of `by`'s claim on `id` owed (since its first failure), or (`settled`) no longer. */
+async function owe($: EngineInterface, id: string, by: string, settled = false): Promise<void> {
+  const all = await owedReleases($)
+  const was = all.find(o => o.id === id && o.by === by)
+  const rest = all.filter(o => o !== was)
+  if (settled) {
+    if (was !== undefined) await $.store.set(OWED, rest)
+    return
+  }
+  await $.store.set(OWED, [...rest, was ?? { id, by, since: await $.clock.now() }].slice(-MAX_KEPT))
+}
+
+/** Whether the owed releases are being tried now: one round of them at a time. */
+let settling = false
+
+/**
+ * Tries each owed release again: one settled is no longer owed, and said; one owed for a day is no longer
+ * tried, and said, with what the person can do. Never throws: the next tick tries again.
+ */
+async function settleOwed($: EngineInterface): Promise<void> {
+  if (settling) return
+  settling = true
+  try {
+    const owed = await owedReleases($)
+    if (owed.length === 0) return
+    const now = await $.clock.now()
+    const found = await machine($)
+    if ('refusal' in found) return
+    for (const o of owed) {
+      // A day by this machine's clock; one dated ahead of it (the clock set back) is tried on until then.
+      if (now - o.since > OWED_KEEP_MS) {
+        await owe($, o.id, o.by, true)
+        $.ui.log(`the claim lock on ${o.id} couldn't be released for a day, and is no longer tried. A window waiting on it resumes ${o.id} once its session exits: close that window to give up.`)
+        continue
+      }
+      if ((await releaseOnce($, found.powershell, found.state, o.id, o.by)) !== undefined) continue
+      await owe($, o.id, o.by, true)
+      $.ui.log(`the claim lock on ${o.id} is released now, on a later try.`)
+    }
+  } catch {
+    // The next tick tries again.
+  } finally {
+    settling = false
   }
 }
 
@@ -864,6 +954,8 @@ async function tick($: EngineInterface): Promise<void> {
   try {
     await heartbeat($)
     const now = await $.clock.now()
+    // The releases owed first: one the prune below owes now gets its 3 and 30 seconds' tries.
+    await settleOwed($)
     await pruneTickets($, now)
     await pruneBeats($, now)
   } catch {

@@ -9,7 +9,9 @@ import { decode, ELSEWHERE, elsewhere, entry, ft, inSlot, LAUNCH, leftExit, mach
 const TOOL = 'mcp__self-switch__switch_after_turn'
 const HOUR = 60 * 60 * 1000
 const MINUTE = 60 * 1000
-const POWERSHELL = 'C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe'
+/** The releases owed in the plugin's store (#40), as [conversation, claim]. */
+const owedOf = (held: Map<string, unknown>): string[][] => ((held.get('owedReleases') ?? []) as { id: string; by: string }[]).map(o => [o.id, o.by])
+const POWERSHELL ='C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe'
 const LOCAL = 'C:\\Users\\u\\AppData\\Local'
 const STATE = `${LOCAL}\\claude-self-tools`
 const CONFIG = 'C:\\Users\\u\\.claude'
@@ -98,8 +100,8 @@ type Options = {
   claim?: 'ours' | 'not-ours' | 'absent'
   /** What the in-place last look's re-check finds holding the conversation now, if anything. */
   checkLive?: string
-  /** What a release answers. */
-  released?: 'released' | 'busy'
+  /** What a release answers; a list, one answer per release in turn, its last for every one after. */
+  released?: 'released' | 'busy' | readonly ('released' | 'busy')[]
   /** What /resume does: switch the session, leave it as it was, or be refused. */
   resume?: 'takes' | 'stays' | 'refused'
   /** What /exit does: end the process (the call never comes back), come back with the session open, or be refused. */
@@ -162,6 +164,7 @@ function engine(
   const files = new Map<string, string>()
   const key = (path: string) => path.replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase()
   const held = new Map<string, unknown>(Object.entries(store))
+  const releases = typeof released === 'string' ? [released] : [...released]
   // A fingerprint's hash (crypto.subtle.digest, in the shared machine code) finishes outside the
   // plugin's engine calls, and the kit's clock settles on those calls alone: under load, an advance
   // came back with a hash still out, before the switch or the baseline it was for had done anything.
@@ -381,7 +384,7 @@ function engine(
       if (SESSION_ID_SHAPE.test(left)) files.set(leftPath(STATE, left), JSON.stringify({ v: 1, id: left, how, pid: '100', created: ft(2), at: String(NOW), by: 'self-switch', mac: '0'.repeat(64) }))
       return ok(`left ${left}\r\n`)
     }
-    if (kind === 'release') return ok(`${released}\r\n`)
+    if (kind === 'release') return ok(`${(releases.length > 1 ? releases.shift() : releases[0]) ?? 'released'}\r\n`)
     if (kind === 'check') return ok(checkLive === undefined ? `${claim}\r\n` : `live ${checkLive}\r\n`)
     return ok('', 1)
   })
@@ -1738,9 +1741,63 @@ describe('arrival', () => {
     await $.classic.SessionStart({ source: 'resume', session_id: T })
     await clock.advance(1000)
     expect(kinds()).toEqual(['release'])
-    expect(logs).toContain(`the claim lock on ${T} wasn't released (another process had it open throughout); it is left in place, and goes stale 15 minutes after its creator exits.`)
+    expect(logs).toContain(`the claim lock on ${T} wasn't released (another process had it open throughout); it is left in place, and tried again in 3 and 30 seconds, then every 2 minutes until it is released.`)
     // The arrival itself still goes ahead.
     expect(prompts).toHaveLength(1)
+  })
+
+  test('#40: a launch claim not confirmed released is owed: tried again at 3 and 30 seconds, then at the next tick, until it is released; then no more', async ($, on) => {
+    const { logs, kinds, held, clock } = engine(on, { id: T, released: ['busy', 'busy', 'busy', 'released'], store: { switches: { [T]: ticket } } })
+    await $.session.start(start)
+    await $.classic.SessionStart({ source: 'resume', session_id: T })
+    await clock.advance(1000)
+    expect(kinds()).toEqual(['release'])
+    expect(owedOf(held)).toEqual([[T, LAUNCH]])
+    await clock.advance(3000)
+    expect(kinds()).toEqual(['release', 'release'])
+    await clock.advance(27_000)
+    expect(kinds()).toEqual(['release', 'release', 'release'])
+    expect(owedOf(held)).toEqual([[T, LAUNCH]])
+    // The heartbeat's next tick, 2 minutes after the start: released now, and no longer owed.
+    await clock.advance(2 * MINUTE)
+    expect(kinds()).toEqual(['release', 'release', 'release', 'release'])
+    expect(owedOf(held)).toEqual([])
+    expect(logs).toContain(`the claim lock on ${T} is released now, on a later try.`)
+    await clock.advance(10 * MINUTE)
+    expect(kinds()).toHaveLength(4)
+  })
+
+  test('#40: a ticket pruned at 15 minutes whose release is not confirmed: the ticket goes, the release stays owed, and is tried again', async ($, on) => {
+    const { kinds, tickets, held, clock } = engine(on, { id: T, released: ['busy', 'released'], store: { switches: { [T]: { ...ticket, at: NOW - 16 * MINUTE } } } })
+    await $.session.start(start)
+    await clock.settle()
+    expect(tickets()).toEqual({})
+    expect(kinds()).toEqual(['release'])
+    expect(owedOf(held)).toEqual([[T, LAUNCH]])
+    await clock.advance(4000)
+    expect(kinds()).toEqual(['release', 'release'])
+    expect(owedOf(held)).toEqual([])
+  })
+
+  test('#40: a release owed from an earlier load is tried at the plugin start; one owed for a day is no longer tried, and said', async ($, on) => {
+    const { kinds, held, logs, clock } = engine(on, { store: { owedReleases: [{ id: T, by: LAUNCH, since: NOW - MINUTE }, { id: X, by: LAUNCH, since: NOW - 25 * 60 * MINUTE }, { id: 'not an id', by: LAUNCH, since: NOW }] } })
+    await $.session.start(start)
+    await clock.settle()
+    expect(kinds()).toEqual(['release'])
+    expect(owedOf(held)).toEqual([])
+    expect(logs).toContain(`the claim lock on ${T} is released now, on a later try.`)
+    expect(logs).toContain(`the claim lock on ${X} couldn't be released for a day, and is no longer tried. A window waiting on it resumes ${X} once its session exits: close that window to give up.`)
+  })
+
+  test("#40: a slot's claim not confirmed released is said, never owed: a later switch through that slot names it too", async ($, on) => {
+    const slotClaim = 'slot:20-134062345678901240'
+    const { kinds, held, logs, clock } = engine(on, { id: T, released: 'busy', store: { switches: { [T]: { ...ticket, by: slotClaim, transport: 'slot' } } } })
+    await $.session.start(start)
+    await $.classic.SessionStart({ source: 'resume', session_id: T })
+    await clock.advance(40_000)
+    expect(kinds()).toEqual(['release'])
+    expect(held.get('owedReleases')).toBeUndefined()
+    expect(logs).toContain(`the claim lock on ${T} wasn't released (another process had it open throughout); it is left in place, and goes stale 15 minutes after its creator exits.`)
   })
 
   test('a ticket older than 15 minutes is dropped, not delivered, and its claim released', async ($, on) => {
@@ -2327,6 +2384,17 @@ describe('a run the switch gave up on can leave nothing behind (the coordinator\
     await switchNow($, clock)
     await clock.advance(4000)
     expect(kinds()).toEqual(['probe', 'launcher', 'release'])
+  })
+
+  test('#40: a switch taken back whose claim is not confirmed released: owed, and tried again 3 seconds later, so no window waiting on it resumes later', async ($, on) => {
+    const { kinds, held, clock } = engine(on, { probe: machine(elsewhere), store: THERE, launcher: 'refuses', released: ['busy', 'released'] })
+    await $.session.start(start)
+    await switchNow($, clock)
+    expect(kinds()).toEqual(['probe', 'launcher', 'release'])
+    expect(owedOf(held)).toEqual([[T, LAUNCH]])
+    await clock.advance(4000)
+    expect(kinds()).toEqual(['probe', 'launcher', 'release', 'release'])
+    expect(owedOf(held)).toEqual([])
   })
 })
 

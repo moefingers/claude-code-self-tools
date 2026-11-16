@@ -2,6 +2,20 @@
 
 Each entry names a plugin and its version, as `version` in `plugins/<name>/.claude-plugin/plugin.json` has it.
 
+## 2026-11-16: self-switch 0.4.4: a launch claim not confirmed released is tried again until it is (#40)
+
+- **The exposure (#40).** Launcher v4's window waits for as long as its launch claim stands, with no time cap, so giving that claim back is what ends a window nobody wants any more. When a release came back unconfirmed (another process had the lock open throughout, or the release script failed), self-switch only logged it. The undo of a switch and the 15-minute ticket prune then deleted the ticket all the same, and nothing tried again. The waiting window would resume the conversation once this session exited, outside any switch the person asked for.
+- **Now** a launch's claim whose release isn't confirmed is owed: kept in the plugin's store (`owedReleases`: the conversation, the claim, since when) and tried again 3 and 30 seconds later, then at every 2-minute heartbeat tick, a plugin start's first tick among them, until the lock reads released, gone or another's. Each launch's claim is its own, so a later try can only remove that one. A release that settles on a later try says so in the log. One still owed after a day is no longer tried, and the log says what to do: close the waiting window to give up.
+- **A slot's claim** (`slot:<pid>-<created>`) is never tried again later: it names the slot, which a later switch through that slot names too. Its failure is logged as before.
+- **Decided on principle:** the coordinator's own fix (0.9.14: persist until a confirmed release, retry at 3 s and 30 s, release leftovers on the next load), not a wait cap in the window. A cap would end a wanted window too, and the window script is shared machine code that open work is changing.
+- **README**: the claim lock's paragraph says so.
+- **Tests** (`tests/self-switch.test.ts`; a release's answer can now be a list, one per release in turn):
+  - an arrival's release that stays busy, tried at 3 s, 30 s and the next tick, then released, and no more tries after;
+  - a ticket pruned at 15 minutes whose release is busy: the ticket goes, the release stays owed and is tried again;
+  - owed releases from an earlier load: tried at the plugin start, one a day old dropped and said, and a malformed entry ignored;
+  - a slot's claim, busy: said, never owed;
+  - a switch taken back (its window refused) whose claim stays busy: owed, then released 3 seconds later.
+
 ## 2026-11-15: self-check 0.2.6: a resume check that only timed out runs once more before it says so (#44)
 
 - **The false alarms.** At resume, self-check probes Bash and PowerShell, each within 10 s. Under the load of a resume a probe can time out though the tool works: on one machine, 20 resume notes in a row were all timeouts, and in each the session's next Bash call answered. Each still showed the toast and added a row to the context, and one session restarted for nothing.
