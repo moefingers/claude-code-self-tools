@@ -1078,6 +1078,113 @@ describe("the probe's slots mode, and the launch's own run, against a running ru
     assert.ok(!existsSync(machine.claimPath(dirs.state, id)), 'nothing taken')
   })
 
+  test("round 1, L1: the cap parsed as heavy-slot.sh's own slots() lines read it, replayed in Git's bash when it is here: leading zeros, all zeros, past int64", () => {
+    const dir = mkdtempSync(join(work, 'caps-'))
+    // [the file's text (undefined: no file), the slots heavy-slot uses]
+    const table = [
+      [undefined, 2], ['', 2], ['none', 2], ['3\r\n', 3], ['x-1', 1], ['0', 0], ['00', 0], ['0000000000', 0], ['0000000001', 1], ['0004', 4], ['12', 4], ['1 2', 4],
+      ['00000000000000000000009', 4], ['9223372036854775807', 4], ['9223372036854775808', 0], ['99999999999999999999', 0],
+    ]
+    const files = table.map(([text], i) => {
+      const path = join(dir, `cap-${i}`)
+      if (text !== undefined) writeFileSync(path, text)
+      return path
+    })
+    // The probe's own lines: the file read as READ_HEAVY reads it, then HEAVY_CAP_PARSE, once per file.
+    const script = [
+      "$ErrorActionPreference = 'Stop'",
+      '$caps = @()',
+      `foreach ($heavyCapFile in @(${files.map(f => `'${f}'`).join(', ')})) {`,
+      '  $heavyCapText = $null',
+      '  if (Test-Path -LiteralPath $heavyCapFile -PathType Leaf) { $heavyCapText = "$(Get-Content -LiteralPath $heavyCapFile -Raw)" }',
+      ...machine.HEAVY_CAP_PARSE.map(line => `  ${line}`),
+      '  $caps += $heavyCap',
+      '}',
+      "[Console]::Out.WriteLine(($caps -join ','))",
+    ].join('\r\n')
+    const ps = spawnSync(WINDOWS_POWERSHELL, ['-NoProfile', '-NonInteractive', '-EncodedCommand', Buffer.from(script, 'utf16le').toString('base64')], { encoding: 'utf8', timeout: 60_000 })
+    assert.equal(ps.stdout.trim(), table.map(([, cap]) => cap).join(','), ps.stderr)
+    // heavy-slot.sh's slots(), byte for byte as it reads the cap, counted: the table is heavy-slot's own answer.
+    const execPath = spawnSync('git', ['--exec-path'], { encoding: 'utf8' }).stdout?.trim() ?? ''
+    const bash = execPath === '' ? '' : join(execPath, '..', '..', '..', 'bin', 'bash.exe')
+    if (bash === '' || !existsSync(bash)) return
+    const SLOTS = [
+      'CAP_FILE=$1',
+      'slots() { # the slot names in use: .gate-lock, then .gate-lock-2 up to .gate-lock-<cap>; none at 0',
+      '    local cap=2 i',
+      '    [ -f "$CAP_FILE" ] && cap=$(tr -dc \'0-9\' < "$CAP_FILE")',
+      '    cap=${cap:-2}',
+      '    [ "$cap" -gt 4 ] && cap=4',
+      '    [ "$cap" -ge 1 ] && echo .gate-lock',
+      '    i=2',
+      '    while [ "$i" -le "$cap" ]; do echo ".gate-lock-$i"; i=$((i + 1)); done',
+      '  }',
+      'slots 2>/dev/null | wc -l',
+    ].join('\n')
+    for (const [i, [text, cap]] of table.entries()) {
+      const run = spawnSync(bash, ['-c', SLOTS, 'slots', files[i].replace(/\\/g, '/')], { encoding: 'utf8', timeout: 30_000 })
+      assert.equal(Number(run.stdout.trim()), cap, `heavy-slot reads ${JSON.stringify(text)} as ${run.stdout.trim()} slots (${run.stderr})`)
+    }
+  })
+
+  test("round 1, M1: a .gate-cap that can't be read is no cap: null, never an error of the folders, so a switch's S3 doesn't stand on it; floorOk waits, and the launch refuses naming .gate-cap", async () => {
+    const dirs = lab()
+    const id = randomUUID()
+    const heavy = join(dirs.root, 'heavy')
+    mkdirSync(join(heavy, '.gate-queue'), { recursive: true })
+    mkdirSync(join(heavy, '.gate-lock'))
+    writeFileSync(join(heavy, '.gate-cap'), '3\n')
+    // The read throws, as an ACL that denies it or another process's exclusive handle would.
+    const denied = text => text.replace('$heavyCapText = "$(Get-Content -LiteralPath $heavyCapFile -Raw)"', "$heavyCapText = \"$(throw 'Access to the path is denied.')\"")
+    const ran = await underStub({ stub, work, env: envOf(dirs), script: () => denied(machine.probeScript({ ids: [id], configDirs: [dirs.config], stateDir: dirs.state, heavySlotRoot: heavy, slots: true })) })
+    const probe = machine.parseProbe(ran.stdout)
+    assert.ok(!('error' in probe), `${probe.error}\n${ran.stdout}${ran.stderr}`)
+    assert.deepEqual([probe.heavyCap, probe.heavyBusy, probe.heavyWaiters !== null], [null, 1, true], 'the cap unread, the slots read')
+    assert.ok(!probe.errors.some(e => e.source === 'heavy'), JSON.stringify(probe.errors))
+    assert.ok(!machine.safePoint(probe, { isReadable: true, markers: [], trees: [] }, []).reasons.some(r => /heavy/.test(r)), 'no S3 for a cap')
+    assert.equal(machine.floorOk({ ...probe, freeKb: 999_999_999, room: 0 }, 40), 'heavy', 'a cap unread is not free')
+    const input = { powershell: WINDOWS_POWERSHELL, kind: 'start', id, name: 'lane-x', folder: dirs.folder, claim: `launch:${randomUUID()}`, configDirs: [dirs.config], stateDir: dirs.state, where: { window: true }, checks: { floor: true, input: true, fresh: true }, maxSessions: 40, heavySlotRoot: heavy, tool: 'coordinator' }
+    const refused = await underStub({ stub, work, env: envOf(dirs), script: () => denied(noWindow(machine.launchScriptText(input))).replace('$needBytes = [math]::Max(', '$freeKb = [long]999999999; $needBytes = [math]::Max(') })
+    assert.equal(machine.parseLaunch(refused.stdout).refused?.code, 'heavy', refused.stdout + refused.stderr)
+    assert.match(refused.stdout, /heavy-slot's \.gate-cap could not be read: Access to the path is denied\./)
+    assert.ok(!/heavy-slot folders could not be read/.test(refused.stdout), 'never the folders')
+    assert.ok(!existsSync(machine.claimPath(dirs.state, id)), 'nothing taken')
+  })
+
+  test("round 1, L2: a slot is held as heavy-slot's stale() reads it: a hung job above a lowered cap stops holding launches once its slot is an hour old", async () => {
+    const dirs = lab()
+    const id = randomUUID()
+    const heavy = join(dirs.root, 'heavy')
+    mkdirSync(join(heavy, '.gate-queue'), { recursive: true })
+    writeFileSync(join(heavy, '.gate-cap'), '1')
+    const now = Math.floor(Date.now() / 1000)
+    // A job that still runs (this test's own process), holding slot 4 since before the cap went down to 1.
+    const slot = (name, owner) => {
+      mkdirSync(join(heavy, name), { recursive: true })
+      writeFileSync(join(heavy, name, 'winpid'), String(process.pid))
+      if (owner !== undefined) writeFileSync(join(heavy, name, 'owner'), owner)
+    }
+    slot('.gate-lock-4', `4242 ${now - 4000} /c/work\n`)
+    // No owner file, its folder two hours old; and an owner file that names no time.
+    slot('.gate-lock-3')
+    utimesSync(join(heavy, '.gate-lock-3'), new Date(Date.now() - 7_200_000), new Date(Date.now() - 7_200_000))
+    slot('.gate-lock-2', '4243\n')
+    const read = async () => {
+      const ran = await underStub({ stub, work, env: envOf(dirs), script: () => machine.probeScript({ ids: [id], configDirs: [dirs.config], stateDir: dirs.state, heavySlotRoot: heavy, slots: true }) })
+      const probe = machine.parseProbe(ran.stdout)
+      assert.ok(!('error' in probe), `${probe.error}\n${ran.stdout}${ran.stderr}`)
+      return probe
+    }
+    const old = await read()
+    assert.deepEqual([old.heavyCap, old.heavyBusy], [1, 0], 'all three stale, as heavy-slot would reclaim them')
+    assert.equal(machine.floorOk({ ...old, freeKb: 999_999_999, room: 0 }, 40), 'ok')
+    // The same job, its owner file's time under an hour: it holds the one slot the cap allows.
+    writeFileSync(join(heavy, '.gate-lock-4', 'owner'), `4242 ${now - 60} /c/work\n`)
+    const young = await read()
+    assert.deepEqual([young.heavyCap, young.heavyBusy], [1, 1])
+    assert.equal(machine.floorOk({ ...young, freeKb: 999_999_999, room: 0 }, 40), 'heavy')
+  })
+
   test('relockScript: a different holder, still running, stays (N12); one gone, or the same, is replaced', async () => {
     const dirs = lab()
     const id = randomUUID()

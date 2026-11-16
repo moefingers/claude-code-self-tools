@@ -1645,26 +1645,55 @@ export const HEAVY_CAP_MAX = HEAVY_SLOTS.length
 /** The slot folders as a PowerShell list, for a `foreach`. */
 const HEAVY_SLOT_LIST = HEAVY_SLOTS.map(s => `"${s}"`).join(', ')
 
+/** The largest number bash's `[ ... -gt ... ]` reads (int64's): past it, every one of heavy-slot's tests of the cap fails. */
+const BASH_INT_MAX = '9223372036854775807'
+
+/**
+ * `$heavyCap` from `$heavyCapText`, the `.gate-cap` file's text ($null with no file), line for line as
+ * heavy-slot.sh's `slots()` reads it: `tr -dc '0-9'` keeps the digits, and none is HEAVY_CAP_DEFAULT
+ * (`${cap:-2}`). bash's `[ "$cap" -gt 4 ]` then reads them as a base-10 integer, leading zeros and all, so
+ * all zeros is 0. A value past int64's largest fails that test and every test after it, so heavy-slot uses no
+ * slot at all: 0. More than HEAVY_CAP_MAX is HEAVY_CAP_MAX. Exported for the test that replays heavy-slot's
+ * own lines against it.
+ */
+export const HEAVY_CAP_PARSE = [
+  `$heavyCap = ${HEAVY_CAP_DEFAULT}`,
+  '$heavyCapDigits = "$heavyCapText" -replace "[^0-9]", ""',
+  'if ($heavyCapDigits.Length -gt 0) {',
+  '  $heavyCapValue = $heavyCapDigits.TrimStart([char]48)',
+  '  if ($heavyCapValue.Length -eq 0) { $heavyCap = 0 }',
+  `  elseif ($heavyCapValue.Length -gt ${BASH_INT_MAX.length} -or ($heavyCapValue.Length -eq ${BASH_INT_MAX.length} -and [string]::CompareOrdinal($heavyCapValue, "${BASH_INT_MAX}") -gt 0)) { $heavyCap = 0 }`,
+  `  else { $heavyCap = [int][math]::Min([long]${HEAVY_CAP_MAX}, [long]$heavyCapValue) }`,
+  '}',
+]
+
 /**
  * heavy-slot's state, from its folders under `$heavyRoot`, by PowerShell alone (never bash, never MSYS):
- * `$heavyWaiters`, the live tickets in .gate-queue; `$heavyCap`, how many slots heavy-slot uses, read from
- * `.gate-cap` as heavy-slot reads it (its digits; none, or no file, is HEAVY_CAP_DEFAULT; over
- * HEAVY_CAP_MAX counts as HEAVY_CAP_MAX; 0 holds every new job); and `$heavyBusy`, the slots held, of all
- * HEAVY_SLOTS (0 to 4), so a job above a lowered cap still counts. A ticket names its waiter by an MSYS pid,
- * which Windows can't look up: it counts while a heavy-slot shell runs at all (the process table) and it is
- * under an hour old, so a ticket a dead waiter left holds a launch only while another job runs, which clears
- * it. A slot counts as held while the Windows pid it names runs, or, with none named, while it is under an
- * hour old. Needs `$table`; throws when the folders or the cap file can't be read, and when `$heavyRoot` is no
- * folder (a typo, a drive not mounted yet): nothing found there is not nothing waiting.
+ * - `$heavyWaiters`: the live tickets in .gate-queue. A ticket names its waiter by an MSYS pid, which
+ *   Windows can't look up: it counts while a heavy-slot shell runs at all (the process table) and it is under
+ *   an hour old, so a ticket a dead waiter left holds a launch only while another job runs, which clears it.
+ * - `$heavyCap`: how many slots heavy-slot uses, from `.gate-cap` as heavy-slot reads it (HEAVY_CAP_PARSE).
+ *   It is read in a try of its own: a cap that can't be read is null, with why in `$heavyCapError`, and no
+ *   error of the folders, so S3 (a heavy job under this session) never stands on it. A floor never takes a
+ *   null cap as free: floorOk waits on it, and floorLines refuses, naming `.gate-cap`.
+ * - `$heavyBusy`: the slots held, of all HEAVY_SLOTS (0 to 4), so a job above a lowered cap still counts. A
+ *   slot is held as heavy-slot's `stale()` reads it, by the Windows pid where the slot names one: its job runs
+ *   (with no pid named, it may), and it is at most HEAVY_STALE_SECS old, by the time its owner file names (an
+ *   owner file with no time is stale), else by the folder's own. So a hung job above a lowered cap, which
+ *   heavy-slot never reclaims, stops holding launches after an hour, as it would stop holding a slot.
+ * Needs `$table`; throws when the folders can't be read, and when `$heavyRoot` is no folder (a typo, a drive
+ * not mounted yet): nothing found there is not nothing waiting.
  */
 const READ_HEAVY = [
   'if (-not (Test-Path -LiteralPath $heavyRoot -PathType Container)) { throw ("no folder at " + $heavyRoot) }',
   '$heavyWaiters = 0',
   '$heavyBusy = 0',
-  `$heavyCap = ${HEAVY_CAP_DEFAULT}`,
   '$heavyCapFile = Join-Path $heavyRoot ".gate-cap"',
-  // heavy-slot: `tr -dc '0-9'` of the file, empty is the default, over the most is the most. Past 9 digits it is over, and no [int] overflows.
-  `if (Test-Path -LiteralPath $heavyCapFile -PathType Leaf) { $heavyCapDigits = "$(Get-Content -LiteralPath $heavyCapFile -Raw)" -replace "[^0-9]", ""; if ($heavyCapDigits.Length -gt 9) { $heavyCap = ${HEAVY_CAP_MAX} } elseif ($heavyCapDigits.Length -gt 0) { $heavyCap = [math]::Min(${HEAVY_CAP_MAX}, [int]$heavyCapDigits) } }`,
+  '$heavyCapText = $null',
+  '$heavyCapError = $null',
+  'try { if (Test-Path -LiteralPath $heavyCapFile -PathType Leaf) { $heavyCapText = "$(Get-Content -LiteralPath $heavyCapFile -Raw)" } } catch { $heavyCapError = $_.Exception.Message }',
+  ...HEAVY_CAP_PARSE,
+  'if ($null -ne $heavyCapError) { $heavyCap = $null }',
   String.raw`$heavyShells = @($table.Values | Where-Object { "$($_.CommandLine)" -match "heavy-slot\.sh" }).Count`,
   '$heavyNow = [DateTime]::UtcNow',
   '$heavyQueue = Join-Path $heavyRoot ".gate-queue"',
@@ -1675,7 +1704,12 @@ const READ_HEAVY = [
   '  $wf = Join-Path $d "winpid"',
   '  $w = $null',
   String.raw`  if (Test-Path -LiteralPath $wf -PathType Leaf) { $w = "$(Get-Content -LiteralPath $wf -Raw)".Trim(); if ($w -notmatch "^\d{1,10}\z") { $w = $null } }`,
-  `  if ($null -ne $w) { if ($null -ne $table[[int]$w]) { $heavyBusy++ } } elseif (($heavyNow - [IO.Directory]::GetLastWriteTimeUtc($d)).TotalSeconds -lt ${HEAVY_STALE_SECS}) { $heavyBusy++ }`,
+  // Its age as heavy-slot's stale() reads it: `<pid> <time> <folder>` in its owner file, else the folder's time.
+  '  $of = Join-Path $d "owner"',
+  '  $since = [IO.Directory]::GetLastWriteTimeUtc($d)',
+  // bash's `$((now - ts))`: no time (or not a number) is 0, so stale; one past the last date .NET has is ahead of now.
+  String.raw`  if (Test-Path -LiteralPath $of -PathType Leaf) { $o = @("$(Get-Content -LiteralPath $of -Raw)".Trim() -split "\s+"); $since = [DateTime]::MinValue; if ($o.Count -ge 2 -and $o[1] -match "^\d{1,18}\z") { $ts = [long]$o[1]; if ($ts -gt 253402300799) { $since = [DateTime]::MaxValue } else { $since = [DateTimeOffset]::FromUnixTimeSeconds($ts).UtcDateTime } } }`,
+  `  if (($heavyNow - $since).TotalSeconds -le ${HEAVY_STALE_SECS} -and ($null -eq $w -or $null -ne $table[[int]$w])) { $heavyBusy++ }`,
   '}',
 ]
 
@@ -3897,6 +3931,8 @@ function floorLines(heavyRoot: string | undefined, maxSessions: number): string[
           ...READ_HEAVY.map(line => `  ${line}`),
           "} catch { Refuse 'heavy' ('the heavy-slot folders could not be read: ' + $_.Exception.Message) }",
           "if ($heavyWaiters -gt 0) { Refuse 'heavy' ($heavyWaiters.ToString() + ' heavy jobs are waiting, and they go first') }",
+          // A cap that can't be read is no reading that a slot is free; it is the file's, never the folders'.
+          `if ($null -eq $heavyCap) { Refuse 'heavy' ("heavy-slot's .gate-cap could not be read: " + $heavyCapError) }`,
           // At heavy-slot's cap no heavy job could start now, and a launch never goes ahead of one: 0 holds them all.
           "if ($heavyCap -eq 0) { Refuse 'heavy' 'heavy-slot holds every heavy job: its cap is 0' }",
           "if ($heavyBusy -ge $heavyCap) { Refuse 'heavy' ('every heavy slot is busy (slots held: ' + $heavyBusy.ToString() + '; heavy-slot''s cap: ' + $heavyCap.ToString() + ')') }",
