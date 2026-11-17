@@ -753,7 +753,7 @@ describe("a window's launch, end to end: the interpreter it chose, the wrapper's
 
   for (const [name, setup] of [
     ['too old (an /exit held past 120 seconds)', { plan: (x, input) => ({ 1: ticketOf(x.id, input.claim, x.dirs.folder, [x.dirs.config], '{OLD}') }), why: /its time is not within the last 120 seconds/, conversation: x => x.id }],
-    ['past the guard of 3 resumes within 30 seconds', { plan: (x, input) => Object.fromEntries([1, 2, 3, 4].map(n => [n, ticketOf(x.id, input.claim, x.dirs.folder, [x.dirs.config])])), why: /this tab resumed 3 times within 30 seconds/, conversation: x => x.id, runs: 4 }],
+    ['past the guard of 3 resumes within 30 seconds', { plan: (x, input) => Object.fromEntries([1, 2, 3, 4].map(n => [n, ticketOf(x.id, input.claim, x.dirs.folder, [x.dirs.config])])), why: /this window resumed 3 times within 30 seconds/, conversation: x => x.id, runs: 4 }],
     [
       'for a conversation open elsewhere (L2)',
       {

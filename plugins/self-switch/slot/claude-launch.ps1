@@ -1,7 +1,7 @@
 # claude-launch.ps1: starts Claude Code as a top-level session. The one script in
 # claude-code-self-tools that runs claude: every launch (a restart's or a switch's window, the
 # coordinator's go, a steward's launch, a slot runner's every start, and you by hand) comes through it.
-# claude-launch version 4
+# claude-launch version 6
 #
 # Part of self-switch (claude-code-self-tools, plugins/self-switch/slot/claude-launch.ps1). Nobody
 # copies it: a launch that opens a window puts the copy it carries in %LOCALAPPDATA%\claude-self-tools,
@@ -25,8 +25,9 @@
 # -Wrapper runs claude through the claude wrapper's verified copy (below), so that a restart or a switch
 # out of the session comes back in this same window or tab. A launch's window always gives it; a slot
 # runner never does (it has its own loop). -Hosted, with -Wrapper, says this run hosts a window a launch
-# opened, and only that window's script passes it: the wrapper's pane file then says hosted, and it
-# resumes up to 30 times an hour instead of 10 in all. Run by hand, -Wrapper alone keeps a profile's ways.
+# opened, and only that window's script passes it: the wrapper's pane file then says hosted. Hosted or
+# not, it resumes up to 30 times an hour, and stops a restart loop. Run by hand, -Wrapper alone keeps a
+# profile's ways.
 #
 # What it does, in order:
 # 1. It checks its arguments: a session id is a lowercase UUID; a name is lowercase letters, digits and
@@ -67,8 +68,8 @@
 #    With the wrapper loaded, it calls the wrapper's `claude` function, the one it just made (never by
 #    the name, which an alias would take), with those arguments, in this process: the wrapper gives
 #    claude a fresh CLAUDE_PANE_TOKEN and a pane file naming this PowerShell, claude.exe's own parent,
-#    marked hosted with -Hosted (30 moves an hour here, not 10 in all; placement.json, when it names a
-#    place, comes first for the next move), and when claude exits it resumes the ticket a restart or a
+#    marked hosted with -Hosted (placement.json, when it names a place, comes first for the next move;
+#    the same caps as in any tab), and when claude exits it resumes the ticket a restart or a
 #    switch left it, here. A
 #    ticket the wrapper doesn't use ends this script with exit 3, the reason left for the window that
 #    ran it ($ClaudeLaunchUnused), which records it and stays open; $ClaudeLaunchLast names the
@@ -97,7 +98,7 @@ $Clear = 'CLAUDE_CODE_CHILD_SESSION', 'CLAUDECODE', 'CLAUDE_CODE_SESSION_ID', 'C
 $Drop = 'PSExecutionPolicyPreference', 'CLAUDE_PANE_TOKEN'
 $Set = [ordered]@{ CLAUDE_CODE_FORCE_SESSION_PERSISTENCE = '1'; CLAUDE_CODE_DISABLE_BG_SHELL_PRESSURE_REAP = '1' }
 # The claude wrapper's copy -Wrapper loads, by its SHA-256: WRAPPER_SCRIPT_SHA256 in the plugins' machine code.
-$WrapperSha256 = '255d8dc23c944b917fa541ae04fee908012927e77d8a85bb27bca06a70980293'
+$WrapperSha256 = '20083123ff9850af6a743373b4e5b38cc3b03500a35447166687c40fc0a09bdd'
 
 function Stop-Launch($why) {
   Write-Host ('claude-launch: ' + $why + ' Nothing was started.')
@@ -324,8 +325,8 @@ foreach ($n in $Set.Keys) { [Environment]::SetEnvironmentVariable($n, $Set[$n], 
 if ($Wrapper -and $null -eq $wrapperWhy) {
   $ErrorActionPreference = 'Continue'
   # Read by the wrapper in the script scope it runs under (this script's, run as a file; the session's, run
-  # as a script block), as $script: names it on both sides: hosted (-Hosted, a launch's window), it resumes
-  # up to 30 times an hour, not 10 in all, and its pane file says hosted. And left by it there: the
+  # as a script block), as $script: names it on both sides: hosted (-Hosted, a launch's window), its pane
+  # file says hosted, and its refusals name the window. And left by it there: the
   # conversation it resumed last, and a ticket it didn't use. The flag is taken away again once it
   # returns, so a session that ran this script by hand never keeps it for a `claude` typed later.
   $script:ClaudeWrapperHosted = [bool]$Hosted
