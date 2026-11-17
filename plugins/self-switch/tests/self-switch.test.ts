@@ -1911,7 +1911,8 @@ describe('arrival', () => {
     expect(kinds()).toEqual(['release'])
     const dated = [...held.entries()].filter(([key]) => key.startsWith('owed:')).map(([, value]) => (value as { since: number }).since)
     expect(dated).toHaveLength(1)
-    expect(dated[0] >= NOW && dated[0] < NOW + 5000).toBe(true)
+    const [since] = dated
+    expect(since !== undefined && since >= NOW && since < NOW + 5000).toBe(true)
   })
 
   test('round 1: a resume start tries the owed releases at once, not at the next tick 2 minutes later', async ($, on) => {
