@@ -129,6 +129,8 @@ type Options = {
   leftOut?: { stdout: string; stderr: string; exitCode: number }
   /** How many prompts the conversation's transcript holds (`$.session.turns()`); unread when not said. */
   turns?: number
+  /** A user input of the process came before this load (a reload, a plugin enabled partway): its prompt's id. */
+  promptId?: string
 }
 
 /**
@@ -181,6 +183,7 @@ function engine(
     markOn,
     leftOut,
     turns,
+    promptId,
   }: Options = {},
 ) {
   const runs: Run[] = []
@@ -267,6 +270,7 @@ function engine(
   on('session.end', (_, e) => ({ sessionId: e.sessionId }))
   on('session.id', () => answer({ value: world.id }))
   on('session.turns', () => answer(turns === undefined ? { deny: 'not read here' } : { value: turns }))
+  on('session.info', () => answer({ value: { transcriptPath: '', ...(promptId === undefined ? {} : { promptId }) } }))
   on('command.register', (_, e) => {
     registered.push(e.name)
     return answer({ value: { command: e.name } })
@@ -2843,7 +2847,8 @@ describe('S3 final', () => {
 // (hooks/classic.ts) takes the process's start up 5 s after session.start (the arrival, a new conversation's baseline),
 // and an in-process /clear or /resume from session.end and the id read as another conversation: there, and only there.
 describe('#53: under the guard', () => {
-  const GRACE = 5000
+  /** The partner's take-up: 5 s for a classic hook, then the id read again 1 s later, the same. */
+  const GRACE = 6000
   const SETTLE = 500
   const ticket = { at: NOW - MINUTE, from: OTHER, by: LAUNCH, transport: 'window', reason: 'Billing is next.', notes: 'notes/billing.md', resume: 'Run the invoice tests.' }
   const ends = (reason: 'clear' | 'resume', id: string) => ({ reason, sessionId: id, resume: { id } })
@@ -2930,6 +2935,16 @@ describe('#53: under the guard', () => {
     const asked = await $.tool.call(call)
     expect(asked.deny).toMatch(/a \/clear or a \/resume has just ended that conversation.+moving between conversations/)
     expect(held.get('switches')).toBeUndefined()
+  })
+
+  test('a reload into this version in an unguarded session (a user input came before it) takes no arrival: the ticket stays for the process it is for', async ($, on) => {
+    const { prompts, kinds, tickets, clock } = engine(on, { id: T, store: { switches: { [T]: ticket } }, turns: 2, promptId: '5d0c4f7e-1a2b-4c3d-9e8f-001122334455' })
+    await $.session.start(start)
+    // Within the ticket's 15 minutes, past which the heartbeat prunes it.
+    await clock.advance(10 * MINUTE)
+    expect(prompts).toEqual([])
+    expect(kinds()).toEqual([])
+    expect(Object.keys(tickets())).toEqual([T])
   })
 
   test('unguarded: a session end leaves the move to the classic SessionStart; no move is looked for, and no left record is written twice', async ($, on) => {

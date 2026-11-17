@@ -777,8 +777,9 @@ test("no prompt text is kept: the person's words reach no state, toast, note, lo
 // while a rate-limit window reads used up read as `rate_limit`.
 const presentation = { isFullscreen: false, columns: 120 } as const
 const ENDED = '0f8fad5b-d9cb-469f-a165-70867728950e'
-/** The rate-limit windows `$.session.usage()` reads, the five-hour one at `used` percent. */
-const usage = (on: On, used: number) => on('session.usage', () => ({ value: { startedAt: 0, context: {}, rateLimits: [{ kind: 'five_hour', percentUsed: used }] } }) as never)
+/** The rate-limit windows `$.session.usage()` reads, the five-hour one at `used` percent, resetting at `resets` (an hour on, by default). */
+const usage = (on: On, used: number, resets = '1970-01-01T01:00:00.000Z') =>
+  on('session.usage', () => ({ value: { startedAt: 0, context: {}, rateLimits: [{ kind: 'five_hour', percentUsed: used, resetsAt: resets }] } }) as never)
 /** The plugin's writes of its last turn, from what it handed the engine. */
 const turnWrites = (seen: readonly string[]) =>
   seen
@@ -832,6 +833,22 @@ test('#53, guarded: a turn dead on an API error with no window used up keeps no 
   expect(last?.outcome).toBe('error')
   expect(last?.error).toBeUndefined()
 })
+
+for (const [name, resets] of [
+  ['resets within a minute', '1970-01-01T00:00:30.000Z'],
+  ['has passed its reset', '1969-12-31T23:00:00.000Z'],
+] as const) {
+  test(`#53, guarded: a used-up reading that ${name} is stale: no error kind`, async ($, on) => {
+    const { seen } = engine(on)
+    usage(on, 100, resets)
+    await $.session.start(start)
+    await $.turn.start({ text: 'go', turnId: 't1' })
+    await $.turn.complete({ ...answered, turnId: 't1', reason: 'error' })
+    const last = turnWrites(seen).at(-1)
+    expect(last?.outcome).toBe('error')
+    expect(last?.error).toBeUndefined()
+  })
+}
 
 test('#53, unguarded: StopFailure names the error as before, and the partner adds nothing, a used-up window or not', async ($, on) => {
   const { seen } = engine(on)

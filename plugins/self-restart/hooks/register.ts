@@ -50,7 +50,7 @@
 // dropped: the window had given up, and the session was resumed later by hand. Where Claude Code's
 // built-in guard passes over this plugin's classic hooks (#52, #53: managed settings, or a Team or
 // Enterprise login), no SessionStart reaches it: its partner (classic.ts, startPartner) takes the
-// restart up instead, 5 seconds after session.start, for the conversation `$.session.id()` names,
+// restart up instead, on the process's own first start only, 5 seconds after session.start and once `$.session.id()` names one conversation on two reads a second apart,
 // unless a classic hook has arrived by then; an in-process /resume, from session.end and the id read
 // as another (moveLook). Whichever comes first takes the record out of the store, so the first prompt
 // is sent once.
@@ -96,7 +96,7 @@ import { launch as buildLaunch, parseLaunch, powershellPath, RELEASED, releaseSc
 import type { AgentLike, LaunchInput, LaunchWhere, Pane, PendingKind, Placement, Probe } from './machine'
 import { goAnswer, goRun, agentsHeld, agentsWayOut, blockersText, claimOf, exitBlockers, idLag, isBusyAgent, isSafeFolder, isWindowName, LAUNCH_DEADLINE_MS, LAUNCH_RETRY_MS, LAUNCH_RUN_MS, launchFolderFault, launchFolderSaid, loadPlacement, markPending, movesConversation, oneLine, paneAfter, paneFallback, paneTicketPath, pickLaunchTransport, plainOutput, powershellCall, quoted, readExit, readGit, readPane, resumeTitle, runProbe, safePoint, SLOT_SCRIPT_SHA256, idPathOrNone, TAB_LABEL } from './machine'
 import { checkTranscript, findTranscript, isProjectOf, type Transcript, transcriptFolder } from './start-folder'
-import { type ClassicIo, classicSeen, configureClassic, keepClassic, type Move, moveBegins, moveLook, movePending, startPartner, startTaken } from './classic'
+import { type ClassicIo, classicSeen, configureClassic, keepClassic, type Move, moveBegins, moveLook, movePending, startPartner, startTaken, takeOwedStart } from './classic'
 import { configureUpdateCheck, loadUpdateCheck, withUpdateNotice } from './update-check'
 
 const queued = { plugin: 'self-restart', key: 'queued' } as const
@@ -1102,18 +1102,18 @@ export const register: Register = (on, options) => {
     })
     loadUpdateCheck($)
     // #52, #53: where the classic SessionStart doesn't reach this plugin, its partner takes this process's start up (a
-    // restart's first prompt among it). Not awaited: it waits START_GRACE_MS for a classic hook first.
+    // restart's first prompt among it): only on the process's first start, never a reload or an enable partway through
+    // a session. Not awaited: it waits START_GRACE_MS for a classic hook, then for the id to settle.
     void startPartner($, classicIo($), id => guardedStart($, id))
     return started
   })
 
   // #53: a /clear or a /resume, where no classic SessionStart will name the conversation it moves to: looked for from
-  // here (moveLook), and taken up as that SessionStart would take it (moved). After the engine's end step, never
-  // holding it.
+  // here (moveLook), and taken up as that SessionStart would take it (moved). Before the engine's end step: a memory
+  // read, a clock read and the look's timer, inside the session end's one short bound.
   on('session.end', async ($, e, next) => {
-    const ended = await next(e)
     await moveBegins($, classicIo($), e, move => moved($, move))
-    return ended
+    return next(e)
   }).catch(($, e, next) => next(e))
 
   // The trampoline's handler. It never reads `next`: it answers its own command, and is no gate.
@@ -1209,6 +1209,8 @@ export const register: Register = (on, options) => {
   on('turn.start', async ($, e, next) => {
     const started = await next(e)
     if (e.agentId === undefined) go.turnStarted()
+    // #52, #53: a start whose id never settled (classic.ts): its restart is taken up now, its first prompt after this turn.
+    if (e.agentId === undefined) void takeOwedStart($, classicIo($))
     if (e.agentId !== undefined || armed === undefined) return started
     armed = undefined
     $.ui.status(undefined)

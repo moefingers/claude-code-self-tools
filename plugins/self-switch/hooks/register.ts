@@ -99,7 +99,7 @@
 //
 // Where Claude Code's built-in guard passes over this plugin's classic hooks (#53: managed settings, or a Team or
 // Enterprise login), no SessionStart reaches it. Its partner does that hook's work there instead, and only there
-// (classic.ts). At the process's start, 5 seconds after session.start unless a classic hook arrives first: the arrival
+// (classic.ts). At the process's own first start, 5 seconds after session.start (once the id settles) unless a classic hook arrives first: the arrival
 // (a switch that placed this process takes it up), and in a conversation with no prompt yet, S11's baseline. At an
 // in-process /clear or /resume: session.end takes back a switch the conversation ending had armed, and the first read
 // of `$.session.id()` as another conversation takes the move up (tookMove): the start folder back in `$.state`, the
@@ -109,7 +109,7 @@
 // (the folder is taken once the conversation's transcript is there, at its first prompt).
 import type { EngineInterface, Register, Timer } from 'claude-code'
 import type { Heartbeat, Queued, Ticket } from '../types'
-import { type ClassicIo, classicRuns, classicSeen, configureClassic, keepClassic, type Move, moveBegins, moveLook, movePending, startPartner, startSource } from './classic'
+import { type ClassicIo, classicRuns, classicSeen, configureClassic, keepClassic, type Move, moveBegins, moveLook, movePending, startPartner, type StartSource, takeOwedStart } from './classic'
 import { go } from './go'
 import type { AgentLike, LaunchInput, LaunchWhere, LeftStat, Pane, Placement, Probe, ProcessRef, Transport } from './machine'
 import {
@@ -1693,8 +1693,8 @@ async function runSwitch($: EngineInterface, value: Queued): Promise<void> {
  * conversation and this process; and in a conversation with no prompt yet, S11's baseline of the folder it started in,
  * as a startup's SessionStart takes it. A conversation with prompts (a resume) takes none: without one, the dirt holds.
  */
-async function guardedStart($: EngineInterface, id: string): Promise<void> {
-  if ((await startSource($)) === 'startup') {
+async function guardedStart($: EngineInterface, id: string, source: StartSource): Promise<void> {
+  if (source === 'startup') {
     const folder = startFolder !== undefined && startFolder !== '' ? startFolder : provisional
     if (folder !== undefined && isSafeFolder(folder)) $.clock.after(SETTLE_MS, () => void keepBaseline($, id, folder))
   }
@@ -1714,7 +1714,8 @@ async function tookMove($: EngineInterface, move: Move): Promise<void> {
   } catch {
     // The heartbeat puts it back when it finds it empty.
   }
-  const previous = current !== undefined && current !== move.to ? current : move.from
+  // The conversation the session end named as ending, the engine's own id for it; else the one this process held.
+  const previous = SESSION_ID.test(move.from) && move.from !== move.to ? move.from : current !== undefined && current !== move.to ? current : move.from
   current = move.to
   currentFromEvent = false
   currentAt = await $.clock.now()
@@ -1817,25 +1818,25 @@ export const register: Register = (on, options) => {
     }
     loadUpdateCheck($)
     startBeat($)
-    // #53: where the classic SessionStart doesn't reach this plugin, its partner takes this process's start up. Not
-    // awaited: it waits START_GRACE_MS for a classic hook first.
-    void startPartner($, classicIo($), id => guardedStart($, id))
+    // #53: where the classic SessionStart doesn't reach this plugin, its partner takes this process's start up: only on
+    // the process's first start, never a reload or an enable partway through a session. Not awaited: it waits
+    // START_GRACE_MS for a classic hook, then for the id to settle.
+    void startPartner($, classicIo($), (id, source) => guardedStart($, id, source))
     return started
   })
 
   // #53: a /clear or a /resume, where no classic SessionStart will name the conversation it moves to. A switch the
   // conversation ending had armed is taken back at once, as that SessionStart takes it back (the switch was that
-  // conversation's); then the move is looked for (moveLook), and taken up as that SessionStart would take it (tookMove),
-  // after the engine's end step, never holding it.
+  // conversation's); then the move is looked for (moveLook), and taken up as that SessionStart would take it (tookMove).
+  // Before the engine's end step: memory reads, a clock read and the look's timer, inside the session end's one bound.
   on('session.end', async ($, e, next) => {
     if ((e.reason === 'clear' || e.reason === 'resume') && armed !== undefined && armed.from !== undefined && armed.from === e.sessionId && !(await classicRuns($, classicIo($)))) {
       armed = undefined
       $.ui.status(undefined)
       $.ui.toast('Switch cancelled: this session became another conversation before it ran.')
     }
-    const ended = await next(e)
     await moveBegins($, classicIo($), e, move => tookMove($, move))
-    return ended
+    return next(e)
   }).catch(($, e, next) => next(e))
 
   // The trampoline's handler. It never reads `next`: it answers its own command, and is no gate.
@@ -1992,6 +1993,8 @@ export const register: Register = (on, options) => {
     if (e.agentId !== undefined) return started
     go.turnStarted()
     void heartbeat($)
+    // #53: a start whose id never settled (classic.ts): its arrival is taken up now.
+    void takeOwedStart($, classicIo($))
     if (armed === undefined) return started
     const value = armed
     armed = undefined

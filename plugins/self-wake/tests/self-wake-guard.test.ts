@@ -48,6 +48,7 @@ function engine(on: On, kept: Record<string, unknown> = {}) {
   on('session.start', (_, e) => ({ cwd: e.cwd }))
   on('session.end', (_, e) => ({ sessionId: e.sessionId }))
   on('session.id', () => ({ value: world.id }))
+  on('session.info', () => ({ value: { transcriptPath: '' } }))
   on('tool.register', (_, e) => ({ value: { tool: `mcp__self-wake__${e.name}` } }))
   on('ui.status', () => ({ value: undefined }))
   on('ui.toast', (_, e) => {

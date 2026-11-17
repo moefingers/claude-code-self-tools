@@ -37,7 +37,7 @@
 //
 // Where Claude Code's built-in guard passes over this plugin's classic hooks (#53: managed settings, or a Team or
 // Enterprise login), no SessionStart reaches it. Its partner does that hook's work there instead, and only there
-// (classic.ts): at the process's start, 5 seconds after session.start unless a classic hook arrives first, the env
+// (classic.ts): at the process's own first start, 5 seconds after session.start (once the id settles) unless a classic hook arrives first, the env
 // guard, and in a conversation that already has prompts (a resume), the quiet check RESUME_MS later; at an in-process
 // /clear or /resume, from session.end and the first read of `$.session.id()` as another conversation, the env guard,
 // and at a /resume the quiet check. What the guard can't give it: the moment right after the SessionStart hooks
@@ -53,7 +53,7 @@ import { dedupeFolder, envFolder, outcomeLine, readEnv, refusedFiles, rewritten 
 import type { DedupeOutcome, EnvReading } from './env-guard'
 import { DEDUPE_OVER, dedupe, GIT_BASH_LIMIT, grouped, roomPhrase, verdictOf } from './env-rules'
 import { isSafeFolder, oneLine, quoted, selfcheckPath, selfcheckRecord, stateFolder, within } from './machine'
-import { type ClassicIo, classicSeen, configureClassic, keepClassic, type Move, moveBegins, startPartner, startSource } from './classic'
+import { type ClassicIo, classicSeen, configureClassic, keepClassic, type Move, moveBegins, startPartner, type StartSource, takeOwedStart } from './classic'
 import { configureUpdateCheck, loadUpdateCheck, withUpdateNotice } from './update-check'
 
 const TOOL = 'mcp__self-check__tools_check'
@@ -519,9 +519,9 @@ const partnerChecked = new Set<string>()
  * START_GRACE_MS of session.start (classic.ts, startPartner): the env guard, and in a conversation that already has
  * prompts (`--resume`, `--continue`), the quiet check RESUME_MS later.
  */
-async function guardedStart($: EngineInterface, id: string): Promise<void> {
+async function guardedStart($: EngineInterface, id: string, source: StartSource): Promise<void> {
   if (envDedupe) await guardAtStart($, id)
-  if (!checkAtResume || (await startSource($)) !== 'resume') return
+  if (!checkAtResume || source !== 'resume') return
   partnerChecked.add(id)
   $.clock.after(RESUME_MS, () => void atIdle($, id))
 }
@@ -572,19 +572,19 @@ export const register: Register = (on, options) => {
       isDeferred: false,
     })
     loadUpdateCheck($)
-    // #53: where the classic SessionStart doesn't reach this plugin, its partner takes this process's start up. Not
-    // awaited: it waits START_GRACE_MS for a classic hook first.
-    void startPartner($, classicIo($), id => guardedStart($, id))
+    // #53: where the classic SessionStart doesn't reach this plugin, its partner takes this process's start up: only on
+    // the process's first start, never a reload or an enable partway through a session. Not awaited: it waits
+    // START_GRACE_MS for a classic hook, then for the id to settle.
+    void startPartner($, classicIo($), (id, source) => guardedStart($, id, source))
     return started
   })
 
   // #53: a /clear or a /resume, where no classic SessionStart will name the conversation it moves to: looked for from
-  // here (moveLook), and taken up as that SessionStart would take it (moved). After the engine's end step, never
-  // holding it.
+  // here (moveLook), and taken up as that SessionStart would take it (moved). Before the engine's end step: a memory
+  // read, a clock read and the look's timer, inside the session end's one short bound.
   on('session.end', async ($, e, next) => {
-    const ended = await next(e)
     await moveBegins($, classicIo($), e, move => moved($, move))
-    return ended
+    return next(e)
   }).catch(($, e, next) => next(e))
 
   on('tool.call', { tool: TOOL }, async ($, e) => {
@@ -616,8 +616,10 @@ export const register: Register = (on, options) => {
   on('turn.start', async ($, e, next) => {
     const started = await next(e)
     if (e.agentId === undefined) inTurn = true
-    // #53: the word that classic hooks reach this process, put back after a /clear's or a /resume's wipe (classic.ts).
+    // #53: the word that classic hooks reach this process, put back after a /clear's or a /resume's wipe (classic.ts);
+    // and a start whose id never settled, taken up now.
     if (e.agentId === undefined) await keepClassic($, classicIo($))
+    if (e.agentId === undefined) void takeOwedStart($, classicIo($))
     return started
   })
 

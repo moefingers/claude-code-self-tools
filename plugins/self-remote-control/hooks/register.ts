@@ -311,15 +311,20 @@ async function queueRename($: EngineInterface, name: string, resume: string | un
   return `${plan}${then(value.resume)}`
 }
 
+/** A window counts as used up only while it resets more than this far ahead: a reading past its reset is stale. */
+const WINDOW_AHEAD_MS = 60_000
+
 /**
  * #53, StopFailure's partner where no classic hook reaches this plugin: the API error kind a main-loop turn died of,
- * as far as the engine shows it, `rate_limit` while a rate-limit window of the account reads used up; undefined when
- * none does, or the windows can't be read (the error stays unknown, so no resume follows it).
+ * as far as the engine shows it, `rate_limit` while a rate-limit window of the account reads used up and resets more
+ * than WINDOW_AHEAD_MS from now (the last response's reading; one past its reset, or with no reset named, is stale);
+ * undefined otherwise, or when the windows can't be read (the error stays unknown, so no resume follows it).
  */
 async function guardedFailure($: EngineInterface): Promise<string | undefined> {
   try {
-    const { rateLimits } = await $.session.usage()
-    return rateLimits.some(w => typeof w.percentUsed === 'number' && w.percentUsed >= 100) ? 'rate_limit' : undefined
+    const [{ rateLimits }, now] = await Promise.all([$.session.usage(), $.clock.now()])
+    const spent = rateLimits.some(w => typeof w.percentUsed === 'number' && w.percentUsed >= 100 && typeof w.resetsAt === 'string' && Date.parse(w.resetsAt) - now > WINDOW_AHEAD_MS)
+    return spent ? 'rate_limit' : undefined
   } catch {
     return undefined
   }
@@ -545,8 +550,9 @@ export const register: Register = (on, options) => {
   // #53, SessionStart's partner where no classic hook reaches this plugin: a /clear or a /resume makes the session
   // another conversation, whose last turn isn't the one this plugin saw end. After the engine's end step.
   on('session.end', async ($, e, next) => {
+    const begun = await moveBegins($, classicIo($), e)
     const ended = await next(e)
-    if ((await moveBegins($, classicIo($), e)) !== undefined) await forgetTurn($)
+    if (begun !== undefined) await forgetTurn($)
     return ended
   }).catch(($, e, next) => next(e))
 

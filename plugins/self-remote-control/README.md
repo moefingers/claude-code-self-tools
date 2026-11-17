@@ -121,7 +121,7 @@ Where Claude Code's built-in guard loads (a machine with managed settings, or a 
 
 - **The session's title** is the one a `/rename` you type sets, or the plugin's own `rename`.
 - **A `/clear` or a `/resume`** forgets the last turn, as before.
-- **After a login change**, a turn that died on an API error while a rate-limit window of the account reads used up counts as cut off by the usage limit, and is resumed.
+- **After a login change**, a turn that died on an API error while a rate-limit window of the account reads used up, and resets more than a minute later, counts as cut off by the usage limit, and is resumed. A reading past its reset is stale, and counts for nothing.
 - **What it can't do there:** a title from `--name`, a hook, the SDK or the app, or one a resumed conversation carries, until you rename; a fork's start; and a turn that died on another error a login could clear (a failed sign-in, billing, an outage), which isn't resumed.
 
 Where the guard isn't loaded, nothing changes. See [Under Claude Code's built-in guard](../../README.md#under-claude-codes-built-in-guard).

@@ -53,7 +53,7 @@
 // switch may not see the wake-up.
 import type { EngineInterface, Register, Timer } from 'claude-code'
 import type { Wake } from '../types'
-import { type ClassicIo, classicSeen, configureClassic, keepClassic, type Move, moveBegins, moveLook, movePending, startPartner } from './classic'
+import { type ClassicIo, classicSeen, configureClassic, keepClassic, type Move, moveBegins, moveLook, movePending, startPartner, takeOwedStart } from './classic'
 import { ID_LAG_MS, idLag, isSafeFolder, movesConversation, powershellPath, removeWakeMarker, SESSION_ID, stateFolder, SYSTEM_ROOT, wakeMarker, wakePath } from './machine'
 import { configureUpdateCheck, loadUpdateCheck, withUpdateNotice } from './update-check'
 
@@ -487,12 +487,11 @@ export const register: Register = (on, options) => {
   })
 
   // #53: a /clear or a /resume, where no classic SessionStart will name the conversation it moves to: looked for from
-  // here (moveLook), and taken up as that SessionStart would take it (moved). After the engine's end step, never
-  // holding it.
+  // here (moveLook), and taken up as that SessionStart would take it (moved). Before the engine's end step: a memory
+  // read, a clock read and the look's timer, inside the session end's one short bound.
   on('session.end', async ($, e, next) => {
-    const ended = await next(e)
     await moveBegins($, classicIo($), e, move => moved($, move))
-    return ended
+    return next(e)
   }).catch(($, e, next) => next(e))
 
   // Each conversation this process comes to holds its marker, by the event's own id: at a startup, a
@@ -586,8 +585,10 @@ export const register: Register = (on, options) => {
   on('turn.complete', async ($, e, next) => {
     const done = await next(e)
     if (e.agentId !== undefined) return done
-    // #53: the word that classic hooks reach this process, put back after a /clear's or a /resume's wipe (classic.ts).
+    // #53: the word that classic hooks reach this process, put back after a /clear's or a /resume's wipe (classic.ts);
+    // and a start whose id never settled, taken up now.
     await keepClassic($, classicIo($))
+    await takeOwedStart($, classicIo($))
     // The conversation as the id now reads it: a /branch past its lag carries the wake-up to the fork.
     if (held !== undefined) await conversation($).catch(() => undefined)
     const { value } = await $.state.get(queued)

@@ -36,12 +36,14 @@ type Options = {
   text?: string
   /** How many prompts the conversation's transcript holds (`$.session.turns()`): a resumed one has some. */
   turns?: number
+  /** A user input of the process came before this load (a reload, a plugin enabled partway): its prompt's id. */
+  promptId?: string
 }
 
 const TOOLS = ['Bash', 'PowerShell', 'Read', 'mcp__linear__whoami', 'mcp__linear__list_issues', 'mcp__coordinator__lanes_list']
 
 /** The engine beneath the plugin, and what the plugin asked of it. */
-function engine(on: On, { bash = 'echoes', powershell = 'echoes', verdicts = {}, tools = TOOLS, probes = {}, env = { LOCALAPPDATA: LOCAL }, text, turns = 0 }: Options = {}) {
+function engine(on: On, { bash = 'echoes', powershell = 'echoes', verdicts = {}, tools = TOOLS, probes = {}, env = { LOCALAPPDATA: LOCAL }, text, turns = 0, promptId }: Options = {}) {
   const world = { bash, powershell, verdicts, tools, probes, id: ID, turns }
   const commands: { tool: string; command: string }[] = []
   const checked: string[] = []
@@ -60,6 +62,7 @@ function engine(on: On, { bash = 'echoes', powershell = 'echoes', verdicts = {},
   on('session.start', (_, e) => ({ cwd: e.cwd }))
   on('session.id', () => ({ value: world.id }))
   on('session.turns', () => ({ value: world.turns }))
+  on('session.info', () => ({ value: { transcriptPath: '', ...(promptId === undefined ? {} : { promptId }) } }))
   on('session.end', (_, e) => ({ sessionId: e.sessionId }))
   on('tool.register', () => ({ value: { tool: TOOL } }))
   on('ui.status', () => ({ value: undefined }))
@@ -512,17 +515,19 @@ test('with checkAtResume off, nothing runs at resume', { options: { checkAtResum
 // (hooks/classic.ts) takes the start up 5 s after session.start, and an in-process /resume from session.end and the id
 // read as another conversation: the quiet check at resume runs there, and only there, once.
 const GRACE = 5000
+/** The partner's take-up: the grace, then the id read again 1 s later, the same. */
+const START = GRACE + 1000
 const OTHER = '7c9e6679-7425-40de-944b-e07fc1f90ae7'
 
 test('#53, guarded: a resumed process (its transcript holds prompts) gets the quiet check 10 s after the partner takes its start up, once', async ($, on) => {
   const { commands, toasts, writes, clock } = engine(on, { turns: 3 })
   await $.session.start(start)
-  await clock.advance(GRACE + 9_999)
+  await clock.advance(START + 9_999)
   expect(commands).toEqual([])
   await clock.advance(1)
   expect(commands.map(c => c.tool)).toEqual(['Bash', 'PowerShell'])
   expect(toasts).toEqual([])
-  expect(writes).toEqual([{ path: RECORD, text: '{"v":1,"at":1015000,"failed":[]}' }])
+  expect(writes).toEqual([{ path: RECORD, text: '{"v":1,"at":1016000,"failed":[]}' }])
   await clock.advance(HOUR)
   expect(commands).toHaveLength(2)
 })
@@ -547,7 +552,7 @@ test('#53, unguarded: the classic SessionStart of the resume schedules the check
 test('#53, unguarded, the classic SessionStart late (after the grace): the partner scheduled the check, and the classic SessionStart adds none: once', async ($, on) => {
   const { commands, clock } = engine(on, { turns: 3 })
   await $.session.start(start)
-  await clock.advance(GRACE)
+  await clock.advance(START)
   await $.classic.SessionStart({ source: 'resume', session_id: ID })
   await clock.advance(HOUR)
   expect(commands.map(c => c.tool)).toEqual(['Bash', 'PowerShell'])
@@ -572,6 +577,13 @@ test('#53, a reload in an unguarded process reads that classic hooks run here: i
   // The session state a reload finds: an earlier load's word that classic hooks reach this process.
   on('state.get', (_, e) => ({ value: { value: e.key === 'classic' ? true : undefined, version: 1 } }))
   on('state.set', () => ({ value: { isSet: true, version: 2 } }))
+  await $.session.start(start)
+  await clock.advance(HOUR)
+  expect(commands).toEqual([])
+})
+
+test('#53: a reload into this version in an unguarded session (a user input came before it, no classic hook since) checks nothing', async ($, on) => {
+  const { commands, clock } = engine(on, { turns: 3, promptId: '5d0c4f7e-1a2b-4c3d-9e8f-001122334455' })
   await $.session.start(start)
   await clock.advance(HOUR)
   expect(commands).toEqual([])

@@ -12,8 +12,12 @@ const ID = '0f8fad5b-d9cb-469f-a165-70867728950e'
 const OTHER = '7c9e6679-7425-40de-944b-e07fc1f90ae7'
 const WINDOWS = { OS: 'Windows_NT', SystemRoot: 'C:\\Windows', LOCALAPPDATA: 'C:\\Users\\u\\AppData\\Local', USERPROFILE: 'C:\\Users\\u' }
 const NOW = 1_000_000
-/** How long the partner waits for a classic hook at a start, and how long after the take-up the prompt goes. */
+/**
+ * When the partner takes a start up: 5 s for a classic hook, then the id read again 1 s later, the same; and how long
+ * after the take-up the prompt goes.
+ */
 const GRACE = 5000
+const START = GRACE + 1000
 const SETTLE = 500
 /** The restart the old process kept: its reason, its first prompt and its claim. */
 const RESTART = { at: NOW - 30_000, reason: 'Switched accounts.', resume: 'Go on with the review.', claim: 'launch:00000000-0000-4000-a000-000000000004' }
@@ -26,13 +30,15 @@ type Options = {
   state?: Record<string, unknown>
   /** The conversation `$.session.id()` reads at the start. */
   id?: string
+  /** A user input of the process came before this load (a reload, a plugin enabled partway): its prompt's id. */
+  promptId?: string
 }
 
 /** The engine beneath the plugin: its store, its session state (which a test empties as Claude Code does), and what it was asked. */
-function engine(on: On, { restarts = { [ID]: RESTART }, state: kept = {}, id = ID }: Options = {}) {
+function engine(on: On, { restarts = { [ID]: RESTART }, state: kept = {}, id = ID, promptId }: Options = {}) {
   const store = new Map<string, unknown>([['restarts', restarts]])
   const state = new Map<string, unknown>(Object.entries(kept))
-  const world = { id }
+  const world: { id: string; reads?: () => string } = { id }
   const prompts: string[] = []
   const toasts: string[] = []
   const releases: string[] = []
@@ -51,8 +57,9 @@ function engine(on: On, { restarts = { [ID]: RESTART }, state: kept = {}, id = I
   })
   on('session.start', (_, e) => ({ cwd: e.cwd }))
   on('session.end', (_, e) => ({ sessionId: e.sessionId }))
-  on('session.id', () => ({ value: world.id }))
-  on('session.info', () => ({ value: { transcriptPath: `C:\\Users\\u\\.claude\\projects\\C--work-repo\\${world.id}.jsonl` } }))
+  on('session.id', () => ({ value: world.reads?.() ?? world.id }))
+  on('session.info', () => ({ value: { transcriptPath: `C:\\Users\\u\\.claude\\projects\\C--work-repo\\${world.id}.jsonl`, ...(promptId === undefined ? {} : { promptId }) } }))
+  on('turn.start', (_, e) => ({ turnId: e.turnId }))
   on('session.turns', () => ({ value: 3 }))
   on('session.cwd', () => ({ value: 'C:\\work\\repo' }))
   on('fs.exists', () => ({ value: true }))
@@ -82,7 +89,7 @@ const start = { cwd: 'C:\\work\\repo', surface: 'terminal', isInteractive: true 
 test('#52, guarded: no classic SessionStart reaches the plugin, and the restart is taken up 5 s after session.start: its first prompt sent once, its claim released, its record gone', async ($, on) => {
   const w = engine(on)
   await $.session.start(start)
-  await w.clock.advance(GRACE - 1)
+  await w.clock.advance(START - 1)
   expect(w.prompts).toEqual([])
   expect(w.toasts).toEqual([])
   await w.clock.advance(1 + SETTLE)
@@ -118,7 +125,7 @@ test('unguarded: the classic SessionStart of the resume sends the first prompt a
 test('unguarded, the classic SessionStart late (after the grace): the partner took it up, and the classic SessionStart finds it gone: once', async ($, on) => {
   const w = engine(on)
   await $.session.start(start)
-  await w.clock.advance(GRACE + SETTLE)
+  await w.clock.advance(START + SETTLE)
   expect(w.prompts).toEqual([PROMPT])
   await $.classic.SessionStart({ source: 'resume', session_id: ID })
   await w.clock.advance(60_000)
@@ -159,7 +166,7 @@ test('guarded, a reload in the process that kept the record: its start was taken
 test('guarded, an in-process /resume to the conversation a restart waits for: session.end, then the id read as that one, takes it up once', async ($, on) => {
   const w = engine(on, { id: OTHER })
   await $.session.start(start)
-  await w.clock.advance(GRACE + SETTLE)
+  await w.clock.advance(START + SETTLE)
   // OTHER's start: no restart waits for it.
   expect(w.prompts).toEqual([])
   await $.session.end({ reason: 'resume', sessionId: OTHER, resume: { id: OTHER } })
@@ -195,4 +202,57 @@ test('unguarded, a /clear: session.end leaves the move to the classic SessionSta
   // No move was looked for, so nothing took the start of OTHER up but the classic SessionStart.
   expect(w.state.get('self-restart/started')).toBe(OTHER)
   expect(w.prompts).toEqual([])
+})
+
+test('#52, guarded: an id that still reads another conversation at the grace is read again until it settles: the resume goes once, to the conversation resumed', async ($, on) => {
+  const OTHERS = { ...RESTART, resume: 'Not this one.' }
+  const w = engine(on, { id: OTHER, restarts: { [ID]: RESTART, [OTHER]: OTHERS } })
+  await $.session.start(start)
+  // The id reads OTHER at the grace's end, then the conversation resumed from 5.5 s on.
+  await w.clock.advance(GRACE + 500)
+  w.world.id = ID
+  // Read at 6 s (ID, not what 5 s read), and at 7 s (ID again): settled.
+  await w.clock.advance(1000)
+  expect(w.prompts).toEqual([])
+  await w.clock.advance(1000 + SETTLE)
+  expect(w.prompts).toEqual([PROMPT])
+  expect(w.state.get('self-restart/started')).toBe(ID)
+  expect(w.store.get('restarts')).toEqual({ [OTHER]: OTHERS })
+  await w.clock.advance(60_000)
+  expect(w.prompts).toEqual([PROMPT])
+})
+
+test('#52, guarded: an id that never settles within 20 s keeps the start owed, and the first main-loop turn takes it up: the resume goes once', async ($, on) => {
+  const w = engine(on)
+  let flip = false
+  w.world.reads = () => ((flip = !flip) ? ID : OTHER)
+  await $.session.start(start)
+  await w.clock.advance(GRACE + 30_000)
+  expect(w.prompts).toEqual([])
+  expect(w.store.get('restarts')).toEqual({ [ID]: RESTART })
+  // The id settles, and the person's first turn starts: the restart is taken up now, its prompt after it.
+  w.world.reads = undefined
+  await $.turn.start({ text: 'are you there?', turnId: 't1' })
+  await w.clock.advance(SETTLE)
+  expect(w.prompts).toEqual([PROMPT])
+  await $.turn.start({ text: 'and again', turnId: 't2' })
+  await w.clock.advance(60_000)
+  expect(w.prompts).toEqual([PROMPT])
+})
+
+test('a reload into this version in an unguarded session (a user input came before it, no classic hook since): nothing runs, no "Restarted", no claim released', async ($, on) => {
+  // An older version kept the record when its restart stopped before the exit; this process is still that one.
+  const w = engine(on, { promptId: '5d0c4f7e-1a2b-4c3d-9e8f-001122334455', restarts: { [ID]: { at: NOW - 60_000, reason: 'Switched accounts.', claim: RESTART.claim } } })
+  await $.session.start(start)
+  await w.clock.advance(120_000)
+  expect(w.prompts).toEqual([])
+  expect(w.toasts).toEqual([])
+  expect(w.releases).toEqual([])
+  expect(w.store.get('restarts')).toEqual({ [ID]: { at: NOW - 60_000, reason: 'Switched accounts.', claim: RESTART.claim } })
+  expect(w.state.get('self-restart/started')).toBeUndefined()
+  // Nor at a turn: no start is owed.
+  await $.turn.start({ text: 'go on', turnId: 't1' })
+  await w.clock.advance(60_000)
+  expect(w.prompts).toEqual([])
+  expect(w.releases).toEqual([])
 })

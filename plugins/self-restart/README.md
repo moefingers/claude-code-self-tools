@@ -52,7 +52,8 @@ To end the session without a restart, see [self-exit](../self-exit). To pick up 
 
 Where Claude Code's built-in guard loads (a machine with managed settings, or a session signed in with `/login` to a Team or Enterprise plan), a plugin you install can't hook Claude Code's classic hook events, so this plugin's `classic.SessionStart` never runs there. Without it, a restart's `resume` prompt was never sent: the restarted session sat idle until someone typed (#52). Where the guard is loaded, and only there, the plugin does that hook's work on Claude Code's own events instead:
 
-- **The restart's first prompt** is sent about 5 seconds after the restarted session starts, rather than half a second after: the plugin waits that long for a classic hook to say the guard isn't loaded. Its toast and the release of the claim come with it, once.
+- **The restart's first prompt** is sent about 6 seconds after the restarted session starts, rather than half a second after: the plugin waits 5 seconds for a classic hook to say the guard isn't loaded, then reads the session's id until two reads a second apart agree, so the prompt goes to the conversation resumed. Its toast and the release of the claim come with it, once. When the id hasn't settled within 20 seconds, the restart is taken up at the session's first turn instead, never dropped.
+- **Only in the restarted process.** A reload of the plugins, or the plugin turned on partway through a session, never takes a restart up: it comes after the first input of the process.
 - **A `/resume` inside a running session** to a conversation a restart is waiting for takes it up once the session's id names that conversation, within seconds.
 - **What it can't do there:** a restart asked in the seconds between a `/clear` or `/resume` and the session's id naming the new conversation is refused, saying so; try again a moment later.
 
