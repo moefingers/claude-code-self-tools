@@ -38,7 +38,7 @@ type Options = {
 function engine(on: On, { restarts = { [ID]: RESTART }, state: kept = {}, id = ID, promptId }: Options = {}) {
   const store = new Map<string, unknown>([['restarts', restarts]])
   const state = new Map<string, unknown>(Object.entries(kept))
-  const world: { id: string; reads?: () => string } = { id }
+  const world: { id: string; reads?: () => string; promptId?: string } = { id, ...(promptId === undefined ? {} : { promptId }) }
   const prompts: string[] = []
   const toasts: string[] = []
   const releases: string[] = []
@@ -58,7 +58,7 @@ function engine(on: On, { restarts = { [ID]: RESTART }, state: kept = {}, id = I
   on('session.start', (_, e) => ({ cwd: e.cwd }))
   on('session.end', (_, e) => ({ sessionId: e.sessionId }))
   on('session.id', () => ({ value: world.reads?.() ?? world.id }))
-  on('session.info', () => ({ value: { transcriptPath: `C:\\Users\\u\\.claude\\projects\\C--work-repo\\${world.id}.jsonl`, ...(promptId === undefined ? {} : { promptId }) } }))
+  on('session.info', () => ({ value: { transcriptPath: `C:\\Users\\u\\.claude\\projects\\C--work-repo\\${world.id}.jsonl`, ...(world.promptId === undefined ? {} : { promptId: world.promptId }) } }))
   on('turn.start', (_, e) => ({ turnId: e.turnId }))
   on('session.turns', () => ({ value: 3 }))
   on('session.cwd', () => ({ value: 'C:\\work\\repo' }))
@@ -255,4 +255,32 @@ test('a reload into this version in an unguarded session (a user input came befo
   await w.clock.advance(60_000)
   expect(w.prompts).toEqual([])
   expect(w.releases).toEqual([])
+})
+
+test('#52, guarded: an id that stays on another conversation until 12 s (the lag the id is known to have) is not taken for it: the resume goes once, to the conversation resumed', async ($, on) => {
+  const w = engine(on, { id: OTHER })
+  await $.session.start(start)
+  // Reads at 5 s to 11 s agree on OTHER, which no restart waits for and which is inside the id's lag: none is taken.
+  await w.clock.advance(11_500)
+  expect(w.state.get('self-restart/started')).toBeUndefined()
+  w.world.id = ID
+  // 12 s reads ID, 13 s reads it again: a restart waits for it, so it is taken then.
+  await w.clock.advance(1000)
+  expect(w.prompts).toEqual([])
+  await w.clock.advance(1000 + SETTLE)
+  expect(w.prompts).toEqual([PROMPT])
+  expect(w.state.get('self-restart/started')).toBe(ID)
+  await w.clock.advance(60_000)
+  expect(w.prompts).toEqual([PROMPT])
+})
+
+test('#52, guarded: a first prompt that arrives the moment session.start returns (a delivery to the resumed session) still finds the start a first start: the resume goes once', async ($, on) => {
+  const w = engine(on)
+  await $.session.start(start)
+  // The process's first input lands right after the start: from now on its prompt id reads present.
+  w.world.promptId = '5d0c4f7e-1a2b-4c3d-9e8f-001122334455'
+  await w.clock.advance(START + SETTLE)
+  expect(w.prompts).toEqual([PROMPT])
+  await w.clock.advance(60_000)
+  expect(w.prompts).toEqual([PROMPT])
 })

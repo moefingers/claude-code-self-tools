@@ -995,6 +995,12 @@ async function welcome($: EngineInterface, id: unknown): Promise<void> {
   }
 }
 
+/** #52, #53: whether a restart waits for conversation `id` in the store: the start partner takes such an id up sooner. */
+async function restartWaits($: EngineInterface, id: string): Promise<boolean> {
+  const stored = await $.store.get(RESTARTS)
+  return isRecord(stored) && id in stored
+}
+
 /**
  * The transcript of conversation `id`, which the start folder is checked against, as `$.session.info()` names it,
  * where no classic SessionStart did (#53). Never throws.
@@ -1103,8 +1109,9 @@ export const register: Register = (on, options) => {
     loadUpdateCheck($)
     // #52, #53: where the classic SessionStart doesn't reach this plugin, its partner takes this process's start up (a
     // restart's first prompt among it): only on the process's first start, never a reload or an enable partway through
-    // a session. Not awaited: it waits START_GRACE_MS for a classic hook, then for the id to settle.
-    void startPartner($, classicIo($), id => guardedStart($, id))
+    // a session. Awaited for its bounded reads (whether this is the first start), which must come before turn one; its
+    // timers then wait START_GRACE_MS for a classic hook, and for the id to settle (sooner for an id a restart waits for).
+    await startPartner($, classicIo($), id => guardedStart($, id), id => restartWaits($, id))
     return started
   })
 

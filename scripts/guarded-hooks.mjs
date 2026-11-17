@@ -166,9 +166,39 @@ export function registrations(text) {
       const one = /\bdoor\s*:\s*(['"`])([^'"`]*)\1\s*[,}]/.exec(matcher)
       door = one === null ? '<computed>' : one[2]
     }
+    // session.append's matcher, when its door can't be read off it: one held in a name (`on(event, M, h)`), or an object
+    // with a spread or a quoted key (its door may hide there). `<computed>`, and guarded.
+    if (literal[2] === 'session.append' && door === undefined) {
+      const args = argumentsFrom(code, at + literal[0].length)
+      const second = args.length >= 2 ? args[0].trim() : undefined
+      if (second !== undefined && (!second.startsWith('{') || /\.\.\./.test(second) || /(['"`])[^'"`]*\1\s*:/.test(second))) door = '<computed>'
+    }
     found.push({ event: literal[2], ...(door === undefined ? {} : { door }), line })
   }
   return found
+}
+
+/** The arguments of a call from `from` (after its first) to its closing parenthesis, at the call's own depth. */
+function argumentsFrom(code, from) {
+  const args = []
+  let depth = 0
+  let start = from
+  for (let i = from; i < code.length; i += 1) {
+    const c = code[i]
+    if (c === '(' || c === '[' || c === '{') depth += 1
+    else if (c === ')' || c === ']' || c === '}') {
+      if (depth === 0) {
+        args.push(code.slice(start, i))
+        return args
+      }
+      depth -= 1
+    } else if (c === ',' && depth === 0) {
+      args.push(code.slice(start, i))
+      start = i + 1
+    }
+  }
+  args.push(code.slice(start))
+  return args
 }
 
 /** The object literal `text` starts with, its braces balanced (strings already blanked); undefined when it never closes. */

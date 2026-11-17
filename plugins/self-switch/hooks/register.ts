@@ -1687,6 +1687,12 @@ async function runSwitch($: EngineInterface, value: Queued): Promise<void> {
   }
 }
 
+/** #53: whether a switch's ticket waits for conversation `id` in the store: the start partner takes such an id up sooner. */
+async function ticketWaits($: EngineInterface, id: string): Promise<boolean> {
+  const stored = await $.store.get(SWITCHES)
+  return isRecord(stored) && id in stored
+}
+
 /**
  * #53: the classic SessionStart's work at this process's start, where no classic hook reached the plugin within
  * START_GRACE_MS of session.start (classic.ts, startPartner): the arrival, once, if a switch left a ticket for this
@@ -1819,9 +1825,10 @@ export const register: Register = (on, options) => {
     loadUpdateCheck($)
     startBeat($)
     // #53: where the classic SessionStart doesn't reach this plugin, its partner takes this process's start up: only on
-    // the process's first start, never a reload or an enable partway through a session. Not awaited: it waits
-    // START_GRACE_MS for a classic hook, then for the id to settle.
-    void startPartner($, classicIo($), (id, source) => guardedStart($, id, source))
+    // the process's first start, never a reload or an enable partway through a session. Awaited for its bounded reads
+    // (whether this is the first start), which must come before turn one; its timers then wait START_GRACE_MS for a
+    // classic hook, and for the id to settle (sooner for an id a switch's ticket waits for).
+    await startPartner($, classicIo($), (id, source) => guardedStart($, id, source), id => ticketWaits($, id))
     return started
   })
 

@@ -515,8 +515,8 @@ test('with checkAtResume off, nothing runs at resume', { options: { checkAtResum
 // (hooks/classic.ts) takes the start up 5 s after session.start, and an in-process /resume from session.end and the id
 // read as another conversation: the quiet check at resume runs there, and only there, once.
 const GRACE = 5000
-/** The partner's take-up: the grace, then the id read again 1 s later, the same. */
-const START = GRACE + 1000
+/** The partner's take-up: two reads of the id that agree, the second past the id's 15 s lag (no work waits for it here). */
+const START = 15_000
 const OTHER = '7c9e6679-7425-40de-944b-e07fc1f90ae7'
 
 test('#53, guarded: a resumed process (its transcript holds prompts) gets the quiet check 10 s after the partner takes its start up, once', async ($, on) => {
@@ -527,7 +527,7 @@ test('#53, guarded: a resumed process (its transcript holds prompts) gets the qu
   await clock.advance(1)
   expect(commands.map(c => c.tool)).toEqual(['Bash', 'PowerShell'])
   expect(toasts).toEqual([])
-  expect(writes).toEqual([{ path: RECORD, text: '{"v":1,"at":1016000,"failed":[]}' }])
+  expect(writes).toEqual([{ path: RECORD, text: '{"v":1,"at":1025000,"failed":[]}' }])
   await clock.advance(HOUR)
   expect(commands).toHaveLength(2)
 })
@@ -552,7 +552,7 @@ test('#53, unguarded: the classic SessionStart of the resume schedules the check
 test('#53, unguarded, the classic SessionStart late (after the grace): the partner scheduled the check, and the classic SessionStart adds none: once', async ($, on) => {
   const { commands, clock } = engine(on, { turns: 3 })
   await $.session.start(start)
-  await clock.advance(START)
+  await clock.advance(START + 1000)
   await $.classic.SessionStart({ source: 'resume', session_id: ID })
   await clock.advance(HOUR)
   expect(commands.map(c => c.tool)).toEqual(['Bash', 'PowerShell'])

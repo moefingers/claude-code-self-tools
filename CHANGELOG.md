@@ -2,13 +2,28 @@
 
 Each entry names a plugin and its version, as `version` in `plugins/<name>/.claude-plugin/plugin.json` has it.
 
+## 2026-11-17: self-check 0.2.11, self-color 0.1.3, self-reload 0.1.6, self-remote-control 0.4.4, self-restart 0.4.8, self-switch 0.4.9, self-wake 0.3.9: review round 2 on the guard-safe partners (#53, #52)
+
+- **The id's known lag.** `$.session.id()` may still read the conversation before for up to 15 s (`ID_LAG_MS` in the shared machine code), steadily, so two reads that agree prove nothing before then.
+  - The start partner now counts two agreeing reads only when the second comes at least 15 s after `session.start` (`START_LAG_MS`).
+  - It counts them sooner only when the conversation the id names has work of the plugin's own waiting: a restart's record for that very id (self-restart), or a switch's ticket (self-switch).
+  - So a restart's first prompt still goes about 6 s after the start when the id reads the conversation resumed at once.
+  - A stale id, one no work waits for, is never taken.
+  - **Tested on the test kit's engine:** an id that stays on another conversation until 12 s, then reads the right one. The resume goes once, to the conversation resumed, at about 13.5 s.
+  - **Not shown:** that Claude Code's id behaves this way in a `claude --resume` process under the guard. That is a live check still to come.
+- **Whether a start is the process's first is read inside `session.start`.** The engine awaits that hook before turn one, and the read is bounded. So a first prompt that lands as the start returns can't make a genuine first start read as a reload: a command-line prompt, a `-p` run, the SDK, Remote Control, or another plugin's delivery to the resumed session. Tested: a first prompt right after the start, and the start still taken once.
+- **A start counts as a resume when either read says so,** the one at `session.start` or the one at the take-up. A transcript not yet counted at the start would otherwise make a resumed conversation read as new, and self-switch would take a fresh S11 baseline that lets its earlier changes through. Tested: a conversation that reads as new at the start and has prompts by the take-up takes no baseline.
+- **Timing:** self-check's start work and self-switch's baseline wait for the 15 s, since no record or ticket waits for them. The quiet resume check now runs about 25 s after the start.
+- **The static check:** a `session.append` matcher held in a name, or one with a spread or a quoted key, counts as guarded, since its door can't be read off it.
+- **self-color, self-reload and self-remote-control** carry the shared `hooks/classic.ts`, which changed, so their versions move too. Their behaviour doesn't change.
+
 ## 2026-11-17: self-check 0.2.10, self-color 0.1.2, self-reload 0.1.5, self-remote-control 0.4.3, self-restart 0.4.7, self-switch 0.4.8, self-wake 0.3.8: review round 1 on the guard-safe partners (#53, #52)
 
 - **A start partner runs only on the process's own first start.** Before, the reload that brings this version into a running session, where the guard isn't loaded, ran every start partner once. So did a plugin turned on partway through a session. Then self-restart could show "Restarted" and release the claim of a restart that an older version had stopped before its exit.
   - Now a start partner runs only while `$.session.info().promptId` is absent. That is Claude Code's own word that no user input has come in the process's lifetime yet.
   - A reload, or a plugin turned on partway through, comes after input, so no start partner runs then.
 - **#52: the id is read until it settles.** The start partner no longer trusts `$.session.id()` at the end of the grace.
-  - It reads the id every second until two reads in a row name the same conversation, and takes that conversation's start up then. So the restart's first prompt is sent once, to the conversation resumed, about 6 s after the start.
+  - It reads the id every second until two reads in a row name the same conversation, and takes that conversation's start up then. On the plugin test kit's engine, an id that reads another conversation at the grace and then settles sends the restart's first prompt once, to the conversation resumed, about 7 s after the start; a live check under the guard is still to come.
   - An id that hasn't settled within 20 s leaves the start owed to the first main-loop turn, never dropped.
   - A move that a session end begins within the grace stands the start partner down. So does one taken up within it. The move's take-up does that conversation's work.
 - **Two looks for one move.** A look that loses the race to take a move up now settles only once the winner's take-up has. Before, self-wake could fire a wake-up that a `/resume` was dropping, into the conversation the session moved to.

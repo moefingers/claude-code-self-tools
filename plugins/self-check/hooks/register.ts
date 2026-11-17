@@ -573,9 +573,10 @@ export const register: Register = (on, options) => {
     })
     loadUpdateCheck($)
     // #53: where the classic SessionStart doesn't reach this plugin, its partner takes this process's start up: only on
-    // the process's first start, never a reload or an enable partway through a session. Not awaited: it waits
-    // START_GRACE_MS for a classic hook, then for the id to settle.
-    void startPartner($, classicIo($), (id, source) => guardedStart($, id, source))
+    // the process's first start, never a reload or an enable partway through a session. Awaited for its bounded reads
+    // (whether this is the first start), which must come before turn one; its timers then wait START_GRACE_MS for a
+    // classic hook, and for the id to settle.
+    await startPartner($, classicIo($), (id, source) => guardedStart($, id, source))
     return started
   })
 

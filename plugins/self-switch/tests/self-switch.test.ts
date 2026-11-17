@@ -196,7 +196,7 @@ function engine(
   const screen: string[] = []
   const writes: { path: string; text: string }[] = []
   const described: string[] = []
-  const world = { id, agents, probe: probe ?? machine(), gate, worktrees: git.worktrees ?? [REPO], diffs: {} as Record<string, string>, untrackedTime: NOW - HOUR, cwd, wake, crons }
+  const world = { id, agents, probe: probe ?? machine(), gate, worktrees: git.worktrees ?? [REPO], diffs: {} as Record<string, string>, untrackedTime: NOW - HOUR, cwd, wake, crons, turns }
   /** The files the scripts wrote (a ticket, a slot's record, a left record) and the plugin wrote over, by path: what fs.read finds. */
   const files = new Map<string, string>()
   const key = (path: string) => path.replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase()
@@ -269,7 +269,7 @@ function engine(
   on('session.start', (_, e) => ({ cwd: e.cwd }))
   on('session.end', (_, e) => ({ sessionId: e.sessionId }))
   on('session.id', () => answer({ value: world.id }))
-  on('session.turns', () => answer(turns === undefined ? { deny: 'not read here' } : { value: turns }))
+  on('session.turns', () => answer(world.turns === undefined ? { deny: 'not read here' } : { value: world.turns }))
   on('session.info', () => answer({ value: { transcriptPath: '', ...(promptId === undefined ? {} : { promptId }) } }))
   on('command.register', (_, e) => {
     registered.push(e.name)
@@ -2847,8 +2847,10 @@ describe('S3 final', () => {
 // (hooks/classic.ts) takes the process's start up 5 s after session.start (the arrival, a new conversation's baseline),
 // and an in-process /clear or /resume from session.end and the id read as another conversation: there, and only there.
 describe('#53: under the guard', () => {
-  /** The partner's take-up: 5 s for a classic hook, then the id read again 1 s later, the same. */
+  /** The partner's take-up: 5 s for a classic hook, then the id read again 1 s later, the same, for an id a ticket waits for. */
   const GRACE = 6000
+  /** For an id no ticket waits for, the second agreeing read comes past the id's 15 s lag. */
+  const LAG = 15_000
   const SETTLE = 500
   const ticket = { at: NOW - MINUTE, from: OTHER, by: LAUNCH, transport: 'window', reason: 'Billing is next.', notes: 'notes/billing.md', resume: 'Run the invoice tests.' }
   const ends = (reason: 'clear' | 'resume', id: string) => ({ reason, sessionId: id, resume: { id } })
@@ -2884,23 +2886,31 @@ describe('#53: under the guard', () => {
   test("guarded: a new conversation's start keeps S11's baseline of the folder it started in, as a startup's SessionStart does", async ($, on) => {
     const { held, clock } = engine(on, { turns: 0, git: { dirty: 2 } })
     await $.session.start(start)
-    await clock.advance(GRACE + SETTLE * 2)
+    await clock.advance(LAG + SETTLE * 2)
     const kept = held.get(`baseline:${W}`) as { folder?: string; fingerprint?: string } | undefined
     expect(kept?.folder).toBe(REPO)
     expect(kept?.fingerprint).toMatch(/^[0-9a-f]{64}$/)
   })
 
+  test('guarded: a conversation that reads as new at session.start but has prompts by the take-up (its transcript counted late) is a resume: no baseline', async ($, on) => {
+    const { held, world, clock } = engine(on, { turns: 0, git: { dirty: 2 } })
+    await $.session.start(start)
+    world.turns = 3
+    await clock.advance(30_000)
+    expect(held.get(`baseline:${W}`)).toBeUndefined()
+  })
+
   test('guarded: a resumed conversation (it has prompts) takes no baseline, so its start folder’s dirt holds', async ($, on) => {
     const { held, clock } = engine(on, { turns: 4, git: { dirty: 2 } })
     await $.session.start(start)
-    await clock.advance(GRACE + SETTLE * 2)
+    await clock.advance(LAG + SETTLE * 2)
     expect(held.get(`baseline:${W}`)).toBeUndefined()
   })
 
   test('guarded: a /clear by hand, taken up once the id reads the new conversation: the left record of the one left, and its baseline carried', async ($, on) => {
     const { held, lefts, world, toasts, clock } = engine(on, { turns: 0, git: { dirty: 1 } })
     await $.session.start(start)
-    await clock.advance(GRACE + SETTLE * 2)
+    await clock.advance(LAG + SETTLE * 2)
     expect(held.get(`baseline:${W}`)).toBeDefined()
     await $.session.end(ends('clear', W))
     // The id lags the move: nothing yet.

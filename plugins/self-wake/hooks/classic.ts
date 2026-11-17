@@ -14,10 +14,13 @@
 // all, before anything is awaited, that it ran (classicSeen). Beside it, a partner on the engine's own events, which
 // the guard lets through, does that hook's work only while no classic hook has reached this process:
 //   - the work of a process's start (startPartner), only on the process's own first start: before any user input of
-//     the process (`$.session.info().promptId` is absent until then, by the engine's word), never a reload or a plugin
-//     enabled partway through a session, which come after input. START_GRACE_MS after session.start, once the id reads
-//     the same conversation on two reads ID_SETTLE_EVERY_MS apart (within ID_SETTLE_FOR_MS; else at the first main-loop
-//     turn, takeOwedStart), once per conversation in a process, kept in $.state (`started`);
+//     the process (`$.session.info().promptId` is absent until then, by the engine's word, read inside session.start,
+//     which the engine awaits before turn one), never a reload or a plugin enabled partway through a session, which
+//     come after input. START_GRACE_MS after session.start, once the id reads the same conversation on two reads
+//     ID_SETTLE_EVERY_MS apart, the second of them START_LAG_MS after session.start (the id may still read the one
+//     before that long), or sooner for an id with work of its own waiting (the plugin's `ready`); within
+//     ID_SETTLE_FOR_MS, else at the first main-loop turn (takeOwedStart). Once per conversation in a process, kept in
+//     $.state (`started`);
 //   - the work of an in-process /clear or /resume (moveBegins, moveLook): session.end names the conversation ending
 //     and why, and the first read of `$.session.id()` that names another conversation takes the move up, as the
 //     classic SessionStart of that move would have. Read every MOVE_LOOK_MS for MOVE_LOOK_FOR_MS, and whenever the
@@ -50,6 +53,12 @@ export const MOVE_LOOK_FOR_MS = 2 * 60 * 1000
 export const ID_SETTLE_EVERY_MS = 1000
 /** How long the id is read for that; past it, the start is owed to the first main-loop turn (takeOwedStart). */
 export const ID_SETTLE_FOR_MS = 20_000
+/**
+ * How long after a start `$.session.id()` may still read the conversation before it, steady: the shared machine code's
+ * ID_LAG_MS (seen live at in-place moves on 2.1.318). Two reads that agree count only from then on, unless the id read
+ * has work of its own waiting (a restart's record, a switch's ticket).
+ */
+export const START_LAG_MS = 15_000
 /** When a mark is written again after a move: Claude Code's wipe of $.state may land a moment after the move. */
 export const MARK_AGAIN_MS = 5000
 /** How long a read of $.state here may take; past it, it reads as nothing known. */
@@ -73,8 +82,11 @@ export type Move = { readonly from: string; readonly to: string; readonly reason
 /** What a plugin does when a move is taken up: the work of that move's classic SessionStart. */
 export type TakeMove = (move: Move) => Promise<void>
 
-/** How the process's conversation began, as session.start found it (startSource). */
+/** How the process's conversation began (startSource): `resume` when a read at session.start or at the take-up says so. */
 export type StartSource = 'startup' | 'resume' | undefined
+
+/** Whether conversation `id` has work of the plugin's own waiting for it (a restart's record, a switch's ticket). */
+export type StartReady = (id: string) => Promise<boolean>
 
 /** What a plugin does when its start is taken up: the work of that start's classic SessionStart, for conversation `id`. */
 export type StartWork = (id: string, source: StartSource) => Promise<void>
@@ -244,35 +256,68 @@ export async function startTaken(io: ClassicIo, id: string): Promise<void> {
  */
 export async function firstStart($: EngineInterface): Promise<boolean> {
   try {
-    const { promptId } = await $.session.info()
-    return promptId === undefined || promptId === ''
+    const info = await within($, $.session.info())
+    if (info === undefined) return false
+    return info.promptId === undefined || info.promptId === ''
   } catch {
     return false
   }
 }
 
-/** The start of conversation `id` taken up, once in this process: never when it was taken already, or a classic hook arrived. */
-async function takeStart($: EngineInterface, io: ClassicIo, id: string, source: StartSource, work: StartWork): Promise<void> {
-  const taken = await readKept($, io, 'started')
-  if (taken === id || classicKnown()) return
-  await startTaken(io, id)
-  await work(id, source)
+/** `work`'s answer, or undefined once STATE_READ_MS have passed without one, or when it fails. */
+function within<T>($: EngineInterface, work: Promise<T>): Promise<T | undefined> {
+  return new Promise(resolve => {
+    let timer: Timer | undefined
+    try {
+      timer = $.clock.after(STATE_READ_MS, () => resolve(undefined))
+    } catch {
+      timer = undefined
+    }
+    work.then(
+      value => {
+        timer?.cancel()
+        resolve(value)
+      },
+      () => {
+        timer?.cancel()
+        resolve(undefined)
+      },
+    )
+  })
 }
 
 /**
- * At session.start, on the process's first start (firstStart) where no classic hook has reached it: `work`, for the
- * conversation the process holds. START_GRACE_MS later, unless a classic hook arrives first, the id is read every
- * ID_SETTLE_EVERY_MS until two reads in a row name the same conversation, and that start is taken up then, unless this
+ * The start of conversation `id` taken up, once in this process: never when it was taken already, or a classic hook
+ * arrived. A resume when the read at session.start (`source`) or the one now says so: a transcript not counted yet at
+ * the start reads as no prompts, and a resume taken for a new conversation errs the safe way (no baseline of its dirt).
+ */
+async function takeStart($: EngineInterface, io: ClassicIo, id: string, source: StartSource, work: StartWork): Promise<void> {
+  const taken = await readKept($, io, 'started')
+  if (taken === id || classicKnown()) return
+  const now = await within($, startSource($))
+  await startTaken(io, id)
+  await work(id, source === 'resume' || now === 'resume' ? 'resume' : (source ?? now))
+}
+
+/**
+ * At session.start, awaited inside it (the engine awaits it before turn one), on the process's first start (firstStart,
+ * read there, so a first prompt that comes right after the start can't make it read as a reload) where no classic hook
+ * has reached it: `work`, for the conversation the process holds. START_GRACE_MS later, unless a classic hook arrives
+ * first, the id is read every ID_SETTLE_EVERY_MS until two reads in a row name the same conversation, the second of
+ * them START_LAG_MS after session.start (the id may still read the conversation before that long), or sooner when
+ * `ready` says that conversation has work of the plugin's own waiting; and that start is taken up then, unless this
  * process took it up already. An id that hasn't settled ID_SETTLE_FOR_MS after the grace leaves the start owed to the
  * first main-loop turn (takeOwedStart), never dropped. A move a session end began, or one taken up, since session.start
- * stands it down: the move's take-up does that conversation's work. Never awaited by the caller's start; never throws.
+ * stands it down: the move's take-up does that conversation's work. Its reads are bounded; it never throws.
  */
-export async function startPartner($: EngineInterface, io: ClassicIo, work: StartWork): Promise<void> {
+export async function startPartner($: EngineInterface, io: ClassicIo, work: StartWork, ready?: StartReady): Promise<void> {
   try {
     if (await classicRuns($, io)) return
     if (!(await firstStart($))) return
-    // Read now, at the start (a prompt typed within the grace would make a new conversation read as a resume).
-    const source = await startSource($)
+    // Read now, at the start (a prompt typed within the grace would make a new conversation read as a resume); the
+    // take-up reads it again, and a resume either time counts.
+    const source = await within($, startSource($))
+    const begun = await $.clock.now()
     const moves = movesTaken
     let last: string | undefined
     let since: number | undefined
@@ -283,7 +328,12 @@ export async function startPartner($: EngineInterface, io: ClassicIo, work: Star
       // A classic hook, or a move, that came while these were read stands it down too.
       if (classicKnown() || movePending() || movesTaken !== moves) return
       since ??= now
-      if (id !== undefined && id === last) return await takeStart($, io, id, source, work)
+      if (id !== undefined && id === last) {
+        // Past the id's lag, two reads that agree name the conversation; before it, only one with its own work waiting.
+        const settled = now - begun >= START_LAG_MS || (ready !== undefined && (await ready(id).catch(() => false)))
+        if (classicKnown() || movePending() || movesTaken !== moves) return
+        if (settled) return await takeStart($, io, id, source, work)
+      }
       last = id
       if (now - since >= ID_SETTLE_FOR_MS) {
         owed = { source, work }

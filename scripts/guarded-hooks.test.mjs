@@ -84,6 +84,18 @@ test('the parse reads registrations, their doors, and none a comment or a string
   assert.deepEqual(read.map(r => r.door), ['<computed>', '<computed>', '<computed>', 'compaction', undefined, undefined, undefined])
   assert.deepEqual(read.map(r => isGuarded(r.event, r.door)), [true, true, true, true, false, true, true])
   assert.equal(read.at(-1)?.event, 'classic.Stop')
+  // A matcher held in a name, one with a quoted key, and one with a spread: the door can't be read, so `<computed>`.
+  const hidden = registrations(
+    [
+      "const M = { door: 'attachment' }",
+      "on('session.append', M, ($, e, next) => next(e))",
+      "on('session.append', { 'door': 'attachment' }, ($, e, next) => next(e))",
+      "on('session.append', { ...M }, ($, e, next) => next(e))",
+      "on('session.append', ($, e, next) => next(e))",
+    ].join('\n'),
+  )
+  assert.deepEqual(hidden.map(r => r.door), ['<computed>', '<computed>', '<computed>', undefined])
+  assert.deepEqual(hidden.map(r => isGuarded(r.event, r.door)), [true, true, true, false])
   // A module with a regex literal holding a quote, then text a mis-read would take for code: nothing is invented.
   assert.deepEqual(onAliases(["export const register: Register = (on, options) => {", "  const RE = /'/", "  on('session.start', h)", "  const s = 'go on now'", '}'].join('\n')), [])
   // What the plugins hook today is found.

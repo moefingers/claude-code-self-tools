@@ -482,7 +482,8 @@ export const register: Register = (on, options) => {
     else void mark($, here)
     loadUpdateCheck($)
     // #53: where the classic SessionStart doesn't reach this plugin, its partner takes this process's start up.
-    void startPartner($, classicIo($), guardedStart)
+    // Awaited for its bounded reads (whether this is the first start), which must come before turn one.
+    await startPartner($, classicIo($), guardedStart)
     return started
   })
 
