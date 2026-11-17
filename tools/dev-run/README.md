@@ -69,12 +69,12 @@ Under `%LOCALAPPDATA%\claude-self-tools\dev-run\`:
     "lastReason": "scheduled restart after 10 min", "slot": null, "runnerPid": 12000, "at": 1793940800000 }
   ```
 
-  `state` is `waiting` (for memory or a slot), `running`, `restarting` or `stopped`. `pid` is the server's root, or null. Times are milliseconds since 1970. `slot` names the heavy slot held (`.gate-lock`, `.gate-lock-2`), or null. `runnerPid` is the runner.
+  `state` is `waiting` (for memory or a slot), `running`, `restarting` or `stopped`. `pid` is the server's root, or null. Times are milliseconds since 1970. `slot` names the heavy slot held (`.gate-lock`, `.gate-lock-2`, up to `.gate-lock-4`), or null. `runnerPid` is the runner.
 - `<name>.out`: the server's own output, appended across restarts, moved to `.out.1` past 5 MiB.
 
 ## Heavy slots
 
-`heavy-slot.sh` lets at most two heavy jobs (commits, builds, tests) run on the machine at once. Each takes a slot directory first, in turn, and once free memory allows. Its own notes leave long-lived `next dev` out. A dev server's heavy moment is its first compile, which takes several GiB at once. Its first page compiles only when that page is first requested.
+`heavy-slot.sh` lets at most its cap of heavy jobs (commits, builds, tests) run on the machine at once: the number in its `.gate-cap` file, 0 to 4, or 2 without one. Each takes a slot directory first, in turn, and once free memory allows. Its own notes leave long-lived `next dev` out. A dev server's heavy moment is its first compile, which takes several GiB at once. Its first page compiles only when that page is first requested.
 
 - **`--slot` (`compile`, the default):** before each spawn, at the floor, dev-run claims a slot through `heavy-slot.sh` itself, and spawns once heavy-slot says it holds one. It releases the slot at the first line matching `--compiled`, or 3 minutes after the spawn, whichever comes first, or when the server stops before that. If memory fell under the floor while it waited for the slot, it gives the slot back and waits for the floor again.
 
