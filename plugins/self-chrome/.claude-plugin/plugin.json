@@ -1,0 +1,39 @@
+{
+  "name": "self-chrome",
+  "version": "0.1.2",
+  "description": "Lets a session make sure Chrome runs for Claude in Chrome: it looks for your Chrome, starts it when it isn't running (the profile you name, or the one Chrome used last; the last session restored; and --silent-debugger-extension-api when you opt in), and reconnects Claude in Chrome once the turn ends. It never quits or restarts Chrome.",
+  "author": { "name": "moefingers", "url": "https://github.com/moefingers" },
+  "homepage": "https://github.com/moefingers/claude-code-self-tools/tree/main/plugins/self-chrome#readme",
+  "repository": "https://github.com/moefingers/claude-code-self-tools",
+  "license": "MIT",
+  "keywords": ["chrome", "claude-in-chrome", "mcp", "mod"],
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "updateCheck": {
+      "type": "string",
+      "title": "Update check",
+      "description": "on: when a tool of this plugin is called and the last check is 30 minutes old, fetch this plugin's published plugin.json from GitHub (a plain GET of a public file) and say when a newer version is out. off: never check.",
+      "default": "on",
+      "options": ["on", "off"]
+    },
+    "silentDebugger": {
+      "type": "string",
+      "title": "Silent debugger flag",
+      "description": "Whether a Chrome this plugin starts gets --silent-debugger-extension-api, which hides Chrome's \"is debugging this browser\" banner for every extension and every profile in that Chrome. auto: only when the environment variable CLAUDE_CHROME_SILENT_DEBUGGER is 1, true or on. on: always. off: never. Chrome takes the flag only when it starts.",
+      "default": "auto",
+      "options": ["auto", "on", "off"]
+    },
+    "profile": {
+      "type": "string",
+      "title": "Chrome profile",
+      "description": "The profile folder a Chrome this plugin starts opens, by its folder's name (Default, Profile 2); it must be one of Chrome's profile folders. Empty: none, and Chrome opens the profile it used last.",
+      "default": ""
+    },
+    "chromePath": {
+      "type": "string",
+      "title": "Chrome executable",
+      "description": "Chrome's executable, as an absolute path with no [, ] or backtick: chrome.exe on Windows, the Google Chrome binary inside its .app on macOS. Empty: the standard install paths.",
+      "default": ""
+    }
+  }
+}
