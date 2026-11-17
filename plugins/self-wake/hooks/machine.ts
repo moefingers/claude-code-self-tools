@@ -1652,29 +1652,84 @@ const READ_INPUT_IDLE = [
 const HEAVY_STALE_SECS = 3600
 
 /**
+ * heavy-slot.sh's slot folders, every one it can use, in the order it takes them: `.gate-lock`, then
+ * `.gate-lock-2` up to `.gate-lock-<cap>`. Each is read whatever the cap, as a job that took a slot above a
+ * cap lowered since runs to its end.
+ */
+export const HEAVY_SLOTS = ['.gate-lock', '.gate-lock-2', '.gate-lock-3', '.gate-lock-4'] as const
+
+/** heavy-slot.sh's cap when its `.gate-cap` file is missing or holds no digit, and the most it reads there (more counts as this). */
+export const HEAVY_CAP_DEFAULT = 2
+export const HEAVY_CAP_MAX = HEAVY_SLOTS.length
+
+/** The slot folders as a PowerShell list, for a `foreach`. */
+const HEAVY_SLOT_LIST = HEAVY_SLOTS.map(s => `"${s}"`).join(', ')
+
+/** The largest number bash's `[ ... -gt ... ]` reads (int64's): past it, every one of heavy-slot's tests of the cap fails. */
+const BASH_INT_MAX = '9223372036854775807'
+
+/**
+ * `$heavyCap` from `$heavyCapText`, the `.gate-cap` file's text ($null with no file), line for line as
+ * heavy-slot.sh's `slots()` reads it: `tr -dc '0-9'` keeps the digits, and none is HEAVY_CAP_DEFAULT
+ * (`${cap:-2}`). bash's `[ "$cap" -gt 4 ]` then reads them as a base-10 integer, leading zeros and all, so
+ * all zeros is 0. A value past int64's largest fails that test and every test after it, so heavy-slot uses no
+ * slot at all: 0. More than HEAVY_CAP_MAX is HEAVY_CAP_MAX. Exported for the test that replays heavy-slot's
+ * own lines against it.
+ */
+export const HEAVY_CAP_PARSE = [
+  `$heavyCap = ${HEAVY_CAP_DEFAULT}`,
+  '$heavyCapDigits = "$heavyCapText" -replace "[^0-9]", ""',
+  'if ($heavyCapDigits.Length -gt 0) {',
+  '  $heavyCapValue = $heavyCapDigits.TrimStart([char]48)',
+  '  if ($heavyCapValue.Length -eq 0) { $heavyCap = 0 }',
+  `  elseif ($heavyCapValue.Length -gt ${BASH_INT_MAX.length} -or ($heavyCapValue.Length -eq ${BASH_INT_MAX.length} -and [string]::CompareOrdinal($heavyCapValue, "${BASH_INT_MAX}") -gt 0)) { $heavyCap = 0 }`,
+  `  else { $heavyCap = [int][math]::Min([long]${HEAVY_CAP_MAX}, [long]$heavyCapValue) }`,
+  '}',
+]
+
+/**
  * heavy-slot's state, from its folders under `$heavyRoot`, by PowerShell alone (never bash, never MSYS):
- * `$heavyWaiters`, the live tickets in .gate-queue, and `$heavyBusy`, the slots held (0 to 2). A ticket
- * names its waiter by an MSYS pid, which Windows can't look up: it counts while a heavy-slot shell runs at
- * all (the process table) and it is under an hour old, so a ticket a dead waiter left holds a launch only
- * while another job runs, which clears it. A slot counts as held while the Windows pid it names runs, or,
- * with none named, while it is under an hour old. Needs `$table`; throws when the folders can't be read, and
- * when `$heavyRoot` is no folder (a typo, a drive not mounted yet): nothing found there is not nothing waiting.
+ * - `$heavyWaiters`: the live tickets in .gate-queue. A ticket names its waiter by an MSYS pid, which
+ *   Windows can't look up: it counts while a heavy-slot shell runs at all (the process table) and it is under
+ *   an hour old, so a ticket a dead waiter left holds a launch only while another job runs, which clears it.
+ * - `$heavyCap`: how many slots heavy-slot uses, from `.gate-cap` as heavy-slot reads it (HEAVY_CAP_PARSE).
+ *   It is read in a try of its own: a cap that can't be read is null, with why in `$heavyCapError`, and no
+ *   error of the folders, so S3 (a heavy job under this session) never stands on it. A floor never takes a
+ *   null cap as free: floorOk waits on it, and floorLines refuses, naming `.gate-cap`.
+ * - `$heavyBusy`: the slots held, of all HEAVY_SLOTS (0 to 4), so a job above a lowered cap still counts. A
+ *   slot is held as heavy-slot's `stale()` reads it, by the Windows pid where the slot names one: its job runs
+ *   (with no pid named, it may), and it is at most HEAVY_STALE_SECS old, by the time its owner file names (an
+ *   owner file with no time is stale), else by the folder's own. So a hung job above a lowered cap, which
+ *   heavy-slot never reclaims, stops holding launches after an hour, as it would stop holding a slot.
+ * Needs `$table`; throws when the folders can't be read, and when `$heavyRoot` is no folder (a typo, a drive
+ * not mounted yet): nothing found there is not nothing waiting.
  */
 const READ_HEAVY = [
   'if (-not (Test-Path -LiteralPath $heavyRoot -PathType Container)) { throw ("no folder at " + $heavyRoot) }',
   '$heavyWaiters = 0',
   '$heavyBusy = 0',
+  '$heavyCapFile = Join-Path $heavyRoot ".gate-cap"',
+  '$heavyCapText = $null',
+  '$heavyCapError = $null',
+  'try { if (Test-Path -LiteralPath $heavyCapFile -PathType Leaf) { $heavyCapText = "$(Get-Content -LiteralPath $heavyCapFile -Raw)" } } catch { $heavyCapError = $_.Exception.Message }',
+  ...HEAVY_CAP_PARSE,
+  'if ($null -ne $heavyCapError) { $heavyCap = $null }',
   String.raw`$heavyShells = @($table.Values | Where-Object { "$($_.CommandLine)" -match "heavy-slot\.sh" }).Count`,
   '$heavyNow = [DateTime]::UtcNow',
   '$heavyQueue = Join-Path $heavyRoot ".gate-queue"',
   `if ($heavyShells -gt 0 -and (Test-Path -LiteralPath $heavyQueue -PathType Container)) { foreach ($t in @(Get-ChildItem -LiteralPath $heavyQueue -File -Force)) { if ($t.Name -match "^\\d+-\\d+\\z" -and ($heavyNow - $t.LastWriteTimeUtc).TotalSeconds -lt ${HEAVY_STALE_SECS}) { $heavyWaiters++ } } }`,
-  'foreach ($s in ".gate-lock", ".gate-lock-2") {',
+  `foreach ($s in ${HEAVY_SLOT_LIST}) {`,
   '  $d = Join-Path $heavyRoot $s',
   '  if (-not (Test-Path -LiteralPath $d -PathType Container)) { continue }',
   '  $wf = Join-Path $d "winpid"',
   '  $w = $null',
   String.raw`  if (Test-Path -LiteralPath $wf -PathType Leaf) { $w = "$(Get-Content -LiteralPath $wf -Raw)".Trim(); if ($w -notmatch "^\d{1,10}\z") { $w = $null } }`,
-  `  if ($null -ne $w) { if ($null -ne $table[[int]$w]) { $heavyBusy++ } } elseif (($heavyNow - [IO.Directory]::GetLastWriteTimeUtc($d)).TotalSeconds -lt ${HEAVY_STALE_SECS}) { $heavyBusy++ }`,
+  // Its age as heavy-slot's stale() reads it: `<pid> <time> <folder>` in its owner file, else the folder's time.
+  '  $of = Join-Path $d "owner"',
+  '  $since = [IO.Directory]::GetLastWriteTimeUtc($d)',
+  // bash's `$((now - ts))`: no time (or not a number) is 0, so stale; one past the last date .NET has is ahead of now.
+  String.raw`  if (Test-Path -LiteralPath $of -PathType Leaf) { $o = @("$(Get-Content -LiteralPath $of -Raw)".Trim() -split "\s+"); $since = [DateTime]::MinValue; if ($o.Count -ge 2 -and $o[1] -match "^\d{1,18}\z") { $ts = [long]$o[1]; if ($ts -gt 253402300799) { $since = [DateTime]::MaxValue } else { $since = [DateTimeOffset]::FromUnixTimeSeconds($ts).UtcDateTime } } }`,
+  `  if (($heavyNow - $since).TotalSeconds -le ${HEAVY_STALE_SECS} -and ($null -eq $w -or $null -ne $table[[int]$w])) { $heavyBusy++ }`,
   '}',
 ]
 
@@ -2059,12 +2114,12 @@ export function probeScript(input: ProbeInput): string {
     '    }',
     '  } catch { [void]$errors.Add("transcripts:$k") }',
     '}',
-    // heavy-slot.sh's two slots: each one held, and the Windows pid of its job when it wrote one.
+    // heavy-slot.sh's slots, all of HEAVY_SLOTS whatever the cap: each one held, and the Windows pid of its job when it wrote one.
     '$heavy = $null',
     'if ($null -ne $heavyRoot) {',
     '  $heavy = New-Object System.Collections.ArrayList',
     '  try {',
-    '    foreach ($s in ".gate-lock", ".gate-lock-2") {',
+    `    foreach ($s in ${HEAVY_SLOT_LIST}) {`,
     '      $d = Join-Path $heavyRoot $s',
     '      if (-not (Test-Path -LiteralPath $d -PathType Container)) { continue }',
     '      $w = $null',
@@ -2081,9 +2136,10 @@ export function probeScript(input: ProbeInput): string {
           ...READ_SLOTS,
           '$heavyWaiters = $null',
           '$heavyBusy = $null',
+          '$heavyCap = $null',
           'if ($null -ne $heavyRoot) { try {',
           ...READ_HEAVY.map(line => `  ${line}`),
-          '} catch { $heavyWaiters = $null; $heavyBusy = $null; if (-not $errors.Contains("heavy:")) { [void]$errors.Add("heavy:") } } }',
+          '} catch { $heavyWaiters = $null; $heavyBusy = $null; $heavyCap = $null; if (-not $errors.Contains("heavy:")) { [void]$errors.Add("heavy:") } } }',
           ...COUNT_SESSIONS,
           ...READ_INPUT_IDLE,
           ...READ_HOLDERS,
@@ -2125,7 +2181,7 @@ export function probeScript(input: ProbeInput): string {
     '$result = [ordered]@{ v = 1; self = [long]$PID; session = $sessionOut; slot = $slot; procs = $procs; registry = $registry; transcripts = $transcripts; locks = $locks; claim = $claim; heavy = $heavy; freeKb = $freeKb; errors = $errors }',
     'if ($slotSeen) { $result["slotSeen"] = $true }',
     ...(leftRead.length > 0 ? ['$result["left"] = $leftOut'] : []),
-    ...(slots ? ['$result["heavyChecked"] = ($null -ne $heavyRoot)', '$result["slots"] = $slotsOut', '$result["heavyWaiters"] = $heavyWaiters', '$result["heavyBusy"] = $heavyBusy', '$result["room"] = $room', '$result["inputIdleSec"] = $inputIdleSec', '$result["holders"] = $holdersOut'] : []),
+    ...(slots ? ['$result["heavyChecked"] = ($null -ne $heavyRoot)', '$result["slots"] = $slotsOut', '$result["heavyWaiters"] = $heavyWaiters', '$result["heavyBusy"] = $heavyBusy', '$result["heavyCap"] = $heavyCap', '$result["room"] = $room', '$result["inputIdleSec"] = $inputIdleSec', '$result["holders"] = $holdersOut'] : []),
     '$result | ConvertTo-Json -Compress -Depth 6',
   ].join('\r\n')
 }
@@ -2217,7 +2273,7 @@ export type ClaimResult = { readonly id: string; readonly taken: true; readonly 
 /** The slot runner: its pid, its creation FILETIME and its id (`<pid>-<created>`) as exact strings, its script and that script's hash. */
 export type SlotParent = { readonly pid: number; readonly created: string; readonly id: string; readonly path: string; readonly sha256: string | null; readonly hashError?: string; readonly live?: boolean }
 
-export type HeavySlot = { readonly slot: '.gate-lock' | '.gate-lock-2'; readonly winpid: number | null }
+export type HeavySlot = { readonly slot: (typeof HEAVY_SLOTS)[number]; readonly winpid: number | null }
 
 /** What the probe couldn't read: a source, and for registry and transcripts the config folder's index. */
 export type ProbeError = 'registry' | 'transcripts' | 'locks' | 'heavy' | 'memory' | 'left'
@@ -2242,9 +2298,11 @@ export type Probe = {
   readonly left: readonly LeftEntry[] | null
   /** Every slot runner found running, from a probe in slots mode; null from any other. */
   readonly slots: readonly SlotRunner[] | null
-  /** heavy-slot's live waiters and busy slots (0 to 2); null with no heavy-slot folder, or none read. */
+  /** heavy-slot's live waiters, and its busy slots of all HEAVY_SLOTS (0 to 4); null with no heavy-slot folder, or none read. */
   readonly heavyWaiters: number | null
   readonly heavyBusy: number | null
+  /** heavy-slot's cap, as its `.gate-cap` file says (0 to 4; 2 with none); null with no heavy-slot folder, or none read. */
+  readonly heavyCap: number | null
   /** Slots mode: whether heavy-slot's folders were read (true), or the caller named none on this machine (false). */
   readonly heavyChecked?: boolean
   /** The sessions running (a Claude Code command left out), from a probe in slots mode. */
@@ -2388,7 +2446,7 @@ export function parseProbe(stdout: string): Probe | { error: string } {
     return { error: "the probe's answer is not JSON" }
   }
   try {
-    const top = fields(raw, 'the answer', ['v', 'self', 'session', 'slot', 'procs', 'registry', 'transcripts', 'locks', 'claim', 'heavy', 'freeKb', 'errors'], ['slotSeen', 'left', 'slots', 'heavyChecked', 'heavyWaiters', 'heavyBusy', 'room', 'inputIdleSec', 'holders'])
+    const top = fields(raw, 'the answer', ['v', 'self', 'session', 'slot', 'procs', 'registry', 'transcripts', 'locks', 'claim', 'heavy', 'freeKb', 'errors'], ['slotSeen', 'left', 'slots', 'heavyChecked', 'heavyWaiters', 'heavyBusy', 'heavyCap', 'room', 'inputIdleSec', 'holders'])
     if ('slotSeen' in top && (top.slotSeen !== true || top.slot !== null)) bad('the answer says a slot runner was seen, but not as one')
     if (top.v !== 1) bad('the answer is not version 1')
     if (!isPid(top.self)) bad("the probe's own pid is not a pid")
@@ -2497,7 +2555,7 @@ export function parseProbe(stdout: string): Probe | { error: string } {
     if (top.heavy !== null) {
       heavy = list(top.heavy, 'the heavy slots').map((value): HeavySlot => {
         const h = fields(value, 'a heavy slot', ['slot', 'winpid'])
-        if (h.slot !== '.gate-lock' && h.slot !== '.gate-lock-2') bad('a heavy slot is not one of the two')
+        if (!(HEAVY_SLOTS as readonly unknown[]).includes(h.slot)) bad("a heavy slot is not one of heavy-slot's folders")
         if (h.winpid !== null && !isPid(h.winpid)) bad("a heavy slot's winpid is not a pid")
         return { slot: h.slot as HeavySlot['slot'], winpid: h.winpid as number | null }
       })
@@ -2552,7 +2610,8 @@ export function parseProbe(stdout: string): Probe | { error: string } {
       left,
       slots,
       heavyWaiters: countOrNull('heavyWaiters', 'the heavy-slot waiters'),
-      heavyBusy: countOrNull('heavyBusy', 'the heavy slots busy', 2),
+      heavyBusy: countOrNull('heavyBusy', 'the heavy slots busy', HEAVY_SLOTS.length),
+      heavyCap: countOrNull('heavyCap', "heavy-slot's cap", HEAVY_CAP_MAX),
       ...('heavyChecked' in top ? { heavyChecked: top.heavyChecked === true || (top.heavyChecked === false ? false : bad('the answer says neither that heavy-slot was read nor that it was not')) } : {}),
       room: countOrNull('room', 'the sessions running'),
       inputIdleSec: countOrNull('inputIdleSec', 'the input idle'),
@@ -3415,7 +3474,7 @@ export type WtTab = { readonly window: string; readonly title: string; readonly 
  * - `fresh`: a start's id is new on this machine: no transcript in any config folder, no registry file
  *   and no command line names it. Required for a start;
  * - `floor`: free memory of at least max(6 GB, 4 GB + the largest session's private bytes), no heavy-slot
- *   waiter, not both heavy slots busy, and the sessions under the cap, as floorOk reads them. Required of
+ *   waiter, fewer heavy slots busy than heavy-slot's cap, and the sessions under the cap, as floorOk reads them. Required of
  *   a launch of another process;
  * - `input`: the machine's input idle for at least 60 s; a reading that fails is not idle (PM2). Required
  *   of a launch of another process. One that replaces its caller may ask (a replacing fresh's window, PM6).
@@ -3870,7 +3929,7 @@ function checkLaunch(input: LaunchInput) {
 /**
  * The floor, in the launch script's own run (`checks.floor`), by floorOk's rules and in its order: free
  * memory of at least max(6 GB, 4 GB + the largest session's private bytes; 2 GB when none could be read),
- * read through Win32; no heavy-slot waiter, not both heavy slots busy, read from heavy-slot's folders; the
+ * read through Win32; no heavy-slot waiter, fewer heavy slots busy than heavy-slot's cap (none at a cap of 0), read from heavy-slot's folders; the
  * sessions under the cap. Anything it can't read refuses. Needs `$table` (with PrivatePageCount),
  * Get-Parent, Get-Cli, and the `Refuse` function.
  */
@@ -3892,7 +3951,11 @@ function floorLines(heavyRoot: string | undefined, maxSessions: number): string[
           ...READ_HEAVY.map(line => `  ${line}`),
           "} catch { Refuse 'heavy' ('the heavy-slot folders could not be read: ' + $_.Exception.Message) }",
           "if ($heavyWaiters -gt 0) { Refuse 'heavy' ($heavyWaiters.ToString() + ' heavy jobs are waiting, and they go first') }",
-          "if ($heavyBusy -ge 2) { Refuse 'heavy' 'both heavy slots are busy' }",
+          // A cap that can't be read is no reading that a slot is free; it is the file's, never the folders'.
+          `if ($null -eq $heavyCap) { Refuse 'heavy' ("heavy-slot's .gate-cap could not be read: " + $heavyCapError) }`,
+          // At heavy-slot's cap no heavy job could start now, and a launch never goes ahead of one: 0 holds them all.
+          "if ($heavyCap -eq 0) { Refuse 'heavy' 'heavy-slot holds every heavy job: its cap is 0' }",
+          "if ($heavyBusy -ge $heavyCap) { Refuse 'heavy' ('every heavy slot is busy (slots held: ' + $heavyBusy.ToString() + '; heavy-slot''s cap: ' + $heavyCap.ToString() + ')') }",
         ]),
     ...COUNT_SESSIONS,
     `if ($room -ge ${maxSessions}) { Refuse 'cap' ($room.ToString() + ' sessions are running, at the cap of ${maxSessions}') }`,
@@ -4677,8 +4740,8 @@ export function floorNeedKb(probe: Probe): number {
 
 /**
  * Whether a launch of another process may proceed, from a probe in slots mode: `ok`, or the first reason
- * it waits (PM5, \u00a75.6): `memory` (free under floorNeedKb, or unread), `heavy` (a heavy-slot waiter, both
- * slots busy, heavy-slot's folders unread, or read with no count), `cap` (the sessions at `maxSessions`, or
+ * it waits (PM5, \u00a75.6): `memory` (free under floorNeedKb, or unread), `heavy` (a heavy-slot waiter, as
+ * many slots busy as heavy-slot's cap, heavy-slot's folders unread, or read with no count), `cap` (the sessions at `maxSessions`, or
  * unread). A pure function: only advisory, as the launch reads each again in its own run (checks.floor).
  */
 export function floorOk(probe: Probe, maxSessions: number): 'ok' | 'memory' | 'heavy' | 'cap' {
@@ -4688,8 +4751,10 @@ export function floorOk(probe: Probe, maxSessions: number): 'ok' | 'memory' | 'h
   // A reading that doesn't say whether heavy-slot was looked at isn't a floor's: only a named none skips it.
   if (probe.heavyChecked === undefined) return 'heavy'
   // Read, yet with no count: not a reading that says it's free. Only a named none has none.
-  if (probe.heavyChecked && (probe.heavyWaiters === null || probe.heavyBusy === null)) return 'heavy'
-  if ((probe.heavyWaiters ?? 0) > 0 || (probe.heavyBusy ?? 0) >= 2) return 'heavy'
+  if (probe.heavyChecked && (probe.heavyWaiters === null || probe.heavyBusy === null || probe.heavyCap === null)) return 'heavy'
+  if ((probe.heavyWaiters ?? 0) > 0) return 'heavy'
+  // At heavy-slot's cap (its .gate-cap, 2 by default; 0 holds every job) no heavy job could start now, and a launch never goes ahead of one.
+  if (probe.heavyChecked && probe.heavyBusy !== null && probe.heavyCap !== null && probe.heavyBusy >= probe.heavyCap) return 'heavy'
   if (probe.room === null || probe.room >= maxSessions) return 'cap'
   return 'ok'
 }

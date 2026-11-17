@@ -49,6 +49,7 @@ const raw = (change = {}) => ({
   heavyChecked: true,
   heavyWaiters: 0,
   heavyBusy: 0,
+  heavyCap: 2,
   room: 3,
   inputIdleSec: 600,
   holders: [],
@@ -181,17 +182,24 @@ const CHECKS = {
     assert.equal(m.floorNeedKb(probeOf(m, { procs: unread })), 6 * GIB_KB)
     assert.equal(m.floorOk(probeOf(m, { freeKb: null }), 12), 'memory', 'unread')
     assert.equal(m.floorOk(probeOf(m, { heavyWaiters: 1 }), 12), 'heavy', 'a heavy waiter')
-    assert.equal(m.floorOk(probeOf(m, { heavyBusy: 2 }), 12), 'heavy', 'both slots busy')
+    assert.equal(m.floorOk(probeOf(m, { heavyBusy: 2 }), 12), 'heavy', 'both slots busy, at the default cap')
     assert.equal(m.floorOk(probeOf(m, { heavyBusy: 1 }), 12), 'ok', 'one slot busy')
+    // #46: heavy-slot's cap, not 2: a launch waits while as many slots are busy as the cap, and a cap of 0 holds it.
+    assert.equal(m.floorOk(probeOf(m, { heavyCap: 4, heavyBusy: 3 }), 12), 'ok', 'cap 4, three busy')
+    assert.equal(m.floorOk(probeOf(m, { heavyCap: 4, heavyBusy: 4 }), 12), 'heavy', 'cap 4, all four busy')
+    assert.equal(m.floorOk(probeOf(m, { heavyCap: 1, heavyBusy: 1 }), 12), 'heavy', 'cap 1, its one slot busy')
+    assert.equal(m.floorOk(probeOf(m, { heavyCap: 1, heavyBusy: 0 }), 12), 'ok', 'cap 1, free')
+    assert.equal(m.floorOk(probeOf(m, { heavyCap: 0, heavyBusy: 0 }), 12), 'heavy', 'cap 0 holds every job')
+    assert.equal(m.floorOk(probeOf(m, { heavyCap: 2, heavyBusy: 3 }), 12), 'heavy', 'a cap lowered under the jobs still running')
     assert.equal(m.floorOk(probeOf(m, { errors: ['heavy:'] }), 12), 'heavy', "heavy-slot's folders unread")
     // D3: read, yet no count, is no reading that it's free; only a named none has none.
-    for (const counts of [{ heavyWaiters: null, heavyBusy: null }, { heavyWaiters: null }, { heavyBusy: null }]) assert.equal(m.floorOk(probeOf(m, counts), 12), 'heavy', `read, with no count: ${JSON.stringify(counts)}`)
+    for (const counts of [{ heavyWaiters: null, heavyBusy: null, heavyCap: null }, { heavyWaiters: null }, { heavyBusy: null }, { heavyCap: null }]) assert.equal(m.floorOk(probeOf(m, counts), 12), 'heavy', `read, with no count: ${JSON.stringify(counts)}`)
     assert.equal(m.floorOk(probeOf(m, { room: 12 }), 12), 'cap')
     assert.equal(m.floorOk(probeOf(m, { room: 11 }), 12), 'ok')
     assert.equal(m.floorOk(probeOf(m, { room: 6 }), 6), 'cap', 'the cap as placement names it')
     assert.throws(() => m.floorOk(probeOf(m)), /the cap/, 'never a default')
     assert.equal(m.floorOk(probeOf(m, { heavyChecked: undefined }), 12), 'heavy', 'a reading that does not say whether heavy-slot was looked at')
-    assert.equal(m.floorOk(probeOf(m, { heavyChecked: false, heavy: null, heavyWaiters: null, heavyBusy: null }), 12), 'ok', 'named none: no heavy-slot on this machine')
+    assert.equal(m.floorOk(probeOf(m, { heavyChecked: false, heavy: null, heavyWaiters: null, heavyBusy: null, heavyCap: null }), 12), 'ok', 'named none: no heavy-slot on this machine')
     // Required: left out, a floor would skip heavy-slot and fall to the default cap without a word (F8).
     assert.throws(() => m.launchScriptText(launchInput({ claim: `slot:${SLOT}`, where: { slot: SLOT }, waitForExit: undefined, checks: { ...FLOOR_CHECKS, live: true }, heavySlotRoot: undefined })), /heavySlotRoot, maxSessions/)
     assert.throws(() => m.launchScriptText(launchInput({ claim: `slot:${SLOT}`, where: { slot: SLOT }, waitForExit: undefined, checks: { ...FLOOR_CHECKS, live: true }, maxSessions: undefined })), /heavySlotRoot, maxSessions/)
@@ -208,7 +216,30 @@ const CHECKS = {
     assert.ok(s.includes('if ($null -eq $largest) { $largest = [long]2 * 1073741824 }'))
     assert.ok(s.includes('PrivatePageCount'))
     assert.ok(s.includes("if ($heavyWaiters -gt 0) { Refuse 'heavy'"), 'a heavy waiter refuses')
-    assert.ok(s.includes("if ($heavyBusy -ge 2) { Refuse 'heavy'"), 'both slots busy refuse')
+    // #46: the busy slots of all four, against heavy-slot's cap from .gate-cap, read as heavy-slot reads it.
+    assert.ok(s.includes("if ($heavyBusy -ge $heavyCap) { Refuse 'heavy' ('every heavy slot is busy (slots held: '"), 'busy at the cap refuses')
+    assert.ok(s.includes("if ($heavyCap -eq 0) { Refuse 'heavy' 'heavy-slot holds every heavy job: its cap is 0' }"), 'a cap of 0 says so')
+    assert.ok(s.includes(`if ($null -eq $heavyCap) { Refuse 'heavy' ("heavy-slot's .gate-cap could not be read: " + $heavyCapError) }`), 'a cap that could not be read refuses, naming .gate-cap')
+    assert.ok(s.indexOf('if ($null -eq $heavyCap) {') < s.indexOf('if ($heavyCap -eq 0) {'), 'before the cap is compared')
+    assert.ok(!s.includes('$heavyBusy -ge 2'), 'never two, whatever the cap')
+    const probeText = m.probeScript({ ids: [T], configDirs: [CONFIG], stateDir: STATE, slots: true, heavySlotRoot: 'O:\\heavy' })
+    for (const script of [s, probeText]) {
+      assert.ok(script.includes('foreach ($s in ".gate-lock", ".gate-lock-2", ".gate-lock-3", ".gate-lock-4") {'), 'every slot heavy-slot can use')
+      assert.ok(!script.includes('foreach ($s in ".gate-lock", ".gate-lock-2") {'), 'never only two')
+      assert.ok(script.includes('$heavyCapFile = Join-Path $heavyRoot ".gate-cap"'), 'the file')
+      // Review round 1, M1: the cap read in a try of its own; one that can't be read is null, never an error of the folders.
+      assert.ok(script.includes('try { if (Test-Path -LiteralPath $heavyCapFile -PathType Leaf) { $heavyCapText = "$(Get-Content -LiteralPath $heavyCapFile -Raw)" } } catch { $heavyCapError = $_.Exception.Message }'), 'the file read, when it is one, in its own try')
+      assert.ok(script.indexOf('if ($null -ne $heavyCapError) { $heavyCap = $null }') > script.indexOf('$heavyCapText = "$(Get-Content'), 'a cap that could not be read is null')
+      // Review round 1, L1: heavy-slot's own reading of it, line for line (replayed against heavy-slot in scripts/slot-live.test.mjs).
+      assert.ok(script.includes(m.HEAVY_CAP_PARSE.map(line => `  ${line}`).join('\r\n')), "the cap parsed as heavy-slot's slots() reads it")
+      assert.ok(script.includes('$heavyCapDigits = "$heavyCapText" -replace "[^0-9]", ""'), "its digits alone, as tr -dc '0-9' keeps them")
+      assert.ok(m.HEAVY_CAP_PARSE[0] === '$heavyCap = 2' && m.HEAVY_CAP_PARSE.some(line => line.includes('.TrimStart([char]48)')) && m.HEAVY_CAP_PARSE.some(line => line.includes('"9223372036854775807"')), 'the default, leading zeros, and the largest number bash reads')
+      // Review round 1, L2: a slot held as heavy-slot's stale() reads it: its job running, and at most an hour old by its owner file's time.
+      assert.ok(script.includes('$of = Join-Path $d "owner"'), "the owner file's time")
+      assert.ok(script.includes('if (($heavyNow - $since).TotalSeconds -le 3600 -and ($null -eq $w -or $null -ne $table[[int]$w])) { $heavyBusy++ }'), 'held while its job runs and it is at most an hour old')
+    }
+    assert.ok(probeText.includes('$result["heavyCap"] = $heavyCap'), 'the probe answers the cap')
+    assert.deepEqual([m.HEAVY_SLOTS, m.HEAVY_CAP_DEFAULT, m.HEAVY_CAP_MAX], [['.gate-lock', '.gate-lock-2', '.gate-lock-3', '.gate-lock-4'], 2, 4])
     // D3: a root that is no folder throws before anything is read, in the launch's own run and the probe's; each turns it into a refusal or an error.
     const noFolder = 'if (-not (Test-Path -LiteralPath $heavyRoot -PathType Container)) { throw ("no folder at " + $heavyRoot) }'
     const probe = m.probeScript({ ids: [T], configDirs: [CONFIG], stateDir: STATE, slots: true, heavySlotRoot: 'O:\\heavy' })
@@ -320,7 +351,7 @@ const CHECKS = {
     assert.ok(p.includes('$beaconFile = Join-Path $state ("slots\\" + $runnerId + ".state.json")'))
     assert.ok(!/Get-ChildItem[^\r\n]*slots/.test(p))
     assert.ok(p.indexOf('$runnerId = ') > p.indexOf('-notmatch "-File'))
-    for (const name of ['heavyWaiters', 'heavyBusy', 'room', 'inputIdleSec', 'holders', 'slots']) assert.ok(p.includes(`$result["${name}"] = `), name)
+    for (const name of ['heavyWaiters', 'heavyBusy', 'heavyCap', 'room', 'inputIdleSec', 'holders', 'slots']) assert.ok(p.includes(`$result["${name}"] = `), name)
     // Without slots, the answer is as it was.
     const plain = m.probeScript({ ids: [T], configDirs: [CONFIG], stateDir: STATE })
     assert.ok(!plain.includes('$result["slots"]') && !plain.includes('PrivatePageCount') && !plain.includes('GetLastInputInfo'))
@@ -338,16 +369,20 @@ const CHECKS = {
       assert.equal(probeOf(m, { slots: [idleRunner(m, { beacon })] }).slots[0].beacon, null, JSON.stringify(beacon))
     }
     // The rest is checked as ever: an answer that isn't of its shape is no answer.
-    for (const change of [{ slots: 'x' }, { slots: [{ pid: 'x' }] }, { slots: [idleRunner(m, { id: 'wrong' })] }, { slots: [idleRunner(m, { sha256: 'zz' })] }, { heavyWaiters: -1 }, { heavyBusy: 3 }, { room: 1.5 }, { inputIdleSec: 'x' }, { holders: [{ id: 'x', pid: 1, created: '1' }] }, { heavyChecked: true, heavy: null }, { heavyChecked: false, heavy: [] }]) {
+    for (const change of [{ slots: 'x' }, { slots: [{ pid: 'x' }] }, { slots: [idleRunner(m, { id: 'wrong' })] }, { slots: [idleRunner(m, { sha256: 'zz' })] }, { heavyWaiters: -1 }, { heavyBusy: 5 }, { heavyCap: 5 }, { heavyCap: -1 }, { heavy: [{ slot: '.gate-lock-5', winpid: null }] }, { heavy: [{ slot: 'gate-lock', winpid: null }] }, { room: 1.5 }, { inputIdleSec: 'x' }, { holders: [{ id: 'x', pid: 1, created: '1' }] }, { heavyChecked: true, heavy: null }, { heavyChecked: false, heavy: [] }]) {
       assert.ok('error' in m.parseProbe(JSON.stringify(raw(change))), JSON.stringify(change))
     }
     // D3: heavyChecked says what the heavy slots say.
     assert.equal(probeOf(m, { heavyChecked: true, heavy: [] }).heavyChecked, true)
-    assert.equal(probeOf(m, { heavyChecked: false, heavy: null, heavyWaiters: null, heavyBusy: null }).heavyChecked, false)
+    assert.equal(probeOf(m, { heavyChecked: false, heavy: null, heavyWaiters: null, heavyBusy: null, heavyCap: null }).heavyChecked, false)
+    // #46: every slot heavy-slot can use, and its counts up to four.
+    const four = probeOf(m, { heavy: m.HEAVY_SLOTS.map((slot, i) => ({ slot, winpid: 100 + i })), heavyBusy: 4, heavyCap: 4 })
+    assert.deepEqual([four.heavy.map(h => h.slot), four.heavyBusy, four.heavyCap], [['.gate-lock', '.gate-lock-2', '.gate-lock-3', '.gate-lock-4'], 4, 4])
+    assert.equal(probeOf(m, { heavyCap: 0 }).heavyCap, 0)
     // An old probe: no slots mode, all of it null.
-    const { slots, heavyWaiters, heavyBusy, room, inputIdleSec, holders, ...old } = raw()
+    const { slots, heavyWaiters, heavyBusy, heavyCap, room, inputIdleSec, holders, ...old } = raw()
     const parsed = m.parseProbe(JSON.stringify(old))
-    assert.deepEqual([parsed.slots, parsed.heavyWaiters, parsed.heavyBusy, parsed.room, parsed.inputIdleSec, parsed.holders], [null, null, null, null, null, null])
+    assert.deepEqual([parsed.slots, parsed.heavyWaiters, parsed.heavyBusy, parsed.heavyCap, parsed.room, parsed.inputIdleSec, parsed.holders], [null, null, null, null, null, null, null])
   },
   holders(m) {
     // claude.exe 500, under no registry: unknown for every other conversation, unless a lock names it.
@@ -675,7 +710,7 @@ const FAULTS = [
   ['the input rule dropped for slots', 'inputIdle', '  if (!inputIdle(probe)) return notIdle\n  if (opts.configDir', '  if (opts.configDir'],
   ['the 6 GB term dropped', 'floorRules', 'Math.max(FLOOR_MIN_GB * 1024 * 1024, HEAVY_FLOOR_GB * 1024 * 1024 + largestKb)', 'HEAVY_FLOOR_GB * 1024 * 1024 + largestKb'],
   ['the largest-private-bytes term dropped', 'floorRules', 'Math.max(FLOOR_MIN_GB * 1024 * 1024, HEAVY_FLOOR_GB * 1024 * 1024 + largestKb)', 'FLOOR_MIN_GB * 1024 * 1024'],
-  ['the heavy-waiter check removed', 'floorRules', '(probe.heavyWaiters ?? 0) > 0 || ', ''],
+  ['the heavy-waiter check removed', 'floorRules', "  if ((probe.heavyWaiters ?? 0) > 0) return 'heavy'\n", ''],
   ['the 6 GB term dropped, in the script', 'floorScript', '`$needBytes = [math]::Max([long]${FLOOR_MIN_GB} * 1073741824, [long]${HEAVY_FLOOR_GB} * 1073741824 + $largest)`', '`$needBytes = [long]${HEAVY_FLOOR_GB} * 1073741824 + $largest`'],
   ['the largest-private-bytes term dropped, in the script', 'floorScript', '`$needBytes = [math]::Max([long]${FLOOR_MIN_GB} * 1073741824, [long]${HEAVY_FLOOR_GB} * 1073741824 + $largest)`', '`$needBytes = [long]${FLOOR_MIN_GB} * 1073741824`'],
   ['the heavy-waiter check removed, in the script', 'floorScript', `          "if ($heavyWaiters -gt 0) { Refuse 'heavy' ($heavyWaiters.ToString() + ' heavy jobs are waiting, and they go first') }",\n`, ''],
@@ -739,7 +774,20 @@ const FAULTS = [
   ['D2: a window whose launcher refused keeping the claim', 'windowRefusal', "    '  if ($code -ne 0) { Release-Claim }',\n", ''],
   ['D2: a window giving the claim back on a normal end too', 'windowRefusal', "'  if ($code -ne 0) { Release-Claim }',", "'  Release-Claim',"],
   ['D3: a heavy-slot root that is no folder read as free', 'floorScript', "  'if (-not (Test-Path -LiteralPath $heavyRoot -PathType Container)) { throw (\"no folder at \" + $heavyRoot) }',\n", ''],
-  ['D3: floorOk passing a reading with no counts', 'floorRules', "if (probe.heavyChecked && (probe.heavyWaiters === null || probe.heavyBusy === null)) return 'heavy'", ''],
+  ['D3: floorOk passing a reading with no counts', 'floorRules', "if (probe.heavyChecked && (probe.heavyWaiters === null || probe.heavyBusy === null || probe.heavyCap === null)) return 'heavy'", ''],
+  ['#46: floorOk passing a reading with no cap', 'floorRules', ' || probe.heavyCap === null)) return', ')) return'],
+  ['#46: floorOk waiting at two slots again, whatever the cap', 'floorRules', 'probe.heavyBusy >= probe.heavyCap)', 'probe.heavyBusy >= 2)'],
+  ['#46: the launch waiting at two slots again, whatever the cap', 'floorScript', 'if ($heavyBusy -ge $heavyCap) {', 'if ($heavyBusy -ge 2) {'],
+  ['#46: only the first two slots read', 'floorScript', "export const HEAVY_SLOTS = ['.gate-lock', '.gate-lock-2', '.gate-lock-3', '.gate-lock-4'] as const", "export const HEAVY_SLOTS = ['.gate-lock', '.gate-lock-2'] as const"],
+  ['#46: the cap file never read', 'floorScript', "  'try { if (Test-Path -LiteralPath $heavyCapFile -PathType Leaf) {", "  'try { if ($false) {"],
+  ['#46: the cap read past its digits', 'floorScript', "  '$heavyCapDigits = \"$heavyCapText\" -replace \"[^0-9]\", \"\"',", "  '$heavyCapDigits = \"$heavyCapText\" -replace \"[^0-9 ]\", \"\"',"],
+  ['round 1, M1: a cap that could not be read taken as the default', 'floorScript', "  'if ($null -ne $heavyCapError) { $heavyCap = $null }',\n", ''],
+  ['round 1, M1: a cap that could not be read let through by the launch', 'floorScript', "          `if ($null -eq $heavyCap) { Refuse 'heavy' (\"heavy-slot's .gate-cap could not be read: \" + $heavyCapError) }`,\n", ''],
+  ['round 1, M1: the cap read in the folders\' try again', 'floorScript', "  'try { if (Test-Path -LiteralPath $heavyCapFile -PathType Leaf) { $heavyCapText = \"$(Get-Content -LiteralPath $heavyCapFile -Raw)\" } } catch { $heavyCapError = $_.Exception.Message }',", "  'if (Test-Path -LiteralPath $heavyCapFile -PathType Leaf) { $heavyCapText = \"$(Get-Content -LiteralPath $heavyCapFile -Raw)\" }',"],
+  ['round 1, L2: a slot held at any age while its job runs', 'floorScript', '(($heavyNow - $since).TotalSeconds -le ${HEAVY_STALE_SECS} -and ', '(('],
+  ['#46: the cap not answered by the probe', 'beaconsOfRunners', "'$result[\"heavyCap\"] = $heavyCap', ", ''],
+  ['#46: a third or fourth slot refused by the parse', 'parsing', 'if (!(HEAVY_SLOTS as readonly unknown[]).includes(h.slot)) bad(', "if (h.slot !== '.gate-lock' && h.slot !== '.gate-lock-2') bad("],
+  ['#46: busy counted to two by the parse', 'parsing', "countOrNull('heavyBusy', 'the heavy slots busy', HEAVY_SLOTS.length)", "countOrNull('heavyBusy', 'the heavy slots busy', 2)"],
   ['D3: floorOk passing a reading with one count missing', 'floorRules', 'probe.heavyWaiters === null || probe.heavyBusy === null', 'probe.heavyWaiters === null && probe.heavyBusy === null'],
   ['D3: heavyChecked taken against its heavy slots', 'parsing', "if (typeof top.heavyChecked === 'boolean' && top.heavyChecked !== (heavy !== null)) bad(", 'if (false) bad('],
   ['D4: the delete tried once', 'windowRefusal', "'      for ($try = 0; $try -lt 3; $try++) {',", "'      for ($try = 0; $try -lt 1; $try++) {',"],
