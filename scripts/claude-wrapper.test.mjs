@@ -394,8 +394,12 @@ async function leftRecord(shell, how, wrapper = WRAPPER) {
   return found
 }
 
-/** Eleven tickets, 10.5 seconds apart: all eleven resumed, as nothing caps a tab's resumes in all (#41). */
-async function pastTen(shell, wrapper = WRAPPER) {
+/**
+ * Eleven tickets, 10.5 seconds apart: all eleven resumed, as nothing caps a tab's resumes in all (#41). In a copy
+ * whose short run is made 5 seconds (review round 1), so each 10.5-second session is a long one and starts the run
+ * cap's count again: only a loop of short sessions is stopped, never a tab in all.
+ */
+async function pastTen(shell, wrapper = capsMade([['shortSecs', 5]])) {
   const dirs = lab()
   const ticket = ticketFor(dirs)
   const plan = Object.fromEntries(Array.from({ length: 11 }, (_, i) => [i + 1, ticket]))
@@ -415,6 +419,65 @@ function hourCapped(cap, change = text => text) {
   const path = join(mkdtempSync(join(work, 'capped-')), 'claude-wrapper.ps1')
   writeFileSync(path, change(text.replace(CAP, `  $hourCap = ${cap}\n`)))
   return path
+}
+
+/** A copy of the wrapper with `changes` ([line's start, its new value]) made to its caps' lines, so a test needs no hour. */
+function capsMade(changes, change = text => text) {
+  let text = readFileSync(WRAPPER, 'utf8')
+  for (const [name, value] of changes) {
+    const line = new RegExp(`^  \\$${name} = \\d+$`, 'm')
+    assert.ok(line.test(text), `the wrapper sets $${name}`)
+    text = text.replace(line, `  $${name} = ${value}`)
+  }
+  const path = join(mkdtempSync(join(work, 'caps-')), 'claude-wrapper.ps1')
+  writeFileSync(path, change(text))
+  return path
+}
+
+/**
+ * Review round 1: old resumes age out of the hourly window. A copy capped at 2 within 5 seconds (the
+ * 30-second guard made 5 seconds too): five tickets about 6 seconds apart all resume.
+ */
+async function agedOut(shell, wrapper = capsMade([['hourCap', 2], ['hourSecs', 5], ['guardSecs', 5]])) {
+  const dirs = lab()
+  const ticket = ticketFor(dirs)
+  const plan = Object.fromEntries(Array.from({ length: 5 }, (_, i) => [i + 1, ticket]))
+  const result = await run(shell, dirs, { wrapper, plan, env: { STUB_SLEEP_MS: '6000' }, timeoutMs: 120_000 })
+  const { found, check } = problems()
+  check(result.runs.length === 6, `five resumes (${result.runs.length} runs; ${result.stdout.slice(-400)})`)
+  check(!result.stdout.includes(NOT_USED), 'no ticket refused')
+  leftAsItWas(check, dirs, result)
+  return found
+}
+
+/** Review round 1, M2: a copy with the run cap made 2: two quick resumes in a row, then the third ticket is refused, saying why and that typing claude starts afresh. */
+async function loopStopped(shell, wrapper = capsMade([['loopCap', 2]])) {
+  const dirs = lab()
+  const ticket = ticketFor(dirs)
+  const result = await run(shell, dirs, { wrapper, plan: { 1: ticket, 2: ticket, 3: ticket } })
+  const { found, check } = problems()
+  check(result.runs.length === 3, `two resumes, no third (${result.runs.length} runs)`)
+  check(result.stdout.includes(`${NOT_USED}this tab resumed 2 times in a row, each session ending within 5 minutes of its start, which is a restart loop; typing claude again starts the count afresh. Once it is safe, resume it yourself: claude --resume ${dirs.id}`), `the run cap is said (${result.stdout.slice(-600)})`)
+  leftAsItWas(check, dirs, result)
+  return found
+}
+
+/**
+ * Review round 1, M2: one long run starts the count again. A copy with the run cap made 2 and a short run
+ * made under 10 seconds (the 30-second guard made 1 second): runs of 0, 0, 12.5, 0 and 0 seconds. The first
+ * resume is short (1), the second long (back to 0), the third and fourth short (1, 2): only the fifth
+ * ticket is refused. 10 seconds, not less: under load a stub run of 0 seconds can take 2.
+ */
+async function loopReset(shell, wrapper = capsMade([['loopCap', 2], ['shortSecs', 10], ['guardSecs', 1]])) {
+  const dirs = lab()
+  const ticket = ticketFor(dirs)
+  const plan = Object.fromEntries(Array.from({ length: 5 }, (_, i) => [i + 1, ticket]))
+  const result = await run(shell, dirs, { wrapper, plan, env: { STUB_SLEEP_MS: '0,0,12500,0,0' }, timeoutMs: 120_000 })
+  const { found, check } = problems()
+  check(result.runs.length === 5, `four resumes, no fifth (${result.runs.length} runs)`)
+  check(result.stdout.includes(`${NOT_USED}this tab resumed 2 times in a row, each session ending within 10 seconds of its start, which is a restart loop`), `the run cap is said after the long run reset it (${result.stdout.slice(-600)})`)
+  leftAsItWas(check, dirs, result)
+  return found
 }
 
 /** Three tickets in a row in a typed tab, its hourly cap made 2: two resumes, then the third is refused, said of the tab. */
@@ -597,7 +660,9 @@ describe('the claude wrapper, in each PowerShell', { skip: !isWindows && 'Window
     assert.ok(slot.includes(unread) && text.includes(`} catch { $live = ${unread} }`))
     // Run right before claude, after every other check, in this tab's own config folder and every one the ticket names.
     const look = text.indexOf('        $why = Get-Live $t.resume $lookIn')
-    assert.ok(look > text.indexOf("{ 'this tab resumed 3 times within 30 seconds' }"))
+    assert.ok(look > text.indexOf('{ "this $place resumed 3 times within $guardSecs seconds" }'))
+    // Review round 1, L5: every age on the monotonic clock, never the wall clock.
+    assert.ok(!text.includes('[datetime]::UtcNow - $_') && text.includes('$resumes += [Diagnostics.Stopwatch]::GetTimestamp()'), 'Stopwatch ticks, never UtcNow')
     assert.ok(look < text.indexOf('& $exe --resume $t.resume'))
     assert.ok(text.indexOf('        $lookIn = @($config)') < look)
     assert.ok(text.indexOf(LOOK_IN) < look)
@@ -653,11 +718,20 @@ describe('the claude wrapper, in each PowerShell', { skip: !isWindows && 'Window
       test('three resumes within 30 seconds, then the loop stops and says so', async () => {
         assert.deepEqual(await cappedIn30s(shell), [])
       })
-      test('eleven resumes 10.5 seconds apart: all run, as nothing caps a tab in all (#41; about two minutes)', async () => {
+      test('eleven resumes 10.5 seconds apart, each session past a short run (made 5 seconds in a copy): all run, as nothing caps a tab in all (#41; about two minutes)', async () => {
         assert.deepEqual(await pastTen(shell), [])
       })
       test('past the hourly cap (30; made 2 in a copy, so the test needs no hour): the next ticket is not used, and said of the tab', async () => {
         assert.deepEqual(await cappedHourly(shell), [])
+      })
+      test('review round 1: old resumes age out of the hourly window (2 within 5 seconds in a copy): five tickets 6 seconds apart all resume', async () => {
+        assert.deepEqual(await agedOut(shell), [])
+      })
+      test('review round 1, M2: a restart loop stops (the run cap made 2 in a copy): the third quick ticket in a row is refused, saying why and that typing claude starts afresh', async () => {
+        assert.deepEqual(await loopStopped(shell), [])
+      })
+      test('review round 1, M2: one long run starts the run count again: runs of 0, 0, 12.5, 0 and 0 seconds, only the fifth ticket refused', async () => {
+        assert.deepEqual(await loopReset(shell), [])
       })
       test('no claude.exe: it says so, and never calls itself', async () => {
         assert.deepEqual(await noClaude(shell), [])
@@ -714,8 +788,10 @@ describe('planted faults, each caught', { skip: !isWindows && 'Windows only', co
   const DELETE = '      try { [IO.File]::Delete($ticketFile) } catch { $deleted = $false }\n'
   const RESUME = '      & $exe --resume $t.resume\n'
   const CLEAR = '      foreach ($name in $markers) { Remove-Item -LiteralPath "Env:$name" -ErrorAction SilentlyContinue }\n'
-  const CAP_HOUR = '        elseif (@($resumes | Where-Object { ([datetime]::UtcNow - $_).TotalMinutes -lt 60 }).Count -ge $hourCap) { "this $place resumed $hourCap times within the last hour" }\n'
-  const CAP_30S = "        elseif (@($resumes | Where-Object { ([datetime]::UtcNow - $_).TotalSeconds -lt 30 }).Count -ge 3) { 'this tab resumed 3 times within 30 seconds' }\n"
+  const CAP_HOUR = '        elseif (@($resumes | Where-Object { ($now - $_) / $ticks -lt $hourSecs }).Count -ge $hourCap) { "this $place resumed $hourCap times within the last hour" }\n'
+  const CAP_30S = '        elseif (@($resumes | Where-Object { ($now - $_) / $ticks -lt $guardSecs }).Count -ge 3) { "this $place resumed 3 times within $guardSecs seconds" }\n'
+  const CAP_LOOP = '        elseif ($shortRuns -ge $loopCap) { "this $place resumed $loopCap times in a row, each session ending within $shortSaid of its start, which is a restart loop; typing claude again starts the count afresh" }\n'
+  const RESET = ' else { $shortRuns = 0 }'
 
   test('the ticket deleted only after it is used: the resumed claude still sees it', async () => {
     const text = readFileSync(WRAPPER, 'utf8')
@@ -740,6 +816,23 @@ describe('planted faults, each caught', { skip: !isWindows && 'Windows only', co
 
   test('the hourly cap removed alone: a third resume runs past a cap of 2', async () => {
     assert.notDeepEqual(await cappedHourly(shell, hourCapped(2, text => text.replace(CAP_HOUR, ''))), [])
+  })
+
+  test('review round 1: the age filter dropped from the hourly cap (a cap in all again): an old resume never ages out', async () => {
+    const text = readFileSync(WRAPPER, 'utf8')
+    assert.ok(text.includes(CAP_HOUR))
+    const inAll = CAP_HOUR.replace('@($resumes | Where-Object { ($now - $_) / $ticks -lt $hourSecs })', '@($resumes)')
+    assert.notDeepEqual(await agedOut(shell, capsMade([['hourCap', 2], ['hourSecs', 5], ['guardSecs', 5]], t => t.replace(CAP_HOUR, inAll))), [])
+  })
+
+  test('review round 1, M2: the run cap removed: the third quick ticket in a row resumes', async () => {
+    assert.ok(readFileSync(WRAPPER, 'utf8').includes(CAP_LOOP))
+    assert.notDeepEqual(await loopStopped(shell, capsMade([['loopCap', 2]], t => t.replace(CAP_LOOP, ''))), [])
+  })
+
+  test('review round 1, M2: a long run not starting the count again: the run cap refuses before the fifth ticket', async () => {
+    assert.ok(readFileSync(WRAPPER, 'utf8').includes(RESET))
+    assert.notDeepEqual(await loopReset(shell, capsMade([['loopCap', 2], ['shortSecs', 10], ['guardSecs', 1]], t => t.replace(RESET, ''))), [])
   })
 
   test("the hourly cap kept for a hosted window only, as before #41: a typed tab's third resume runs past a cap of 2", async () => {

@@ -1,7 +1,7 @@
 # claude-launch.ps1: starts Claude Code as a top-level session. The one script in
 # claude-code-self-tools that runs claude: every launch (a restart's or a switch's window, the
 # coordinator's go, a steward's launch, a slot runner's every start, and you by hand) comes through it.
-# claude-launch version 5
+# claude-launch version 6
 #
 # Part of self-switch (claude-code-self-tools, plugins/self-switch/slot/claude-launch.ps1). Nobody
 # copies it: a launch that opens a window puts the copy it carries in %LOCALAPPDATA%\claude-self-tools,
@@ -26,7 +26,8 @@
 # out of the session comes back in this same window or tab. A launch's window always gives it; a slot
 # runner never does (it has its own loop). -Hosted, with -Wrapper, says this run hosts a window a launch
 # opened, and only that window's script passes it: the wrapper's pane file then says hosted. Hosted or
-# not, it resumes up to 30 times an hour. Run by hand, -Wrapper alone keeps a profile's ways.
+# not, it resumes up to 30 times an hour, and stops a restart loop. Run by hand, -Wrapper alone keeps a
+# profile's ways.
 #
 # What it does, in order:
 # 1. It checks its arguments: a session id is a lowercase UUID; a name is lowercase letters, digits and
@@ -68,7 +69,7 @@
 #    the name, which an alias would take), with those arguments, in this process: the wrapper gives
 #    claude a fresh CLAUDE_PANE_TOKEN and a pane file naming this PowerShell, claude.exe's own parent,
 #    marked hosted with -Hosted (placement.json, when it names a place, comes first for the next move;
-#    30 moves an hour, as in any tab), and when claude exits it resumes the ticket a restart or a
+#    the same caps as in any tab), and when claude exits it resumes the ticket a restart or a
 #    switch left it, here. A
 #    ticket the wrapper doesn't use ends this script with exit 3, the reason left for the window that
 #    ran it ($ClaudeLaunchUnused), which records it and stays open; $ClaudeLaunchLast names the
@@ -97,7 +98,7 @@ $Clear = 'CLAUDE_CODE_CHILD_SESSION', 'CLAUDECODE', 'CLAUDE_CODE_SESSION_ID', 'C
 $Drop = 'PSExecutionPolicyPreference', 'CLAUDE_PANE_TOKEN'
 $Set = [ordered]@{ CLAUDE_CODE_FORCE_SESSION_PERSISTENCE = '1'; CLAUDE_CODE_DISABLE_BG_SHELL_PRESSURE_REAP = '1' }
 # The claude wrapper's copy -Wrapper loads, by its SHA-256: WRAPPER_SCRIPT_SHA256 in the plugins' machine code.
-$WrapperSha256 = 'e312ef2188def0b35d62145c5c2800ebc2673ae84117cf59f709f5204a06ec0f'
+$WrapperSha256 = '20083123ff9850af6a743373b4e5b38cc3b03500a35447166687c40fc0a09bdd'
 
 function Stop-Launch($why) {
   Write-Host ('claude-launch: ' + $why + ' Nothing was started.')

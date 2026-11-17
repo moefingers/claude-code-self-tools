@@ -451,12 +451,17 @@ async function unusedTicket(shell, path = LAUNCH) {
   return run(shell, dirs, ['-Resume', t.id, '-Dir', dirs.work, '-Wrapper', '-Hosted'], { script: path, extra: { STUB_PLAN: t.plan } })
 }
 
-/** Eleven moves out of one run, 10.5 seconds apart (past the 30-second guard), hosted (-Hosted) or by hand: its result. */
-async function manyMoves(shell, path = LAUNCH, { hosted = true } = {}) {
+/**
+ * Eleven moves out of one run, 10.5 seconds apart (past the 30-second guard), hosted (-Hosted) or by hand: its
+ * result. In the wrapper's copy with its short run made 5 seconds, pinned as its own (review round 1), so each
+ * 10.5-second session is a long one and starts the run cap's count again: only a cap in all could stop them.
+ */
+async function manyMoves(shell, { hosted = true } = {}) {
   const dirs = lab()
-  placeWrapper(dirs)
+  const made = shortMade(5)
+  placeWrapper(dirs, made.text, made.sha)
   const t = ticketLab(dirs, 11)
-  return run(shell, dirs, ['-Resume', t.id, '-Dir', dirs.work, '-Wrapper', ...(hosted ? ['-Hosted'] : [])], { script: path, extra: { STUB_PLAN: t.plan, STUB_SLEEP_MS: '10500' }, timeoutMs: 240_000 })
+  return run(shell, dirs, ['-Resume', t.id, '-Dir', dirs.work, '-Wrapper', ...(hosted ? ['-Hosted'] : [])], { script: made.launcher, extra: { STUB_PLAN: t.plan, STUB_SLEEP_MS: '10500' }, timeoutMs: 240_000 })
 }
 
 /** The claude wrapper's copy with its hourly cap made `cap`, and a launcher that pins it as its own (a test needs no hour). */
@@ -464,6 +469,18 @@ function cappedAt(cap) {
   const CAP = '  $hourCap = 30\n'
   assert.ok(machine.WRAPPER_SCRIPT_TEXT.includes(CAP), 'the cap is 30 within any hour')
   const text = machine.WRAPPER_SCRIPT_TEXT.replace(CAP, `  $hourCap = ${cap}\n`)
+  const sha = sha256(text)
+  return { text, sha, launcher: planted(`$WrapperSha256 = '${machine.WRAPPER_SCRIPT_SHA256}'`, `$WrapperSha256 = '${sha}'`) }
+}
+
+/**
+ * The claude wrapper's copy with its short run made `secs` seconds, and a launcher that pins it as its own
+ * (review round 1): a session that runs longer starts the run cap's count again.
+ */
+function shortMade(secs) {
+  const SHORT = '  $shortSecs = 300\n'
+  assert.ok(machine.WRAPPER_SCRIPT_TEXT.includes(SHORT), 'a short run is one under 300 seconds')
+  const text = machine.WRAPPER_SCRIPT_TEXT.replace(SHORT, `  $shortSecs = ${secs}\n`)
   const sha = sha256(text)
   return { text, sha, launcher: planted(`$WrapperSha256 = '${machine.WRAPPER_SCRIPT_SHA256}'`, `$WrapperSha256 = '${sha}'`) }
 }
@@ -750,15 +767,15 @@ describe('claude-launch.ps1, run for real against the stub', { skip: !isWindows 
         assert.equal(r.code, machine.WRAPPER_UNUSED_EXIT)
       })
 
-      test('eleven moves out of one hosted run: all resumed here, no cap of 10 (the 30-second guard still stands; about two minutes)', { skip: shell !== SHELLS.at(-1)?.[1] && 'one shell is enough for the long run' }, async () => {
+      test('eleven moves out of one hosted run, each session past a short run (made 5 seconds in a copy): all resumed here, no cap of 10 (the 30-second guard still stands; about two minutes)', { skip: shell !== SHELLS.at(-1)?.[1] && 'one shell is enough for the long run' }, async () => {
         const r = await manyMoves(shell)
         assert.equal(r.runs.length, 12, r.stdout.slice(-600))
         assert.ok(!r.stdout.includes('resumed 10 times'), r.stdout.slice(-600))
         assert.equal(r.code, 7)
       })
 
-      test('eleven moves out of a -Wrapper run by hand (no -Hosted): a profile\'s wrapper, its pane file not hosted, and no cap of 10 either (#41; about two minutes)', { skip: shell !== SHELLS.at(-1)?.[1] && 'one shell is enough for the long run' }, async () => {
-        const r = await manyMoves(shell, LAUNCH, { hosted: false })
+      test('eleven moves out of a -Wrapper run by hand (no -Hosted), each session past a short run (made 5 seconds in a copy): a profile\'s wrapper, its pane file not hosted, and no cap of 10 either (#41; about two minutes)', { skip: shell !== SHELLS.at(-1)?.[1] && 'one shell is enough for the long run' }, async () => {
+        const r = await manyMoves(shell, { hosted: false })
         assert.equal(r.runs.length, 12, r.stdout.slice(-600))
         assert.ok(r.runs.every(one => one.pane !== null && machine.parsePane(one.pane).hosted === undefined), 'no pane file says hosted')
         assert.ok(!r.stdout.includes('resumed 10 times'), r.stdout.slice(-600))
@@ -782,6 +799,16 @@ describe('claude-launch.ps1, run for real against the stub', { skip: !isWindows 
         assert.equal(byHand.runs.length, 3, byHand.stdout.slice(-600))
         assert.match(byHand.stdout, /claude: the ticket to resume a session in this tab was not used: this tab resumed 2 times within the last hour\./)
         assert.equal(byHand.code, machine.WRAPPER_UNUSED_EXIT)
+      })
+
+      test('review round 1, L4: a hosted run past the 30-second guard: the fourth quick move is not used, said of the window, and the launcher ends with 3', async () => {
+        const dirs = lab()
+        placeWrapper(dirs)
+        const t = ticketLab(dirs, 4)
+        const r = await run(shell, dirs, ['-Resume', t.id, '-Dir', dirs.work, '-Wrapper', '-Hosted'], { extra: { STUB_PLAN: t.plan } })
+        assert.equal(r.runs.length, 4, r.stdout.slice(-600))
+        assert.match(r.stdout, /claude: the ticket to resume a session in this tab was not used: this window resumed 3 times within 30 seconds\./)
+        assert.equal(r.code, machine.WRAPPER_UNUSED_EXIT)
       })
 
       test('-Wrapper under a Restricted execution policy, set for this process alone: the copy loads all the same (its bytes, never a script file)', async () => {

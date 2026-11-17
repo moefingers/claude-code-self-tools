@@ -572,14 +572,14 @@ export const WT_MIN = { names: '1.8', pos: '1.17', stamps: '1.19' } as const
  * starts claude. A window runs it only from launchScriptPath, with this hash, checked by .NET just
  * before it runs. scripts/embed-launch.mjs writes it.
  */
-export const LAUNCH_SCRIPT_SHA256 = '837bfdf9d1c7d178d00e7947920d59175f2071592132abe38063dab84e5080de'
+export const LAUNCH_SCRIPT_SHA256 = '744f14e795e789ca9a903c872265ac8e9e050727a860eb65593720c2d5115af8'
 
 /**
  * claude-launch.ps1's version, its `# claude-launch version <n>` line: one more with every change to the
  * script. The copy kept for use by hand (launchHandPath) is replaced only by a higher one, so plugins of
  * two versions never trade it back and forth. scripts/embed-launch.mjs writes it from the script.
  */
-export const LAUNCH_SCRIPT_VERSION = 5
+export const LAUNCH_SCRIPT_VERSION = 6
 
 /**
  * Where a launch puts claude-launch.ps1 and a window runs it from: beside the slot runner, named by the
@@ -605,7 +605,7 @@ export const LAUNCH_SCRIPT_TEXT = [
   "# claude-launch.ps1: starts Claude Code as a top-level session. The one script in",
   "# claude-code-self-tools that runs claude: every launch (a restart's or a switch's window, the",
   "# coordinator's go, a steward's launch, a slot runner's every start, and you by hand) comes through it.",
-  "# claude-launch version 5",
+  "# claude-launch version 6",
   "#",
   "# Part of self-switch (claude-code-self-tools, plugins/self-switch/slot/claude-launch.ps1). Nobody",
   "# copies it: a launch that opens a window puts the copy it carries in %LOCALAPPDATA%\\claude-self-tools,",
@@ -630,7 +630,8 @@ export const LAUNCH_SCRIPT_TEXT = [
   "# out of the session comes back in this same window or tab. A launch's window always gives it; a slot",
   "# runner never does (it has its own loop). -Hosted, with -Wrapper, says this run hosts a window a launch",
   "# opened, and only that window's script passes it: the wrapper's pane file then says hosted. Hosted or",
-  "# not, it resumes up to 30 times an hour. Run by hand, -Wrapper alone keeps a profile's ways.",
+  "# not, it resumes up to 30 times an hour, and stops a restart loop. Run by hand, -Wrapper alone keeps a",
+  "# profile's ways.",
   "#",
   "# What it does, in order:",
   "# 1. It checks its arguments: a session id is a lowercase UUID; a name is lowercase letters, digits and",
@@ -672,7 +673,7 @@ export const LAUNCH_SCRIPT_TEXT = [
   "#    the name, which an alias would take), with those arguments, in this process: the wrapper gives",
   "#    claude a fresh CLAUDE_PANE_TOKEN and a pane file naming this PowerShell, claude.exe's own parent,",
   "#    marked hosted with -Hosted (placement.json, when it names a place, comes first for the next move;",
-  "#    30 moves an hour, as in any tab), and when claude exits it resumes the ticket a restart or a",
+  "#    the same caps as in any tab), and when claude exits it resumes the ticket a restart or a",
   "#    switch left it, here. A",
   "#    ticket the wrapper doesn't use ends this script with exit 3, the reason left for the window that",
   "#    ran it ($ClaudeLaunchUnused), which records it and stays open; $ClaudeLaunchLast names the",
@@ -701,7 +702,7 @@ export const LAUNCH_SCRIPT_TEXT = [
   "$Drop = 'PSExecutionPolicyPreference', 'CLAUDE_PANE_TOKEN'",
   "$Set = [ordered]@{ CLAUDE_CODE_FORCE_SESSION_PERSISTENCE = '1'; CLAUDE_CODE_DISABLE_BG_SHELL_PRESSURE_REAP = '1' }",
   "# The claude wrapper's copy -Wrapper loads, by its SHA-256: WRAPPER_SCRIPT_SHA256 in the plugins' machine code.",
-  "$WrapperSha256 = 'e312ef2188def0b35d62145c5c2800ebc2673ae84117cf59f709f5204a06ec0f'",
+  "$WrapperSha256 = '20083123ff9850af6a743373b4e5b38cc3b03500a35447166687c40fc0a09bdd'",
   "",
   "function Stop-Launch($why) {",
   "  Write-Host ('claude-launch: ' + $why + ' Nothing was started.')",
@@ -966,7 +967,7 @@ export const LAUNCH_SCRIPT_TEXT = [
  * inside its own pinned text, and checks the copy's bytes against it before it defines the function from
  * those bytes. scripts/embed-launch.mjs writes both.
  */
-export const WRAPPER_SCRIPT_SHA256 = 'e312ef2188def0b35d62145c5c2800ebc2673ae84117cf59f709f5204a06ec0f'
+export const WRAPPER_SCRIPT_SHA256 = '20083123ff9850af6a743373b4e5b38cc3b03500a35447166687c40fc0a09bdd'
 
 /**
  * Where a launch puts the claude wrapper's copy, and claude-launch.ps1 -Wrapper loads it from: beside the
@@ -1012,9 +1013,12 @@ export const WRAPPER_SCRIPT_TEXT = [
   "#   same look here as in its window; and, for a switch back to a conversation left moments ago (one that",
   "#   rests on a left record), its transcript is as the record says, unchanged since. Then it runs",
   "#   claude --resume <id> in that folder, in this tab, and loops: a resumed session can restart again.",
-  "#   At most 30 resumes within any hour, and never a fourth within 30 seconds: the two stop a loop, and",
-  "#   nothing caps a tab's resumes in all, so a long-lived session keeps coming back in its tab. A ticket",
-  "#   it doesn't use is said in one line, and you are back at the prompt.",
+  "#   At most 30 resumes within any hour, never a fourth within 30 seconds, and never a ninth in a row",
+  "#   when each of the 8 before it ended within 5 minutes of its start: those stop a loop. One run of 5",
+  "#   minutes or more starts that count again, and nothing caps a tab's resumes in all, so a long-lived",
+  "#   session keeps coming back in its tab. The times are the machine's monotonic clock, never the wall",
+  "#   clock. A ticket it doesn't use is said in one line, and you are back at the prompt, where typing",
+  "#   claude starts afresh.",
   "# - In a window claude-launch.ps1 opened (claude-launch.ps1 -Wrapper -Hosted, which only that window's",
   "#   script passes, sets $ClaudeWrapperHosted in its own scope first), the caps are the same, said of",
   "#   the window. Its pane file says it is hosted (\"hosted\": true), so a move out of it goes to the place",
@@ -1051,9 +1055,18 @@ export const WRAPPER_SCRIPT_TEXT = [
   "  $panes = Join-Path $state 'panes'",
   "  # Hosted by claude-launch.ps1 -Wrapper (set in the calling script's own scope), or typed at a prompt.",
   "  $hosted = $script:ClaudeWrapperHosted -eq $true",
-  "  # At most this many resumes within any hour, typed at a prompt or hosted: with the 30-second guard it",
-  "  # stops a loop, and a long-lived session's tab, which restarts for real reasons, is never stranded.",
+  "  # Typed at a prompt or hosted: at most $hourCap resumes within any $hourSecs, never a fourth within",
+  "  # $guardSecs, and never more than $loopCap in a row whose sessions each ended within $shortSecs of their",
+  "  # start, which is a restart loop. One run as long or longer starts that count again, so a long-lived",
+  "  # session's tab, which restarts for real reasons, is never stranded. Every age is in Stopwatch ticks,",
+  "  # the monotonic clock: a wall clock set back never makes old resumes read as recent.",
   "  $hourCap = 30",
+  "  $hourSecs = 3600",
+  "  $guardSecs = 30",
+  "  $loopCap = 8",
+  "  $shortSecs = 300",
+  "  $shortSaid = if ($shortSecs % 60 -eq 0) { \"$($shortSecs / 60) minutes\" } else { \"$shortSecs seconds\" }",
+  "  $ticks = [Diagnostics.Stopwatch]::Frequency",
   "  $place = if ($hosted) { 'window' } else { 'tab' }",
   "  $uuid = '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\\z'",
   "  $claim = '^launch:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\\z'",
@@ -1161,6 +1174,8 @@ export const WRAPPER_SCRIPT_TEXT = [
   "  }",
   "",
   "  $resumes = @()",
+  "  # The resumes in a row whose session each ended within $shortSecs of its start.",
+  "  $shortRuns = 0",
   "  $code = 0",
   "  Push-Location",
   "  try {",
@@ -1178,6 +1193,7 @@ export const WRAPPER_SCRIPT_TEXT = [
   "      # The claim lock on the conversation: a switch or restart took it, and the ticket names it.",
   "      $lock = $null",
   "      if ($t.resume -is [string] -and $t.resume -cmatch $uuid) { try { $lock = [IO.File]::ReadAllText((Join-Path $state \"claims\\$($t.resume).lock\")) | ConvertFrom-Json } catch { } }",
+  "      $now = [Diagnostics.Stopwatch]::GetTimestamp()",
   "      $why = if (-not $deleted) { 'it could not be deleted' }",
   "        elseif ($t -isnot [Management.Automation.PSCustomObject] -or $text -notmatch '^\\s*\\{') { 'it is not a JSON object' }",
   "        elseif ($t.cancelled -is [bool] -and $t.cancelled) { 'it was withdrawn' }",
@@ -1191,8 +1207,9 @@ export const WRAPPER_SCRIPT_TEXT = [
   "        elseif ($null -ne $t.left -and -not (& $isLeft $t.left)) { 'its left record''s stat is not a size and a time, or an exit time' }",
   "        elseif (-not (Test-Path -LiteralPath (Join-Path $config ('projects\\' + ($t.dir -replace '[^A-Za-z0-9]', '-') + '\\' + $t.resume + '.jsonl')) -PathType Leaf)) { \"no transcript of it is under its folder's project\" }",
   "        elseif ($null -eq $lock -or $lock.by -cne $t.by) { 'the claim lock on that conversation does not name this ticket' }",
-  "        elseif (@($resumes | Where-Object { ([datetime]::UtcNow - $_).TotalMinutes -lt 60 }).Count -ge $hourCap) { \"this $place resumed $hourCap times within the last hour\" }",
-  "        elseif (@($resumes | Where-Object { ([datetime]::UtcNow - $_).TotalSeconds -lt 30 }).Count -ge 3) { 'this tab resumed 3 times within 30 seconds' }",
+  "        elseif (@($resumes | Where-Object { ($now - $_) / $ticks -lt $hourSecs }).Count -ge $hourCap) { \"this $place resumed $hourCap times within the last hour\" }",
+  "        elseif ($shortRuns -ge $loopCap) { \"this $place resumed $loopCap times in a row, each session ending within $shortSaid of its start, which is a restart loop; typing claude again starts the count afresh\" }",
+  "        elseif (@($resumes | Where-Object { ($now - $_) / $ticks -lt $guardSecs }).Count -ge 3) { \"this $place resumed 3 times within $guardSecs seconds\" }",
   "      # The last look, right before claude runs: is the conversation open anywhere now? In this tab's own",
   "      # config folder and every one the ticket names, as the switch read them: reading more registries",
   "      # can only find the conversation held, never free it. Then, for a move that rests on a left record,",
@@ -1210,7 +1227,7 @@ export const WRAPPER_SCRIPT_TEXT = [
   "        $script:ClaudeWrapperUnused = [pscustomobject]@{ why = $why; resume = $(if ($t.resume -is [string] -and $t.resume -cmatch $uuid) { $t.resume } else { $null }); by = $(if ($t.by -is [string] -and $t.by -cmatch $claim) { $t.by } else { $null }); dir = $(if ($t.dir -is [string]) { $t.dir } else { $null }) }",
   "        break",
   "      }",
-  "      $resumes += [datetime]::UtcNow",
+  "      $resumes += [Diagnostics.Stopwatch]::GetTimestamp()",
   "      # For the script that called this function: the conversation resumed last, and its folder.",
   "      $script:ClaudeWrapperLast = [pscustomobject]@{ resume = $t.resume; dir = $t.dir }",
   "      # The environment a new session gets: Claude Code's markers and NO_COLOR removed (not set to empty,",
@@ -1219,8 +1236,10 @@ export const WRAPPER_SCRIPT_TEXT = [
   "      foreach ($name in $launchSet.Keys) { Set-Item -LiteralPath \"Env:$name\" -Value $launchSet[$name] }",
   "      Set-Location -LiteralPath $t.dir",
   "      Write-Host \"Resuming $($t.resume) here, in $($t.dir).\"",
+  "      $runStart = [Diagnostics.Stopwatch]::GetTimestamp()",
   "      & $exe --resume $t.resume",
   "      $code = $LASTEXITCODE",
+  "      if (([Diagnostics.Stopwatch]::GetTimestamp() - $runStart) / $ticks -lt $shortSecs) { $shortRuns++ } else { $shortRuns = 0 }",
   "    }",
   "  } finally {",
   "    Pop-Location",

@@ -29,9 +29,12 @@
 #   same look here as in its window; and, for a switch back to a conversation left moments ago (one that
 #   rests on a left record), its transcript is as the record says, unchanged since. Then it runs
 #   claude --resume <id> in that folder, in this tab, and loops: a resumed session can restart again.
-#   At most 30 resumes within any hour, and never a fourth within 30 seconds: the two stop a loop, and
-#   nothing caps a tab's resumes in all, so a long-lived session keeps coming back in its tab. A ticket
-#   it doesn't use is said in one line, and you are back at the prompt.
+#   At most 30 resumes within any hour, never a fourth within 30 seconds, and never a ninth in a row
+#   when each of the 8 before it ended within 5 minutes of its start: those stop a loop. One run of 5
+#   minutes or more starts that count again, and nothing caps a tab's resumes in all, so a long-lived
+#   session keeps coming back in its tab. The times are the machine's monotonic clock, never the wall
+#   clock. A ticket it doesn't use is said in one line, and you are back at the prompt, where typing
+#   claude starts afresh.
 # - In a window claude-launch.ps1 opened (claude-launch.ps1 -Wrapper -Hosted, which only that window's
 #   script passes, sets $ClaudeWrapperHosted in its own scope first), the caps are the same, said of
 #   the window. Its pane file says it is hosted ("hosted": true), so a move out of it goes to the place
@@ -68,9 +71,18 @@ function claude {
   $panes = Join-Path $state 'panes'
   # Hosted by claude-launch.ps1 -Wrapper (set in the calling script's own scope), or typed at a prompt.
   $hosted = $script:ClaudeWrapperHosted -eq $true
-  # At most this many resumes within any hour, typed at a prompt or hosted: with the 30-second guard it
-  # stops a loop, and a long-lived session's tab, which restarts for real reasons, is never stranded.
+  # Typed at a prompt or hosted: at most $hourCap resumes within any $hourSecs, never a fourth within
+  # $guardSecs, and never more than $loopCap in a row whose sessions each ended within $shortSecs of their
+  # start, which is a restart loop. One run as long or longer starts that count again, so a long-lived
+  # session's tab, which restarts for real reasons, is never stranded. Every age is in Stopwatch ticks,
+  # the monotonic clock: a wall clock set back never makes old resumes read as recent.
   $hourCap = 30
+  $hourSecs = 3600
+  $guardSecs = 30
+  $loopCap = 8
+  $shortSecs = 300
+  $shortSaid = if ($shortSecs % 60 -eq 0) { "$($shortSecs / 60) minutes" } else { "$shortSecs seconds" }
+  $ticks = [Diagnostics.Stopwatch]::Frequency
   $place = if ($hosted) { 'window' } else { 'tab' }
   $uuid = '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\z'
   $claim = '^launch:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\z'
@@ -178,6 +190,8 @@ function claude {
   }
 
   $resumes = @()
+  # The resumes in a row whose session each ended within $shortSecs of its start.
+  $shortRuns = 0
   $code = 0
   Push-Location
   try {
@@ -195,6 +209,7 @@ function claude {
       # The claim lock on the conversation: a switch or restart took it, and the ticket names it.
       $lock = $null
       if ($t.resume -is [string] -and $t.resume -cmatch $uuid) { try { $lock = [IO.File]::ReadAllText((Join-Path $state "claims\$($t.resume).lock")) | ConvertFrom-Json } catch { } }
+      $now = [Diagnostics.Stopwatch]::GetTimestamp()
       $why = if (-not $deleted) { 'it could not be deleted' }
         elseif ($t -isnot [Management.Automation.PSCustomObject] -or $text -notmatch '^\s*\{') { 'it is not a JSON object' }
         elseif ($t.cancelled -is [bool] -and $t.cancelled) { 'it was withdrawn' }
@@ -208,8 +223,9 @@ function claude {
         elseif ($null -ne $t.left -and -not (& $isLeft $t.left)) { 'its left record''s stat is not a size and a time, or an exit time' }
         elseif (-not (Test-Path -LiteralPath (Join-Path $config ('projects\' + ($t.dir -replace '[^A-Za-z0-9]', '-') + '\' + $t.resume + '.jsonl')) -PathType Leaf)) { "no transcript of it is under its folder's project" }
         elseif ($null -eq $lock -or $lock.by -cne $t.by) { 'the claim lock on that conversation does not name this ticket' }
-        elseif (@($resumes | Where-Object { ([datetime]::UtcNow - $_).TotalMinutes -lt 60 }).Count -ge $hourCap) { "this $place resumed $hourCap times within the last hour" }
-        elseif (@($resumes | Where-Object { ([datetime]::UtcNow - $_).TotalSeconds -lt 30 }).Count -ge 3) { 'this tab resumed 3 times within 30 seconds' }
+        elseif (@($resumes | Where-Object { ($now - $_) / $ticks -lt $hourSecs }).Count -ge $hourCap) { "this $place resumed $hourCap times within the last hour" }
+        elseif ($shortRuns -ge $loopCap) { "this $place resumed $loopCap times in a row, each session ending within $shortSaid of its start, which is a restart loop; typing claude again starts the count afresh" }
+        elseif (@($resumes | Where-Object { ($now - $_) / $ticks -lt $guardSecs }).Count -ge 3) { "this $place resumed 3 times within $guardSecs seconds" }
       # The last look, right before claude runs: is the conversation open anywhere now? In this tab's own
       # config folder and every one the ticket names, as the switch read them: reading more registries
       # can only find the conversation held, never free it. Then, for a move that rests on a left record,
@@ -227,7 +243,7 @@ function claude {
         $script:ClaudeWrapperUnused = [pscustomobject]@{ why = $why; resume = $(if ($t.resume -is [string] -and $t.resume -cmatch $uuid) { $t.resume } else { $null }); by = $(if ($t.by -is [string] -and $t.by -cmatch $claim) { $t.by } else { $null }); dir = $(if ($t.dir -is [string]) { $t.dir } else { $null }) }
         break
       }
-      $resumes += [datetime]::UtcNow
+      $resumes += [Diagnostics.Stopwatch]::GetTimestamp()
       # For the script that called this function: the conversation resumed last, and its folder.
       $script:ClaudeWrapperLast = [pscustomobject]@{ resume = $t.resume; dir = $t.dir }
       # The environment a new session gets: Claude Code's markers and NO_COLOR removed (not set to empty,
@@ -236,8 +252,10 @@ function claude {
       foreach ($name in $launchSet.Keys) { Set-Item -LiteralPath "Env:$name" -Value $launchSet[$name] }
       Set-Location -LiteralPath $t.dir
       Write-Host "Resuming $($t.resume) here, in $($t.dir)."
+      $runStart = [Diagnostics.Stopwatch]::GetTimestamp()
       & $exe --resume $t.resume
       $code = $LASTEXITCODE
+      if (([Diagnostics.Stopwatch]::GetTimestamp() - $runStart) / $ticks -lt $shortSecs) { $shortRuns++ } else { $shortRuns = 0 }
     }
   } finally {
     Pop-Location

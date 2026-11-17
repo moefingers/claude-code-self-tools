@@ -9,7 +9,8 @@
 // processes under that same parent (shellSiblings). Then, as self-restart or self-switch would, it writes the
 // ticket for its run from %STUB_PLAN%\<run>.json, if there is one, with {TOKEN} replaced by its
 // CLAUDE_PANE_TOKEN and "{NOW}", "{OLD}" and "{AHEAD}" by the time now, 200 s ago and 60 s ahead, in
-// milliseconds. It sleeps %STUB_SLEEP_MS% and exits with %STUB_EXIT%, when they are set.
+// milliseconds. It sleeps %STUB_SLEEP_MS% and exits with %STUB_EXIT%, when they are set; a list of sleeps
+// ("0,2500,0") gives one per run in turn, its last for every run after.
 //
 // For the scripts a plugin runs under its own claude.exe (scripts/launch-live.test.mjs and
 // scripts/left-record.test.mjs), before all that: with %STUB_SELF%, it first writes there its process id
@@ -157,7 +158,10 @@ public static class ClaudeStub {
       File.WriteAllText(ticket, text);
     }
     string sleep = Environment.GetEnvironmentVariable("STUB_SLEEP_MS");
-    if (!string.IsNullOrEmpty(sleep)) Thread.Sleep(int.Parse(sleep));
+    if (!string.IsNullOrEmpty(sleep)) {
+      string[] sleeps = sleep.Split(',');
+      Thread.Sleep(int.Parse(sleeps[Math.Min(run, sleeps.Length) - 1]));
+    }
     string code = Environment.GetEnvironmentVariable("STUB_EXIT");
     return string.IsNullOrEmpty(code) ? 0 : int.Parse(code);
   }
