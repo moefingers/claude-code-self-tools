@@ -3,18 +3,18 @@
 // and start, and the lines the tool answers with. register.ts runs them on the machine.
 //
 // What it reads, and only that:
-// - Chrome's browser processes: on Windows, a fixed Windows PowerShell script reads chrome.exe processes through
-//   Get-CimInstance, as the shared machine code reads processes, and passes on only those that are no child of a
-//   browser (no --type=); on macOS, pgrep finds the processes whose command starts with Chrome's executable, and ps
-//   reads those alone. Of each command line the plugin keeps whether it has the flag, its --profile-directory and its
-//   --user-data-dir, and never prints it.
-// - One field of Chrome's Local State, profile.last_active_profiles, and only when a start needs a profile. The file
-//   is parsed and only that field is kept: never an account's name or address.
-// It prints profile folder names only, never a path, an account or a command line.
+// - Chrome's browser processes, this login's alone: on Windows, a fixed Windows PowerShell script reads the chrome.exe
+//   processes of its own Windows session through Get-CimInstance, as the shared machine code reads processes, and
+//   passes on only those that are no child of a browser (no --type=); on macOS, pgrep finds this user's processes whose
+//   command starts with Chrome's executable, and ps reads those alone. Of each command line the plugin keeps whether it
+//   has the flag and --no-startup-window, its --profile-directory and its --user-data-dir, and never prints it.
+// - When a call or the setting names a profile folder: whether that folder, with its Preferences file, is in Chrome's
+//   user data folder; and, when it isn't, the names of the folders there that are (directory names only).
+// It reads nothing of Local State, and prints profile folder names only, never a path, an account or a command line.
 //
-// What it never does: quit, kill or restart Chrome (that closes every session's tabs and tab groups), sign in, or
-// type anything into Chrome.
-import { LAUNCH_ENV_CLEAR, LAUNCH_ENV_DROP, isSafeFolder, PSMODULEPATH_RESET, psQuote, quoted } from './machine'
+// What it never does: quit, kill or restart Chrome (that closes every session's tabs and tab groups), open a profile in
+// a Chrome that runs, sign in, or type anything into Chrome.
+import { isSafeFolder, PSMODULEPATH_RESET, psQuote } from './machine'
 
 /** The flag that hides Chrome's "is debugging this browser" banner, for every extension and every profile in that Chrome. */
 export const FLAG = '--silent-debugger-extension-api'
@@ -28,8 +28,22 @@ export const ENV_VAR = 'CLAUDE_CHROME_SILENT_DEBUGGER'
 /** How long a start waits for Chrome's browser process to show, in seconds. */
 export const START_WAIT_S = 20
 
+/** How many looks a start's wait makes at most, whatever the clock says. */
+export const START_LOOKS = 20
+
+/** How many reconnects one session queues within RECONNECT_WINDOW_MS; past it, the person is asked. */
+export const RECONNECT_CAP = 3
+
+/** The window RECONNECT_CAP counts in. */
+export const RECONNECT_WINDOW_MS = 10 * 60 * 1000
+
+/** How long a start's mark in the plugin's store, which every session on the machine reads, holds other starts off. */
+export const START_MARK_MS = 60_000
+
 /** The operating systems the plugin looks after Chrome on. */
 export type Platform = 'windows' | 'macos'
+
+const BOM = String.fromCharCode(0xfeff)
 
 // ---------------------------------------------------------------------------------------------
 // The flag: the setting, and the environment variable while the setting is auto.
@@ -59,7 +73,7 @@ export function flagChoice(setting: SilentSetting, env: string | undefined): Fla
 }
 
 // ---------------------------------------------------------------------------------------------
-// The profile: the call's, the setting's, Chrome's last active one, or Default.
+// The profile: the call's, else the setting's, else none, so Chrome opens the profile it used last.
 
 /** A profile folder's name as --profile-directory takes it (Default, Profile 2, Guest Profile): letters, digits, spaces, _ and -, no space at either end, at most 64. */
 export const PROFILE_NAME = /^[A-Za-z0-9_-](?:[A-Za-z0-9 _-]{0,62}[A-Za-z0-9_-])?$/
@@ -67,45 +81,54 @@ export const PROFILE_NAME = /^[A-Za-z0-9_-](?:[A-Za-z0-9 _-]{0,62}[A-Za-z0-9_-])
 /** Whether `value` is a profile folder's name the plugin passes to Chrome and prints. */
 export const isProfileName = (value: unknown): value is string => typeof value === 'string' && PROFILE_NAME.test(value)
 
-const isRecord = (value: unknown): value is Record<string, unknown> => typeof value === 'object' && value !== null && !Array.isArray(value)
-
-/** What Local State said: the first of its last active profiles, or why there is none to take. */
-export type LocalStateRead = { readonly profile: string } | { readonly why: string }
+/** Where a named profile came from. */
+export type ProfileSource = 'call' | 'setting'
 
 /**
- * The first of Local State's `profile.last_active_profiles`, when it is a profile folder's name. Nothing else of the
- * file is kept, and nothing of it is said but that name: Local State also holds the accounts signed in to each profile.
+ * The profile a start opens: the call's `profile` (checked at the call), else the profile setting, else none, and
+ * Chrome opens the profile it used last, which it knows better than any guess. A setting that isn't a profile folder's
+ * name refuses, saying how long it is, never what it says: a person may have typed an account there.
  */
-export function lastActiveProfile(text: string): LocalStateRead {
-  let parsed: unknown
-  try {
-    parsed = JSON.parse(text.replace(/^\uFEFF/, ''))
-  } catch {
-    return { why: "its Local State isn't JSON" }
+export type ProfileChoice =
+  | { readonly profile: string; readonly source: ProfileSource }
+  | { readonly profile: undefined }
+  | { readonly refusal: string; readonly fix: string }
+
+export function chooseProfile(asked: string | undefined, setting: string): ProfileChoice {
+  if (asked !== undefined) return { profile: asked, source: 'call' }
+  if (setting === '') return { profile: undefined }
+  if (PROFILE_NAME.test(setting)) return { profile: setting, source: 'setting' }
+  return {
+    refusal: `the profile setting isn't a profile folder's name (it is ${setting.length} character${setting.length === 1 ? '' : 's'} long)`,
+    fix: "set the profile setting to one of Chrome's profile folders, by its folder's name (Default, Profile 2), or empty it, so Chrome opens the profile it used last",
   }
-  const profile = isRecord(parsed) ? parsed.profile : undefined
-  const last = isRecord(profile) ? profile.last_active_profiles : undefined
-  if (!Array.isArray(last) || last.length === 0) return { why: 'its Local State lists no last active profile' }
-  return isProfileName(last[0]) ? { profile: last[0] } : { why: "the first of its last active profiles isn't a plain folder name" }
 }
 
-/** The profile a start opens, and where it came from; or why none is taken, and what fixes it. */
-export type ProfileChoice = { readonly profile: string; readonly from: string } | { readonly refusal: string; readonly fix: string }
+/** The folder names under Chrome's user data folder that may be profile folders: plain names only, sorted, at most 40. */
+export function profileCandidates(entries: readonly { readonly name: string; readonly kind: string }[]): string[] {
+  return entries
+    .filter(entry => entry.kind === 'dir' && isProfileName(entry.name))
+    .map(entry => entry.name)
+    .sort((a, b) => a.localeCompare(b, 'en'))
+    .slice(0, 40)
+}
 
 /**
- * The profile a start opens: the call's `profile` (checked at the call), else the profile setting, else the first of
- * Chrome's last active profiles, else Default. `localState` is undefined when it wasn't read (no folder to read it in).
- * A setting that isn't a profile folder's name refuses, rather than open another profile than the person set.
+ * The refusal for a profile folder that isn't in Chrome's user data folder: Chrome would make a new, empty profile of
+ * that name, without Claude in Chrome. It names the profile folders that are there, by folder name only (a folder
+ * with a Preferences file); never the name asked for, which may be an account's.
  */
-export function chooseProfile(asked: string | undefined, setting: string, localState: LocalStateRead | undefined): ProfileChoice {
-  if (asked !== undefined) return { profile: asked, from: 'asked for in this call' }
-  if (setting !== '') {
-    return isProfileName(setting)
-      ? { profile: setting, from: 'the profile setting' }
-      : { refusal: `the profile setting reads ${quoted(setting)}, which is no profile folder's name`, fix: "set it to a profile folder's name, such as Default or Profile 2, or empty it" }
+export function missingProfile(source: ProfileSource, folders: readonly string[] | undefined): { readonly why: string; readonly fix: string } {
+  const named = source === 'call' ? 'the profile asked for in this call' : 'the profile setting'
+  const list = folders === undefined ? undefined : folders.length === 0 ? 'none was found' : folders.map(f => JSON.stringify(f)).join(', ')
+  const how = source === 'call' ? 'call chrome_ensure again with `profile` set to' : 'set the profile setting to'
+  return {
+    why: `${named} names no profile folder in Chrome's user data folder, and Chrome would make a new, empty profile of that name`,
+    fix:
+      list === undefined
+        ? `${how} one of Chrome's profile folders, by its folder's name, or leave it out, so Chrome opens the profile it used last`
+        : `${how} one of Chrome's profile folders (${list}), or leave it out, so Chrome opens the profile it used last`,
   }
-  if (localState !== undefined && 'profile' in localState) return { profile: localState.profile, from: "Chrome's last active profile, from its Local State" }
-  return { profile: 'Default', from: localState === undefined ? "Chrome's first profile" : `Chrome's first profile: ${localState.why}` }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -114,33 +137,40 @@ export function chooseProfile(asked: string | undefined, setting: string, localS
 /** The standard install of Chrome on macOS: the binary inside its .app, under /Applications. */
 export const MAC_CHROME = '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome'
 
-/** The binary inside a macOS app: the .app's folder, then Contents/MacOS/<name>. */
-const MAC_BINARY = /^(\/[^\u0000-\u001f\u007f]*?\.app)\/Contents\/MacOS\/[^/\u0000-\u001f\u007f]+$/
+/** The binary inside a macOS app: the .app's folder, then Contents/MacOS/<a name with Chrome in it>. */
+const MAC_BINARY = /^(\/[^\x00-\x1f\x7f]*?\.app)\/Contents\/MacOS\/([^/\x00-\x1f\x7f]*Chrome[^/\x00-\x1f\x7f]*)$/
 
-/** Why `path` isn't Chrome's executable on Windows as the plugin takes it (an absolute path to a chrome.exe, isSafeFolder's rules); undefined when it is. */
+/**
+ * Why `path` isn't Chrome's executable on Windows as the plugin takes it: an absolute path to a chrome.exe, by
+ * isSafeFolder's rules, with no [, ] or backtick, which PowerShell reads as a wildcard or an escape. Undefined when it is.
+ */
 export function windowsChromeFault(path: unknown): string | undefined {
   if (!isSafeFolder(path)) return 'is not an absolute path with no quote, control character, or . or .. part'
+  if (/[[\]`]/.test(path)) return 'holds [, ] or a backtick, which PowerShell reads as a wildcard or an escape'
   return /\\chrome\.exe$/i.test(path) ? undefined : 'does not end in \\chrome.exe'
 }
 
-/** Why `path` isn't Chrome's executable on macOS as the plugin takes it (the binary inside an .app); undefined when it is. */
+/** Why `path` isn't Chrome's executable on macOS as the plugin takes it (a Chrome binary inside an .app); undefined when it is. */
 export function macChromeFault(path: unknown): string | undefined {
-  if (typeof path !== 'string' || path.length > 1024 || !MAC_BINARY.test(path)) return 'is not the binary inside an app (/Applications/Google Chrome.app/Contents/MacOS/Google Chrome)'
+  if (typeof path !== 'string' || path.length > 1024 || !MAC_BINARY.test(path)) return 'is not the Chrome binary inside an app (/Applications/Google Chrome.app/Contents/MacOS/Google Chrome)'
   return path.split('/').some(part => part === '.' || part === '..') ? 'has a . or .. part' : undefined
 }
 
 /** The .app folder a macOS binary sits in, as `open -a` takes it; undefined when it sits in none. */
 export const macBundle = (binary: string): string | undefined => MAC_BINARY.exec(binary)?.[1]
 
+/** A home folder fit to build a path on: absolute, no control character. */
+const isHome = (home: string | undefined): home is string => home !== undefined && /^\/[^\x00-\x1f\x7f]*$/.test(home)
+
 /** The standard places of Chrome on macOS: /Applications, then the home folder's own Applications. */
 export function macStandard(home: string | undefined): string[] {
-  const own = home !== undefined && /^\/[^\u0000-\u001f\u007f]*$/.test(home) ? `${home.replace(/\/+$/, '')}${MAC_CHROME}` : undefined
+  const own = isHome(home) ? `${home.replace(/\/+$/, '')}${MAC_CHROME}` : undefined
   return own === undefined || macChromeFault(own) !== undefined ? [MAC_CHROME] : [MAC_CHROME, own]
 }
 
 /** Chrome's default user data folder on macOS, from the home folder; undefined without one. */
 export const macUserData = (home: string | undefined): string | undefined =>
-  home !== undefined && /^\/[^\u0000-\u001f\u007f]*$/.test(home) ? `${home.replace(/\/+$/, '')}/Library/Application Support/Google/Chrome` : undefined
+  isHome(home) ? `${home.replace(/\/+$/, '')}/Library/Application Support/Google/Chrome` : undefined
 
 // ---------------------------------------------------------------------------------------------
 // Reading a command line.
@@ -184,17 +214,22 @@ const firstToken = (cmd: string): string => /^\s*"([^"]*)"/.exec(cmd)?.[1] ?? /^
 // ---------------------------------------------------------------------------------------------
 // Which process is the person's Chrome.
 
-/** A Chrome process as a look reads it: its id, its executable (empty when unknown), its command line. */
+/** A Chrome process as a look reads it: its id, its executable (empty when unknown), its command line (empty when unreadable). */
 export type ChromeProcess = { readonly pid: number; readonly exe: string; readonly cmd: string }
 
 /**
  * What the plugin keeps of a browser process: never its command line. `profile` is the --profile-directory it names
- * when that is a profile folder's name; `namesProfile` whether it names one at all.
+ * when that is a profile folder's name; `namesProfile` whether it names one at all; `background` whether it started
+ * with --no-startup-window (Chrome running with no window, as it does at login).
  */
-export type Browser = { readonly pid: number; readonly flag: boolean; readonly profile?: string; readonly namesProfile: boolean }
+export type Browser = { readonly pid: number; readonly flag: boolean; readonly profile?: string; readonly namesProfile: boolean; readonly background: boolean }
 
-/** The person's Chrome, as a look found it: its browser processes on the default user data folder, and how many others had their own. */
-export type Judged = { readonly browsers: readonly Browser[]; readonly isolated: number }
+/**
+ * The person's Chrome, as a look found it: its browser processes on the default user data folder; how many others had
+ * a user data folder of their own; and how many chrome.exe processes of this login had a command line that couldn't
+ * be read (an elevated Chrome), which leaves the look unable to say Chrome isn't running.
+ */
+export type Judged = { readonly browsers: readonly Browser[]; readonly isolated: number; readonly unreadable: number }
 
 /**
  * The person's Chrome among `procs`: a browser process (no --type=, which every child of one has) of one of `paths`,
@@ -205,7 +240,12 @@ export function judge(procs: readonly ChromeProcess[], where: { readonly platfor
   const paths = new Set(where.paths.map(pathKey))
   const browsers: Browser[] = []
   let isolated = 0
+  let unreadable = 0
   for (const proc of [...procs].sort((a, b) => a.pid - b.pid)) {
+    if (proc.cmd.trim() === '') {
+      unreadable += 1
+      continue
+    }
     if (hasSwitch(proc.cmd, '--type')) continue
     const exe = proc.exe !== '' ? proc.exe : where.platform === 'windows' ? firstToken(proc.cmd) : ''
     if (!paths.has(pathKey(exe))) continue
@@ -215,22 +255,58 @@ export function judge(procs: readonly ChromeProcess[], where: { readonly platfor
       continue
     }
     const named = switchValue(proc.cmd, '--profile-directory', where.platform)
-    browsers.push({ pid: proc.pid, flag: hasSwitch(proc.cmd, FLAG), namesProfile: named !== undefined, ...(isProfileName(named) ? { profile: named } : {}) })
+    browsers.push({
+      pid: proc.pid,
+      flag: hasSwitch(proc.cmd, FLAG),
+      namesProfile: named !== undefined,
+      background: hasSwitch(proc.cmd, '--no-startup-window'),
+      ...(isProfileName(named) ? { profile: named } : {}),
+    })
   }
-  return { browsers, isolated }
+  return { browsers, isolated, unreadable }
 }
+
+// ---------------------------------------------------------------------------------------------
+// The reconnect's cap.
+
+/** The reconnects this session queued within RECONNECT_WINDOW_MS of `now`, and whether another would pass RECONNECT_CAP. */
+export function reconnectsWithin(times: unknown, now: number): { readonly kept: number[]; readonly isCapped: boolean } {
+  const kept = (Array.isArray(times) ? times : []).filter((t): t is number => typeof t === 'number' && t > now - RECONNECT_WINDOW_MS && t <= now)
+  return { kept, isCapped: kept.length >= RECONNECT_CAP }
+}
+
+// ---------------------------------------------------------------------------------------------
+// The start's mark, which keeps two sessions from starting Chrome at once.
+
+/** A start in flight: until when, and by which call. */
+export type StartMark = { readonly until: number; readonly by: string }
+
+/** A stored mark, checked; undefined when there is none, or it isn't one. */
+export function readMark(raw: unknown): StartMark | undefined {
+  if (typeof raw !== 'object' || raw === null) return undefined
+  const { until, by } = raw as { until?: unknown; by?: unknown }
+  return typeof until === 'number' && typeof by === 'string' && by !== '' ? { until, by } : undefined
+}
+
+/** Whether `mark` still holds other starts off at `now`. A mark further ahead than START_MARK_MS is bad, and holds nothing. */
+export const isHeld = (mark: StartMark | undefined, now: number): mark is StartMark => mark !== undefined && mark.until > now && mark.until <= now + START_MARK_MS
 
 // ---------------------------------------------------------------------------------------------
 // Starting Chrome: the arguments, macOS's argv, Windows' scripts.
 
-/** Chrome's arguments for a start, as one argv takes them: the profile folder, the last session restored, the flag when on. */
-export const launchArgs = (profile: string, flag: boolean): string[] => [`--profile-directory=${profile}`, '--restore-last-session', ...(flag ? [FLAG] : [])]
+/** Chrome's arguments for a start: the profile folder when one is named, the last session restored, the flag when on. */
+export const launchArgs = (profile: string | undefined, flag: boolean): string[] => [
+  ...(profile === undefined ? [] : [`--profile-directory=${profile}`]),
+  '--restore-last-session',
+  ...(flag ? [FLAG] : []),
+]
 
 /**
- * The same as Windows' Start-Process passes them: it joins its argument list with spaces and quotes nothing, so the
- * profile folder, which may hold a space, is quoted here. A profile folder's name holds no quote.
+ * The same as Windows passes them, joined into one command line: the profile folder, which may hold a space, quoted.
+ * A profile folder's name holds no quote.
  */
-export const windowsLaunchArgs = (profile: string, flag: boolean): string[] => [`--profile-directory="${profile}"`, ...launchArgs(profile, flag).slice(1)]
+export const windowsLaunchArgs = (profile: string | undefined, flag: boolean): string[] =>
+  launchArgs(profile, flag).map(arg => (arg.startsWith('--profile-directory=') ? `--profile-directory="${profile}"` : arg))
 
 /** macOS's open, by its known path. */
 export const OPEN = '/usr/bin/open'
@@ -238,25 +314,32 @@ export const OPEN = '/usr/bin/open'
 export const PGREP = '/usr/bin/pgrep'
 /** macOS's ps, by its known path. */
 export const PS = '/bin/ps'
+/** macOS's id, by its known path: this user's uid, which pgrep is held to. */
+export const ID = '/usr/bin/id'
 /** macOS's sleep, by its known path: a start's wait between looks, run as a process so it is no hook's own time. */
 export const SLEEP = '/bin/sleep'
 
 /**
  * The start on macOS: `open -a <the .app> --args <arguments>`. LaunchServices starts Chrome, with its own environment
- * and none of this session's; `open` passes the arguments only when Chrome isn't running, which is the only time a
- * start runs. Throws when `binary` sits in no .app.
+ * and none of this session's; `open` passes the arguments only when Chrome isn't running, which a look right before it
+ * checks. Throws when `binary` sits in no .app, or `profile` isn't a profile folder's name.
  */
-export function macOpenArgv(binary: string, profile: string, flag: boolean): string[] {
+export function macOpenArgv(binary: string, profile: string | undefined, flag: boolean): string[] {
   const bundle = macBundle(binary)
-  if (bundle === undefined || !isProfileName(profile)) throw new Error('a start takes the binary inside an .app and a profile folder\'s name')
+  if (bundle === undefined || (profile !== undefined && !isProfileName(profile))) throw new Error("a start takes the Chrome binary inside an .app, and a profile folder's name or none")
   return [OPEN, '-a', bundle, '--args', ...launchArgs(profile, flag)]
 }
 
 /**
- * The look on macOS, first step: pgrep for the processes whose full command starts with one of `binaries`, then a
- * space or its end. Only those processes' command lines are read after it (psArgv).
+ * The look on macOS, first step: pgrep for this user's processes (`uid`, when it is known) whose full command starts
+ * with one of `binaries`, then a space or its end. Only those processes' command lines are read after it (psArgv).
  */
-export const pgrepArgv = (binaries: readonly string[]): string[] => [PGREP, '-f', `^(${binaries.map(b => b.replace(/[\\^$.|?*+()[\]{}]/g, '\\$&')).join('|')})( |$)`]
+export const pgrepArgv = (binaries: readonly string[], uid?: number): string[] => [
+  PGREP,
+  ...(uid === undefined ? [] : ['-U', String(uid)]),
+  '-f',
+  `^(${binaries.map(b => b.replace(/[\\^$.|?*+()[\]{}]/g, '\\$&')).join('|')})( |$)`,
+]
 
 /** The look on macOS, second step: ps of those processes alone, each as its id and its whole command. */
 export const psArgv = (pids: readonly number[]): string[] => [PS, '-ww', '-o', 'pid=,command=', '-p', pids.join(',')]
@@ -288,13 +371,22 @@ const literal = (text: string): string => `'${psQuote(text)}'`
 const PREAMBLE = ["$ErrorActionPreference = 'Stop'", "$ProgressPreference = 'SilentlyContinue'", PSMODULEPATH_RESET, '[Console]::OutputEncoding = [Text.Encoding]::UTF8']
 
 /**
- * Read-Browsers: every chrome.exe that is no child of a browser (no --type=), as { pid, exe, cmd }. A child's command
- * line never leaves the script. An ArrayList, so one entry or none still writes a JSON list.
+ * Read-Browsers: every chrome.exe of this script's own Windows session (never another login's) that is no child of a
+ * browser (no --type=), as { pid, exe, cmd }. A child's command line never leaves the script. One whose command line
+ * reads empty (an elevated Chrome, or one in its last milliseconds) is read again once, 300 ms later: gone, it is
+ * dropped; still empty, it goes out with an empty command line, so the look can say it can't tell. An ArrayList, so
+ * one entry or none still writes a JSON list.
  */
 const READ_BROWSERS = [
   'function Read-Browsers {',
+  '  $own = [Diagnostics.Process]::GetCurrentProcess().SessionId',
+  "  $found = @(Get-CimInstance -ClassName Win32_Process -Filter \"Name = 'chrome.exe'\" -Property ProcessId, SessionId, CommandLine, ExecutablePath | Where-Object { [int]$_.SessionId -eq $own })",
+  '  if (@($found | Where-Object { [string]::IsNullOrEmpty("$($_.CommandLine)") }).Count -gt 0) {',
+  '    Start-Sleep -Milliseconds 300',
+  '    $found = @(foreach ($p in $found) { if (-not [string]::IsNullOrEmpty("$($p.CommandLine)")) { $p } else { Get-CimInstance -ClassName Win32_Process -Filter "ProcessId = $([int]$p.ProcessId)" -Property ProcessId, SessionId, CommandLine, ExecutablePath } })',
+  '  }',
   '  $out = New-Object System.Collections.ArrayList',
-  `  foreach ($p in @(Get-CimInstance -ClassName Win32_Process -Filter "Name = 'chrome.exe'" -Property ProcessId, CommandLine, ExecutablePath)) {`,
+  '  foreach ($p in $found) {',
   '    $c = "$($p.CommandLine)"',
   String.raw`    if ($c -match '(^|\s)"?--type=') { continue }`,
   '    [void]$out.Add([ordered]@{ pid = [long]$p.ProcessId; exe = "$($p.ExecutablePath)"; cmd = $c })',
@@ -306,13 +398,16 @@ const READ_BROWSERS = [
 /**
  * The look on Windows: Chrome's browser processes, the paths that count as Chrome (`configured`, else the standard
  * installs, each under the folder Windows names, never an environment variable), the first of them that is there to
- * start, and the default user data folder. One JSON line: { v, paths, start, userData, procs }.
+ * start, and the default user data folder. `pauseMs` first, for a start's wait between looks. One JSON line:
+ * { v, paths, start, userData, procs }.
  */
-export function windowsLookScript(configured: string | undefined): string {
+export function windowsLookScript(configured: string | undefined, pauseMs = 0): string {
   if (configured !== undefined && windowsChromeFault(configured) !== undefined) throw new Error(`the chromePath setting ${windowsChromeFault(configured)}`)
+  if (!Number.isInteger(pauseMs) || pauseMs < 0 || pauseMs > 5000) throw new Error('a look pauses 0 to 5000 ms')
   return [
     ...PREAMBLE,
     ...READ_BROWSERS,
+    ...(pauseMs > 0 ? [`Start-Sleep -Milliseconds ${pauseMs}`] : []),
     `$configured = ${configured === undefined ? '$null' : literal(configured)}`,
     "$local = [Environment]::GetFolderPath('LocalApplicationData').TrimEnd([char]92)",
     '$paths = New-Object System.Collections.ArrayList',
@@ -331,47 +426,69 @@ export function windowsLookScript(configured: string | undefined): string {
 }
 
 /**
- * The start on Windows: Chrome by `chrome` (a path the look found), with `args` (windowsLaunchArgs), detached through
- * Start-Process, in Chrome's own folder (never the session's, which it would hold for its whole life), with none of
- * the variables Claude Code sets in the processes it starts (the launch environment's lists in the shared machine
- * code). Then it waits up to START_WAIT_S for a browser process of that chrome.exe on the default user data folder,
- * and writes the browser processes as the look does: { v, procs }. It quits, kills and restarts nothing.
+ * The login environment, as Windows builds it for a process the person starts: CreateEnvironmentBlock for this
+ * process's own token, without inheriting this process's environment. That is the machine's and the user's
+ * Environment keys in the registry (HKLM and HKCU), the volatile ones, and the system's own variables (SystemRoot,
+ * USERPROFILE, ProgramFiles and the rest), with nothing of the Claude Code session.
+ */
+const LOGIN_ENV = [
+  "Add-Type -ErrorAction Stop -TypeDefinition 'using System; using System.Collections.Generic; using System.ComponentModel; using System.Runtime.InteropServices; public static class SelfChromeLoginEnv { [DllImport(\"advapi32.dll\", SetLastError = true)] static extern bool OpenProcessToken(IntPtr process, uint access, out IntPtr token); [DllImport(\"kernel32.dll\")] static extern IntPtr GetCurrentProcess(); [DllImport(\"kernel32.dll\", SetLastError = true)] static extern bool CloseHandle(IntPtr handle); [DllImport(\"userenv.dll\", SetLastError = true)] static extern bool CreateEnvironmentBlock(out IntPtr block, IntPtr token, bool inherit); [DllImport(\"userenv.dll\", SetLastError = true)] static extern bool DestroyEnvironmentBlock(IntPtr block); public static string[] Read() { IntPtr token; if (!OpenProcessToken(GetCurrentProcess(), 0x000E, out token)) throw new Win32Exception(); try { IntPtr block; if (!CreateEnvironmentBlock(out block, token, false)) throw new Win32Exception(); try { List<string> pairs = new List<string>(); IntPtr at = block; while (true) { string pair = Marshal.PtrToStringUni(at); if (String.IsNullOrEmpty(pair)) break; pairs.Add(pair); at = new IntPtr(at.ToInt64() + (pair.Length + 1) * 2); } return pairs.ToArray(); } finally { DestroyEnvironmentBlock(block); } } finally { CloseHandle(token); } } }'",
+]
+
+/**
+ * The start on Windows, short: it returns once Chrome is launched, with the launched process's id, and never waits
+ * for the browser (the plugin's own looks do that, each in a run of its own).
+ * - A last look first: a Chrome of `chrome` on the default user data folder that came up since the plugin's look is
+ *   never started again (`{ v, running }`).
+ * - Then this process's environment is emptied and set to the login environment (LOGIN_ENV), so Chrome, and every
+ *   process Chrome starts for as long as it runs, gets the person's environment and none of the session's.
+ * - Then Chrome by `chrome` (a path the look found), with `args` (windowsLaunchArgs), through ShellExecute (the call
+ *   Start-Process -PassThru makes, made directly, so no cmdlet is looked up once the environment is the login one, and
+ *   neither path is read as a wildcard), in Chrome's own folder, never the session's, which Chrome would hold for its
+ *   whole life. ShellExecute hands Chrome none of this script's pipes. `{ v, started }`, the id, or null when Windows
+ *   names no process.
+ * It quits, kills and restarts nothing.
  */
 export function windowsStartScript(chrome: string, args: readonly string[]): string {
   if (windowsChromeFault(chrome) !== undefined) throw new Error(`Chrome's path ${windowsChromeFault(chrome)}`)
-  if (args.some(arg => !/^--[a-z-]+(?:="[A-Za-z0-9 _-]{1,64}")?$/.test(arg))) throw new Error('a start takes only switches, and a profile folder\'s name')
-  const cleared = [...LAUNCH_ENV_CLEAR, ...LAUNCH_ENV_DROP]
+  if (args.some(arg => !/^--[a-z-]+(?:="[A-Za-z0-9 _-]{1,64}")?$/.test(arg))) throw new Error("a start takes only switches, and a profile folder's name")
   return [
     ...PREAMBLE,
     ...READ_BROWSERS,
     `$chrome = ${literal(chrome)}`,
-    `$arguments = @(${args.map(literal).join(', ')})`,
-    `foreach ($name in @(${cleared.map(literal).join(', ')})) { Remove-Item -LiteralPath ('Env:' + $name) -ErrorAction SilentlyContinue }`,
-    'Start-Process -FilePath $chrome -ArgumentList $arguments -WorkingDirectory (Split-Path -Parent $chrome)',
-    `$deadline = [DateTime]::UtcNow.AddSeconds(${START_WAIT_S})`,
-    'do {',
-    '  Start-Sleep -Milliseconds 500',
-    '  $procs = Read-Browsers',
-    '  $mine = $false',
-    '  foreach ($p in $procs) {',
-    "    $exe = if (\"$($p['exe'])\" -ne '') { \"$($p['exe'])\" } elseif (\"$($p['cmd'])\" -match '^\\s*\"([^\"]*)\"') { $Matches[1] } else { '' }",
-    "    if ($exe -ieq $chrome -and \"$($p['cmd'])\" -notmatch '--user-data-dir') { $mine = $true }",
-    '  }',
-    '} while (-not $mine -and [DateTime]::UtcNow -lt $deadline)',
-    '[ordered]@{ v = 1; procs = $procs } | ConvertTo-Json -Compress -Depth 4',
+    `$arguments = ${literal(args.join(' '))}`,
+    // The last look, right before the launch.
+    'foreach ($p in (Read-Browsers)) {',
+    "  $exe = if (\"$($p['exe'])\" -ne '') { \"$($p['exe'])\" } elseif (\"$($p['cmd'])\" -match '^\\s*\"([^\"]*)\"') { $Matches[1] } else { '' }",
+    "  if ($exe -ieq $chrome -and \"$($p['cmd'])\" -notmatch '--user-data-dir') { [ordered]@{ v = 1; running = [long]$p['pid'] } | ConvertTo-Json -Compress; return }",
+    '}',
+    ...LOGIN_ENV,
+    '$launch = New-Object System.Diagnostics.ProcessStartInfo',
+    '$launch.FileName = $chrome',
+    '$launch.Arguments = $arguments',
+    '$launch.WorkingDirectory = [IO.Path]::GetDirectoryName($chrome)',
+    '$launch.UseShellExecute = $true',
+    '$login = [SelfChromeLoginEnv]::Read()',
+    // From here on, .NET calls only: no cmdlet is looked up in the login environment.
+    "foreach ($name in @([Environment]::GetEnvironmentVariables('Process').Keys)) { [Environment]::SetEnvironmentVariable([string]$name, $null, 'Process') }",
+    "foreach ($pair in $login) { $at = $pair.IndexOf('=', 1); if ($at -gt 0) { [Environment]::SetEnvironmentVariable($pair.Substring(0, $at), $pair.Substring($at + 1), 'Process') } }",
+    '$started = [System.Diagnostics.Process]::Start($launch)',
+    "if ($null -eq $started) { [Console]::Out.WriteLine('{\"v\":1,\"started\":null}') } else { [Console]::Out.WriteLine('{\"v\":1,\"started\":' + [string][long]$started.Id + '}') }",
   ].join('\r\n')
 }
 
 /** A script's JSON line: the last line of its output that reads as an object. */
 function jsonLine(stdout: string): Record<string, unknown> | undefined {
-  const lines = stdout.replace(/^\uFEFF/, '').split(/\r?\n/).map(line => line.trim()).filter(line => line.startsWith('{'))
+  const lines = stdout.replace(BOM, '').split(/\r?\n/).map(line => line.trim()).filter(line => line.startsWith('{'))
   try {
     const parsed: unknown = JSON.parse(lines.at(-1) ?? '')
-    return isRecord(parsed) ? parsed : undefined
+    return typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed) ? (parsed as Record<string, unknown>) : undefined
   } catch {
     return undefined
   }
 }
+
+const isRecord = (value: unknown): value is Record<string, unknown> => typeof value === 'object' && value !== null && !Array.isArray(value)
 
 /** A script's `procs`, each checked; undefined when it isn't a list of them. */
 function procsOf(raw: unknown): ChromeProcess[] | undefined {
@@ -400,11 +517,17 @@ export function parseWindowsLook(stdout: string): WindowsLook | string {
   return { paths, start, userData, procs }
 }
 
-/** The start script's line, checked: the browser processes after the wait; a string says what is wrong with it. */
-export function parseWindowsStart(stdout: string): ChromeProcess[] | string {
+/** What a start's run came to: launched (with the id Windows gave, when it gave one), or a Chrome found running by its last look. */
+export type StartAnswer = { readonly kind: 'launched'; readonly pid?: number } | { readonly kind: 'running'; readonly pid: number }
+
+/** The start script's line, checked; a string says what is wrong with it. */
+export function parseWindowsStart(stdout: string): StartAnswer | string {
   const line = jsonLine(stdout)
   if (line === undefined || line.v !== 1) return "the start's answer isn't the line it writes"
-  return procsOf(line.procs) ?? "the start's answer lists processes in a shape this plugin doesn't know"
+  if (typeof line.running === 'number' && Number.isInteger(line.running)) return { kind: 'running', pid: line.running }
+  if (typeof line.started === 'number' && Number.isInteger(line.started)) return { kind: 'launched', pid: line.started }
+  if (line.started === null) return { kind: 'launched' }
+  return "the start's answer isn't the line it writes"
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -413,37 +536,66 @@ export function parseWindowsStart(stdout: string): ChromeProcess[] | string {
 /** What the look found: the person's Chrome, or why it couldn't tell. */
 export type Look = { readonly kind: 'read'; readonly judged: Judged } | { readonly kind: 'failed'; readonly why: string }
 
+/** The profile a start passed: a named folder and where it came from, or none. */
+export type StartProfile = { readonly profile: string; readonly source: ProfileSource } | { readonly profile: undefined }
+
 /** What the tool did about starting Chrome. */
 export type Start =
   /** Chrome runs, or the look couldn't tell: nothing started. */
   | { readonly kind: 'none' }
   /** Chrome doesn't run, and nothing was started: why, and what fixes it. */
   | { readonly kind: 'refused'; readonly why: string; readonly fix: string }
-  /** The start was run and failed. */
+  /** The start ran and said it failed, and no browser came up. */
   | { readonly kind: 'failed'; readonly why: string }
-  /** The start ran: with that profile and flag; the browser process that showed, if one did within START_WAIT_S. */
-  | { readonly kind: 'started'; readonly profile: string; readonly from: string; readonly flag: boolean; readonly browser?: Browser }
+  /** Another session was starting Chrome: this call launched nothing, and looked; the browser that showed, if one did. */
+  | { readonly kind: 'waited'; readonly browser?: Browser }
+  /** Chrome came up between the look and the start (its last look found it): nothing launched. */
+  | { readonly kind: 'late'; readonly browser?: Browser }
+  /**
+   * The start ran: with that profile and flag; the browser process that showed, if one did within START_WAIT_S;
+   * `launched`, the id Windows gave the launched process; `unknown`, why the start's own answer didn't come.
+   */
+  | {
+      readonly kind: 'started'
+      readonly profile: StartProfile
+      readonly flag: boolean
+      readonly browser?: Browser
+      readonly launched?: number
+      readonly unknown?: string
+    }
 
 /** What became of the reconnect. */
 export type Reconnect =
   | { readonly kind: 'queued'; readonly resume?: string }
   | { readonly kind: 'not-asked' }
-  | { readonly kind: 'absent' }
-  | { readonly kind: 'unlisted'; readonly why: string }
   | { readonly kind: 'not-running' }
+  | { readonly kind: 'capped' }
   | { readonly kind: 'failed' }
 
 /** Everything the answer says. */
 export type Outcome = { readonly platform: Platform; readonly flag: FlagChoice; readonly look: Look; readonly start: Start; readonly reconnect: Reconnect }
 
-/** Whether Chrome runs once the tool is done: found running, or started (a start that showed no process yet may still come up). */
-export const isRunning = (look: Look, start: Start): boolean => (look.kind === 'read' && look.judged.browsers.length > 0) || start.kind === 'started'
+/** Whether Chrome runs once the tool is done: found running, started (a start that showed no process yet may still come up), or found after. */
+export function isRunning(look: Look, start: Start): boolean {
+  if (look.kind === 'read' && look.judged.browsers.length > 0) return true
+  if (start.kind === 'started') return start.browser !== undefined || start.unknown === undefined
+  return (start.kind === 'waited' || start.kind === 'late') && start.browser !== undefined
+}
 
 /** What a browser's command line says of its profile, as a phrase: a profile folder's name only. */
 function profileSaid(browser: Browser): string {
   if (browser.profile !== undefined) return `its command line names the profile folder ${JSON.stringify(browser.profile)}`
   if (browser.namesProfile) return "its command line names a profile folder whose name isn't plain, so it isn't shown"
-  return 'its command line names no profile folder (Chrome opened the one it used last)'
+  return browser.background ? 'its command line names no profile folder' : 'its command line names no profile folder (Chrome opened the one it used last)'
+}
+
+/** A browser process found running, as the Chrome line says it. */
+function runningSaid(browser: Browser, more: number): string {
+  const also = more === 0 ? '' : ` (and ${more} more browser process${more === 1 ? '' : 'es'} of it)`
+  const background = browser.background
+    ? ', in the background with no window. That counts as running: a start now would only hand off to it, and Chrome took its flags when it started'
+    : ''
+  return `Chrome: running (PID ${browser.pid}${also})${background}; ${browser.flag ? 'with' : 'without'} ${FLAG}; ${profileSaid(browser)}.`
 }
 
 /** The test or isolated Chromes a look passed over, as a sentence; empty for none. */
@@ -467,6 +619,18 @@ function addFlagByHand(platform: Platform): string {
   return `for the flag, ${quit}; ${always}. Until then Chrome shows its "is debugging this browser" banner while an extension drives a tab. Quitting Chrome closes every session's tabs and tab groups, so it is the person's call.`
 }
 
+/** The arguments a start passed, as a phrase. */
+function argsSaid(profile: StartProfile, flag: boolean): string {
+  const named =
+    profile.profile === undefined
+      ? 'no profile folder named (Chrome opens the profile it used last)'
+      : `the profile folder ${JSON.stringify(profile.profile)} (${profile.source === 'call' ? 'asked for in this call' : 'the profile setting'})`
+  return `${named}, --restore-last-session${flag ? ` and ${FLAG}` : `, without ${FLAG}`}`
+}
+
+/** Whether a browser has the flag a start asked for, as the end of a sentence. */
+const flagSaid = (browser: Browser, wanted: boolean): string => (wanted ? (browser.flag ? ', and the flag took' : ', but without the flag') : '')
+
 /** The tool's answer, one line each: what it found, the flag, what it did, the reconnect, and what is left for the person. */
 export function answer(o: Outcome): string {
   const lines: string[] = []
@@ -476,18 +640,15 @@ export function answer(o: Outcome): string {
   else {
     const [browser, ...more] = o.look.judged.browsers
     const others = isolatedSaid(o.look.judged.isolated)
-    if (browser === undefined) lines.push(`Chrome: not running.${others}`)
-    else {
-      const also = more.length === 0 ? '' : ` (and ${more.length} more browser process${more.length === 1 ? '' : 'es'} of it)`
-      lines.push(`Chrome: running (PID ${browser.pid}${also}), ${browser.flag ? 'with' : 'without'} ${FLAG}; ${profileSaid(browser)}.${others}`)
-    }
+    lines.push(browser === undefined ? `Chrome: not running.${others}` : `${runningSaid(browser, more.length)}${others}`)
   }
   lines.push(`Flag: ${o.flag.on ? 'on' : 'off'}: ${o.flag.why}.`)
   // What it did.
   const running = o.look.kind === 'read' ? o.look.judged.browsers[0] : undefined
+  const s = o.start
   if (o.look.kind === 'failed') {
-    lines.push('Did: nothing. It starts Chrome only when it can see that Chrome isn\'t running.')
-    left.push('check whether Chrome runs, and start it by hand if it doesn\'t.')
+    lines.push("Did: nothing. It starts Chrome only when it can see that Chrome isn't running.")
+    left.push("check whether Chrome runs, and start it by hand if it doesn't.")
   } else if (running !== undefined) {
     if (running.flag && o.flag.on) lines.push('Did: nothing: Chrome runs, with the flag.')
     else if (running.flag) lines.push('Did: nothing. Chrome runs with the flag though it is off here; Chrome keeps it until it next starts.')
@@ -496,23 +657,38 @@ export function answer(o: Outcome): string {
       lines.push("Did: nothing to Chrome. Chrome takes flags only when it starts, and this tool never quits, kills or restarts Chrome: that would close every session's tabs and tab groups.")
       left.push(addFlagByHand(o.platform))
     }
-  } else if (o.start.kind === 'refused') {
-    lines.push(`Did: nothing: ${o.start.why}.`)
-    left.push(`${o.start.fix}.`)
-  } else if (o.start.kind === 'failed') {
-    lines.push(`Did: tried to start Chrome, but ${o.start.why}.`)
+  } else if (s.kind === 'refused') {
+    lines.push(`Did: nothing: ${s.why}.`)
+    left.push(`${s.fix}.`)
+  } else if (s.kind === 'failed') {
+    lines.push(`Did: tried to start Chrome, but ${s.why}.`)
     left.push('start Chrome by hand.')
-  } else if (o.start.kind === 'started') {
-    const flag = o.start.flag ? ` and ${FLAG}` : `, without ${FLAG}`
-    const args = `the profile folder ${JSON.stringify(o.start.profile)} (${o.start.from}), --restore-last-session${flag}`
-    const shown = o.start.browser
+  } else if (s.kind === 'waited') {
+    if (s.browser === undefined) {
+      lines.push(`Did: nothing: another session is starting Chrome, and no browser process of it showed within ${START_WAIT_S} s.`)
+      left.push('call chrome_ensure again in a minute; if Chrome still isn\'t running, start it by hand.')
+    } else {
+      lines.push(`Did: nothing: another session was starting Chrome, which runs as PID ${s.browser.pid}, ${s.browser.flag ? 'with' : 'without'} the flag.`)
+      if (o.flag.on && !s.browser.flag) left.push(addFlagByHand(o.platform))
+    }
+  } else if (s.kind === 'late') {
+    const pid = s.browser === undefined ? '' : `, PID ${s.browser.pid}, ${s.browser.flag ? 'with' : 'without'} the flag`
+    lines.push(`Did: nothing: Chrome came up just before the start (another session's start, or the person's)${pid}.`)
+    if (o.flag.on && s.browser !== undefined && !s.browser.flag) left.push(addFlagByHand(o.platform))
+  } else if (s.kind === 'started') {
+    const args = argsSaid(s.profile, s.flag)
+    const shown = s.browser
+    const unknown = s.unknown === undefined ? '' : `; the start's own answer didn't come (${s.unknown})`
     if (shown === undefined) {
-      lines.push(`Did: asked Chrome to start, with ${args}, but no browser process of it showed within ${START_WAIT_S} s.`)
-      left.push('check whether Chrome opened; if it didn\'t, start it by hand, or call chrome_ensure again.')
-    } else if (o.start.flag && !shown.flag) {
-      lines.push(`Did: started Chrome, with ${args}. It runs as PID ${shown.pid}, but without the flag: a Chrome already starting may have taken the launch.`)
+      lines.push(`Did: asked Chrome to start, with ${args}${unknown}, but no browser process of it showed within ${START_WAIT_S} s.`)
+      left.push("check whether Chrome opened; if it didn't, start it by hand, or call chrome_ensure again.")
+    } else if (s.launched !== undefined && s.launched !== shown.pid) {
+      lines.push(`Did: launched Chrome, with ${args}, but the launch handed off to a Chrome that was starting already: it runs as PID ${shown.pid}${flagSaid(shown, s.flag)}.`)
+      if (s.flag && !shown.flag) left.push(addFlagByHand(o.platform))
+    } else if (s.flag && !shown.flag) {
+      lines.push(`Did: started Chrome, with ${args}${unknown}. It runs as PID ${shown.pid}, but without the flag: a Chrome already starting may have taken the launch.`)
       left.push(addFlagByHand(o.platform))
-    } else lines.push(`Did: started Chrome, with ${args}. It runs as PID ${shown.pid}${o.start.flag ? ', and the flag took' : ''}.`)
+    } else lines.push(`Did: started Chrome, with ${args}${unknown}. It runs as PID ${shown.pid}${flagSaid(shown, s.flag)}.`)
   }
   // The reconnect.
   const r = o.reconnect
@@ -520,10 +696,13 @@ export function answer(o: Outcome): string {
     const then = r.resume === undefined ? 'waits for the next message' : `resumes with: ${r.resume}`
     lines.push(`Reconnect: /mcp reconnect ${SERVER} runs once this turn ends: end your turn now, and do nothing more until it has run. Then the session ${then}`)
   } else if (r.kind === 'not-asked') lines.push('Reconnect: not asked for (reconnect is false).')
-  else if (r.kind === 'absent') lines.push(`Reconnect: not queued: Claude in Chrome isn't one of this session's MCP servers (no mcp__${SERVER}__ tool is listed).`)
-  else if (r.kind === 'unlisted') lines.push(`Reconnect: not queued: this session's tools can't be listed (${r.why}).`)
   else if (r.kind === 'not-running') lines.push("Reconnect: not queued: Chrome isn't known to run. reconnect_mcp_after_turn (self-mcp) reconnects Claude in Chrome by itself.")
-  else lines.push('Reconnect: not queued: queuing it failed.')
+  else if (r.kind === 'capped') {
+    lines.push(
+      `Reconnect: not queued: this session has queued ${RECONNECT_CAP} reconnects of Claude in Chrome in the last ${RECONNECT_WINDOW_MS / 60_000} minutes, and it still isn't connected. Ask the person rather than call chrome_ensure again.`,
+    )
+    left.push('check that Claude in Chrome is turned on, and signed in, in the Chrome profile it should use.')
+  } else lines.push('Reconnect: not queued: queuing it failed.')
   lines.push(`Left for the person: ${left.length === 0 ? 'nothing.' : left.join(' ')}`)
   return lines.join('\n')
 }

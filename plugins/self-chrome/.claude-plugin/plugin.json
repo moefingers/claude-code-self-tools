@@ -1,7 +1,7 @@
 {
   "name": "self-chrome",
-  "version": "0.1.0",
-  "description": "Lets a session make sure Chrome runs for Claude in Chrome: it looks for your Chrome, starts it when it isn't running (your profile, the last session restored, and --silent-debugger-extension-api when you opt in), and reconnects Claude in Chrome once the turn ends. It never quits or restarts Chrome.",
+  "version": "0.1.1",
+  "description": "Lets a session make sure Chrome runs for Claude in Chrome: it looks for your Chrome, starts it when it isn't running (the profile you name, or the one Chrome used last; the last session restored; and --silent-debugger-extension-api when you opt in), and reconnects Claude in Chrome once the turn ends. It never quits or restarts Chrome.",
   "author": { "name": "moefingers", "url": "https://github.com/moefingers" },
   "homepage": "https://github.com/moefingers/claude-code-self-tools/tree/main/plugins/self-chrome#readme",
   "repository": "https://github.com/moefingers/claude-code-self-tools",
@@ -26,13 +26,13 @@
     "profile": {
       "type": "string",
       "title": "Chrome profile",
-      "description": "The profile folder a Chrome this plugin starts opens, by its folder's name (Default, Profile 2). Empty: the first of Chrome's last active profiles, else Default.",
+      "description": "The profile folder a Chrome this plugin starts opens, by its folder's name (Default, Profile 2); it must be one of Chrome's profile folders. Empty: none, and Chrome opens the profile it used last.",
       "default": ""
     },
     "chromePath": {
       "type": "string",
       "title": "Chrome executable",
-      "description": "Chrome's executable, as an absolute path: chrome.exe on Windows, the Google Chrome binary inside its .app on macOS. Empty: the standard install paths.",
+      "description": "Chrome's executable, as an absolute path with no [, ] or backtick: chrome.exe on Windows, the Google Chrome binary inside its .app on macOS. Empty: the standard install paths.",
       "default": ""
     }
   }

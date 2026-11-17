@@ -2,6 +2,23 @@
 
 Each entry names a plugin and its version, as `version` in `plugins/<name>/.claude-plugin/plugin.json` has it.
 
+## 2026-11-17: self-chrome 0.1.1: review round 1 (#54)
+
+- **A named profile must be one of Chrome's profile folders.** The call's `profile`, or the `profile` setting, must name a folder of exactly that name in Chrome's user data folder, with its `Preferences` file. Given any other name, Chrome would make a new, empty profile without Claude in Chrome. So the start is refused, and the answer lists the profile folders that are there, by directory name only, never the name given.
+- **No profile named: no `--profile-directory`.** With neither the call nor the setting naming one, Chrome opens the profile it used last, restoring the profiles it had open. Chrome knows its last profile better than a guess. The plugin no longer reads Chrome's Local State at all.
+- **The reconnect is queued whenever Chrome runs.** It no longer waits for Claude in Chrome's tools to be listed: a server that dropped lists none, and needs the reconnect most.
+- **At most 3 reconnects in 10 minutes a session.** Past that, the answer says to ask the person, and queues nothing.
+- **Windows: Chrome starts with the login environment.** It is rebuilt by Windows from the registry (`CreateEnvironmentBlock` for the user's own token, not inheriting): the machine's and the user's Environment keys and the system's own variables. Every variable of the session's is emptied before the launch, so none reaches Chrome or what Chrome starts. The launch goes through ShellExecute, with no `-UseNewEnvironment` or `-NoNewWindow`, which would hand Chrome the script's pipes.
+- **Windows: the launch is short.** It returns the launched process's id at once. Looks of their own, each in a run of its own after a short pause, then wait up to 20 s for the browser, as on macOS. A start whose answer never came (a timeout) is looked for, not called failed. A launch that handed off to a Chrome already starting is said.
+- **One start at a time on the machine.** A mark in the plugin's store, which every session reads, holds other starts off for up to 60 s. A call that finds it launches nothing, waits, and says what the other session's start came to. A last look right before the launch (Windows: in the start's own script) starts no Chrome that came up meanwhile.
+- **Lows.**
+  - A Chrome in the background with no window (`--no-startup-window`) is said plainly to run, and counts as running.
+  - Only the user's own Chrome is looked at: its own Windows session (`SessionId`), and `pgrep -U <uid>` on macOS. A `chrome.exe` whose command line can't be read (an elevated Chrome) leaves the look unable to tell, rather than saying Chrome isn't running.
+  - `chromePath` refuses `[`, `]` and the backtick on Windows, and a macOS binary whose name has no `Chrome` in it.
+  - A `profile` setting that isn't a folder's name is said to be invalid, with its length, and never echoed.
+  - Not opening a profile in a Chrome that runs is now a stated decision in the README. A handed-off launch is the one Chrome may answer by ending a browser it takes for hung.
+- **Tests:** a profile that isn't one of Chrome's folders (by the call, by the setting, by case), the listing, no `--profile-directory` when none is named, the reconnect without listed tools, the cap and its window, two calls in one turn counted once, a start that fails, hangs, hands off, or finds Chrome already up, another session's start in flight, the start script's order (last look, login environment, launch) with no session variable in it, background Chrome, an unreadable `chrome.exe`, WSL and an unnamed platform, and macOS's open failing, hanging and finding nothing.
+
 ## 2026-11-17: self-chrome 0.1.0, new: a session makes sure Chrome runs for Claude in Chrome (#54)
 
 - **`chrome_ensure`** looks for the person's Chrome: the browser process of the configured Chrome (no `--type=`), on Chrome's default user data folder. A test or isolated Chrome, with a `--user-data-dir` of its own, is counted apart and never touched. It says whether Chrome runs, whether it started with `--silent-debugger-extension-api`, and the profile folder its command line names.

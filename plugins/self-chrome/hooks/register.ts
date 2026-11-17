@@ -2,16 +2,19 @@
 // decides Claude in Chrome isn't connected when all it needs is Chrome started, or the MCP reconnected; the model
 // calls chrome_ensure, and the plugin:
 // 1. Looks for the person's Chrome: the browser process of the configured chrome.exe (or Google Chrome binary on
-//    macOS) on the default user data folder, never a test or isolated Chrome with a --user-data-dir of its own; and
-//    whether it started with --silent-debugger-extension-api. On Windows through a fixed Windows PowerShell script, as
-//    the shared machine code reads processes (machine.ts: powershellCall); on macOS with pgrep and ps.
-// 2. Starts Chrome when it isn't running, detached: the profile folder, --restore-last-session, and the flag when the
-//    person opted in (the silentDebugger setting, or CLAUDE_CHROME_SILENT_DEBUGGER while it is auto). Then it waits up
-//    to 20 s for the browser process, and says its PID and whether the flag took.
+//    macOS), of this login, on the default user data folder, never a test or isolated Chrome with a --user-data-dir of
+//    its own; and whether it started with --silent-debugger-extension-api. On Windows through a fixed Windows
+//    PowerShell script, as the shared machine code reads processes (machine.ts: powershellCall); on macOS with pgrep
+//    and ps.
+// 2. Starts Chrome when it isn't running, detached: the profile folder when the call or the setting names one (and it
+//    is one of Chrome's), else none, so Chrome opens the profile it used last; --restore-last-session; and the flag
+//    when the person opted in (the silentDebugger setting, or CLAUDE_CHROME_SILENT_DEBUGGER while it is auto). The
+//    launch is short and returns at once; looks of their own then wait up to 20 s for the browser process. A mark in
+//    the plugin's store, which every session on the machine reads, keeps two sessions from starting Chrome at once.
 // 3. Never quits, kills or restarts Chrome: that closes every session's tabs and tab groups. A Chrome running without
 //    the flag the person opted in to is said, with how the person fixes it.
-// 4. Queues `/mcp reconnect claude-in-chrome` for when the turn ends, as self-mcp does, only while Claude in Chrome is
-//    one of the session's MCP servers and Chrome runs; then resumes with `resume`, or tells the model.
+// 4. Queues `/mcp reconnect claude-in-chrome` for when the turn ends, as self-mcp does, whenever Chrome runs, at most
+//    RECONNECT_CAP times in RECONNECT_WINDOW_MS a session; then resumes with `resume`, or tells the model.
 // The rules are in chrome.ts, pure; this file runs them. It hooks no event Claude Code's built-in guard passes over.
 import type { EngineInterface, Register } from 'claude-code'
 import type { Queued } from '../types'
@@ -22,50 +25,61 @@ import {
   chooseProfile,
   type FlagChoice,
   flagChoice,
+  isHeld,
   isProfileName,
   isRunning,
   judge,
-  lastActiveProfile,
-  type LocalStateRead,
   type Look,
   macChromeFault,
   macOpenArgv,
   macStandard,
   macUserData,
+  missingProfile,
   parsePids,
   parsePs,
   parseWindowsLook,
   parseWindowsStart,
   pgrepArgv,
+  ID,
   type Platform,
-  type ProfileChoice,
+  profileCandidates,
   psArgv,
+  readMark,
   type Reconnect,
+  reconnectsWithin,
   SERVER,
   type SilentSetting,
   silentSetting,
   SLEEP,
   type Start,
+  START_LOOKS,
+  START_MARK_MS,
   START_WAIT_S,
+  type StartMark,
+  type StartProfile,
   windowsChromeFault,
   windowsLaunchArgs,
   windowsLookScript,
   windowsStartScript,
 } from './chrome'
-import { oneLine, plainOutput, powershellCall, powershellPath, SYSTEM_ROOT, within } from './machine'
+import { oneLine, plainOutput, powershellCall, powershellPath, SYSTEM_ROOT } from './machine'
 import { configureUpdateCheck, loadUpdateCheck, withUpdateNotice } from './update-check'
 
 const TOOL = 'mcp__self-chrome__chrome_ensure'
 const queued = { plugin: 'self-chrome', key: 'queued' } as const
+const reconnects = { plugin: 'self-chrome', key: 'reconnects' } as const
 
-/** How long the look's script may take on Windows: Get-CimInstance can be slow on a loaded machine. */
+/** The store key of a start in flight, which every session on the machine reads. */
+const START_MARK = 'starting'
+
+/** How long a look's script may take on Windows: Get-CimInstance can be slow on a loaded machine. */
 const LOOK_MS = 30_000
-/** How long the start's script may take on Windows: its wait for the browser process, and the look after it. */
-const START_MS = (START_WAIT_S + 25) * 1000
-/** How long each of macOS's open, pgrep and ps may take. */
+/** How long the start's script may take on Windows: a last look, Add-Type's compile, and the launch. */
+const START_MS = 30_000
+/** How long each of macOS's open, pgrep, ps and id may take. */
 const MAC_MS = 10_000
-/** How long reading Chrome's Local State may take. */
-const LOCAL_STATE_MS = 5_000
+/** How long a look in a start's wait pauses first. */
+const PAUSE_MS = 700
 
 /** When the reconnect starts after the turn's end: at once, the moment the turn's end returns, as self-mcp's. */
 const TURN_END_MS = 0
@@ -147,11 +161,11 @@ function closeArm(arm: Arm): void {
 
 const DESCRIPTION = [
   'Makes sure Chrome runs for Claude in Chrome, and reconnects Claude in Chrome: for when its tools say the browser is not connected, before asking the person.',
-  "It looks for the person's Chrome (its browser process on the default user data folder; never a test or isolated Chrome), starts it when it isn't running (the profile folder, the last session restored, and --silent-debugger-extension-api when the person opted in), and queues /mcp reconnect claude-in-chrome for when this turn ends, when Claude in Chrome is one of this session's MCP servers.",
-  "It never quits, kills or restarts Chrome, which would close every session's tabs and tab groups: when Chrome runs without the flag the person opted in to, it says how the person can fix it. It never signs in or types anything into Chrome.",
-  '`profile` (optional) is the profile folder a start opens, by its name (Default, Profile 2), never an account; left out, the plugin\'s setting, else Chrome\'s last active profile, else Default. `reconnect` (default true) queues the reconnect. `resume` is the message that starts your next turn once the reconnect has run: what to try again.',
+  "It looks for the person's Chrome (its browser process on the default user data folder; never a test or isolated Chrome), starts it when it isn't running (the profile folder when one is named, else the profile Chrome used last; the last session restored; and --silent-debugger-extension-api when the person opted in), and queues /mcp reconnect claude-in-chrome for when this turn ends whenever Chrome runs, at most 3 times in 10 minutes.",
+  "It never quits, kills or restarts Chrome, which would close every session's tabs and tab groups: when Chrome runs without the flag the person opted in to, it says how the person can fix it. It never opens a profile in a Chrome that runs, signs in, or types anything into Chrome.",
+  "`profile` (optional) is the profile folder a start opens, by its folder's name (Default, Profile 2), never an account, and only one that is in Chrome's user data folder; left out, the plugin's setting, else none, so Chrome opens the profile it used last. `reconnect` (default true) queues the reconnect. `resume` is the message that starts your next turn once the reconnect has run: what to try again.",
   "The reconnect runs when the session is idle: Claude Code queues a plugin's command behind anything already waiting (a message typed during this turn, a background task's notification), so under a nonstop stream of work and notifications it may run in the distant future. Nothing waiting is lost.",
-  'Windows and macOS. When it says the reconnect is queued, end your turn and do nothing more until it has run; then carry on.',
+  'Windows and macOS. When it says the reconnect is queued, end your turn and do nothing more until it has run; then carry on. When it says to ask the person, ask them; don\'t call it again.',
 ].join(' ')
 
 const SUBAGENT =
@@ -168,6 +182,9 @@ function why(err: unknown): string {
   const said = oneLine(err instanceof Error ? err.message : String(err), 300)
   return said === '' ? 'no reason given' : said
 }
+
+/** A command's standard error as the end of a phrase: `: <one line>`, or nothing. */
+const errSaid = (stderr: string): string => (stderr.trim() === '' ? '' : `: ${oneLine(stderr, 200)}`)
 
 /**
  * A variable of this process's environment, or undefined when unset or unreadable. `read` is the engine's read with
@@ -195,8 +212,253 @@ async function platformOf($: EngineInterface): Promise<Platform | string> {
   if (isHosted) return 'a hosted server, not the machine Chrome runs on'
   if (platform === 'windows' || platform === 'macos') return platform
   if ((platform === undefined || platform === 'unknown') && (await env(() => $.env.get('OS'))) === 'Windows_NT') return 'windows'
-  if (platform === 'wsl') return 'WSL, whose processes are not Windows\' own'
+  if (platform === 'wsl') return "WSL, whose processes are not Windows' own"
   return platform === undefined || platform === 'unknown' ? 'a platform Claude Code does not name' : platform
+}
+
+/** Whether `path` is there, as far as a read can tell. */
+async function isThere($: EngineInterface, path: string): Promise<boolean> {
+  try {
+    return await $.fs.exists(path)
+  } catch {
+    return false
+  }
+}
+
+/** The clock now; 0 when it can't be read, which no mark or count takes for a time. */
+async function now($: EngineInterface): Promise<number> {
+  try {
+    return await $.clock.now()
+  } catch {
+    return 0
+  }
+}
+
+// ---------------------------------------------------------------------------------------------
+// The machine: a look, and a start, on Windows or macOS.
+
+/** What a start's run came to. `unknown`: its answer didn't come (a timeout), so it may have launched: the looks tell. */
+type StartRun = { readonly kind: 'launched'; readonly pid?: number } | { readonly kind: 'running' } | { readonly kind: 'failed'; readonly why: string } | { readonly kind: 'unknown'; readonly why: string }
+
+/** Chrome on this machine, as its first look found it, and how to look again and to start it. */
+type Machine = {
+  readonly platform: Platform
+  readonly paths: readonly string[]
+  readonly userData: string | undefined
+  readonly sep: '\\' | '/'
+  /** The executable a start runs: the first of `paths` that is there. */
+  readonly binary: string | undefined
+  readonly first: readonly ChromeProcess[]
+  /** Another look, after a short pause when `pause`; a string says why it failed. */
+  look(pause: boolean): Promise<ChromeProcess[] | string>
+  start(profile: string | undefined, flag: boolean): Promise<StartRun>
+}
+
+/** One fixed script in Windows PowerShell, by its known path: its output; or why it failed (`exited`), or never answered (`threw`). */
+async function powershell($: EngineInterface, exe: string, script: string, ms: number): Promise<{ readonly stdout: string } | { readonly exited: string } | { readonly threw: string }> {
+  try {
+    const call = powershellCall(exe, script)
+    const run = await $.process.run(call.argv, { stdin: call.stdin, timeoutMs: ms })
+    if (run.exitCode !== 0) {
+      const err = plainOutput(run.stderr)
+      return { exited: `exited ${run.exitCode}${err === '' ? '' : `: ${err}`}` }
+    }
+    return { stdout: run.stdout }
+  } catch (err) {
+    return { threw: `didn't answer (${why(err)})` }
+  }
+}
+
+async function windowsMachine($: EngineInterface): Promise<Machine | string> {
+  const root = await env(() => $.env.get('SystemRoot'))
+  if (root === undefined || !SYSTEM_ROOT.test(root)) return `the Windows folder (SystemRoot) reads ${JSON.stringify(root ?? '')}, so Windows PowerShell can't be found by its known path`
+  const exe = powershellPath(root)
+  const configured = chromePathSetting === '' ? undefined : chromePathSetting
+  const fault = configured === undefined ? undefined : windowsChromeFault(configured)
+  if (fault !== undefined) return `the chromePath setting ${fault}; set it to chrome.exe's absolute path, or empty it for the standard installs`
+  const ran = await powershell($, exe, windowsLookScript(configured), LOOK_MS)
+  if (!('stdout' in ran)) return `the look ${'exited' in ran ? ran.exited : ran.threw}`
+  const first = parseWindowsLook(ran.stdout)
+  if (typeof first === 'string') return first
+  const binary = first.start
+  return {
+    platform: 'windows',
+    paths: first.paths,
+    userData: first.userData,
+    sep: '\\',
+    binary,
+    first: first.procs,
+    async look(pause) {
+      const again = await powershell($, exe, windowsLookScript(configured, pause ? PAUSE_MS : 0), LOOK_MS)
+      if (!('stdout' in again)) return `the look ${'exited' in again ? again.exited : again.threw}`
+      const read = parseWindowsLook(again.stdout)
+      return typeof read === 'string' ? read : [...read.procs]
+    },
+    async start(profile, flag) {
+      if (binary === undefined) return { kind: 'failed', why: 'no chrome.exe is there to start' }
+      const run = await powershell($, exe, windowsStartScript(binary, windowsLaunchArgs(profile, flag)), START_MS)
+      if ('threw' in run) return { kind: 'unknown', why: `the start ${run.threw}` }
+      if ('exited' in run) return { kind: 'failed', why: `the start ${run.exited}` }
+      const said = parseWindowsStart(run.stdout)
+      if (typeof said === 'string') return { kind: 'unknown', why: said }
+      if (said.kind === 'running') return { kind: 'running' }
+      return said.pid === undefined ? { kind: 'launched' } : { kind: 'launched', pid: said.pid }
+    },
+  }
+}
+
+/** This user's uid on macOS, which pgrep is held to; undefined when id doesn't say, and pgrep then reads every user's. */
+async function uidOf($: EngineInterface): Promise<number | undefined> {
+  try {
+    const run = await $.process.run([ID, '-u'], { timeoutMs: MAC_MS })
+    const uid = run.stdout.trim()
+    return run.exitCode === 0 && /^\d{1,10}$/.test(uid) ? Number(uid) : undefined
+  } catch {
+    return undefined
+  }
+}
+
+/** The look on macOS: pgrep for this user's Chrome binaries, then ps of those processes alone. A string says why it failed. */
+async function lookMac($: EngineInterface, paths: readonly string[], uid: number | undefined): Promise<ChromeProcess[] | string> {
+  try {
+    const found = await $.process.run(pgrepArgv(paths, uid), { timeoutMs: MAC_MS })
+    // pgrep exits 1 when nothing matched.
+    if (found.exitCode === 1) return []
+    if (found.exitCode !== 0) return `pgrep exited ${found.exitCode}${errSaid(found.stderr)}`
+    const pids = parsePids(found.stdout)
+    if (pids.length === 0) return []
+    const listed = await $.process.run(psArgv(pids), { timeoutMs: MAC_MS })
+    // ps exits 1 when a process it was asked about has gone meanwhile; it lists the rest.
+    if (listed.exitCode !== 0 && listed.exitCode !== 1) return `ps exited ${listed.exitCode}${errSaid(listed.stderr)}`
+    return parsePs(listed.stdout, paths)
+  } catch (err) {
+    return `the look didn't answer (${why(err)})`
+  }
+}
+
+async function macMachine($: EngineInterface): Promise<Machine | string> {
+  const home = await env(() => $.env.get('HOME'))
+  const fault = chromePathSetting === '' ? undefined : macChromeFault(chromePathSetting)
+  if (fault !== undefined) return `the chromePath setting ${fault}; set it to that binary, or empty it for the standard install`
+  const paths = chromePathSetting === '' ? macStandard(home) : [chromePathSetting]
+  const userData = macUserData(home)
+  const uid = await uidOf($)
+  const first = await lookMac($, paths, uid)
+  if (typeof first === 'string') return first
+  let binary: string | undefined
+  for (const path of paths) {
+    if (await isThere($, path)) {
+      binary = path
+      break
+    }
+  }
+  return {
+    platform: 'macos',
+    paths,
+    userData,
+    sep: '/',
+    binary,
+    first,
+    async look(pause) {
+      if (pause) {
+        // A sleep process, never the hook's own clock: a hook's own time is bounded, and the engine stops that clock
+        // while a `$` call is in flight.
+        try {
+          await $.process.run([SLEEP, '1'], { timeoutMs: 5_000 })
+        } catch {
+          // The look goes at once.
+        }
+      }
+      return lookMac($, paths, uid)
+    },
+    async start(profile, flag) {
+      if (binary === undefined) return { kind: 'failed', why: 'no Chrome binary is there to start' }
+      // The last look, right before the launch: a Chrome that came up since is never started again.
+      const last = await lookMac($, paths, uid)
+      if (typeof last !== 'string' && judge(last, { platform: 'macos', paths, userData }).browsers.length > 0) return { kind: 'running' }
+      try {
+        const opened = await $.process.run(macOpenArgv(binary, profile, flag), { timeoutMs: MAC_MS })
+        return opened.exitCode === 0 ? { kind: 'launched' } : { kind: 'failed', why: `open exited ${opened.exitCode}${errSaid(opened.stderr)}` }
+      } catch (err) {
+        return { kind: 'unknown', why: `open didn't answer (${why(err)})` }
+      }
+    },
+  }
+}
+
+// ---------------------------------------------------------------------------------------------
+// The profile, the start's mark, the start and its wait.
+
+/**
+ * Why a named profile isn't one to start: Chrome's user data folder unknown, or no folder of that exact name with its
+ * Preferences file there, which Chrome would make as a new, empty profile. Undefined when it is one.
+ */
+async function profileMissing($: EngineInterface, m: Machine, name: string, source: 'call' | 'setting'): Promise<{ readonly why: string; readonly fix: string } | undefined> {
+  if (m.userData === undefined) {
+    return {
+      why: "Chrome's user data folder isn't known here, so the profile named can't be checked against Chrome's profile folders",
+      fix: 'leave the profile out, so Chrome opens the profile it used last',
+    }
+  }
+  const folder = (child: string) => `${m.userData}${m.sep}${child}${m.sep}Preferences`
+  let entries: readonly { readonly name: string; readonly kind: string }[] | undefined
+  try {
+    entries = await $.fs.list(m.userData)
+  } catch {
+    entries = undefined
+  }
+  // The exact name, as Chrome keys its profiles, never one that differs only in case.
+  if (entries?.some(e => e.kind === 'dir' && e.name === name) && (await isThere($, folder(name)))) return undefined
+  let folders: string[] | undefined
+  if (entries !== undefined) {
+    folders = []
+    for (const candidate of profileCandidates(entries)) if (await isThere($, folder(candidate))) folders.push(candidate)
+  }
+  return missingProfile(source, folders)
+}
+
+/** This call's hold on the start: its mark; another call's mark found; or none, the store unreadable. */
+type Claim = { readonly kind: 'mine'; readonly mark: StartMark } | { readonly kind: 'other' } | { readonly kind: 'unmarked' }
+
+/**
+ * The start's mark in the plugin's store, which every session on the machine reads: a call that finds another's still
+ * held only looks, and never launches. Written, then read back, so of two calls that write at once, only the one
+ * whose mark stands launches. A store that can't be read leaves the start unmarked, as before the mark.
+ */
+async function claimStart($: EngineInterface): Promise<Claim> {
+  try {
+    const at = await now($)
+    if (isHeld(readMark(await $.store.get(START_MARK)), at)) return { kind: 'other' }
+    const mark: StartMark = { until: at + START_MARK_MS, by: crypto.randomUUID() }
+    await $.store.set(START_MARK, mark)
+    return readMark(await $.store.get(START_MARK))?.by === mark.by ? { kind: 'mine', mark } : { kind: 'other' }
+  } catch {
+    return { kind: 'unmarked' }
+  }
+}
+
+/** Takes this call's mark back, when it still stands. */
+async function releaseStart($: EngineInterface, claim: Claim): Promise<void> {
+  if (claim.kind !== 'mine') return
+  try {
+    if (readMark(await $.store.get(START_MARK))?.by === claim.mark.by) await $.store.delete(START_MARK)
+  } catch {
+    // It holds other starts off until START_MARK_MS has passed, and no longer.
+  }
+}
+
+/** Looks, each in a run of its own after a short pause, until the person's Chrome shows, START_WAIT_S pass, or `looks` are made. */
+async function waitForBrowser($: EngineInterface, m: Machine, looks: number): Promise<Browser | undefined> {
+  const began = await now($)
+  for (let i = 0; i < looks; i += 1) {
+    const procs = await m.look(true)
+    if (typeof procs !== 'string') {
+      const shown = judge(procs, { platform: m.platform, paths: m.paths, userData: m.userData }).browsers[0]
+      if (shown !== undefined) return shown
+    }
+    if ((await now($)) - began >= START_WAIT_S * 1000) break
+  }
+  return undefined
 }
 
 /** What the look and the start came to. */
@@ -205,171 +467,80 @@ type Found = { readonly look: Look; readonly start: Start }
 const none: Start = { kind: 'none' }
 const lookFailed = (whyNot: string): Found => ({ look: { kind: 'failed', why: whyNot }, start: none })
 
-/** Chrome's Local State's last active profile, read within LOCAL_STATE_MS; why not, when it can't be. */
-async function readLocalState($: EngineInterface, path: string): Promise<LocalStateRead> {
-  try {
-    const read = await within($, LOCAL_STATE_MS, $.fs.read(path))
-    if (read === undefined) return { why: `its Local State wasn't read within ${LOCAL_STATE_MS / 1000} s` }
-    return lastActiveProfile(String(read.value))
-  } catch {
-    return { why: "its Local State can't be read" }
+async function ensureChrome($: EngineInterface, platform: Platform, flag: FlagChoice, asked: string | undefined): Promise<Found> {
+  const m = platform === 'windows' ? await windowsMachine($) : await macMachine($)
+  if (typeof m === 'string') return lookFailed(m)
+  const judged = judge(m.first, { platform, paths: m.paths, userData: m.userData })
+  if (judged.browsers.length === 0 && judged.unreadable > 0) {
+    const n = judged.unreadable
+    return lookFailed(`${n} Chrome process${n === 1 ? '' : 'es'} of this login ${n === 1 ? 'has' : 'have'} a command line that can't be read, as an elevated Chrome's can't`)
   }
-}
-
-/** The profile a start opens: Local State is read only when neither the call nor the setting names one. */
-async function profileFor($: EngineInterface, asked: string | undefined, localState: string | undefined): Promise<ProfileChoice> {
-  if (asked !== undefined || profileSetting !== '' || localState === undefined) return chooseProfile(asked, profileSetting, undefined)
-  return chooseProfile(undefined, '', await readLocalState($, localState))
-}
-
-/** One fixed script in Windows PowerShell, by its known path: its output, or why it failed, as a phrase. */
-async function powershell($: EngineInterface, exe: string, script: string, ms: number): Promise<{ readonly stdout: string } | string> {
-  try {
-    const call = powershellCall(exe, script)
-    const run = await $.process.run(call.argv, { stdin: call.stdin, timeoutMs: ms })
-    if (run.exitCode !== 0) {
-      const err = plainOutput(run.stderr)
-      return `exited ${run.exitCode}${err === '' ? '' : `: ${err}`}`
-    }
-    return { stdout: run.stdout }
-  } catch (err) {
-    return `didn't run (${why(err)})`
-  }
-}
-
-async function ensureWindows($: EngineInterface, flag: FlagChoice, asked: string | undefined): Promise<Found> {
-  const root = await env(() => $.env.get('SystemRoot'))
-  if (root === undefined || !SYSTEM_ROOT.test(root)) return lookFailed(`the Windows folder (SystemRoot) reads ${JSON.stringify(root ?? '')}, so Windows PowerShell can't be found by its known path`)
-  const exe = powershellPath(root)
-  const configured = chromePathSetting === '' ? undefined : chromePathSetting
-  const fault = configured === undefined ? undefined : windowsChromeFault(configured)
-  if (fault !== undefined) return lookFailed(`the chromePath setting ${fault}; set it to chrome.exe's absolute path, or empty it for the standard installs`)
-  const ran = await powershell($, exe, windowsLookScript(configured), LOOK_MS)
-  if (typeof ran === 'string') return lookFailed(`the look ${ran}`)
-  const look = parseWindowsLook(ran.stdout)
-  if (typeof look === 'string') return lookFailed(look)
-  const where = { platform: 'windows', paths: look.paths, userData: look.userData } as const
-  const judged = judge(look.procs, where)
   const found: Look = { kind: 'read', judged }
   if (judged.browsers.length > 0) return { look: found, start: none }
-  if (look.start === undefined) {
+  if (m.binary === undefined) {
+    const configured = chromePathSetting !== ''
+    const standard = platform === 'windows' ? "Chrome isn't at its standard install paths (under Program Files, or the per-user install)" : "Chrome isn't at its standard install path (/Applications/Google Chrome.app)"
+    const fix = platform === 'windows' ? "set the chromePath setting to chrome.exe's absolute path" : 'set the chromePath setting to the Google Chrome binary inside its .app'
+    return { look: found, start: { kind: 'refused', why: configured ? 'the chromePath setting names no file' : standard, fix } }
+  }
+  const choice = chooseProfile(asked, profileSetting)
+  if ('refusal' in choice) return { look: found, start: { kind: 'refused', why: choice.refusal, fix: choice.fix } }
+  if (choice.profile !== undefined) {
+    const missing = await profileMissing($, m, choice.profile, choice.source)
+    if (missing !== undefined) return { look: found, start: { kind: 'refused', ...missing } }
+  }
+  const profile: StartProfile = choice.profile === undefined ? { profile: undefined } : { profile: choice.profile, source: choice.source }
+  const claim = await claimStart($)
+  if (claim.kind === 'other') {
+    const shown = await waitForBrowser($, m, START_LOOKS)
+    return { look: found, start: { kind: 'waited', ...(shown === undefined ? {} : { browser: shown }) } }
+  }
+  try {
+    const run = await m.start(profile.profile, flag.on)
+    if (run.kind === 'running') {
+      const shown = await waitForBrowser($, m, 1)
+      return { look: found, start: { kind: 'late', ...(shown === undefined ? {} : { browser: shown }) } }
+    }
+    // A start that said it failed gets one look, in case it launched before it failed; any other, the whole wait.
+    const shown = await waitForBrowser($, m, run.kind === 'failed' ? 1 : START_LOOKS)
+    if (run.kind === 'failed' && shown === undefined) return { look: found, start: { kind: 'failed', why: run.why } }
     return {
       look: found,
       start: {
-        kind: 'refused',
-        why: configured === undefined ? "Chrome isn't at its standard install paths (under Program Files, or the per-user install)" : 'the chromePath setting names no file',
-        fix: "set the chromePath setting to chrome.exe's absolute path",
+        kind: 'started',
+        profile,
+        flag: flag.on,
+        ...(shown === undefined ? {} : { browser: shown }),
+        ...(run.kind === 'launched' && run.pid !== undefined ? { launched: run.pid } : {}),
+        ...(run.kind === 'unknown' || run.kind === 'failed' ? { unknown: run.why } : {}),
       },
     }
+  } finally {
+    await releaseStart($, claim)
   }
-  const profile = await profileFor($, asked, look.userData === undefined ? undefined : `${look.userData}\\Local State`)
-  if ('refusal' in profile) return { look: found, start: { kind: 'refused', why: profile.refusal, fix: profile.fix } }
-  const started = await powershell($, exe, windowsStartScript(look.start, windowsLaunchArgs(profile.profile, flag.on)), START_MS)
-  if (typeof started === 'string') return { look: found, start: { kind: 'failed', why: `the start ${started}` } }
-  const after = parseWindowsStart(started.stdout)
-  if (typeof after === 'string') return { look: found, start: { kind: 'failed', why: after } }
-  return { look: found, start: startedAs(profile, flag, judge(after, where).browsers[0]) }
-}
-
-/** The start that ran, with the browser process that showed after it, if any. */
-const startedAs = (profile: { readonly profile: string; readonly from: string }, flag: FlagChoice, shown: Browser | undefined): Start => ({
-  kind: 'started',
-  profile: profile.profile,
-  from: profile.from,
-  flag: flag.on,
-  ...(shown === undefined ? {} : { browser: shown }),
-})
-
-/** The look on macOS: pgrep for Chrome's binaries, then ps of those processes alone. A string says why it failed. */
-async function lookMac($: EngineInterface, paths: readonly string[]): Promise<ChromeProcess[] | string> {
-  try {
-    const found = await $.process.run(pgrepArgv(paths), { timeoutMs: MAC_MS })
-    // pgrep exits 1 when nothing matched.
-    if (found.exitCode === 1) return []
-    if (found.exitCode !== 0) return `pgrep exited ${found.exitCode}${found.stderr.trim() === '' ? '' : `: ${oneLine(found.stderr, 200)}`}`
-    const pids = parsePids(found.stdout)
-    if (pids.length === 0) return []
-    const listed = await $.process.run(psArgv(pids), { timeoutMs: MAC_MS })
-    // ps exits 1 when a process it was asked about has gone meanwhile; it lists the rest.
-    if (listed.exitCode !== 0 && listed.exitCode !== 1) return `ps exited ${listed.exitCode}${listed.stderr.trim() === '' ? '' : `: ${oneLine(listed.stderr, 200)}`}`
-    return parsePs(listed.stdout, paths)
-  } catch (err) {
-    return `the look didn't run (${why(err)})`
-  }
-}
-
-/** The first of `paths` that is there. */
-async function firstThere($: EngineInterface, paths: readonly string[]): Promise<string | undefined> {
-  for (const path of paths) {
-    try {
-      if (await $.fs.exists(path)) return path
-    } catch {
-      // Not there, as far as this read can tell.
-    }
-  }
-  return undefined
-}
-
-async function ensureMac($: EngineInterface, flag: FlagChoice, asked: string | undefined): Promise<Found> {
-  const home = await env(() => $.env.get('HOME'))
-  const fault = chromePathSetting === '' ? undefined : macChromeFault(chromePathSetting)
-  if (fault !== undefined) return lookFailed(`the chromePath setting ${fault}; set it to that binary, or empty it for the standard install`)
-  const paths = chromePathSetting === '' ? macStandard(home) : [chromePathSetting]
-  const where = { platform: 'macos', paths, userData: macUserData(home) } as const
-  const first = await lookMac($, paths)
-  if (typeof first === 'string') return lookFailed(first)
-  const judged = judge(first, where)
-  const found: Look = { kind: 'read', judged }
-  if (judged.browsers.length > 0) return { look: found, start: none }
-  const binary = await firstThere($, paths)
-  if (binary === undefined) {
-    return {
-      look: found,
-      start: {
-        kind: 'refused',
-        why: chromePathSetting === '' ? "Chrome isn't at its standard install path (/Applications/Google Chrome.app)" : 'the chromePath setting names no file',
-        fix: 'set the chromePath setting to the Google Chrome binary inside its .app',
-      },
-    }
-  }
-  const profile = await profileFor($, asked, where.userData === undefined ? undefined : `${where.userData}/Local State`)
-  if ('refusal' in profile) return { look: found, start: { kind: 'refused', why: profile.refusal, fix: profile.fix } }
-  try {
-    const opened = await $.process.run(macOpenArgv(binary, profile.profile, flag.on), { timeoutMs: MAC_MS })
-    if (opened.exitCode !== 0) {
-      return { look: found, start: { kind: 'failed', why: `open exited ${opened.exitCode}${opened.stderr.trim() === '' ? '' : `: ${oneLine(opened.stderr, 200)}`}` } }
-    }
-  } catch (err) {
-    return { look: found, start: { kind: 'failed', why: `open didn't run (${why(err)})` } }
-  }
-  // A look a second, up to START_WAIT_S of them. The wait is a sleep process, never the hook's own clock: a hook's
-  // own time is bounded, and the engine stops that clock while a `$` call is in flight.
-  let shown: Browser | undefined
-  for (let i = 0; i < START_WAIT_S && shown === undefined; i += 1) {
-    try {
-      await $.process.run([SLEEP, '1'], { timeoutMs: 5_000 })
-    } catch {
-      // The next look goes at once.
-    }
-    const now = await lookMac($, paths)
-    if (typeof now !== 'string') shown = judge(now, where).browsers[0]
-  }
-  return { look: found, start: startedAs(profile, flag, shown) }
 }
 
 /**
- * The reconnect, queued for when the turn ends: only when it was asked for, Chrome runs (found, or started), and
- * Claude in Chrome is one of this session's MCP servers (one of its tools is listed).
+ * The reconnect, queued for when the turn ends: whenever it was asked for and Chrome runs (found, or started), as
+ * self-mcp queues one; a server that dropped lists no tools, and is the one that needs it most. At most RECONNECT_CAP
+ * in RECONNECT_WINDOW_MS a session: past it, a loop of reconnects that don't help is the person's to look at. A second
+ * call in the same turn changes the resume, and counts no second reconnect.
  */
 async function queueReconnect($: EngineInterface, asked: boolean, running: boolean, resume: string | undefined): Promise<Reconnect> {
   if (!asked) return { kind: 'not-asked' }
   if (!running) return { kind: 'not-running' }
   try {
-    if (!(await $.tool.list()).some(t => t.name.startsWith(`mcp__${SERVER}__`))) return { kind: 'absent' }
-  } catch (err) {
-    return { kind: 'unlisted', why: why(err) }
-  }
-  try {
+    const { value: waiting } = await $.state.get(queued)
+    if (waiting === null || waiting === undefined) {
+      const at = await now($)
+      const { value: times } = await $.state.get(reconnects)
+      const { kept, isCapped } = reconnectsWithin(times, at)
+      if (isCapped) {
+        await $.state.set(reconnects, kept)
+        return { kind: 'capped' }
+      }
+      await $.state.set(reconnects, [...kept, at])
+    }
     await $.state.set(queued, resume === undefined ? {} : { resume })
   } catch {
     return { kind: 'failed' }
@@ -457,11 +628,12 @@ export const register: Register = (on, options) => {
         properties: {
           profile: {
             type: 'string',
-            description: "The profile folder a start opens, by its folder's name (Default, Profile 2), never an account. Used only when Chrome isn't running. Left out: the plugin's profile setting, else Chrome's last active profile, else Default.",
+            description:
+              "The profile folder a start opens, by its folder's name (Default, Profile 2), never an account; one that isn't in Chrome's user data folder is refused, with the folders that are. Used only when Chrome isn't running. Left out: the plugin's profile setting, else none, so Chrome opens the profile it used last.",
           },
           reconnect: {
             type: 'boolean',
-            description: 'Queue /mcp reconnect claude-in-chrome for when this turn ends (default true): only when Claude in Chrome is one of this session\'s MCP servers and Chrome runs.',
+            description: 'Queue /mcp reconnect claude-in-chrome for when this turn ends (default true), whenever Chrome runs; at most 3 times in 10 minutes.',
           },
           resume: {
             type: 'string',
@@ -490,7 +662,7 @@ export const register: Register = (on, options) => {
       return { result: `Chrome: not looked for. self-chrome looks after Chrome on Windows and macOS, on the machine Chrome runs on, and this session runs on ${platform}. Nothing was started or queued.` }
     }
     const flag = flagChoice(silent, await env(() => $.env.get('CLAUDE_CHROME_SILENT_DEBUGGER')))
-    const { look, start } = platform === 'windows' ? await ensureWindows($, flag, asked) : await ensureMac($, flag, asked)
+    const { look, start } = await ensureChrome($, platform, flag, asked)
     const reconnect = await queueReconnect($, input.reconnect !== false, isRunning(look, start), resume)
     return { result: answer({ platform, flag, look, start, reconnect }) }
   }).catch(($, e, next) => (next.called ? next(e) : { deny: 'self-chrome: chrome_ensure failed before it could answer. Call it again to see where Chrome stands.' }))

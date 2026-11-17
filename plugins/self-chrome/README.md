@@ -16,26 +16,43 @@ So the flag is opt-in, and off unless you turn it on. Some people want the banne
 
 `chrome_ensure` (Claude sees `mcp__self-chrome__chrome_ensure`):
 
-- `profile` (optional): the profile folder a start opens, by its folder's name (`Default`, `Profile 2`), never an account. Used only when Chrome isn't running. Left out: the `profile` setting, else Chrome's last active profile, else `Default`.
+- `profile` (optional): the profile folder a start opens, by its folder's name (`Default`, `Profile 2`), never an account. It must be one of Chrome's profile folders ([below](#the-profile)). Used only when Chrome isn't running. Left out: the `profile` setting, else none, and Chrome opens the profile it used last.
 - `reconnect` (optional, default `true`): queue `/mcp reconnect claude-in-chrome` for when the turn ends.
 - `resume` (optional): the message that starts the session's next turn once the reconnect has run, as [self-mcp](../self-mcp)'s `resume`.
 
 ## What it does
 
-1. **It looks for your Chrome**: the browser process of the configured Chrome (the one that is no child of another, with no `--type=`), on Chrome's default user data folder. A test or isolated Chrome, started with a `--user-data-dir` of its own (Playwright's, say), isn't yours: it is counted apart, and never touched. It says whether Chrome runs, whether it started with the flag, and the profile folder its command line names, if any.
-2. **If Chrome isn't running, it starts it**, detached: with `--profile-directory=<profile>`, `--restore-last-session`, and the flag when you opted in. Then it waits up to 20 seconds for the browser process, and says its PID and whether the flag took.
-   - Windows: `chrome.exe` through `Start-Process`, in Chrome's own folder (never the session's, which Chrome would hold open for its whole life), without the variables Claude Code sets in the processes it starts.
-   - macOS: `open -a "<Google Chrome.app>" --args …`, so Chrome starts as it would from the Dock.
+1. **It looks for your Chrome**: the browser process of the configured Chrome (the one that is no child of another, with no `--type=`), of your own login, on Chrome's default user data folder. A test or isolated Chrome, started with a `--user-data-dir` of its own (Playwright's, say), isn't yours: it is counted apart, and never touched. It says whether Chrome runs, whether it started with the flag, and the profile folder its command line names, if any.
+   - **Chrome in the background counts as running.** A Chrome with no window (`--no-startup-window`, as Chrome starts at login when it keeps running in the background) is said plainly to run in the background with no window. A start would only hand off to it, and it took its flags when it started.
+   - **A Chrome whose command line can't be read** (an elevated Chrome, run as administrator) leaves the look unable to say that Chrome isn't running. So it says it can't tell, and starts nothing.
+2. **If Chrome isn't running, it starts it**, detached, with `--restore-last-session`, the flag when you opted in, and `--profile-directory=<profile>` only when the call or the `profile` setting names one. The launch is short: it returns at once, and looks of their own then wait up to 20 seconds for the browser process. It says the PID, and whether the flag took.
+   - **Windows:** `chrome.exe` through ShellExecute (what `Start-Process -PassThru` calls), in Chrome's own folder, never the session's, which Chrome would hold open for its whole life. Chrome gets your login environment, as Windows builds it for a program you start (`CreateEnvironmentBlock`): the machine's and your own Environment keys in the registry, and the system's own variables. None of the Claude Code session's environment reaches Chrome, or anything Chrome starts while it runs.
+   - **macOS:** `open -a "<Google Chrome.app>" --args …`, so Chrome starts as it would from the Dock, with launchd's environment.
+   - **A last look comes right before the launch.** A Chrome that came up meanwhile is never started again, and the answer says so.
+   - **One start at a time on the machine.** While a session starts Chrome, a mark in the plugin's store, which every session on the machine reads, holds other starts off for up to 60 seconds. A call that finds the mark launches nothing: it looks, and says what the other session's start came to.
+   - **A launch that handed off** to a Chrome that was already starting is said: Windows names the launched process, and the browser found is another.
+   - **A launch whose answer never came** (a timeout under load) isn't taken for a failed one. The looks still run, and say whether Chrome came up.
 3. **If Chrome runs without the flag while you opted in**, it says so, and how you fix it (below). It does nothing to Chrome.
-4. **It queues `/mcp reconnect claude-in-chrome`** for when the turn ends, as [self-mcp](../self-mcp) does: only while Claude in Chrome is one of the session's MCP servers (one of its tools is listed), and Chrome runs (found, or started). Once the reconnect has run, the session resumes with `resume`, or Claude is told on its next turn and the session waits for your message. A message of yours after the reconnect was queued turns the `resume` into a note, as with self-mcp.
+4. **It queues `/mcp reconnect claude-in-chrome`** for when the turn ends, as [self-mcp](../self-mcp) does, whenever Chrome runs (found, or started). A Claude in Chrome server that dropped lists no tools, and it is the one that needs the reconnect most, so the plugin doesn't look for them. Once the reconnect has run, the session resumes with `resume`, or Claude is told on its next turn and the session waits for your message. A message of yours after the reconnect was queued turns the `resume` into a note, as with self-mcp.
+   - **At most 3 reconnects in 10 minutes** a session. Past that, the answer says to ask you rather than call the tool again: reconnects that keep not helping usually mean Claude in Chrome is off, or signed out, in the profile Chrome opened.
+   - **A reconnect starts Claude in Chrome's session over.** The session's tab group stays open in Chrome, and the session makes a new one.
 5. **It answers** with one line each: what it found, the flag, what it did, the reconnect, and what is left for you.
+
+## The profile
+
+**Decided on principle: when nothing names a profile, the plugin names none.** With no `profile` in the call and no `profile` setting, a start passes no `--profile-directory`, and Chrome opens the profile it used last, restoring the profiles it had open. Chrome knows its last profile better than any guess the plugin could make. So the plugin reads nothing of Chrome's Local State.
+
+A profile that is named must be one of Chrome's profile folders: a folder of exactly that name in Chrome's user data folder, with its `Preferences` file. Given any other name, Chrome would make a new, empty profile of that name, without Claude in Chrome, and leave it in your profile picker. So the plugin starts nothing, and lists the profile folders that are there, by folder name only (`"Default", "Profile 3"`), never their display names or accounts. It never repeats the name it was given, which may be an account's.
+
+`--restore-last-session` reopens the last session of each profile Chrome opens, whatever that profile's own "On startup" setting says.
 
 ## What it doesn't do
 
 - **It never quits, kills or restarts Chrome.** That would close every session's tabs and tab groups. A restart is your call.
 - **It never signs in, and never types anything into Chrome.** Starting Chrome and reconnecting are all it does.
-- **It never opens a profile in a Chrome that is running.** The profile applies only to a start.
+- **Decided on principle: it never opens a profile in a Chrome that is running.** A launch of `chrome.exe --profile-directory=<profile>` at a running Chrome would hand off to it and open that profile's window, as the profile menu does. But when the running Chrome doesn't answer a handed-off launch in time, Chrome ends the browser it takes for hung, and every session's tabs and tab groups with it. So the profile applies only to a start, and opening another profile in a running Chrome stays yours.
 - **It acts only on Windows and macOS**, on the machine Chrome runs on. On Linux, WSL or a hosted server it says so, and does nothing.
+- **Known limits.** It doesn't see a Chrome whose install path holds a quote, such as a per-user install under a Windows profile folder with an apostrophe: it says Chrome isn't running, and a start then hands off to the running one. The macOS path is tested on fixtures only, not yet on a real Mac.
 
 ## Flags apply only when Chrome starts
 
@@ -74,18 +91,19 @@ Either applies to the next Chrome the plugin starts, not to one running now.
 | Setting | Default | What |
 | :- | :- | :- |
 | `silentDebugger` | `auto` | Whether a Chrome the plugin starts gets the flag: `auto`, `on` or `off` (above). |
-| `profile` | empty | The profile folder a start opens, by its folder's name. Empty: the first of Chrome's last active profiles (Local State's `profile.last_active_profiles`), else `Default`. A value that isn't a folder's name (letters, digits, spaces, `_` and `-`) starts nothing, and says so. |
-| `chromePath` | empty | Chrome's executable, as an absolute path. Empty: the standard installs. On Windows, `chrome.exe` under Program Files, then Program Files (x86), then the per-user install under your local application data folder, each as Windows names that folder, never from an environment variable. On macOS, `/Applications/Google Chrome.app/Contents/MacOS/Google Chrome`, then the same under your home folder's Applications. |
+| `profile` | empty | The profile folder a start opens, by its folder's name; it must be one of Chrome's profile folders ([above](#the-profile)). Empty: none, and Chrome opens the profile it used last. A value that isn't a folder's name (letters, digits, spaces, `_` and `-`) starts nothing; the answer says how long it is, never what it says. |
+| `chromePath` | empty | Chrome's executable, as an absolute path, with no `[`, `]` or backtick. Empty: the standard installs. On Windows, `chrome.exe` under Program Files, then Program Files (x86), then the per-user install under your local application data folder, each as Windows names that folder, never from an environment variable. On macOS, `/Applications/Google Chrome.app/Contents/MacOS/Google Chrome`, then the same under your home folder's Applications; a binary whose name has no `Chrome` in it is refused. |
 | `updateCheck` | `on` | See [Update check](#update-check). |
 
 Set them in `/config`, or with `claude plugin configure self-chrome@claude-code-self-tools --values-stdin`.
 
 ## Privacy
 
-- **It reads process command lines, Chrome's alone.** On Windows, a fixed Windows PowerShell script, run by its known path as the shared machine code runs its scripts, reads the `chrome.exe` processes with `Get-CimInstance`, and passes on only those that are no child of another (no `--type=`): a child's command line never leaves the script. On macOS, `pgrep` finds the processes whose command starts with Chrome's executable, and `ps` reads those alone. Of each command line the plugin keeps whether it has the flag, its `--profile-directory` and its `--user-data-dir`, and nothing else.
-- **It reads one field of Chrome's Local State**, `profile.last_active_profiles`, and only when a start needs a profile and neither the call nor the setting names one. Local State also holds the accounts signed in to each profile; the plugin keeps none of it, and never prints an account's name or address.
-- **It prints folder names only**: a profile folder's name (`Profile 3`), never a path, an account or a command line. A profile folder whose name isn't plain (letters, digits, spaces, `_`, `-`) is said to be there, and not shown.
-- **It writes nothing** but the queued reconnect in its own session state, and sends nothing anywhere but the update check below.
+- **It reads process command lines, Chrome's alone, of your own login.** On Windows, a fixed Windows PowerShell script, run by its known path as the shared machine code runs its scripts, reads the `chrome.exe` processes of its own Windows session with `Get-CimInstance`. It passes on only those that are no child of another (no `--type=`): a child's command line never leaves the script. On macOS, `pgrep -U <your uid>` finds your processes whose command starts with Chrome's executable, and `ps` reads those alone. Of each command line the plugin keeps whether it has the flag and `--no-startup-window`, its `--profile-directory` and its `--user-data-dir`, and nothing else.
+- **It reads nothing of Chrome's Local State.** When a profile is named, it checks that folder in Chrome's user data folder. When it isn't there, it lists the folder names there that have a `Preferences` file: directory names only.
+- **It prints folder names only**: a profile folder's name (`Profile 3`), never a path, an account or a command line. A profile folder whose name isn't plain (letters, digits, spaces, `_`, `-`) is said to be there, and not shown. A `profile` setting that isn't a folder's name is said to be invalid, with its length, and never repeated.
+- **Chrome never gets the session's environment.** On Windows it starts with your login environment, which Windows rebuilds from the registry; on macOS, LaunchServices starts it with its own.
+- **It writes nothing** but its own session state (the queued reconnect, and the times of its recent reconnects) and the start's mark in its store. It sends nothing anywhere but the update check below.
 
 ## Update check
 
@@ -96,7 +114,7 @@ When Claude calls one of this plugin's tools, and the last check is 30 minutes o
 - **It never holds up the tool.** The check runs beside the call, which never waits on it. Offline, refused by policy, a 404, a rate limit, no answer within 5 seconds, or anything but a plain version such as `0.2.0` all mean no notice.
 - **When a newer version is out**, a toast tells you, and the result of one of Claude's next calls ends with a line like this:
 
-  > self-chrome 0.1.0 is out of date (0.2.0 is published). To update, the person runs: claude plugin marketplace update claude-code-self-tools, then claude plugin update self-chrome@claude-code-self-tools, then /reload-plugins in each open session (a new session loads the update on its own). Don't run these yourself unless the person asks.
+  > self-chrome 0.1.1 is out of date (0.2.0 is published). To update, the person runs: claude plugin marketplace update claude-code-self-tools, then claude plugin update self-chrome@claude-code-self-tools, then /reload-plugins in each open session (a new session loads the update on its own). Don't run these yourself unless the person asks.
 
   The line is fixed text. Only the two version numbers vary, and each must be three plain numbers. Nothing else from the fetched file reaches Claude. A session is told of each check once, and at most once every 30 minutes, not on every call, and the toast follows the same rule. A call carries only what an earlier check found: the call that starts a check doesn't wait for its answer.
 - **Turn it off** with the plugin's `updateCheck` setting: `off` never checks. Set it in `/config`, or from your shell:

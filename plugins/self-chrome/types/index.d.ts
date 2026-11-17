@@ -6,6 +6,10 @@ export type Queued = { resume?: string }
 
 declare module 'claude-code' {
   interface PluginState {
-    'self-chrome': { queued: Queued | null }
+    /**
+     * `queued`: the reconnect waiting for its turn to end. `reconnects`: when this session queued each of its recent
+     * reconnects (milliseconds since the epoch), which the cap of 3 in 10 minutes counts.
+     */
+    'self-chrome': { queued: Queued | null; reconnects: number[] | null }
   }
 }
