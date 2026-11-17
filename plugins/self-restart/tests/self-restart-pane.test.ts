@@ -4,7 +4,7 @@
 // the full safe point and the pending marker hold as they do for the window. Each is one run of the
 // shared launcher (launch). The scripts answer from fixtures: nothing here starts a process.
 import { expect, mock, test } from 'claude-code/testing'
-import type { On } from 'claude-code'
+import type { AgentInfo, AgentStatus, On } from 'claude-code'
 import { launchScriptText } from '../hooks/launcher'
 import { checkPaneTicket, type LaunchInput, panePath, paneTicketPath, placementPath, quoted, SLOT_SCRIPT_SHA256, slotRecordPath } from '../hooks/machine'
 
@@ -74,10 +74,30 @@ type Options = {
 /** The slot runner a `slot` launcher found: its id, and the claim it took. */
 const SLOT = '20-134062345678901240'
 
+/**
+ * An agent as `$.agent.list()` answers it (AgentInfo, Claude Code 2.1.326): a subagent with the test's
+ * description and status; its task's status by the engine's rule (`waiting` is a subagent whose turn
+ * ended, `idle` a teammate between turns); zeros for its start and readings. The plugin reads its
+ * status, description, type and id alone.
+ */
+const listed = (a: { description: string; status: AgentStatus }, i: number): AgentInfo => ({
+  id: `a${i}`,
+  type: 'general-purpose',
+  ...a,
+  kind: 'local_agent',
+  taskStatus: a.status === 'waiting' ? 'completed' : a.status === 'idle' ? 'running' : a.status,
+  label: a.description,
+  startTime: 0,
+  cwd: '/',
+  tokenCount: 0,
+  tokenSamples: [0],
+  hasRow: false,
+})
+
 /** The engine beneath the plugin; and what it was asked to run and say. */
 function engine(on: On, { token = TOKEN, pane = PANE, probe = probeOf(), paneScript: answer = 'writes', crons = [], exit = 'exits', launcher = 'window', agentDuring = false }: Options = {}) {
   const prompts: string[] = []
-  const agents: { id: string; type: string; description: string; status: 'running' }[] = []
+  const agents: AgentInfo[] = []
   const scripts: string[] = []
   const kinds: string[] = []
   const described: string[] = []
@@ -145,7 +165,7 @@ function engine(on: On, { token = TOKEN, pane = PANE, probe = probeOf(), paneScr
     kinds.push(kind)
     scripts.push(script)
     if (kind === 'release') return ok('released\r\n')
-    if (agentDuring) agents.push({ id: 'a1', type: 'general-purpose', description: 'Lint', status: 'running' })
+    if (agentDuring) agents.push(listed({ description: 'Lint', status: 'running' }, 1))
     // The launch takes the claim its script names, and says so, as it does on the machine.
     const by = /^\$by = '(launch:[0-9a-f-]{36})'$/m.exec(script)?.[1] ?? 'none'
     if (kind === 'launcher' && launcher === 'slot-late') {

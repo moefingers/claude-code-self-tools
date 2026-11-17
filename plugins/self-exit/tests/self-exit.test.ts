@@ -1,5 +1,5 @@
 import { expect, mock, test } from 'claude-code/testing'
-import type { AgentStatus, On } from 'claude-code'
+import type { AgentInfo, AgentStatus, On } from 'claude-code'
 import { wakeMarker } from '../hooks/machine'
 
 const TOOL = 'mcp__self-exit__exit_after_turn'
@@ -64,6 +64,26 @@ type Options = {
   probe?: string | 'fails'
 }
 
+/**
+ * An agent as `$.agent.list()` answers it (AgentInfo, Claude Code 2.1.326): a subagent with the test's
+ * description and status; its task's status by the engine's rule (`waiting` is a subagent whose turn
+ * ended, `idle` a teammate between turns); zeros for its start and readings. The plugin reads its
+ * status, description, type and id alone.
+ */
+const listed = (a: { description: string; status: AgentStatus }, i: number): AgentInfo => ({
+  id: `a${i}`,
+  type: 'general-purpose',
+  ...a,
+  kind: 'local_agent',
+  taskStatus: a.status === 'waiting' ? 'completed' : a.status === 'idle' ? 'running' : a.status,
+  label: a.description,
+  startTime: 0,
+  cwd: '/',
+  tokenCount: 0,
+  tokenSamples: [0],
+  hasRow: false,
+})
+
 /** The engine beneath the plugin: its agents, crons and machine, and the commands, rows, lines and files it was asked for. */
 function engine(on: On, { exit = 'exits', agents = [], env = {}, id = ID, crons = [], cronCheck = 'allow', cronList = 'answers', probe = probeOf() }: Options = {}) {
   const commands: string[] = []
@@ -101,7 +121,7 @@ function engine(on: On, { exit = 'exits', agents = [], env = {}, id = ID, crons 
     return { value: undefined }
   })
   on('agent.list', () => ({
-    value: world.agents.map((a, i) => ({ id: `a${i}`, type: 'general-purpose', ...a })),
+    value: world.agents.map(listed),
   }))
   on('tool.check', { tool: 'CronList' }, (_, e) => {
     checkInputs.push(e.input)
