@@ -115,6 +115,17 @@ Every plugin that runs `/remote-control` in a session on its own takes one lock 
 - **Running**: run `/remote-control` only while holding the lock, and only after a reading of *not connected* taken after the lock was taken.
 - **Who takes the file lock: any plugin that can place it.** That means `%LOCALAPPDATA%` is a plain folder, `$.session.id()` is a session id, and `%SystemRoot%` names the Windows folder. Gate on those three, not on the operating system's name, so that two plugins in one session either both use the file or neither does. Where this plugin can't place it, as off Windows, it uses a lock kept in the session's state instead, which only orders this plugin's own runs.
 
+## Under Claude Code's built-in guard
+
+Where Claude Code's built-in guard loads (a machine with managed settings, or a session signed in with `/login` to a Team or Enterprise plan), a plugin you install can't hook Claude Code's classic hook events, so this plugin's `classic.SessionStart`, `classic.UserPromptSubmit` and `classic.StopFailure` never run there. Where the guard is loaded, and only there, the plugin does their work on Claude Code's own events instead:
+
+- **The session's title** is the one a `/rename` you type sets, or the plugin's own `rename`.
+- **A `/clear` or a `/resume`** forgets the last turn, as before.
+- **After a login change**, a turn that died on an API error while a rate-limit window of the account reads used up counts as cut off by the usage limit, and is resumed.
+- **What it can't do there:** a title from `--name`, a hook, the SDK or the app, or one a resumed conversation carries, until you rename; a fork's start; and a turn that died on another error a login could clear (a failed sign-in, billing, an outage), which isn't resumed.
+
+Where the guard isn't loaded, nothing changes. See [Under Claude Code's built-in guard](../../README.md#under-claude-codes-built-in-guard).
+
 ## Update check
 
 When Claude calls one of this plugin's tools, and the last check is 30 minutes old or there hasn't been one, the plugin checks whether a newer version is published. It fetches this plugin's `plugin.json` from the `main` branch of the repository its installed `plugin.json` names, [`plugins/self-remote-control/.claude-plugin/plugin.json`](https://raw.githubusercontent.com/moefingers/claude-code-self-tools/main/plugins/self-remote-control/.claude-plugin/plugin.json), and compares its `version` with the installed one.

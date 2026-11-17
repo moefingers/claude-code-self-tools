@@ -15,8 +15,16 @@
 // but its resume was the conversation left's: so at that classic SessionStart, while a reload this module
 // armed waits, the resume is dropped, from the module's copy of the record and from $.state if it is still
 // there, and a toast and a note to the model say so. It is never sent into the conversation arrived at.
+//
+// Where Claude Code's built-in guard passes over this plugin's classic hooks (#53: managed settings, or a Team or
+// Enterprise login), no SessionStart says the session moved. There its partner drops the resume instead, and only there
+// (classic.ts): at the session end of the /clear or the /resume (session.end's `reason`), which comes before the queued
+// reload can run. The module's copy loses it at once; the record in $.state after the engine's end step, marked
+// `dropped`, so whichever module reports the reload tells the model why no resume came (the note goes to the
+// conversation arrived at, never the one ending). When the move's wipe came first, the record goes back without it.
 import type { EngineInterface, Register } from 'claude-code'
 import type { Pending, Queued } from '../types'
+import { type ClassicIo, classicSeen, configureClassic, keepClassic, moveBegins } from './classic'
 import { configureUpdateCheck, loadUpdateCheck, withUpdateNotice } from './update-check'
 
 const queued = { plugin: 'self-reload', key: 'queued' } as const
@@ -272,9 +280,45 @@ function dropResume($: EngineInterface, source: 'clear' | 'resume'): Promise<voi
       if ((await $.state.set(pending, withoutResume(held.value), { ifVersion: held.version })).isSet) break
     }
     const move = source === 'clear' ? '/clear' : '/resume'
-    $.ui.toast(`Resume dropped: a ${move} ran before the queued plugin reload, so its resume, which was for the conversation left, isn't sent. The reload still runs.`)
+    $.ui.toast(droppedToast(move))
     await tellModel($, `self-reload: a plugin reload queued before this ${move} still runs, but its resume was dropped: it was for the conversation the ${move} left, not this one.`)
   })
+}
+
+/** What the model is told once the reload reports, when a /clear or a /resume before it dropped its resume (#53). */
+const droppedNote = (source: 'clear' | 'resume'): string => {
+  const move = source === 'clear' ? '/clear' : '/resume'
+  return `self-reload: the plugin reload queued before this ${move} ran, but its resume was dropped: it was for the conversation the ${move} left, not this one.`
+}
+
+/** The toast when a /clear or a /resume runs before the queued reload, whose resume is dropped. */
+const droppedToast = (move: string): string =>
+  `Resume dropped: a ${move} ran before the queued plugin reload, so its resume, which was for the conversation left, isn't sent. The reload still runs.`
+
+/**
+ * #53, the partner of dropResume where no classic SessionStart reaches this plugin: at the session end of a /clear or a
+ * /resume, while a reload this module armed waits with a resume, the module's copy loses it at once, marked `dropped`.
+ * Answers the step that does the same to the record in $.state, after the engine's end step: read fresh, so the
+ * compare-and-set's version is from after it; when the wipe came first, the record goes back without its resume, so
+ * the reload's end still reports, and tells the model. Undefined when the waiting reload has no resume.
+ */
+function dropAtEnd($: EngineInterface, source: 'clear' | 'resume'): (() => Promise<void>) | undefined {
+  const mine = written
+  if (mine === undefined || mine.resume === undefined) return undefined
+  const kept: Pending = { ...withoutResume(mine), dropped: source }
+  written = kept
+  return () =>
+    serial(async () => {
+      for (let tries = 0; tries < 3; tries += 1) {
+        const held = await $.state.get(pending)
+        if (!held.value) {
+          await $.state.set(pending, kept)
+          return
+        }
+        if (held.value.at !== mine.at) return
+        if ((await $.state.set(pending, { ...withoutResume(held.value), dropped: source }, { ifVersion: held.version })).isSet) return
+      }
+    })
 }
 
 /** Runs the reload; then, if this module is still the one running, sends what is pending. */
@@ -289,6 +333,8 @@ async function reloadNow($: EngineInterface): Promise<void> {
   }
   const value = await claim($)
   if (value === undefined) return
+  // #53: a /clear or a /resume before the reload dropped its resume, at the session end; the model hears why now.
+  if (value.dropped !== undefined) await tellModel($, droppedNote(value.dropped))
   if (failed !== undefined) {
     $.ui.toast(`Plugin reload didn't run: ${failed}`)
     if (value.resume !== undefined) await resumeOrNote($, `Plugin reload didn't run (${failed}).`, value)
@@ -315,12 +361,28 @@ async function resumeAfterReload($: EngineInterface): Promise<void> {
     return
   }
   $.ui.toast('Plugins reloaded.')
+  // #53: a /clear or a /resume before the reload dropped its resume, at the session end; the model hears why now.
+  if (value.dropped !== undefined) await tellModel($, droppedNote(value.dropped))
   // Not awaited: a submitted prompt starts its turn only once this start has finished.
   void resumeOrNote($, 'Plugins reloaded.', value)
 }
 
+/** #53: the shared partner code's two keys (classic.ts), in this plugin's own $.state, read and written here by name. */
+const classicRef = { plugin: 'self-reload', key: 'classic' } as const
+const startedRef = { plugin: 'self-reload', key: 'started' } as const
+
+/** #53: this plugin's $.state, as the shared partner code reads and writes it (classic.ts, ClassicIo). */
+function classicIo($: EngineInterface): ClassicIo {
+  return {
+    get: async key => (key === 'classic' ? (await $.state.get(classicRef)).value : (await $.state.get(startedRef)).value),
+    set: (key, value) => (key === 'classic' ? $.state.set(classicRef, value === true) : $.state.set(startedRef, typeof value === 'string' ? value : null)),
+  }
+}
+
 export const register: Register = (on, options) => {
   configureUpdateCheck('self-reload', options)
+  // #53: the classic SessionStart's partner, which acts only where no classic hook reaches this process (classic.ts).
+  configureClassic()
 
   // First, so it is outermost on this plugin's tools: it sees each answer, and adds the update
   // notice when one is due. It never waits on the check; see update-check.ts.
@@ -397,11 +459,26 @@ export const register: Register = (on, options) => {
     }
   })
 
-  // A /clear or a /resume before the queued reload ran: the resume was the conversation's it left, and is dropped.
+  // A /clear or a /resume before the queued reload ran: the resume was the conversation's it left, and is dropped. #53:
+  // first, before anything is awaited, it says classic hooks reach this process, and the partner stands down.
   on('classic.SessionStart', async ($, e, next) => {
+    void classicSeen($, classicIo($), e)
     const done = await next(e)
     if (e.agent_id === undefined && (e.source === 'clear' || e.source === 'resume')) await dropResume($, e.source).catch(() => undefined)
     return done
+  }).catch(($, e, next) => next(e))
+
+  // #53, the partner: where no classic SessionStart reaches this plugin, the session end of a /clear or a /resume drops
+  // the waiting reload's resume (dropAtEnd): the module's copy at once, the record after the engine's end step.
+  on('session.end', async ($, e, next) => {
+    const begun = await moveBegins($, classicIo($), e)
+    const settle = begun === undefined ? undefined : dropAtEnd($, begun.reason)
+    const ended = await next(e)
+    if (begun !== undefined && settle !== undefined) {
+      $.ui.toast(droppedToast(begun.reason === 'clear' ? '/clear' : '/resume'))
+      await settle().catch(() => undefined)
+    }
+    return ended
   }).catch(($, e, next) => next(e))
 
   // A main-loop turn's start: a mark the prompt's own hook couldn't write into the record (see Typed) is written now,
@@ -409,6 +486,8 @@ export const register: Register = (on, options) => {
   on('turn.start', async ($, e, next) => {
     const started = await next(e)
     if (e.agentId === undefined) for (const arm of openArms) if (arm.sure) await syncMark($, arm).catch(() => undefined)
+    // #53: the word that classic hooks reach this process, put back after a /clear's or a /resume's wipe (classic.ts).
+    if (e.agentId === undefined) await keepClassic($, classicIo($))
     return started
   }).catch(($, e, next) => next(e))
 

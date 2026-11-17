@@ -22,6 +22,10 @@ Lets a session set its own prompt bar color once the current turn ends, as `/col
 - **Subagents can't use it.** A subagent that calls the tool is told to finish its piece and return its result; the main session can set the color.
 - **It keeps nothing past the change.** The queued color lives in the plugin's session state for the turn that queued it; the turn's end takes it, and the plugin holds it until it runs or is dropped.
 
+## Under Claude Code's built-in guard
+
+Where Claude Code's built-in guard loads (a machine with managed settings, or a session signed in with `/login` to a Team or Enterprise plan), a plugin you install can't hook Claude Code's classic hook events, so this plugin's `classic.SessionStart` never runs there. Where the guard is loaded, and only there, a `/resume` or `/clear` that runs before the color change still drops it: at the end of the conversation it left. Nothing is missing. Where the guard isn't loaded, nothing changes. See [Under Claude Code's built-in guard](../../README.md#under-claude-codes-built-in-guard).
+
 ## Update check
 
 When Claude calls one of this plugin's tools, and the last check is 30 minutes old or there hasn't been one, the plugin checks whether a newer version is published. It fetches this plugin's `plugin.json` from the `main` branch of the repository its installed `plugin.json` names, [`plugins/self-color/.claude-plugin/plugin.json`](https://raw.githubusercontent.com/moefingers/claude-code-self-tools/main/plugins/self-color/.claude-plugin/plugin.json), and compares its `version` with the installed one.

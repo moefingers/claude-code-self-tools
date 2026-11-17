@@ -24,3 +24,14 @@ export type EnvVerdict = 'OK' | 'AT RISK' | 'BROKEN'
  * when (milliseconds since the epoch), and the failed tools by name only, at most 8.
  */
 export type SelfCheckRecord = { v: 1; at: number; failed: string[] }
+
+/**
+ * The plugin's session state. #53, shared/hooks/classic.ts: `classic`, true once a classic hook reached this process
+ * (Claude Code's built-in guard isn't loaded here); `started`, the conversation whose start this process took up,
+ * so a reload doesn't take it again.
+ */
+declare module 'claude-code' {
+  interface PluginState {
+    'self-check': { classic: boolean | null; started: string | null }
+  }
+}

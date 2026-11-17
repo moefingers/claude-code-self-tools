@@ -8,8 +8,13 @@ export type QueuedWake = { minutes: number; note: string }
  */
 export type Wake = { id: string; dueAt: number; note: string; conversation?: string }
 
+/**
+ * The plugin's session state. #53, shared/hooks/classic.ts: `classic`, true once a classic hook reached this process
+ * (Claude Code's built-in guard isn't loaded here); `started`, the conversation whose start this process took up,
+ * so a reload doesn't take it again.
+ */
 declare module 'claude-code' {
   interface PluginState {
-    'self-wake': { queued: QueuedWake | null; armed: Wake | null }
+    'self-wake': { queued: QueuedWake | null; armed: Wake | null; classic: boolean | null; started: string | null }
   }
 }

@@ -22,8 +22,13 @@ export type Folder = string | null
 /** How many times in a row a new turn has cancelled a queued restart before its run began; a run that begins clears it. */
 export type Cancels = { key: string; count: number }
 
+/**
+ * The plugin's session state. #53, shared/hooks/classic.ts: `classic`, true once a classic hook reached this process
+ * (Claude Code's built-in guard isn't loaded here); `started`, the conversation whose start this process took up,
+ * so a reload doesn't take it again.
+ */
 declare module 'claude-code' {
   interface PluginState {
-    'self-restart': { queued: Queued | null; folder: Folder; cancels: Cancels | null }
+    'self-restart': { queued: Queued | null; folder: Folder; cancels: Cancels | null; classic: boolean | null; started: string | null }
   }
 }

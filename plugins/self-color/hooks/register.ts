@@ -17,10 +17,16 @@
 // Claude Code's own line. A headless /color hands its line back, and only its exact success line
 // counts as set.
 //
+// Where Claude Code's built-in guard passes over this plugin's classic hooks (#53: managed settings, or a Team or
+// Enterprise login), no SessionStart says the session moved. There its partner drops the change instead, and only
+// there (classic.ts): at the session end of the /resume or /clear (session.end's `reason`), which comes inside the
+// command's run, while the change is held.
+//
 // What is queued lives in $.state for one turn: the turn's end takes it and clears it, and from then
 // the module holds it until it runs or is dropped, so nothing here needs to outlive a /clear or a /resume.
 import type { EngineInterface, Register, Timer } from 'claude-code'
 import type { Color, Queued } from '../types'
+import { type ClassicIo, classicSeen, configureClassic, keepClassic, moveBegins } from './classic'
 import { didntRun, oneLine, text, why } from './text'
 import { configureUpdateCheck, loadUpdateCheck, withUpdateNotice } from './update-check'
 
@@ -141,6 +147,16 @@ function settle($: EngineInterface): void {
   })
 }
 
+/** The session moved to another conversation before the waiting change ran: it was for the one left, so it is dropped, and said. */
+function dropWaiting($: EngineInterface): void {
+  if (waiting === undefined) return
+  const { color } = waiting
+  waiting = undefined
+  stopLooking()
+  $.ui.status(undefined)
+  $.ui.toast(droppedToast(color))
+}
+
 /** Holds a waiting change while a /resume or /clear runs, and looks again once it has ended. */
 async function aroundMove<T>($: EngineInterface, run: () => Promise<T>): Promise<T> {
   moving += 1
@@ -152,8 +168,22 @@ async function aroundMove<T>($: EngineInterface, run: () => Promise<T>): Promise
   }
 }
 
+/** #53: the shared partner code's two keys (classic.ts), in this plugin's own $.state, read and written here by name. */
+const classicRef = { plugin: 'self-color', key: 'classic' } as const
+const startedRef = { plugin: 'self-color', key: 'started' } as const
+
+/** #53: this plugin's $.state, as the shared partner code reads and writes it (classic.ts, ClassicIo). */
+function classicIo($: EngineInterface): ClassicIo {
+  return {
+    get: async key => (key === 'classic' ? (await $.state.get(classicRef)).value : (await $.state.get(startedRef)).value),
+    set: (key, value) => (key === 'classic' ? $.state.set(classicRef, value === true) : $.state.set(startedRef, typeof value === 'string' ? value : null)),
+  }
+}
+
 export const register: Register = (on, options) => {
   configureUpdateCheck('self-color', options)
+  // #53: the classic SessionStart's partner, which acts only where no classic hook reaches this process (classic.ts).
+  configureClassic()
 
   // First, so it is outermost on this plugin's tools: it sees each answer, and adds the update
   // notice when one is due. It never waits on the check; see update-check.ts.
@@ -196,6 +226,8 @@ export const register: Register = (on, options) => {
     if (e.agentId === undefined) {
       isTurnRunning = true
       stopLooking()
+      // #53: the word that classic hooks reach this process, put back after a /clear's or a /resume's wipe (classic.ts).
+      void keepClassic($, classicIo($))
     }
     return next(e)
   }).catch(($, e, next) => next(e))
@@ -225,16 +257,20 @@ export const register: Register = (on, options) => {
   on('command.run', { command: 'resume' }, ($, e, next) => aroundMove($, () => next(e))).catch(($, e, next) => next(e))
   on('command.run', { command: 'clear' }, ($, e, next) => aroundMove($, () => next(e))).catch(($, e, next) => next(e))
 
-  // The session moved to another conversation before the change ran: it was for the one left, so it is dropped.
+  // The session moved to another conversation before the change ran: it was for the one left, so it is dropped. #53:
+  // first, before anything is awaited, it says classic hooks reach this process, and the partner stands down.
   on('classic.SessionStart', async ($, e, next) => {
+    void classicSeen($, classicIo($), e)
     const done = await next(e)
-    if (e.agent_id === undefined && (e.source === 'resume' || e.source === 'clear') && waiting !== undefined) {
-      const { color } = waiting
-      waiting = undefined
-      stopLooking()
-      $.ui.status(undefined)
-      $.ui.toast(droppedToast(color))
-    }
+    if (e.agent_id === undefined && (e.source === 'resume' || e.source === 'clear')) dropWaiting($)
     return done
+  }).catch(($, e, next) => next(e))
+
+  // #53, the partner: where no classic SessionStart reaches this plugin, the session end of a /resume or a /clear says
+  // the session is moving to another conversation, and the waiting change is dropped there. It comes inside the
+  // command's run (aroundMove holds the change meanwhile), before the conversation moved to can see it run.
+  on('session.end', async ($, e, next) => {
+    if ((await moveBegins($, classicIo($), e)) !== undefined) dropWaiting($)
+    return next(e)
   }).catch(($, e, next) => next(e))
 }

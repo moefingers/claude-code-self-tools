@@ -32,11 +32,20 @@
 // the limit before it) cut off, on its own: relogin.ts. Both a queued connect and that reconnect
 // run the command only under the Remote Control lock, which the coordinator plugin takes too:
 // rc-lock.ts.
+//
+// Where Claude Code's built-in guard passes over this plugin's classic hooks (#53: managed settings, or a Team or
+// Enterprise login), none of the three reaches it: SessionStart, UserPromptSubmit and StopFailure. Their partners, on
+// the engine's own events, do their work there instead, and only there (classic.ts): a /rename's title, as typed
+// (command.run, and this plugin's own rename); at the session end of a /clear or a /resume, the last turn forgotten; and
+// at a main-loop turn's death on an API error while a rate-limit window of the account reads used up, the error kind
+// `rate_limit`, which a login change may resume. What the guard can't give them: a title set any other way (`--name`, a
+// hook, the app) or carried by a resumed conversation, an error kind other than a used-up window's, and a fork's start.
 import type { EngineInterface, Register } from 'claude-code'
 import type { Held, Queued } from '../types'
 import { read, readNow, runRemoteControl, sessionTitle, why, type Reading } from './connection'
 import { LOCK_HOLD_MS, releaseLock, takeLock } from './rc-lock'
 import { aroundLogin, configureRelogin, forgetTurn, noteFailure, notePersonPrompt, noteServers, noteTurnEnd, noteTurnStart, restoreAfterMove, startWatch } from './relogin'
+import { type ClassicIo, classicRuns, classicSeen, configureClassic, moveBegins } from './classic'
 import { configureUpdateCheck, loadUpdateCheck, withUpdateNotice } from './update-check'
 
 const queued = { plugin: 'self-remote-control', key: 'queued' } as const
@@ -302,6 +311,20 @@ async function queueRename($: EngineInterface, name: string, resume: string | un
   return `${plan}${then(value.resume)}`
 }
 
+/**
+ * #53, StopFailure's partner where no classic hook reaches this plugin: the API error kind a main-loop turn died of,
+ * as far as the engine shows it, `rate_limit` while a rate-limit window of the account reads used up; undefined when
+ * none does, or the windows can't be read (the error stays unknown, so no resume follows it).
+ */
+async function guardedFailure($: EngineInterface): Promise<string | undefined> {
+  try {
+    const { rateLimits } = await $.session.usage()
+    return rateLimits.some(w => typeof w.percentUsed === 'number' && w.percentUsed >= 100) ? 'rate_limit' : undefined
+  } catch {
+    return undefined
+  }
+}
+
 /** At the turn's end: the rename, then the connect if one is queued, then the report. */
 async function runQueued($: EngineInterface, value: Queued, arm: Arm): Promise<void> {
   $.ui.status(undefined)
@@ -318,6 +341,9 @@ async function runQueued($: EngineInterface, value: Queued, arm: Arm): Promise<v
       )
       return
     }
+    // #53: where no UserPromptSubmit reaches this plugin to carry the title, the rename it ran is the title (this
+    // plugin's own command passes none of its own hooks).
+    if (!(await classicRuns($, classicIo($)))) await remember($, { session_title: value.name })
     if (!value.connect) {
       await report($, { toast: `Session renamed "${value.name}".` }, value.resume, arm)
       return
@@ -398,9 +424,23 @@ async function checkConnected($: EngineInterface, name: string | undefined, resu
   )
 }
 
+/** #53: the shared partner code's two keys (classic.ts), in this plugin's own $.state, read and written here by name. */
+const classicRef = { plugin: 'self-remote-control', key: 'classic' } as const
+const startedRef = { plugin: 'self-remote-control', key: 'started' } as const
+
+/** #53: this plugin's $.state, as the shared partner code reads and writes it (classic.ts, ClassicIo). */
+function classicIo($: EngineInterface): ClassicIo {
+  return {
+    get: async key => (key === 'classic' ? (await $.state.get(classicRef)).value : (await $.state.get(startedRef)).value),
+    set: (key, value) => (key === 'classic' ? $.state.set(classicRef, value === true) : $.state.set(startedRef, typeof value === 'string' ? value : null)),
+  }
+}
+
 export const register: Register = (on, options) => {
   configureUpdateCheck('self-remote-control', options)
   configureRelogin(options)
+  // #53: the classic hooks' partners, which act only where no classic hook reaches this process (classic.ts).
+  configureClassic()
 
   // First, so it is outermost on this plugin's tools: it sees each answer, and adds the update
   // notice when one is due. It never waits on the check; see update-check.ts.
@@ -441,7 +481,10 @@ export const register: Register = (on, options) => {
     return started
   })
 
+  // #53: each classic hook says first, before anything is awaited, that classic hooks reach this process, and the
+  // partners stand down (classic.ts).
   on('classic.SessionStart', async ($, e, next) => {
+    void classicSeen($, classicIo($), e)
     const done = await next(e)
     await remember($, e)
     // The conversation it names; at a /clear or a /resume, the login record and the servers seen back from their mirrors.
@@ -459,6 +502,7 @@ export const register: Register = (on, options) => {
   })
 
   on('classic.StopFailure', async ($, e, next) => {
+    void classicSeen($, classicIo($))
     const done = await next(e)
     if (e.agent_id === undefined) await noteFailure($, String(e.error))
     return done
@@ -483,10 +527,28 @@ export const register: Register = (on, options) => {
   on('command.run', { command: 'login' }, ($, e, next) => aroundLogin($, () => next(e))).catch(($, e, next) => next(e))
 
   on('classic.UserPromptSubmit', async ($, e, next) => {
+    void classicSeen($, classicIo($))
     const done = await next(e)
     await remember($, e)
     return done
   })
+
+  // #53, UserPromptSubmit's partner where no classic hook reaches this plugin: a /rename's title, as typed. A /rename
+  // with none (Claude Code names the session itself) leaves the title as it was.
+  on('command.run', { command: 'rename' }, async ($, e, next) => {
+    const done = await next(e)
+    const name = text(e.args)
+    if (name !== undefined && !(await classicRuns($, classicIo($)))) await remember($, { session_title: name })
+    return done
+  }).catch(($, e, next) => next(e))
+
+  // #53, SessionStart's partner where no classic hook reaches this plugin: a /clear or a /resume makes the session
+  // another conversation, whose last turn isn't the one this plugin saw end. After the engine's end step.
+  on('session.end', async ($, e, next) => {
+    const ended = await next(e)
+    if ((await moveBegins($, classicIo($), e)) !== undefined) await forgetTurn($)
+    return ended
+  }).catch(($, e, next) => next(e))
 
   on('tool.call', { tool: 'mcp__self-remote-control__remote_control' }, async ($, e) => {
     if (e.agentId !== undefined) return { deny: SUBAGENT }
@@ -516,6 +578,11 @@ export const register: Register = (on, options) => {
     let isArmed = false
     try {
       const done = await next(e)
+      // #53, StopFailure's partner where no classic hook reaches this plugin: the error kind, as far as the engine shows it.
+      if (e.reason === 'error' && !(await classicRuns($, classicIo($)))) {
+        const kind = await guardedFailure($)
+        if (kind !== undefined) await noteFailure($, kind)
+      }
       await noteTurnEnd($, { reason: e.reason, durationMs: e.durationMs, turnId: e.turnId, ...(e.usage === undefined ? {} : { usage: e.usage }) })
       void noteServers($)
       const { value } = await $.state.get(queued)

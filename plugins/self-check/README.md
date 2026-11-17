@@ -92,6 +92,16 @@ The debug log (`claude --debug`) has a line for each dedupe: the files, their le
   echo '{"probes":["linear=whoami"]}' | claude plugin configure self-check@claude-code-self-tools --values-stdin
   ```
 
+## Under Claude Code's built-in guard
+
+Where Claude Code's built-in guard loads (a machine with managed settings, or a session signed in with `/login` to a Team or Enterprise plan), a plugin you install can't hook Claude Code's classic hook events, so this plugin's `classic.SessionStart` never runs there. Where the guard is loaded, and only there, the plugin does that hook's work on Claude Code's own events instead:
+
+- **The env guard** runs about 5 seconds after the session starts, and again after a `/clear` or a `/resume` inside it.
+- **The quiet check after a resume** runs 10 seconds after that: about 15 seconds after the session starts, or after the `/resume`.
+- **What it can't do there:** the dedupe right after the SessionStart hooks have run (a SessionStart hook that appends later is caught at the next start or check), and the dedupe after a compaction or a fork, which no event the guard lets through names.
+
+Where the guard isn't loaded, nothing changes. See [Under Claude Code's built-in guard](../../README.md#under-claude-codes-built-in-guard).
+
 ## Update check
 
 When Claude calls this plugin's tool, and the last check is 30 minutes old or there hasn't been one, the plugin checks whether a newer version is published. It fetches this plugin's `plugin.json` from the `main` branch of the repository its installed `plugin.json` names, [`plugins/self-check/.claude-plugin/plugin.json`](https://raw.githubusercontent.com/moefingers/claude-code-self-tools/main/plugins/self-check/.claude-plugin/plugin.json), and compares its `version` with the installed one.

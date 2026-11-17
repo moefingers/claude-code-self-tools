@@ -22,6 +22,15 @@ Lets a session reload its own plugins once the current turn ends, as `/reload-pl
 - **An interrupted turn cancels it**, with a notice.
 - **Subagents can't use it.** A subagent that calls the tool is told to finish its piece and say a reload is needed.
 
+## Under Claude Code's built-in guard
+
+Where Claude Code's built-in guard loads (a machine with managed settings, or a session signed in with `/login` to a Team or Enterprise plan), a plugin you install can't hook Claude Code's classic hook events, so this plugin's `classic.SessionStart` never runs there. Where the guard is loaded, and only there, the plugin does that hook's work on Claude Code's own events instead:
+
+- **A `/clear` or a `/resume` before the queued reload** still drops its resume, at the end of the conversation it was for, and the toast says so. The reload still runs.
+- **What it can't do there:** the note telling Claude why no resume came arrives with the reload's report, rather than at once; and when Claude Code empties the plugin's session state after the drop, the reload reports nothing (the toast has said it).
+
+Where the guard isn't loaded, nothing changes. See [Under Claude Code's built-in guard](../../README.md#under-claude-codes-built-in-guard).
+
 ## Update check
 
 When Claude calls one of this plugin's tools, and the last check is 30 minutes old or there hasn't been one, the plugin checks whether a newer version is published. It fetches this plugin's `plugin.json` from the `main` branch of the repository its installed `plugin.json` names, [`plugins/self-reload/.claude-plugin/plugin.json`](https://raw.githubusercontent.com/moefingers/claude-code-self-tools/main/plugins/self-reload/.claude-plugin/plugin.json), and compares its `version` with the installed one.

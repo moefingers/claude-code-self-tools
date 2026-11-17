@@ -185,6 +185,11 @@ export type Resumes = {
   personAt?: number
 }
 
+/**
+ * The plugin's session state. #53, shared/hooks/classic.ts: `classic`, true once a classic hook reached this process
+ * (Claude Code's built-in guard isn't loaded here); `started`, the conversation whose start this process took up,
+ * so a reload doesn't take it again.
+ */
 declare module 'claude-code' {
   interface PluginState {
     'self-remote-control': {
@@ -196,6 +201,8 @@ declare module 'claude-code' {
       rcLock: MemoryLock | null
       servers: Servers | null
       resumeClaims: string[] | null
+      classic: boolean | null
+      started: string | null
     }
   }
 }

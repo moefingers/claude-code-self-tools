@@ -35,6 +35,15 @@
 // lands after the copy was built, so it takes effect when the copy is dropped again: the shell
 // tool's directory moving, or the next start.
 //
+// Where Claude Code's built-in guard passes over this plugin's classic hooks (#53: managed settings, or a Team or
+// Enterprise login), no SessionStart reaches it. Its partner does that hook's work there instead, and only there
+// (classic.ts): at the process's start, 5 seconds after session.start unless a classic hook arrives first, the env
+// guard, and in a conversation that already has prompts (a resume), the quiet check RESUME_MS later; at an in-process
+// /clear or /resume, from session.end and the first read of `$.session.id()` as another conversation, the env guard,
+// and at a /resume the quiet check. What the guard can't give it: the moment right after the SessionStart hooks
+// beneath have run (the partner's dedupe comes at its own time, so a hook that appends later is caught at the next
+// start or check), and a compaction's or a fork's start, which no engine event names.
+//
 // Each check writes one record, %LOCALAPPDATA%\claude-self-tools\selfcheck\<conversation>.json:
 // `{ v: 1, at, failed }`, the failed tools by name only, which the coordinator's lane report carries.
 // Besides that record, the plugin writes only the deduped env files and their backups (.orig, once; .bak).
@@ -44,6 +53,7 @@ import { dedupeFolder, envFolder, outcomeLine, readEnv, refusedFiles, rewritten 
 import type { DedupeOutcome, EnvReading } from './env-guard'
 import { DEDUPE_OVER, dedupe, GIT_BASH_LIMIT, grouped, roomPhrase, verdictOf } from './env-rules'
 import { isSafeFolder, oneLine, quoted, selfcheckPath, selfcheckRecord, stateFolder, within } from './machine'
+import { type ClassicIo, classicSeen, configureClassic, keepClassic, type Move, moveBegins, startPartner, startSource } from './classic'
 import { configureUpdateCheck, loadUpdateCheck, withUpdateNotice } from './update-check'
 
 const TOOL = 'mcp__self-check__tools_check'
@@ -498,8 +508,52 @@ async function atIdle($: EngineInterface, id: string, retry = false): Promise<vo
   }
 }
 
+/**
+ * The conversations whose quiet check at resume the partner scheduled (#53): the classic SessionStart of the same
+ * resume, arriving after it, schedules none, so the check runs once.
+ */
+const partnerChecked = new Set<string>()
+
+/**
+ * #53: the classic SessionStart's work at this process's start, where no classic hook reached the plugin within
+ * START_GRACE_MS of session.start (classic.ts, startPartner): the env guard, and in a conversation that already has
+ * prompts (`--resume`, `--continue`), the quiet check RESUME_MS later.
+ */
+async function guardedStart($: EngineInterface, id: string): Promise<void> {
+  if (envDedupe) await guardAtStart($, id)
+  if (!checkAtResume || (await startSource($)) !== 'resume') return
+  partnerChecked.add(id)
+  $.clock.after(RESUME_MS, () => void atIdle($, id))
+}
+
+/**
+ * #53: the classic SessionStart's work at an in-process /clear or /resume, where none reached the plugin (classic.ts,
+ * moveLook): the env guard, and at a /resume the quiet check RESUME_MS later, for the conversation moved to.
+ */
+async function moved($: EngineInterface, move: Move): Promise<void> {
+  if (envDedupe) await guardAtStart($, move.to)
+  if (move.reason !== 'resume' || !checkAtResume) return
+  partnerChecked.add(move.to)
+  $.clock.after(RESUME_MS, () => void atIdle($, move.to))
+}
+
+/** #53: the shared partner code's two keys (classic.ts), in this plugin's own $.state, read and written here by name. */
+const classicRef = { plugin: 'self-check', key: 'classic' } as const
+const startedRef = { plugin: 'self-check', key: 'started' } as const
+
+/** #53: this plugin's $.state, as the shared partner code reads and writes it (classic.ts, ClassicIo). */
+function classicIo($: EngineInterface): ClassicIo {
+  return {
+    get: async key => (key === 'classic' ? (await $.state.get(classicRef)).value : (await $.state.get(startedRef)).value),
+    set: (key, value) => (key === 'classic' ? $.state.set(classicRef, value === true) : $.state.set(startedRef, typeof value === 'string' ? value : null)),
+  }
+}
+
 export const register: Register = (on, options) => {
   configureUpdateCheck('self-check', options)
+  // #53: the classic SessionStart's partners, which act only where no classic hook reaches this process (classic.ts).
+  configureClassic()
+  partnerChecked.clear()
   checkAtResume = options.checkAtResume !== 'off'
   envDedupe = options.envDedupe !== 'off'
   damaged.clear()
@@ -518,8 +572,20 @@ export const register: Register = (on, options) => {
       isDeferred: false,
     })
     loadUpdateCheck($)
+    // #53: where the classic SessionStart doesn't reach this plugin, its partner takes this process's start up. Not
+    // awaited: it waits START_GRACE_MS for a classic hook first.
+    void startPartner($, classicIo($), id => guardedStart($, id))
     return started
   })
+
+  // #53: a /clear or a /resume, where no classic SessionStart will name the conversation it moves to: looked for from
+  // here (moveLook), and taken up as that SessionStart would take it (moved). After the engine's end step, never
+  // holding it.
+  on('session.end', async ($, e, next) => {
+    const ended = await next(e)
+    await moveBegins($, classicIo($), e, move => moved($, move))
+    return ended
+  }).catch(($, e, next) => next(e))
 
   on('tool.call', { tool: TOOL }, async ($, e) => {
     if (e.agentId !== undefined) return { deny: SUBAGENT }
@@ -533,12 +599,16 @@ export const register: Register = (on, options) => {
   // session's first Bash call reads what it leaves; then, at a resume, the quiet check 10 s later. It
   // answers with what the chain beneath answered, always: a failure here passes the start through
   // unchanged.
+  // #53: first, before anything is awaited, it says classic hooks reach this process, and the partners stand down; a
+  // quiet check its partner already scheduled for this resume (it came after the partner's grace) isn't scheduled again.
   on('classic.SessionStart', async ($, e, next) => {
+    void classicSeen($, classicIo($), e)
     const done = await next(e)
     if (e.agent_id !== undefined) return done
     if (envDedupe) await guardAtStart($, typeof e.session_id === 'string' ? e.session_id : await sessionId($))
     if (e.source !== 'resume' || !checkAtResume) return done
     const id = e.session_id
+    if (partnerChecked.delete(id)) return done
     $.clock.after(RESUME_MS, () => void atIdle($, id))
     return done
   }).catch(($, e, next) => next(e))
@@ -546,6 +616,8 @@ export const register: Register = (on, options) => {
   on('turn.start', async ($, e, next) => {
     const started = await next(e)
     if (e.agentId === undefined) inTurn = true
+    // #53: the word that classic hooks reach this process, put back after a /clear's or a /resume's wipe (classic.ts).
+    if (e.agentId === undefined) await keepClassic($, classicIo($))
     return started
   })
 
