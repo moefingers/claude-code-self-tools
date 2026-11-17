@@ -2,7 +2,7 @@
 // from fixtures; /resume and /exit are recorded, never run. Nothing here starts a process.
 import { describe, expect, mock, test } from 'claude-code/testing'
 import { go } from '../hooks/go'
-import type { AgentStatus, On } from 'claude-code'
+import type { AgentInfo, AgentStatus, On } from 'claude-code'
 import { claimPath, gatePath, goAnswer, GO_NOTHING, GO_VIA, launchScriptText, placementPath, type LaunchInput, leftPath, MAX_UNTRACKED, paneNoLeft, panePath, paneTicketPath, quoted, SLOT_NOT_RECOGNISED, SLOT_SCRIPT_SHA256, slotRecordPath, STDIN_BOOTSTRAP, wakeMarker, wakePath } from '../hooks/machine'
 import { decode, ELSEWHERE, elsewhere, entry, ft, inSlot, LAUNCH, leftExit, machine, NOW, OTHER, PERMISSION_FLAGS, PROJECT, type RawProbe, REPO, T, under, W, X } from './fixtures'
 
@@ -119,6 +119,26 @@ type Options = {
   /** What the left record's script answers, in place of writing one: its output, its error output and its exit code. */
   leftOut?: { stdout: string; stderr: string; exitCode: number }
 }
+
+/**
+ * An agent as `$.agent.list()` answers it (AgentInfo, Claude Code 2.1.326): a subagent with the test's
+ * description and status; its task's status by the engine's rule (`waiting` is a subagent whose turn
+ * ended, `idle` a teammate between turns); zeros for its start and readings. The plugin reads its
+ * status, description, type and id alone.
+ */
+const listed = (a: { description: string; status: AgentStatus }, i: number): AgentInfo => ({
+  id: `a${i}`,
+  type: 'general-purpose',
+  ...a,
+  kind: 'local_agent',
+  taskStatus: a.status === 'waiting' ? 'completed' : a.status === 'idle' ? 'running' : a.status,
+  label: a.description,
+  startTime: 0,
+  cwd: '/',
+  tokenCount: 0,
+  tokenSamples: [0],
+  hasRow: false,
+})
 
 /** The engine beneath the plugin; and what it was asked to run, write and say. */
 function engine(
@@ -250,7 +270,7 @@ function engine(
     if ((e as { to?: string }).to !== 'debug') screen.push(String(e.text))
     return answer({ value: undefined })
   })
-  on('agent.list', () => answer({ value: world.agents.map((a, i) => ({ id: `a${i}`, type: 'general-purpose', ...a })) }))
+  on('agent.list', () => answer({ value: world.agents.map(listed) }))
   on('classic.SessionStart', () => ({}))
   on('prompt.submit', (_, e) => {
     prompts.push({ text: e.text, origin: e.origin })

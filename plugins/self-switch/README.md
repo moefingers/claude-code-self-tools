@@ -113,7 +113,7 @@ What the slot does:
 - `updateCheck` (`on`): see [Update check](#update-check).
 - `requireCoordinator` (`off`): `on` refuses every switch in a session the coordinator hasn't written a gate file for.
 - `configDirs` (none): other Claude Code config folders on this machine (another `CLAUDE_CONFIG_DIR`), whose registries and transcripts the liveness check also reads. This session's own is always read.
-- `heavySlotRoot` (empty): the folder holding a `heavy-slot.sh`'s `.gate-lock` and `.gate-lock-2` slots, if you use one. A slot whose job runs under this session (by the Windows pid the slot records in `winpid`) holds the switch; a `heavy-slot.sh` job under it holds it either way.
+- `heavySlotRoot` (empty): the folder holding a `heavy-slot.sh`'s slots (`.gate-lock`, `.gate-lock-2`, `.gate-lock-3` and `.gate-lock-4`; each is read whatever its `.gate-cap` says), if you use one. A slot whose job runs under this session (by the Windows pid the slot records in `winpid`) holds the switch; a `heavy-slot.sh` job under it holds it either way.
 
 Set them in `/config`, or from your shell, for example:
 
