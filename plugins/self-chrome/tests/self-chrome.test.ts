@@ -6,11 +6,13 @@ import {
   chooseProfile,
   flagChoice,
   hasSwitch,
-  isHeld,
+  isStaleLock,
   judge,
+  LOGIN_ENV_CS,
   MAC_CHROME,
   macBundle,
   macChromeFault,
+  macLockPath,
   macOpenArgv,
   macStandard,
   missingProfile,
@@ -19,14 +21,14 @@ import {
   pgrepArgv,
   profileCandidates,
   psArgv,
-  readMark,
   reconnectsWithin,
   silentSetting,
-  START_MARK_MS,
+  START_LOCK_MS,
   switchValue,
   windowsChromeFault,
   windowsLaunchArgs,
   windowsLookScript,
+  windowsReleaseScript,
   windowsStartScript,
 } from '../hooks/chrome'
 
@@ -64,7 +66,9 @@ type World = {
   /** The look's `start`: the chrome.exe that is there to start (null: none is). */
   start?: string | null
   /** What the start's run does. */
-  startRun?: 'launched' | 'no-pid' | 'running' | 'fails' | 'hangs'
+  startRun?: 'launched' | 'no-pid' | 'running' | 'fails' | 'hangs' | 'held' | 'mismatch'
+  /** macOS's lock folder: there, made by another start now (`held`), or long ago (`stale`). */
+  macLock?: 'held' | 'stale'
   /** The id the start's run says it launched. */
   launchedPid?: number
   /** What macOS's open does. */
@@ -105,8 +109,9 @@ function engine(on: On, world: World = {}) {
   const prompts: string[] = []
   const toasts: string[] = []
   const described: string[] = []
-  /** Whether the start's mark stood in the store when each start ran. */
-  const markedAtStart: boolean[] = []
+  /** The Windows release scripts run, and the macOS lock folder: there or not. */
+  const releases: string[] = []
+  let macLockThere = world.macLock !== undefined
   const store = new Map<string, unknown>(Object.entries(world.store ?? {}))
   const profiles = world.profiles ?? ['Default', 'Profile 3']
   const clock = mock.clock(on, { now: NOW })
@@ -150,6 +155,8 @@ function engine(on: On, world: World = {}) {
   })
   // The standard install is there, and each profile folder's Preferences. Matched by the tail: a host on Windows may
   // spell a POSIX path its own way.
+  // The macOS lock folder's age: just made by another start, or long ago.
+  on('fs.stat', () => ({ value: { kind: 'dir' as const, size: 0, mtimeMs: world.macLock === 'stale' ? NOW - START_LOCK_MS - 1 : NOW, isLink: false } }))
   on('fs.exists', (_, e) => {
     const path = e.path.replace(/\\/g, '/')
     if (/\/Google Chrome\.app\/Contents\/MacOS\/Google Chrome$/.test(path)) return { value: true }
@@ -171,15 +178,20 @@ function engine(on: On, world: World = {}) {
       scripts.push(script)
       if (script.includes('[System.Diagnostics.Process]::Start(')) {
         starts.push(script)
-        markedAtStart.push(store.has('starting'))
         const after = world.after ?? [{ pid: 4321, cmd: `"${CHROME}" ${argumentsOf(script)}` }]
         const run = world.startRun ?? 'launched'
         if (run === 'fails') return failed('Exception calling "Start" with "1" argument(s): "The system cannot find the file specified"')
+        if (run === 'held') return ok('{"v":1,"held":true}\r\n')
+        if (run === 'mismatch') return ok('{"v":1,"mismatch":true}\r\n')
         running = after
         if (run === 'hangs') return { deny: 'the command was still running after 30000 ms' }
         if (run === 'running') return ok(`${JSON.stringify({ v: 1, running: after[0]?.pid ?? 1 })}\r\n`)
         if (run === 'no-pid') return ok('{"v":1,"started":null}\r\n')
         return ok(`{"v":1,"started":${world.launchedPid ?? 4321}}\r\n`)
+      }
+      if (/^Free-Lock\r?$/m.test(script)) {
+        releases.push(script)
+        return ok('')
       }
       if (world.look === 'fails') return failed('Get-CimInstance : Access denied')
       if (world.look === 'garbled') return ok('not json\r\n')
@@ -196,8 +208,17 @@ function engine(on: On, world: World = {}) {
       const asked = (argv.at(-1) ?? '').split(',').map(Number)
       return ok(running.filter(p => asked.includes(p.pid)).map(p => `${String(p.pid).padStart(5)} ${p.cmd}`).join('\n'))
     }
+    if (argv[0] === '/bin/mkdir') {
+      if (argv[1] === '-p') return ok('')
+      if (macLockThere) return failed(`mkdir: ${argv[1]}: File exists`)
+      macLockThere = true
+      return ok('')
+    }
+    if (argv[0] === '/bin/rmdir') {
+      macLockThere = false
+      return ok('')
+    }
     if (argv[0] === '/usr/bin/open') {
-      markedAtStart.push(store.has('starting'))
       if (world.open === 'fails') return failed('LSOpenURLsWithRole() failed with error -10810', 1)
       running = world.after ?? [{ pid: 4321, cmd: [MAC_CHROME, ...argv.slice(argv.indexOf('--args') + 1)].join(' ') }]
       if (world.open === 'hangs') return { deny: 'the command was still running after 10000 ms' }
@@ -216,7 +237,7 @@ function engine(on: On, world: World = {}) {
     commands.push(`${e.command} ${e.args}`)
     return {}
   })
-  return { scripts, starts, argvs, reads, lists, commands, prompts, toasts, described, markedAtStart, store, clock, session }
+  return { scripts, starts, releases, argvs, reads, lists, commands, prompts, toasts, described, store, clock, session, macLock: () => macLockThere }
 }
 
 /** The call's result, as text; it must not be refused. */
@@ -250,7 +271,7 @@ test('the flag: auto follows CLAUDE_CHROME_SILENT_DEBUGGER (1, true or on), and 
 })
 
 test('not running, opted in by the variable, no profile named: Chrome starts with the flag and no --profile-directory, and the reconnect runs once the turn ends', async ($, on) => {
-  const { starts, argvs, scripts, reads, commands, markedAtStart, store, clock } = engine(on, { env: { CLAUDE_CHROME_SILENT_DEBUGGER: '1' } })
+  const { starts, releases, argvs, scripts, reads, commands, clock } = engine(on, { env: { CLAUDE_CHROME_SILENT_DEBUGGER: '1' } })
   await $.session.start(START)
   const said = await ensure($)
   expect(said).toMatch(/^Chrome: not running\.$/m)
@@ -261,14 +282,17 @@ test('not running, opted in by the variable, no profile named: Chrome starts wit
   // The start: one short launch, then a look of its own; no --profile-directory, so Chrome picks its own last profile.
   expect(starts).toHaveLength(1)
   expect(argumentsOf(starts[0] ?? '')).toBe(`--restore-last-session ${FLAG}`)
-  expect(scripts.at(-1)).toContain('Start-Sleep -Milliseconds 700')
+  expect(scripts.at(-2)).toContain('Start-Sleep -Milliseconds 700')
   // Windows PowerShell by its known path, the script on standard input; nothing of Local State read.
   expect(argvs[0]?.[0]).toBe('C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe')
   expect(reads.filter(path => /Local State/.test(path))).toEqual([])
   expect(killsAnything(scripts, argvs)).toBe(false)
-  // The start's mark stood while it ran, and was taken back after.
-  expect(markedAtStart).toEqual([true])
-  expect(store.has('starting')).toBe(false)
+  // The start's lock is let go after the wait, under the start's own claim.
+  const claim = /^\$claim = '([0-9a-f-]{36})'\r?$/m.exec(starts[0] ?? '')?.[1]
+  expect(claim).toBeDefined()
+  expect(releases).toHaveLength(1)
+  expect(releases[0]).toContain(`$claim = '${claim}'`)
+  expect(scripts.at(-1)).toBe(releases[0])
 
   expect(commands).toEqual([])
   await $.turn.complete(ANSWERED)
@@ -524,9 +548,10 @@ test('started, but no browser process within 20 s: it says so after its looks, a
   await $.session.start(START)
   const said = await ensure($)
   expect(said).toMatch(/Did: asked Chrome to start, with .+, but no browser process of it showed within 20 s\./)
-  // The first look, the start, then 20 looks of its own, each after a pause: never one long run.
-  expect(scripts).toHaveLength(22)
-  expect(scripts.slice(2).every(s => s.includes('Start-Sleep -Milliseconds 700') && !s.includes('Process]::Start('))).toBe(true)
+  // The first look, the start, then 20 looks of its own, each after a pause: never one long run; then the release.
+  expect(scripts).toHaveLength(23)
+  expect(scripts.slice(2, 22).every(s => s.includes('Start-Sleep -Milliseconds 700') && !s.includes('Process]::Start('))).toBe(true)
+  expect(scripts[22]).toMatch(/^Free-Lock\r?$/m)
   await $.turn.complete(ANSWERED)
   await clock.advance(1000)
   expect(commands).toEqual(['mcp reconnect claude-in-chrome'])
@@ -560,47 +585,57 @@ test('a start that fails says why, after one look, and queues no reconnect', asy
   expect(said).toMatch(/^Did: tried to start Chrome, but the start exited 1: Exception calling "Start" with "1" argument\(s\): "The system cannot find the file specified"\.$/m)
   expect(said).toMatch(/^Left for the person: start Chrome by hand\.$/m)
   expect(said).toMatch(/^Reconnect: not queued/m)
-  expect(scripts).toHaveLength(3)
+  // The look, the start, one look, and the release.
+  expect(scripts).toHaveLength(4)
 })
 
 test('a Chrome that came up between the look and the start is never started again', async ($, on) => {
-  const { starts } = engine(on, { startRun: 'running', after: [{ pid: 808, cmd: `"${CHROME}" ${FLAG}` }] })
+  const { starts, releases } = engine(on, { startRun: 'running', after: [{ pid: 808, cmd: `"${CHROME}" ${FLAG}` }] })
   await $.session.start(START)
   const said = await ensure($)
   expect(said).toMatch(/^Did: nothing: Chrome came up just before the start \(another session's start, or the person's\), PID 808, with the flag\.$/m)
   expect(starts).toHaveLength(1)
+  // The start's own script let its lock go.
+  expect(releases).toEqual([])
 })
 
-test("another session's start in flight: this call launches nothing, waits for it, and says what it found", async ($, on) => {
-  const { starts, store } = engine(on, {
-    store: { starting: { until: NOW + 30_000, by: 'another-call' } },
-    appear: { after: 2, procs: [{ pid: 515, cmd: `"${CHROME}" --restore-last-session` }] },
-  })
+test("another session's start holding the lock: this call launches nothing, waits for it, and says what it found", async ($, on) => {
+  const { starts, releases } = engine(on, { startRun: 'held', after: [], appear: { after: 2, procs: [{ pid: 515, cmd: `"${CHROME}" --restore-last-session` }] } })
   await $.session.start(START)
   const said = await ensure($)
   expect(said).toMatch(/^Did: nothing: another session was starting Chrome, which runs as PID 515, without the flag\.$/m)
-  expect(starts).toEqual([])
-  // Its mark is the other call's to take back.
-  expect(store.get('starting')).toEqual({ until: NOW + 30_000, by: 'another-call' })
+  // Its start script found the lock held, and launched nothing; the lock is the other start's to let go.
+  expect(starts).toHaveLength(1)
+  expect(releases).toEqual([])
 })
 
 test("another session's start that shows no browser: this call says so, and asks to call again later", async ($, on) => {
-  const { starts } = engine(on, { store: { starting: { until: NOW + 30_000, by: 'another-call' } } })
+  engine(on, { startRun: 'held', after: [] })
   await $.session.start(START)
-  const said = await ensure($)
-  expect(said).toMatch(/^Did: nothing: another session is starting Chrome, and no browser process of it showed within 20 s\.$/m)
-  expect(starts).toEqual([])
+  expect(await ensure($)).toMatch(/^Did: nothing: another session is starting Chrome, and no browser process of it showed within 20 s\.$/m)
 })
 
-test('a mark past its time, or one further ahead than a start takes, holds nothing', async ($, on) => {
-  expect(isHeld(readMark({ until: NOW - 1, by: 'x' }), NOW)).toBe(false)
-  expect(isHeld(readMark({ until: NOW + START_MARK_MS + 1, by: 'x' }), NOW)).toBe(false)
-  expect(isHeld(readMark({ until: NOW + 1, by: 'x' }), NOW)).toBe(true)
-  expect(readMark({ until: 'soon' })).toBeUndefined()
-  const { starts } = engine(on, { store: { starting: { until: NOW - 1, by: 'gone' } } })
+test("an environment that isn't the login's exactly launches nothing, and the answer names no variable", async ($, on) => {
+  const { scripts, releases, commands, clock } = engine(on, { startRun: 'mismatch', after: [] })
   await $.session.start(START)
-  await ensure($)
-  expect(starts).toHaveLength(1)
+  const said = await ensure($)
+  expect(said).toMatch(/^Did: tried to start Chrome, but the environment it would have started Chrome with wasn't the login environment exactly, so it launched nothing \(it never hands Chrome the session's\)\.$/m)
+  expect(said).toMatch(/^Reconnect: not queued/m)
+  // No look after it: nothing was launched, for sure; the start's own script let its lock go.
+  expect(scripts).toHaveLength(2)
+  expect(releases).toEqual([])
+  await $.turn.complete(ANSWERED)
+  await clock.advance(1000)
+  expect(commands).toEqual([])
+})
+
+test('a lock is stale once older than a start can take', () => {
+  expect(START_LOCK_MS).toBeGreaterThanOrEqual(30_000 + 20_000 + 30_000)
+  expect(isStaleLock(NOW - START_LOCK_MS - 1, NOW)).toBe(true)
+  expect(isStaleLock(NOW - START_LOCK_MS, NOW)).toBe(false)
+  expect(isStaleLock(NOW, NOW)).toBe(false)
+  expect(macLockPath(HOME)).toBe(`${HOME}/Library/Caches/claude-self-tools/chrome-start.lock`)
+  expect(macLockPath(undefined)).toBeUndefined()
 })
 
 test("Chrome not installed at its standard paths: nothing started, and the setting that fixes it named", async ($, on) => {
@@ -855,15 +890,19 @@ test("macOS argument building: open -a with the .app, the arguments after --args
 })
 
 test('macOS, not running: a last look, then open with the flag and no profile named, and the wait finds it', async ($, on) => {
-  const { argvs, commands, markedAtStart, clock } = engine(on, { platform: 'macos', env: { CLAUDE_CHROME_SILENT_DEBUGGER: '1' } })
+  const { argvs, commands, clock, macLock } = engine(on, { platform: 'macos', env: { CLAUDE_CHROME_SILENT_DEBUGGER: '1' } })
   await $.session.start(START)
   const said = await ensure($)
   expect(said).toContain(`Did: started Chrome, with no profile folder named (Chrome opens the profile it used last), --restore-last-session and ${FLAG}. It runs as PID 4321, and the flag took.`)
   expect(argvs.find(a => a[0] === '/usr/bin/open')).toEqual(['/usr/bin/open', '-a', '/Applications/Google Chrome.app', '--args', '--restore-last-session', FLAG])
-  // This user's uid; the first look; the last look right before open; open; then a sleep and a look until it shows.
-  expect(argvs.map(a => a[0])).toEqual(['/usr/bin/id', '/usr/bin/pgrep', '/usr/bin/pgrep', '/usr/bin/open', '/bin/sleep', '/usr/bin/pgrep', '/bin/ps'])
+  // This user's uid; the first look; the lock (its folder's parent, then the folder); the last look right before
+  // open; open; then a sleep and a look until it shows; then the lock let go.
+  expect(argvs.map(a => a[0])).toEqual(['/usr/bin/id', '/usr/bin/pgrep', '/bin/mkdir', '/bin/mkdir', '/usr/bin/pgrep', '/usr/bin/open', '/bin/sleep', '/usr/bin/pgrep', '/bin/ps', '/bin/rmdir'])
+  const lock = `${HOME}/Library/Caches/claude-self-tools/chrome-start.lock`
+  expect(argvs.filter(a => a[0] === '/bin/mkdir')).toEqual([['/bin/mkdir', '-p', `${HOME}/Library/Caches/claude-self-tools`], ['/bin/mkdir', lock]])
+  expect(argvs.find(a => a[0] === '/bin/rmdir')).toEqual(['/bin/rmdir', lock])
+  expect(macLock()).toBe(false)
   expect(argvs.filter(a => a[0] === '/usr/bin/pgrep').every(a => a[1] === '-U' && a[2] === '501')).toBe(true)
-  expect(markedAtStart).toEqual([true])
   expect(killsAnything([], argvs)).toBe(false)
   await $.turn.complete(ANSWERED)
   await clock.advance(1000)
@@ -909,6 +948,23 @@ test('macOS, running without the flag while opted in: it says so, and never quit
   expect(killsAnything([], argvs)).toBe(false)
 })
 
+test("macOS, another start holding the lock: open never runs, and this call waits for what that start makes", async ($, on) => {
+  const { argvs, macLock } = engine(on, { platform: 'macos', macLock: 'held', after: [], appear: { after: 2, procs: [{ pid: 515, cmd: `${MAC_CHROME} --restore-last-session` }] } })
+  await $.session.start(START)
+  expect(await ensure($)).toMatch(/^Did: nothing: another session was starting Chrome, which runs as PID 515, without the flag\.$/m)
+  expect(argvs.some(a => a[0] === '/usr/bin/open')).toBe(false)
+  expect(argvs.some(a => a[0] === '/bin/rmdir')).toBe(false)
+  expect(macLock()).toBe(true)
+})
+
+test('macOS, a lock older than a start can take is taken over', async ($, on) => {
+  const { argvs } = engine(on, { platform: 'macos', macLock: 'stale' })
+  await $.session.start(START)
+  expect(await ensure($)).toMatch(/^Did: started Chrome/m)
+  // mkdir fails on the old lock; it is removed and made again; open runs; the lock is let go after the wait.
+  expect(argvs.map(a => a[0]).filter(c => c === '/bin/mkdir' || c === '/bin/rmdir' || c === '/usr/bin/open')).toEqual(['/bin/mkdir', '/bin/mkdir', '/bin/rmdir', '/bin/mkdir', '/usr/bin/open', '/bin/rmdir'])
+})
+
 // ---------------------------------------------------------------------------------------------
 // Windows' scripts.
 
@@ -929,44 +985,67 @@ test("Windows' look: fixed text around checked inputs, this login's processes on
   expect(windowsChromeFault('chrome.exe')).toBeDefined()
 })
 
-test("Windows' start: a last look, then the login environment in place of every variable of the session's, then the launch in Chrome's own folder; short, and nothing quit", () => {
-  const start = windowsStartScript(CHROME, windowsLaunchArgs('Profile 3', true))
+test("Windows' start: Add-Type and the login read first; then the lock; then the last look, the swap, the check and the launch, back to back; short, and nothing quit", () => {
+  const CLAIM = '6b0e1c2a-3d4f-4a5b-9c6d-7e8f9a0b1c2d'
+  const start = windowsStartScript(CHROME, windowsLaunchArgs('Profile 3', true), CLAIM)
   expect(argumentsOf(start)).toBe(`--profile-directory="Profile 3" --restore-last-session ${FLAG}`)
   const at = (needle: string) => {
     const i = start.indexOf(needle)
     expect(i).toBeGreaterThan(-1)
     return i
   }
+  const compile = at("Add-Type -ErrorAction Stop -TypeDefinition '")
+  const loginRead = at('$login = [SelfChromeLoginEnv]::Login()')
+  const take = at('$taken = Take-Lock')
+  const held = at(`if (-not $taken) { [Console]::Out.WriteLine('{"v":1,"held":true}'); return }`)
   const lastLook = at('foreach ($p in (Read-Browsers))')
-  const running = at('running = [long]$p')
-  const loginRead = at('$login = [SelfChromeLoginEnv]::Read()')
-  const cleared = at("foreach ($name in @([Environment]::GetEnvironmentVariables('Process').Keys)) { [Environment]::SetEnvironmentVariable([string]$name, $null, 'Process') }")
-  const loginSet = at("foreach ($pair in $login)")
+  const swap = at('[SelfChromeLoginEnv]::Swap($login)')
+  const check = at('if (-not [SelfChromeLoginEnv]::Same($login)) { Free-Lock;')
   const launch = at('$started = [System.Diagnostics.Process]::Start($launch)')
-  // The last look comes first; every variable of the process is emptied, and only the login's set, before the launch.
-  expect(lastLook < running && running < loginRead && loginRead < cleared && cleared < loginSet && loginSet < launch).toBe(true)
-  // The login environment is Windows' own for this user's token, never inheriting the session's.
-  expect(start).toContain('CreateEnvironmentBlock(out block, token, false)')
-  // Nothing of the session's is named, kept or passed: no variable is set but from the login environment.
-  expect(start.match(/SetEnvironmentVariable\(/g)).toHaveLength(2)
+  // N3: what takes time first; then the lock; then the last look, the swap, the check and the launch, in that order.
+  expect(compile < loginRead && loginRead < take && take < held && held < lastLook && lastLook < swap && swap < check && check < launch).toBe(true)
+  // Between the last look and the launch: no cmdlet, no pipeline, no compile.
+  expect(start.slice(swap)).not.toMatch(/Add-Type|Get-CimInstance|ConvertTo-Json|Start-Process|New-Object|Write-Output|\|/)
+  // N1: the swap and the check are Windows' own calls, in C#: no variable is set through .NET or PowerShell, so no
+  // host can leave a session variable in place.
+  expect(start).not.toMatch(/\[Environment\]::SetEnvironmentVariable|\$env:[A-Za-z]+ = (?!@\()/)
+  expect(LOGIN_ENV_CS).toContain('SetEnvironmentVariableW(name, null)')
+  expect(LOGIN_ENV_CS).toContain('GetEnvironmentStringsW()')
+  expect(LOGIN_ENV_CS).toContain('CreateEnvironmentBlock(out block, token, false)')
+  expect(LOGIN_ENV_CS).not.toContain("'")
+  // Nothing of the session's is named in the script, but its own module path in the preamble, which the swap clears.
   expect(start).not.toMatch(/CLAUDE/)
-  // The one variable the script sets by name is its own module path, in the preamble, which the emptying then clears.
   expect(start.match(/\$env:/g)).toEqual(['$env:'])
-  expect(start.indexOf('$env:PSModulePath = ')).toBeLessThan(cleared)
-  // After the environment is emptied, .NET calls only: no cmdlet to look up, no pipeline.
-  const after = start.slice(cleared)
-  expect(after).not.toMatch(/ConvertTo-Json|Start-Process|New-Object|Write-Output|\|/)
+  expect(start.indexOf('$env:PSModulePath = ')).toBeLessThan(swap)
+  // N2: the lock, one file per user beside the self tools' own, made with an exclusive create, taken over when stale.
+  expect(start).toContain(String.raw`$lockDir = [Environment]::GetFolderPath('LocalApplicationData').TrimEnd([char]92) + '\claude-self-tools'`)
+  expect(start).toContain(String.raw`$lock = $lockDir + '\chrome-start.lock'`)
+  expect(start).toContain('[IO.FileMode]::CreateNew')
+  expect(start).toContain(`-gt ${START_LOCK_MS}) { try { [IO.File]::Delete($lock) } catch { }; $taken = Take-Lock }`)
+  expect(start).toContain(`$claim = '${CLAIM}'`)
+  // A last look that finds Chrome, and a refused check, each let the lock go before they answer.
+  expect(start).toMatch(/Free-Lock; \[Console\]::Out\.WriteLine\('\{"v":1,"running":'/)
+  expect(start).toMatch(/Free-Lock; \[Console\]::Out\.WriteLine\('\{"v":1,"mismatch":true\}'\)/)
   // ShellExecute, in Chrome's own folder, never -UseNewEnvironment or -NoNewWindow, which hand Chrome this script's pipes.
   expect(start).toContain('$launch.UseShellExecute = $true')
   expect(start).toContain('$launch.WorkingDirectory = [IO.Path]::GetDirectoryName($chrome)')
   expect(start).not.toMatch(/UseNewEnvironment|NoNewWindow|Start-Sleep -Milliseconds 500/)
   expect(windowsLaunchArgs(undefined, false)).toEqual(['--restore-last-session'])
-  expect(() => windowsStartScript(CHROME, ['--profile-directory="a"; calc"'])).toThrow()
-  expect(() => windowsStartScript('C:\\Windows\\notepad.exe', [])).toThrow()
+  expect(() => windowsStartScript(CHROME, ['--profile-directory="a"; calc"'], CLAIM)).toThrow()
+  expect(() => windowsStartScript('C:\\Windows\\notepad.exe', [], CLAIM)).toThrow()
+  expect(() => windowsStartScript(CHROME, [], "x'; Remove-Item C:\\; '")).toThrow()
   expect(killsAnything([start], [])).toBe(false)
+  // The release: the lock deleted only when it names this claim.
+  const release = windowsReleaseScript(CLAIM)
+  expect(release).toContain(`$claim = '${CLAIM}'`)
+  expect(release).toContain(`if ([IO.File]::ReadAllText($lock).Contains('"by":"' + $claim + '"')) { [IO.File]::Delete($lock) }`)
+  expect(release).toMatch(/^Free-Lock\r?$/m)
+  expect(() => windowsReleaseScript('not-a-claim')).toThrow()
   expect(parseWindowsStart('{"v":1,"started":4321}\r\n')).toEqual({ kind: 'launched', pid: 4321 })
   expect(parseWindowsStart('{"v":1,"started":null}')).toEqual({ kind: 'launched' })
   expect(parseWindowsStart('{"v":1,"running":12}')).toEqual({ kind: 'running', pid: 12 })
+  expect(parseWindowsStart('{"v":1,"held":true}')).toEqual({ kind: 'held' })
+  expect(parseWindowsStart('{"v":1,"mismatch":true}')).toEqual({ kind: 'mismatch' })
   expect(typeof parseWindowsStart('nothing')).toBe('string')
 })
 

@@ -2,6 +2,13 @@
 
 Each entry names a plugin and its version, as `version` in `plugins/<name>/.claude-plugin/plugin.json` has it.
 
+## 2026-11-17: self-chrome 0.1.2: review round 2 (#54)
+
+- **The swap to the login environment is Windows' own calls, then checked.** It runs in the C# helper: every variable of the process is deleted (`SetEnvironmentVariableW` with no value, over `GetEnvironmentStringsW`), then the login block's are set. Under PowerShell 7, setting a variable to null through .NET had left every session name in place; Windows PowerShell 5.1, which the plugin runs, deleted them. Right before the launch, the start checks that the environment is the login block exactly. When it isn't, it launches nothing, and says so without naming any variable. Shown under both shells, up to the launch and never past it.
+- **The start's lock is a file made with an exclusive create.** It is `%LOCALAPPDATA%\claude-self-tools\chrome-start.lock` on Windows, made in the start's own script. On macOS it is a folder, `~/Library/Caches/claude-self-tools/chrome-start.lock`, made with `mkdir`. There is one per user, whatever Claude Code config folder a session runs under, in place of the mark in the plugin's store. Of two starts at once, only one makes it; the other launches nothing, waits, and says what the first start came to. The start lets it go once its wait is over, and only its own (Windows: the file names the start's own UUID). One older than 90 s, more than a start, its wait and a look can take, is taken over.
+- **What takes time comes first.** On Windows, Add-Type's compile and the login environment's read come before the lock. The last look, the swap, the check and the launch then run back to back, with no cmdlet between them.
+- **Tests:** the start script's order; the swap and the check in C#, with no variable set through .NET or PowerShell; the lock (held, taken over when stale, let go by its own start only, never by a start that found Chrome running or refused); and an environment that isn't the login's launching nothing.
+
 ## 2026-11-17: self-chrome 0.1.1: review round 1 (#54)
 
 - **A named profile must be one of Chrome's profile folders.** The call's `profile`, or the `profile` setting, must name a folder of exactly that name in Chrome's user data folder, with its `Preferences` file. Given any other name, Chrome would make a new, empty profile without Claude in Chrome. So the start is refused, and the answer lists the profile folders that are there, by directory name only, never the name given.

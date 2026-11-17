@@ -9,8 +9,9 @@
 // 2. Starts Chrome when it isn't running, detached: the profile folder when the call or the setting names one (and it
 //    is one of Chrome's), else none, so Chrome opens the profile it used last; --restore-last-session; and the flag
 //    when the person opted in (the silentDebugger setting, or CLAUDE_CHROME_SILENT_DEBUGGER while it is auto). The
-//    launch is short and returns at once; looks of their own then wait up to 20 s for the browser process. A mark in
-//    the plugin's store, which every session on the machine reads, keeps two sessions from starting Chrome at once.
+//    launch is short and returns at once; looks of their own then wait up to 20 s for the browser process. A lock
+//    made with an exclusive create, one per user whatever the config folder, keeps two sessions from starting Chrome
+//    at once (chrome.ts: windowsStartScript; macLockPath).
 // 3. Never quits, kills or restarts Chrome: that closes every session's tabs and tab groups. A Chrome running without
 //    the flag the person opted in to is said, with how the person fixes it.
 // 4. Queues `/mcp reconnect claude-in-chrome` for when the turn ends, as self-mcp does, whenever Chrome runs, at most
@@ -25,16 +26,18 @@ import {
   chooseProfile,
   type FlagChoice,
   flagChoice,
-  isHeld,
+  isStaleLock,
   isProfileName,
   isRunning,
   judge,
   type Look,
   macChromeFault,
+  macLockPath,
   macOpenArgv,
   macStandard,
   macUserData,
   missingProfile,
+  MKDIR,
   parsePids,
   parsePs,
   parseWindowsLook,
@@ -44,22 +47,21 @@ import {
   type Platform,
   profileCandidates,
   psArgv,
-  readMark,
   type Reconnect,
   reconnectsWithin,
+  RMDIR,
   SERVER,
   type SilentSetting,
   silentSetting,
   SLEEP,
   type Start,
   START_LOOKS,
-  START_MARK_MS,
   START_WAIT_S,
-  type StartMark,
   type StartProfile,
   windowsChromeFault,
   windowsLaunchArgs,
   windowsLookScript,
+  windowsReleaseScript,
   windowsStartScript,
 } from './chrome'
 import { oneLine, plainOutput, powershellCall, powershellPath, SYSTEM_ROOT } from './machine'
@@ -68,9 +70,6 @@ import { configureUpdateCheck, loadUpdateCheck, withUpdateNotice } from './updat
 const TOOL = 'mcp__self-chrome__chrome_ensure'
 const queued = { plugin: 'self-chrome', key: 'queued' } as const
 const reconnects = { plugin: 'self-chrome', key: 'reconnects' } as const
-
-/** The store key of a start in flight, which every session on the machine reads. */
-const START_MARK = 'starting'
 
 /** How long a look's script may take on Windows: Get-CimInstance can be slow on a loaded machine. */
 const LOOK_MS = 30_000
@@ -237,8 +236,21 @@ async function now($: EngineInterface): Promise<number> {
 // ---------------------------------------------------------------------------------------------
 // The machine: a look, and a start, on Windows or macOS.
 
-/** What a start's run came to. `unknown`: its answer didn't come (a timeout), so it may have launched: the looks tell. */
-type StartRun = { readonly kind: 'launched'; readonly pid?: number } | { readonly kind: 'running' } | { readonly kind: 'failed'; readonly why: string } | { readonly kind: 'unknown'; readonly why: string }
+/**
+ * What a start's run came to. `unknown`: its answer didn't come (a timeout), so it may have launched: the looks tell.
+ * `held`: another start holds the lock, so nothing was launched. `refused`: nothing was launched, for sure.
+ */
+type StartRun =
+  | { readonly kind: 'launched'; readonly pid?: number }
+  | { readonly kind: 'running' }
+  | { readonly kind: 'held' }
+  | { readonly kind: 'refused'; readonly why: string }
+  | { readonly kind: 'failed'; readonly why: string }
+  | { readonly kind: 'unknown'; readonly why: string }
+
+/** Why the Windows start launched nothing when the environment wasn't the login's exactly. Names no variable, nor any value. */
+const MISMATCH =
+  "the environment it would have started Chrome with wasn't the login environment exactly, so it launched nothing (it never hands Chrome the session's)"
 
 /** Chrome on this machine, as its first look found it, and how to look again and to start it. */
 type Machine = {
@@ -251,7 +263,10 @@ type Machine = {
   readonly first: readonly ChromeProcess[]
   /** Another look, after a short pause when `pause`; a string says why it failed. */
   look(pause: boolean): Promise<ChromeProcess[] | string>
-  start(profile: string | undefined, flag: boolean): Promise<StartRun>
+  /** The start, under the lock, named by `claim`: a fresh UUID. */
+  start(profile: string | undefined, flag: boolean, claim: string): Promise<StartRun>
+  /** Lets the start's lock go, when it is still `claim`'s own. Never throws. */
+  release(claim: string): Promise<void>
 }
 
 /** One fixed script in Windows PowerShell, by its known path: its output; or why it failed (`exited`), or never answered (`threw`). */
@@ -294,15 +309,19 @@ async function windowsMachine($: EngineInterface): Promise<Machine | string> {
       const read = parseWindowsLook(again.stdout)
       return typeof read === 'string' ? read : [...read.procs]
     },
-    async start(profile, flag) {
-      if (binary === undefined) return { kind: 'failed', why: 'no chrome.exe is there to start' }
-      const run = await powershell($, exe, windowsStartScript(binary, windowsLaunchArgs(profile, flag)), START_MS)
+    async start(profile, flag, claim) {
+      if (binary === undefined) return { kind: 'refused', why: 'no chrome.exe is there to start' }
+      const run = await powershell($, exe, windowsStartScript(binary, windowsLaunchArgs(profile, flag), claim), START_MS)
       if ('threw' in run) return { kind: 'unknown', why: `the start ${run.threw}` }
       if ('exited' in run) return { kind: 'failed', why: `the start ${run.exited}` }
       const said = parseWindowsStart(run.stdout)
       if (typeof said === 'string') return { kind: 'unknown', why: said }
-      if (said.kind === 'running') return { kind: 'running' }
+      if (said.kind === 'running' || said.kind === 'held') return { kind: said.kind }
+      if (said.kind === 'mismatch') return { kind: 'refused', why: MISMATCH }
       return said.pid === undefined ? { kind: 'launched' } : { kind: 'launched', pid: said.pid }
+    },
+    async release(claim) {
+      await powershell($, exe, windowsReleaseScript(claim), LOOK_MS)
     },
   }
 }
@@ -342,6 +361,21 @@ async function macMachine($: EngineInterface): Promise<Machine | string> {
   if (fault !== undefined) return `the chromePath setting ${fault}; set it to that binary, or empty it for the standard install`
   const paths = chromePathSetting === '' ? macStandard(home) : [chromePathSetting]
   const userData = macUserData(home)
+  const lock = macLockPath(home)
+  /** When this call made the lock, by its clock; undefined while it holds none. */
+  let heldAt: number | undefined
+  /** Lets the lock go: only one this call made, and only while it can't have been taken over (within START_LOCK_MS). */
+  const releaseLock = async (): Promise<void> => {
+    if (lock === undefined || heldAt === undefined) return
+    const made = heldAt
+    heldAt = undefined
+    if (isStaleLock(made, await now($))) return
+    try {
+      await $.process.run([RMDIR, lock], { timeoutMs: MAC_MS })
+    } catch {
+      // It is taken over once older than START_LOCK_MS.
+    }
+  }
   const uid = await uidOf($)
   const first = await lookMac($, paths, uid)
   if (typeof first === 'string') return first
@@ -372,10 +406,18 @@ async function macMachine($: EngineInterface): Promise<Machine | string> {
       return lookMac($, paths, uid)
     },
     async start(profile, flag) {
-      if (binary === undefined) return { kind: 'failed', why: 'no Chrome binary is there to start' }
+      if (binary === undefined) return { kind: 'refused', why: 'no Chrome binary is there to start' }
+      // The lock: a folder, which mkdir makes or finds there, atomically.
+      if (lock !== undefined) {
+        heldAt = await takeMacLock($, lock)
+        if (heldAt === undefined) return { kind: 'held' }
+      }
       // The last look, right before the launch: a Chrome that came up since is never started again.
       const last = await lookMac($, paths, uid)
-      if (typeof last !== 'string' && judge(last, { platform: 'macos', paths, userData }).browsers.length > 0) return { kind: 'running' }
+      if (typeof last !== 'string' && judge(last, { platform: 'macos', paths, userData }).browsers.length > 0) {
+        await releaseLock()
+        return { kind: 'running' }
+      }
       try {
         const opened = await $.process.run(macOpenArgv(binary, profile, flag), { timeoutMs: MAC_MS })
         return opened.exitCode === 0 ? { kind: 'launched' } : { kind: 'failed', why: `open exited ${opened.exitCode}${errSaid(opened.stderr)}` }
@@ -383,11 +425,45 @@ async function macMachine($: EngineInterface): Promise<Machine | string> {
         return { kind: 'unknown', why: `open didn't answer (${why(err)})` }
       }
     },
+    release: releaseLock,
   }
 }
 
+/**
+ * The macOS lock taken: mkdir of the lock folder, which fails when it is there; one older than START_LOCK_MS is taken
+ * over (removed, and made again). When this call made it, by this call's clock; undefined when another start holds it.
+ */
+async function takeMacLock($: EngineInterface, lock: string): Promise<number | undefined> {
+  const make = async (): Promise<boolean> => {
+    try {
+      return (await $.process.run([MKDIR, lock], { timeoutMs: MAC_MS })).exitCode === 0
+    } catch {
+      return false
+    }
+  }
+  try {
+    await $.process.run([MKDIR, '-p', lock.slice(0, lock.lastIndexOf('/'))], { timeoutMs: MAC_MS })
+  } catch {
+    // mkdir of the lock says what is wrong.
+  }
+  if (await make()) return now($)
+  let mtimeMs: number | undefined
+  try {
+    mtimeMs = (await $.fs.stat(lock)).mtimeMs
+  } catch {
+    // Gone meanwhile: made again below, or held by whoever made it.
+  }
+  if (mtimeMs !== undefined && !isStaleLock(mtimeMs, await now($))) return undefined
+  try {
+    await $.process.run([RMDIR, lock], { timeoutMs: MAC_MS })
+  } catch {
+    // The make below says whether it went.
+  }
+  return (await make()) ? now($) : undefined
+}
+
 // ---------------------------------------------------------------------------------------------
-// The profile, the start's mark, the start and its wait.
+// The profile, the start and its wait.
 
 /**
  * Why a named profile isn't one to start: Chrome's user data folder unknown, or no folder of that exact name with its
@@ -415,36 +491,6 @@ async function profileMissing($: EngineInterface, m: Machine, name: string, sour
     for (const candidate of profileCandidates(entries)) if (await isThere($, folder(candidate))) folders.push(candidate)
   }
   return missingProfile(source, folders)
-}
-
-/** This call's hold on the start: its mark; another call's mark found; or none, the store unreadable. */
-type Claim = { readonly kind: 'mine'; readonly mark: StartMark } | { readonly kind: 'other' } | { readonly kind: 'unmarked' }
-
-/**
- * The start's mark in the plugin's store, which every session on the machine reads: a call that finds another's still
- * held only looks, and never launches. Written, then read back, so of two calls that write at once, only the one
- * whose mark stands launches. A store that can't be read leaves the start unmarked, as before the mark.
- */
-async function claimStart($: EngineInterface): Promise<Claim> {
-  try {
-    const at = await now($)
-    if (isHeld(readMark(await $.store.get(START_MARK)), at)) return { kind: 'other' }
-    const mark: StartMark = { until: at + START_MARK_MS, by: crypto.randomUUID() }
-    await $.store.set(START_MARK, mark)
-    return readMark(await $.store.get(START_MARK))?.by === mark.by ? { kind: 'mine', mark } : { kind: 'other' }
-  } catch {
-    return { kind: 'unmarked' }
-  }
-}
-
-/** Takes this call's mark back, when it still stands. */
-async function releaseStart($: EngineInterface, claim: Claim): Promise<void> {
-  if (claim.kind !== 'mine') return
-  try {
-    if (readMark(await $.store.get(START_MARK))?.by === claim.mark.by) await $.store.delete(START_MARK)
-  } catch {
-    // It holds other starts off until START_MARK_MS has passed, and no longer.
-  }
 }
 
 /** Looks, each in a run of its own after a short pause, until the person's Chrome shows, START_WAIT_S pass, or `looks` are made. */
@@ -490,17 +536,20 @@ async function ensureChrome($: EngineInterface, platform: Platform, flag: FlagCh
     if (missing !== undefined) return { look: found, start: { kind: 'refused', ...missing } }
   }
   const profile: StartProfile = choice.profile === undefined ? { profile: undefined } : { profile: choice.profile, source: choice.source }
-  const claim = await claimStart($)
-  if (claim.kind === 'other') {
+  const claim = crypto.randomUUID()
+  const run = await m.start(profile.profile, flag.on, claim)
+  // Held by another start: this call launched nothing, and looks for what that start makes.
+  if (run.kind === 'held') {
     const shown = await waitForBrowser($, m, START_LOOKS)
     return { look: found, start: { kind: 'waited', ...(shown === undefined ? {} : { browser: shown }) } }
   }
+  if (run.kind === 'refused') return { look: found, start: { kind: 'failed', why: run.why } }
+  // Found running by the start's last look, which let the lock go itself.
+  if (run.kind === 'running') {
+    const shown = await waitForBrowser($, m, 1)
+    return { look: found, start: { kind: 'late', ...(shown === undefined ? {} : { browser: shown }) } }
+  }
   try {
-    const run = await m.start(profile.profile, flag.on)
-    if (run.kind === 'running') {
-      const shown = await waitForBrowser($, m, 1)
-      return { look: found, start: { kind: 'late', ...(shown === undefined ? {} : { browser: shown }) } }
-    }
     // A start that said it failed gets one look, in case it launched before it failed; any other, the whole wait.
     const shown = await waitForBrowser($, m, run.kind === 'failed' ? 1 : START_LOOKS)
     if (run.kind === 'failed' && shown === undefined) return { look: found, start: { kind: 'failed', why: run.why } }
@@ -516,7 +565,8 @@ async function ensureChrome($: EngineInterface, platform: Platform, flag: FlagCh
       },
     }
   } finally {
-    await releaseStart($, claim)
+    // The lock is let go once the wait is over, so the next start needn't wait out its age.
+    await m.release(claim)
   }
 }
 

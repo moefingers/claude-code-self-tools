@@ -11,6 +11,7 @@
 // - When a call or the setting names a profile folder: whether that folder, with its Preferences file, is in Chrome's
 //   user data folder; and, when it isn't, the names of the folders there that are (directory names only).
 // It reads nothing of Local State, and prints profile folder names only, never a path, an account or a command line.
+// It writes only the start's lock, which names a fresh UUID and when, and lets it go after the start's wait.
 //
 // What it never does: quit, kill or restart Chrome (that closes every session's tabs and tab groups), open a profile in
 // a Chrome that runs, sign in, or type anything into Chrome.
@@ -37,8 +38,11 @@ export const RECONNECT_CAP = 3
 /** The window RECONNECT_CAP counts in. */
 export const RECONNECT_WINDOW_MS = 10 * 60 * 1000
 
-/** How long a start's mark in the plugin's store, which every session on the machine reads, holds other starts off. */
-export const START_MARK_MS = 60_000
+/**
+ * How long a start's lock holds other starts off, at most: the start's own run (30 s), its wait (START_WAIT_S) and one
+ * more look (30 s), with room to spare. A lock older than this is taken over: its start ended without letting it go.
+ */
+export const START_LOCK_MS = 90_000
 
 /** The operating systems the plugin looks after Chrome on. */
 export type Platform = 'windows' | 'macos'
@@ -276,20 +280,27 @@ export function reconnectsWithin(times: unknown, now: number): { readonly kept: 
 }
 
 // ---------------------------------------------------------------------------------------------
-// The start's mark, which keeps two sessions from starting Chrome at once.
+// The start's lock, which keeps two sessions from starting Chrome at once. It is one file (Windows) or folder (macOS)
+// per user, outside every Claude Code config folder, so sessions under any of them share it. Made with an exclusive
+// create, so of two starts at once one makes it and the other finds it held; taken over once older than
+// START_LOCK_MS; let go by the start that made it, and only by that one.
 
-/** A start in flight: until when, and by which call. */
-export type StartMark = { readonly until: number; readonly by: string }
+/** A start's own claim on the lock: a fresh UUID, which the Windows lock file names. */
+export const START_CLAIM = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
 
-/** A stored mark, checked; undefined when there is none, or it isn't one. */
-export function readMark(raw: unknown): StartMark | undefined {
-  if (typeof raw !== 'object' || raw === null) return undefined
-  const { until, by } = raw as { until?: unknown; by?: unknown }
-  return typeof until === 'number' && typeof by === 'string' && by !== '' ? { until, by } : undefined
-}
+/** The lock's name, beside the self tools' other files. */
+export const LOCK_NAME = 'chrome-start.lock'
 
-/** Whether `mark` still holds other starts off at `now`. A mark further ahead than START_MARK_MS is bad, and holds nothing. */
-export const isHeld = (mark: StartMark | undefined, now: number): mark is StartMark => mark !== undefined && mark.until > now && mark.until <= now + START_MARK_MS
+/** The macOS lock, a folder (mkdir is atomic), under the home folder's caches; undefined without a home folder. */
+export const macLockPath = (home: string | undefined): string | undefined =>
+  isHome(home) ? `${home.replace(/\/+$/, '')}/Library/Caches/claude-self-tools/${LOCK_NAME}` : undefined
+
+/** macOS's mkdir and rmdir, by their known paths: mkdir of the lock fails when it is there, which is what makes it a lock. */
+export const MKDIR = '/bin/mkdir'
+export const RMDIR = '/bin/rmdir'
+
+/** Whether a lock last written at `mtimeMs` is stale at `now`: older than START_LOCK_MS. */
+export const isStaleLock = (mtimeMs: number, now: number): boolean => now - mtimeMs > START_LOCK_MS
 
 // ---------------------------------------------------------------------------------------------
 // Starting Chrome: the arguments, macOS's argv, Windows' scripts.
@@ -426,55 +437,126 @@ export function windowsLookScript(configured: string | undefined, pauseMs = 0): 
 }
 
 /**
- * The login environment, as Windows builds it for a process the person starts: CreateEnvironmentBlock for this
- * process's own token, without inheriting this process's environment. That is the machine's and the user's
- * Environment keys in the registry (HKLM and HKCU), the volatile ones, and the system's own variables (SystemRoot,
- * USERPROFILE, ProgramFiles and the rest), with nothing of the Claude Code session.
+ * The login environment, and the swap to it, in C#: the swap is Windows' own calls, so it is the same under every
+ * PowerShell and .NET (under PowerShell 7, setting a variable to null through .NET left its name in place).
+ * - `Login()`: the environment Windows builds for a process the person starts, CreateEnvironmentBlock for this
+ *   process's own token, not inheriting this process's environment: the machine's and the user's Environment keys in
+ *   the registry (HKLM and HKCU), the volatile ones, and the system's own variables (SystemRoot, USERPROFILE,
+ *   ProgramFiles and the rest), with nothing of the Claude Code session.
+ * - `Swap(login)`: every variable of this process deleted (SetEnvironmentVariableW with no value, over
+ *   GetEnvironmentStringsW, the hidden drive-folder entries included), then each of the login's set.
+ * - `Same(login)`: whether this process's environment, as Windows holds it, is the login's exactly. The start
+ *   launches nothing when it isn't.
+ * No single quote in it: it goes to Add-Type inside a single-quoted PowerShell string.
  */
-const LOGIN_ENV = [
-  "Add-Type -ErrorAction Stop -TypeDefinition 'using System; using System.Collections.Generic; using System.ComponentModel; using System.Runtime.InteropServices; public static class SelfChromeLoginEnv { [DllImport(\"advapi32.dll\", SetLastError = true)] static extern bool OpenProcessToken(IntPtr process, uint access, out IntPtr token); [DllImport(\"kernel32.dll\")] static extern IntPtr GetCurrentProcess(); [DllImport(\"kernel32.dll\", SetLastError = true)] static extern bool CloseHandle(IntPtr handle); [DllImport(\"userenv.dll\", SetLastError = true)] static extern bool CreateEnvironmentBlock(out IntPtr block, IntPtr token, bool inherit); [DllImport(\"userenv.dll\", SetLastError = true)] static extern bool DestroyEnvironmentBlock(IntPtr block); public static string[] Read() { IntPtr token; if (!OpenProcessToken(GetCurrentProcess(), 0x000E, out token)) throw new Win32Exception(); try { IntPtr block; if (!CreateEnvironmentBlock(out block, token, false)) throw new Win32Exception(); try { List<string> pairs = new List<string>(); IntPtr at = block; while (true) { string pair = Marshal.PtrToStringUni(at); if (String.IsNullOrEmpty(pair)) break; pairs.Add(pair); at = new IntPtr(at.ToInt64() + (pair.Length + 1) * 2); } return pairs.ToArray(); } finally { DestroyEnvironmentBlock(block); } } finally { CloseHandle(token); } } }'",
+export const LOGIN_ENV_CS = [
+  'using System; using System.Collections.Generic; using System.ComponentModel; using System.Runtime.InteropServices;',
+  'public static class SelfChromeLoginEnv {',
+  '[DllImport("advapi32.dll", SetLastError = true)] static extern bool OpenProcessToken(IntPtr process, uint access, out IntPtr token);',
+  '[DllImport("kernel32.dll")] static extern IntPtr GetCurrentProcess();',
+  '[DllImport("kernel32.dll", SetLastError = true)] static extern bool CloseHandle(IntPtr handle);',
+  '[DllImport("userenv.dll", SetLastError = true)] static extern bool CreateEnvironmentBlock(out IntPtr block, IntPtr token, bool inherit);',
+  '[DllImport("userenv.dll", SetLastError = true)] static extern bool DestroyEnvironmentBlock(IntPtr block);',
+  '[DllImport("kernel32.dll", SetLastError = true)] static extern IntPtr GetEnvironmentStringsW();',
+  '[DllImport("kernel32.dll")] static extern bool FreeEnvironmentStringsW(IntPtr block);',
+  '[DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)] static extern bool SetEnvironmentVariableW(string name, string value);',
+  'static string[] Pairs(IntPtr block) { List<string> pairs = new List<string>(); IntPtr at = block; while (true) { string pair = Marshal.PtrToStringUni(at); if (String.IsNullOrEmpty(pair)) break; pairs.Add(pair); at = new IntPtr(at.ToInt64() + (pair.Length + 1) * 2); } return pairs.ToArray(); }',
+  'static string NameOf(string pair) { int at = pair.IndexOf("=", 1, StringComparison.Ordinal); return at > 0 ? pair.Substring(0, at) : null; }',
+  'public static string[] Login() { IntPtr token; if (!OpenProcessToken(GetCurrentProcess(), 0x000E, out token)) throw new Win32Exception(); try { IntPtr block; if (!CreateEnvironmentBlock(out block, token, false)) throw new Win32Exception(); try { return Pairs(block); } finally { DestroyEnvironmentBlock(block); } } finally { CloseHandle(token); } }',
+  'public static string[] Current() { IntPtr block = GetEnvironmentStringsW(); if (block == IntPtr.Zero) throw new Win32Exception(); try { return Pairs(block); } finally { FreeEnvironmentStringsW(block); } }',
+  'public static void Swap(string[] login) { foreach (string pair in Current()) { string name = NameOf(pair); if (name != null) SetEnvironmentVariableW(name, null); } foreach (string pair in login) { string name = NameOf(pair); if (name != null && !SetEnvironmentVariableW(name, pair.Substring(name.Length + 1))) throw new Win32Exception(); } }',
+  'public static bool Same(string[] login) { string[] now = Current(); string[] want = (string[])login.Clone(); if (now.Length != want.Length) return false; Array.Sort(now, StringComparer.Ordinal); Array.Sort(want, StringComparer.Ordinal); for (int i = 0; i < now.Length; i++) { if (!String.Equals(now[i], want[i], StringComparison.Ordinal)) return false; } return true; }',
+  '}',
+].join(' ')
+
+/** The start's lock, as the start script and the release script name it: one file per user, beside the self tools' own. */
+const LOCK_PATH = [
+  String.raw`$lockDir = [Environment]::GetFolderPath('LocalApplicationData').TrimEnd([char]92) + '\claude-self-tools'`,
+  `$lock = $lockDir + '\\${LOCK_NAME}'`,
+]
+
+/** Free-Lock: deletes the lock when it is this start's own (it names `$claim`), and only then. */
+const FREE_LOCK = [
+  'function Free-Lock {',
+  `  try { if ([IO.File]::ReadAllText($lock).Contains('"by":"' + $claim + '"')) { [IO.File]::Delete($lock) } } catch { }`,
+  '}',
+]
+
+/**
+ * Take-Lock: the lock made with an exclusive create, naming `$claim` and when; false when another start's is there.
+ * Any other failure (the folder can't be written) stops the script.
+ */
+const TAKE_LOCK = [
+  'function Take-Lock {',
+  '  try { $file = [IO.File]::Open($lock, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None) } catch { if ([IO.File]::Exists($lock)) { return $false }; throw }',
+  `  try { $bytes = [Text.Encoding]::UTF8.GetBytes('{"by":"' + $claim + '","at":' + [string][DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() + '}'); $file.Write($bytes, 0, $bytes.Length) } finally { $file.Dispose() }`,
+  '  return $true',
+  '}',
 ]
 
 /**
  * The start on Windows, short: it returns once Chrome is launched, with the launched process's id, and never waits
- * for the browser (the plugin's own looks do that, each in a run of its own).
- * - A last look first: a Chrome of `chrome` on the default user data folder that came up since the plugin's look is
- *   never started again (`{ v, running }`).
- * - Then this process's environment is emptied and set to the login environment (LOGIN_ENV), so Chrome, and every
- *   process Chrome starts for as long as it runs, gets the person's environment and none of the session's.
- * - Then Chrome by `chrome` (a path the look found), with `args` (windowsLaunchArgs), through ShellExecute (the call
- *   Start-Process -PassThru makes, made directly, so no cmdlet is looked up once the environment is the login one, and
- *   neither path is read as a wildcard), in Chrome's own folder, never the session's, which Chrome would hold for its
- *   whole life. ShellExecute hands Chrome none of this script's pipes. `{ v, started }`, the id, or null when Windows
- *   names no process.
+ * for the browser (the plugin's own looks do that, each in a run of its own). In order:
+ * 1. What takes time, first: Add-Type's compile (LOGIN_ENV_CS) and the login environment's read.
+ * 2. The lock, %LOCALAPPDATA%\claude-self-tools\chrome-start.lock, one per user whatever the config folder: made with
+ *    an exclusive create and naming `claim`; taken over once older than START_LOCK_MS; held by another start, nothing
+ *    is launched (`{ v, held }`).
+ * 3. Then back to back: a last look, so a Chrome of `chrome` on the default user data folder that came up since the
+ *    plugin's look is never started again (`{ v, running }`); the swap to the login environment; the check that the
+ *    environment is the login's exactly, else nothing is launched (`{ v, mismatch }`); and the launch.
+ * The launch: Chrome by `chrome` (a path the look found), with `args` (windowsLaunchArgs), through ShellExecute (the
+ * call Start-Process -PassThru makes, made directly, so no cmdlet is looked up once the environment is the login one,
+ * and neither path is read as a wildcard), in Chrome's own folder, never the session's, which Chrome would hold for its
+ * whole life. ShellExecute hands Chrome none of this script's pipes, and the login environment, so Chrome and every
+ * process it starts for as long as it runs get the person's environment and none of the session's. `{ v, started }`,
+ * the id, or null when Windows names no process. The lock stays for the plugin's wait, and the release script lets it
+ * go; a start that found Chrome running, or refused, lets it go itself.
  * It quits, kills and restarts nothing.
  */
-export function windowsStartScript(chrome: string, args: readonly string[]): string {
+export function windowsStartScript(chrome: string, args: readonly string[], claim: string): string {
   if (windowsChromeFault(chrome) !== undefined) throw new Error(`Chrome's path ${windowsChromeFault(chrome)}`)
   if (args.some(arg => !/^--[a-z-]+(?:="[A-Za-z0-9 _-]{1,64}")?$/.test(arg))) throw new Error("a start takes only switches, and a profile folder's name")
+  if (!START_CLAIM.test(claim)) throw new Error("a start's claim is a UUID")
+  if (LOGIN_ENV_CS.includes("'")) throw new Error('the login environment helper holds a single quote')
   return [
     ...PREAMBLE,
     ...READ_BROWSERS,
+    // 1. What takes time.
+    `Add-Type -ErrorAction Stop -TypeDefinition '${LOGIN_ENV_CS}'`,
+    '$login = [SelfChromeLoginEnv]::Login()',
     `$chrome = ${literal(chrome)}`,
     `$arguments = ${literal(args.join(' '))}`,
-    // The last look, right before the launch.
-    'foreach ($p in (Read-Browsers)) {',
-    "  $exe = if (\"$($p['exe'])\" -ne '') { \"$($p['exe'])\" } elseif (\"$($p['cmd'])\" -match '^\\s*\"([^\"]*)\"') { $Matches[1] } else { '' }",
-    "  if ($exe -ieq $chrome -and \"$($p['cmd'])\" -notmatch '--user-data-dir') { [ordered]@{ v = 1; running = [long]$p['pid'] } | ConvertTo-Json -Compress; return }",
-    '}',
-    ...LOGIN_ENV,
+    `$claim = '${claim}'`,
     '$launch = New-Object System.Diagnostics.ProcessStartInfo',
     '$launch.FileName = $chrome',
     '$launch.Arguments = $arguments',
     '$launch.WorkingDirectory = [IO.Path]::GetDirectoryName($chrome)',
     '$launch.UseShellExecute = $true',
-    '$login = [SelfChromeLoginEnv]::Read()',
-    // From here on, .NET calls only: no cmdlet is looked up in the login environment.
-    "foreach ($name in @([Environment]::GetEnvironmentVariables('Process').Keys)) { [Environment]::SetEnvironmentVariable([string]$name, $null, 'Process') }",
-    "foreach ($pair in $login) { $at = $pair.IndexOf('=', 1); if ($at -gt 0) { [Environment]::SetEnvironmentVariable($pair.Substring(0, $at), $pair.Substring($at + 1), 'Process') } }",
+    // 2. The lock.
+    ...LOCK_PATH,
+    '[void][IO.Directory]::CreateDirectory($lockDir)',
+    ...FREE_LOCK,
+    ...TAKE_LOCK,
+    '$taken = Take-Lock',
+    `if (-not $taken -and ([DateTime]::UtcNow - [IO.File]::GetLastWriteTimeUtc($lock)).TotalMilliseconds -gt ${START_LOCK_MS}) { try { [IO.File]::Delete($lock) } catch { }; $taken = Take-Lock }`,
+    `if (-not $taken) { [Console]::Out.WriteLine('{"v":1,"held":true}'); return }`,
+    // 3. The last look, the swap and the launch, back to back.
+    'foreach ($p in (Read-Browsers)) {',
+    "  $exe = if (\"$($p['exe'])\" -ne '') { \"$($p['exe'])\" } elseif (\"$($p['cmd'])\" -match '^\\s*\"([^\"]*)\"') { $Matches[1] } else { '' }",
+    `  if ($exe -ieq $chrome -and "$($p['cmd'])" -notmatch '--user-data-dir') { Free-Lock; [Console]::Out.WriteLine('{"v":1,"running":' + [string][long]$p['pid'] + '}'); return }`,
+    '}',
+    // From here on, .NET calls and this script's own functions only: no cmdlet is looked up in the login environment.
+    '[SelfChromeLoginEnv]::Swap($login)',
+    `if (-not [SelfChromeLoginEnv]::Same($login)) { Free-Lock; [Console]::Out.WriteLine('{"v":1,"mismatch":true}'); return }`,
     '$started = [System.Diagnostics.Process]::Start($launch)',
-    "if ($null -eq $started) { [Console]::Out.WriteLine('{\"v\":1,\"started\":null}') } else { [Console]::Out.WriteLine('{\"v\":1,\"started\":' + [string][long]$started.Id + '}') }",
+    `if ($null -eq $started) { [Console]::Out.WriteLine('{"v":1,"started":null}') } else { [Console]::Out.WriteLine('{"v":1,"started":' + [string][long]$started.Id + '}') }`,
   ].join('\r\n')
+}
+
+/** The release on Windows: the start's lock let go, when it is still `claim`'s own. Writes nothing. */
+export function windowsReleaseScript(claim: string): string {
+  if (!START_CLAIM.test(claim)) throw new Error("a start's claim is a UUID")
+  return [...PREAMBLE, `$claim = '${claim}'`, ...LOCK_PATH, ...FREE_LOCK, 'Free-Lock'].join('\r\n')
 }
 
 /** A script's JSON line: the last line of its output that reads as an object. */
@@ -517,13 +599,22 @@ export function parseWindowsLook(stdout: string): WindowsLook | string {
   return { paths, start, userData, procs }
 }
 
-/** What a start's run came to: launched (with the id Windows gave, when it gave one), or a Chrome found running by its last look. */
-export type StartAnswer = { readonly kind: 'launched'; readonly pid?: number } | { readonly kind: 'running'; readonly pid: number }
+/**
+ * What a start's run came to: launched (with the id Windows gave, when it gave one); a Chrome found running by its last
+ * look; the lock held by another start; or an environment that wasn't the login's exactly, so nothing launched.
+ */
+export type StartAnswer =
+  | { readonly kind: 'launched'; readonly pid?: number }
+  | { readonly kind: 'running'; readonly pid: number }
+  | { readonly kind: 'held' }
+  | { readonly kind: 'mismatch' }
 
 /** The start script's line, checked; a string says what is wrong with it. */
 export function parseWindowsStart(stdout: string): StartAnswer | string {
   const line = jsonLine(stdout)
   if (line === undefined || line.v !== 1) return "the start's answer isn't the line it writes"
+  if (line.held === true) return { kind: 'held' }
+  if (line.mismatch === true) return { kind: 'mismatch' }
   if (typeof line.running === 'number' && Number.isInteger(line.running)) return { kind: 'running', pid: line.running }
   if (typeof line.started === 'number' && Number.isInteger(line.started)) return { kind: 'launched', pid: line.started }
   if (line.started === null) return { kind: 'launched' }
