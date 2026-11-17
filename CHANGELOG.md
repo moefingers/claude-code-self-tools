@@ -2,6 +2,19 @@
 
 Each entry names a plugin and its version, as `version` in `plugins/<name>/.claude-plugin/plugin.json` has it.
 
+## 2026-11-17: self-chrome 0.1.0, new: a session makes sure Chrome runs for Claude in Chrome (#54)
+
+- **`chrome_ensure`** looks for the person's Chrome: the browser process of the configured Chrome (no `--type=`), on Chrome's default user data folder. A test or isolated Chrome, with a `--user-data-dir` of its own, is counted apart and never touched. It says whether Chrome runs, whether it started with `--silent-debugger-extension-api`, and the profile folder its command line names.
+- **Not running: it starts Chrome**, detached, with `--profile-directory=<profile>`, `--restore-last-session`, and the flag when the person opted in. It waits up to 20 s for the browser process, and says its PID and whether the flag took.
+  - Windows: `chrome.exe` through `Start-Process`, from a fixed Windows PowerShell script run as the shared machine code runs its scripts, in Chrome's own folder, without the variables Claude Code sets in the processes it starts.
+  - macOS: `open -a "<Google Chrome.app>" --args …`; the look is `pgrep` by Chrome's executable, then `ps` of those processes alone.
+- **Running without the flag the person opted in to: it says so**, and how the person fixes it (quit Chrome fully and call it again, or the flag in the shortcut). It never quits, kills or restarts Chrome, which would close every session's tabs and tab groups.
+- **The reconnect:** `/mcp reconnect claude-in-chrome` once the turn ends, as self-mcp queues it, with self-mcp's `resume` and its rule for a message of the person's after the queue. Only while Claude in Chrome is one of the session's MCP servers and Chrome runs.
+- **The opt-in:** the `silentDebugger` setting, `auto` (the default: on only when `CLAUDE_CHROME_SILENT_DEBUGGER` is `1`, `true` or `on`), `on` or `off`. Three values, because Claude Code fills an unset option in with its default, so a plain on/off could never let the variable apply.
+- **The profile:** the call's `profile`, else the `profile` setting, else the first of Local State's `profile.last_active_profiles`, else `Default`. Only that field of Local State is kept, and only profile folder names are printed.
+- **The shared code knows self-chrome.** `shared/hooks/update-check.ts` lists it, so every plugin's copy changes by that one line, and the machine code (`shared/hooks/machine.ts`) names it on its `Copies:` line, so its five carriers' copies change by that one line. The other plugins keep their versions, as when self-secret and self-color were added: nothing they do changes. `scripts/shared-copies.test.mjs` holds the machine code's new list. A vendored copy of the machine code pinned by its SHA-256 needs the new hash.
+- **Tests.** `tests/self-chrome.test.ts`: the flag's setting and variable, a start with and without it, Chrome running with and without it (nothing that could quit, kill or restart a process in any script or argv), a test or isolated Chrome passed over, the profile from a fixture Local State (its made-up accounts never in the answer) and its order, the reconnect only with Claude in Chrome's tools listed, macOS's argv, and the refusals. The shared update-check test.
+
 ## 2026-11-17: self-check 0.2.11, self-color 0.1.3, self-reload 0.1.6, self-remote-control 0.4.4, self-restart 0.4.8, self-switch 0.4.9, self-wake 0.3.9: review round 2 on the guard-safe partners (#53, #52)
 
 - **The id's known lag.** `$.session.id()` may still read the conversation before for up to 15 s (`ID_LAG_MS` in the shared machine code), steadily, so two reads that agree prove nothing before then.

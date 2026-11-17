@@ -1,6 +1,6 @@
 {
   "name": "claude-code-self-tools",
-  "description": "Small Claude Code plugins that let a session act on itself: compact or clear its conversation, reload its plugins, reconnect an MCP server, read its context window, check its own tools, wake itself later, turn on Remote Control under a title, set its prompt bar color, exit or restart, switch to another conversation, and run a command with a secret pasted at the machine that it never sees; and a skill for running several sessions as a hierarchy. Install only the ones you want.",
+  "description": "Small Claude Code plugins that let a session act on itself: compact or clear its conversation, reload its plugins, reconnect an MCP server, read its context window, check its own tools, wake itself later, turn on Remote Control under a title, set its prompt bar color, exit or restart, switch to another conversation, run a command with a secret pasted at the machine that it never sees, and make sure Chrome runs for Claude in Chrome; and a skill for running several sessions as a hierarchy. Install only the ones you want.",
   "owner": {
     "name": "moefingers",
     "url": "https://github.com/moefingers"
@@ -70,6 +70,11 @@
       "name": "self-secret",
       "source": "./plugins/self-secret",
       "description": "Runs a command with a secret the session never sees: you paste it into a form on 127.0.0.1 in your browser, it is checked before anything runs, handed to that one command in an environment variable, and masked in everything the command prints; a hold keeps it for later commands. The tool answers with the exact command line and runs nothing itself."
+    },
+    {
+      "name": "self-chrome",
+      "source": "./plugins/self-chrome",
+      "description": "Makes sure Chrome runs for Claude in Chrome: looks for your Chrome, starts it when it isn't running (your profile, the last session restored, and --silent-debugger-extension-api only when you opt in), and reconnects Claude in Chrome once the turn ends. It never quits or restarts Chrome."
     },
     {
       "name": "self-hierarchy",

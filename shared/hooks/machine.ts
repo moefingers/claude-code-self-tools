@@ -6,7 +6,7 @@
 // line, at plugins/<name>/hooks/machine.ts; `node scripts/sync-shared.mjs` writes those copies and
 // `node --test "scripts/*.test.mjs"` fails when one differs, or sits in a plugin not named. Edit the
 // canonical copy only.
-// Copies: self-check, self-exit, self-restart, self-switch, self-wake
+// Copies: self-check, self-chrome, self-exit, self-restart, self-switch, self-wake
 //
 // One self-contained module: it imports nothing but the engine's types, so another plugin (the
 // coordinator's, agent-coordinator-3000) can vendor it byte for byte. Copies outside this repository
