@@ -135,6 +135,7 @@ import {
   launch as buildLaunch,
   LAUNCH_DEADLINE_MS,
   LAUNCH_RETRY_MS,
+  LAUNCH_CLAIM,
   LEFT_SETTLE_MS,
   LEFT_WRITTEN,
   leftScript,
@@ -222,6 +223,16 @@ const PRUNE_EVERY_MS = 6 * 60 * 60 * 1000
 const ARRIVAL_FALLBACK_MS = 5000
 /** The most switches under way the store keeps. */
 const MAX_KEPT = 50
+/**
+ * The plugin's store keys for the launch claims given back and not confirmed released, each tried again
+ * until it is: `owed:<id>:<the claim's uuid>`, one key each, set and deleted, never a list rewritten, so no
+ * process's write (or round's) ever drops another's.
+ */
+const OWED = 'owed:'
+/** After a release that isn't confirmed, when it is tried again; then at every heartbeat tick, a plugin start's first among them, and at a resume. */
+const OWED_RETRY_MS = [3000, 30_000] as const
+/** An owed release this old is no longer tried, and the log says so: the store stays bounded. */
+const OWED_KEEP_MS = DAY_MS
 
 const DESCRIPTION = [
   "Switches this terminal to another conversation once the current turn ends: this conversation ends here, its context untouched, and conversation `to` (a session id, as claude --resume takes) is resumed in its place: in this same process when both live in one project folder, else in this pane's slot (a Windows Terminal pane running self-switch's claude-slot.ps1), else in this same tab when Claude Code was started through the claude wrapper (the `claude` function from claude-code-self-tools in the person's PowerShell profile), else in a new window.",
@@ -638,19 +649,163 @@ async function keepTicket($: EngineInterface, id: string, value: Ticket | null):
   await $.store.set(SWITCHES, Object.fromEntries(value === null ? rest : [...rest, [id, value]]))
 }
 
-/** Removes the claim lock on `id` when it names `by`; says so in the log when it can't. */
-async function release($: EngineInterface, powershell: string, state: string, id: string, by: string): Promise<void> {
+/**
+ * How one try at a release settled (`released`; `absent`, no lock there; `not-ours`, a lock another launch,
+ * session or slot took over), or why it didn't (`failed`).
+ */
+type Tried = 'released' | 'absent' | 'not-ours' | { readonly failed: string }
+
+/** One try at removing the claim lock on `id` when it names `by`: how it settled, or why it didn't (Tried). */
+async function releaseOnce($: EngineInterface, powershell: string, state: string, id: string, by: string): Promise<Tried> {
   try {
     const call = powershellCall(powershell, releaseScript({ stateDir: state, id, by }))
     const run = await $.process.run(call.argv, { stdin: call.stdin, timeoutMs: RELEASE_MS })
     const said = run.exitCode === 0 ? RELEASED.exec(run.stdout)?.[1] : undefined
-    if (said === 'released' || said === 'absent' || said === 'not-ours') return
-    // `busy`: another process had it open throughout. Left in place, it refuses every other move on
-    // that conversation until it goes stale, which is the safe side; said so, never taken as released.
-    const what = said === 'busy' ? 'another process had it open throughout' : `exit ${run.exitCode}`
-    $.ui.log(`the claim lock on ${id} wasn't released (${what}); it is left in place, and goes stale 15 minutes after its creator exits.`)
+    if (said === 'released' || said === 'absent' || said === 'not-ours') return said
+    // `busy`: another process had it open throughout.
+    return { failed: said === 'busy' ? 'another process had it open throughout' : `exit ${run.exitCode}` }
   } catch (err) {
-    $.ui.log(`the claim lock on ${id} wasn't released (${why(err)}); it goes stale 15 minutes after its creator exits.`)
+    return { failed: why(err) }
+  }
+}
+
+/**
+ * Removes the claim lock on `id` when it names `by`. One that isn't confirmed released is left in place,
+ * which refuses every other move on that conversation until it goes stale (the safe side), and is never
+ * taken as released. A launch's own claim is owed then (#40): a window that waits on it has no time cap,
+ * and would resume `id` once this session exits, outside any switch the person asked for. So it is kept
+ * under a store key of its own and tried again 3 and 30 seconds later, then at every heartbeat tick (a
+ * plugin start's first among them, and a resume's), until it is settled; each launch's claim is its own,
+ * so a later try can only remove that one. When the store can't keep it, this process still tries it at
+ * 3 and 30 seconds and at its ticks. A slot's claim names the slot, which a later switch through it names
+ * too: never tried later.
+ *
+ * This narrows the exposure, not closes it: a session that exits before a retry lands leaves the window
+ * waiting on a claim still named (#50, the window's own check of a lasting withdrawal).
+ */
+async function release($: EngineInterface, powershell: string, state: string, id: string, by: string): Promise<void> {
+  const tried = await releaseOnce($, powershell, state, id, by)
+  if (typeof tried === 'string') return
+  if (!LAUNCH_CLAIM.test(by)) {
+    $.ui.log(`the claim lock on ${id} wasn't released (${tried.failed}); it is left in place, and goes stale 15 minutes after its creator exits.`)
+    return
+  }
+  const unkept = await owe($, id, by)
+  $.ui.log(
+    unkept === undefined
+      ? `the claim lock on ${id} wasn't released (${tried.failed}); it is left in place, and tried again in 3 and 30 seconds, then every 2 minutes until it is released.`
+      : `the claim lock on ${id} wasn't released (${tried.failed}), and the plugin's store couldn't keep it (${unkept}); it is left in place, and this process tries it again in 3 and 30 seconds, then every 2 minutes while it runs.`,
+  )
+  for (const ms of OWED_RETRY_MS) $.clock.after(ms, () => void settleOwed($))
+}
+
+/** A launch's claim given back whose release isn't confirmed: the conversation, the claim, and since when it is owed. */
+type Owed = { readonly id: string; readonly by: string; readonly since: number }
+
+/** The store key of the release of `by`'s claim on `id`: one key each, so no write of one ever carries another. */
+const owedKey = (id: string, by: string): string => `${OWED}${id}:${by.slice('launch:'.length)}`
+
+/** An owed release as stored, checked against its own key; undefined when it isn't one. */
+function owedOf(key: string, value: unknown): Owed | undefined {
+  if (!isRecord(value) || typeof value.id !== 'string' || !SESSION_ID.test(value.id) || typeof value.by !== 'string' || !LAUNCH_CLAIM.test(value.by)) return undefined
+  if (typeof value.since !== 'number' || !Number.isFinite(value.since) || owedKey(value.id, value.by) !== key) return undefined
+  return { id: value.id, by: value.by, since: value.since }
+}
+
+/** The releases this process owes that the store couldn't keep: tried by the same rounds while it runs. */
+const owedHere = new Map<string, Owed>()
+
+/** Every owed release by its key: the store's (one under the prefix that isn't one is deleted), and this process's own that the store couldn't keep. */
+async function owedReleases($: EngineInterface): Promise<Map<string, Owed>> {
+  const all = new Map(owedHere)
+  for (const key of await $.store.keys()) {
+    if (!key.startsWith(OWED)) continue
+    const entry = owedOf(key, await $.store.get(key))
+    if (entry !== undefined) all.set(key, entry)
+    else await $.store.delete(key)
+  }
+  return all
+}
+
+/**
+ * Keeps the release of `by`'s claim on `id` owed under its own key, dated at its first failure. Past
+ * MAX_KEPT owed releases the oldest is no longer kept, and the log names it. When the store can't keep it,
+ * this process keeps it, and why comes back.
+ */
+async function owe($: EngineInterface, id: string, by: string): Promise<string | undefined> {
+  const key = owedKey(id, by)
+  const entry: Owed = { id, by, since: await $.clock.now() }
+  try {
+    if (owedOf(key, await $.store.get(key)) === undefined) await $.store.set(key, entry)
+    owedHere.delete(key)
+  } catch (err) {
+    if (!owedHere.has(key)) owedHere.set(key, entry)
+    return why(err)
+  }
+  await dropOverflow($)
+  return undefined
+}
+
+/** Forgets the owed release under `key`, in this process and in the store. */
+async function forget($: EngineInterface, key: string): Promise<void> {
+  owedHere.delete(key)
+  await $.store.delete(key)
+}
+
+/** Past MAX_KEPT owed releases, the oldest are no longer kept, each named in the log with what to do. Never throws. */
+async function dropOverflow($: EngineInterface): Promise<void> {
+  try {
+    const all = [...(await owedReleases($)).entries()].sort(([, a], [, b]) => a.since - b.since)
+    for (const [key, o] of all.slice(0, Math.max(0, all.length - MAX_KEPT))) {
+      await forget($, key)
+      $.ui.log(`more than ${MAX_KEPT} claim releases are owed, so the oldest is no longer tried: the claim lock on ${o.id}, owed since ${new Date(o.since).toISOString()}. A window waiting on it resumes ${o.id} once its session exits: close that window to give up.`)
+    }
+  } catch {
+    // The next owed release tries again.
+  }
+}
+
+/** Whether the owed releases are being tried now: one round of them at a time in this process. */
+let settling = false
+
+/**
+ * Tries each owed release again. One settled is no longer owed, and said: released, or no longer this
+ * launch's (gone, or taken over). One dated ahead of this clock (the clock set back) is dated now, so its
+ * day starts when the skew is seen. One owed for a day is no longer tried, and said, with what the person
+ * can do. Never throws: the next tick tries again.
+ */
+async function settleOwed($: EngineInterface): Promise<void> {
+  if (settling) return
+  settling = true
+  try {
+    const owed = await owedReleases($)
+    if (owed.size === 0) return
+    const now = await $.clock.now()
+    const found = await machine($)
+    if ('refusal' in found) return
+    for (const [key, o] of owed) {
+      if (o.since > now) {
+        const dated = { ...o, since: now }
+        if (owedHere.has(key)) owedHere.set(key, dated)
+        else await $.store.set(key, dated)
+      } else if (now - o.since > OWED_KEEP_MS) {
+        await forget($, key)
+        $.ui.log(`the claim lock on ${o.id} couldn't be released for a day, and is no longer tried. A window waiting on it resumes ${o.id} once its session exits: close that window to give up.`)
+        continue
+      }
+      const tried = await releaseOnce($, found.powershell, found.state, o.id, o.by)
+      if (typeof tried !== 'string') continue
+      await forget($, key)
+      $.ui.log(
+        tried === 'released'
+          ? `the claim lock on ${o.id} is released now, on a later try.`
+          : `the claim lock on ${o.id} is no longer this launch's (${tried === 'absent' ? 'it is gone' : 'another launch, session or slot took it over'}), so it is no longer tried.`,
+      )
+    }
+  } catch {
+    // The next tick tries again.
+  } finally {
+    settling = false
   }
 }
 
@@ -864,6 +1019,8 @@ async function tick($: EngineInterface): Promise<void> {
   try {
     await heartbeat($)
     const now = await $.clock.now()
+    // The releases owed first: one the prune below owes now gets its 3 and 30 seconds' tries.
+    await settleOwed($)
     await pruneTickets($, now)
     await pruneBeats($, now)
   } catch {
@@ -878,8 +1035,11 @@ async function tick($: EngineInterface): Promise<void> {
 function startBeat($: EngineInterface, resumed?: string): void {
   beat?.cancel()
   beat = $.clock.every(BEAT_MS, () => void tick($))
-  if (resumed !== undefined) void heartbeat($, resumed)
-  else void tick($)
+  // A resume beats the conversation it resumed, and tries the owed releases at once, as a start's tick does.
+  if (resumed !== undefined) {
+    void heartbeat($, resumed)
+    void settleOwed($)
+  } else void tick($)
 }
 
 /** Each registry key the probe saw that isn't in REGISTRY_KEYS, logged the first time this process sees it; it is ignored. */

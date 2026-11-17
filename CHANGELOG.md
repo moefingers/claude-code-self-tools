@@ -2,6 +2,30 @@
 
 Each entry names a plugin and its version, as `version` in `plugins/<name>/.claude-plugin/plugin.json` has it.
 
+## 2026-11-16: self-switch 0.4.6: a launch claim not confirmed released is tried again until it is (#40)
+
+Merges after #47 and #48, whose numbers for self-switch (0.4.4, 0.4.5) come before this one.
+
+- **The exposure (#40).** Launcher v4's window waits for as long as its launch claim stands, with no time cap, so giving that claim back is what ends a window nobody wants any more. When a release came back unconfirmed (another process had the lock open throughout, or the release script failed), self-switch only logged it. The undo of a switch and the 15-minute ticket prune then deleted the ticket all the same, and nothing tried again. The waiting window would resume the conversation once this session exited, outside any switch the person asked for.
+- **Now** a launch's claim whose release isn't confirmed is owed: kept in the plugin's store under a key of its own (`owed:<id>:<the claim's uuid>`: the conversation, the claim, since when), set and deleted, never a list rewritten, so no other process's write, or round, drops it. It is tried again 3 and 30 seconds later, then at every 2-minute heartbeat tick (a plugin start's first tick among them) and at once at a resume, until the lock reads released, gone or another's. Each launch's claim is its own, so a later try can only remove that one. A release that settles on a later try says how: "is released now, on a later try", or "is no longer this launch's (it is gone / another launch, session or slot took it over)". One still owed after a day is no longer tried, and the log says what to do: close the waiting window to give up. One dated ahead of the clock (the clock set back) is dated now, so its day starts when the skew is seen.
+- **When the store can't keep it**, this process still tries it 3 and 30 seconds later and at its ticks, and the log says the store couldn't keep it. Past 50 owed releases the oldest is no longer kept, and the log names it.
+- **Narrowed, not closed.** The retries live in processes: a session that exits before one lands still leaves a waiting window to resume the conversation. The window's own check of a lasting withdrawal is #50, after open PR #43's rewrite of the window script.
+- **A slot's claim** (`slot:<pid>-<created>`) is never tried again later: it names the slot, which a later switch through that slot names too. Its failure is logged as before.
+- **Decided on principle:** the coordinator's own fix (0.9.14: persist until a confirmed release, retry at 3 s and 30 s, release leftovers on the next load), not a wait cap in the window. A cap would end a wanted window too, and the window script is shared machine code that open work is changing.
+- **README**: the claim lock's paragraph says so, and names #50.
+- **Tests** (`tests/self-switch.test.ts`; a release's answer can now be a list, one per release in turn):
+  - an arrival's release that stays busy, tried at 3 s, 30 s and the next tick, then released, and no more tries after;
+  - a ticket pruned at 15 minutes whose release is busy: the ticket goes, the release stays owed and is tried again;
+  - owed releases from an earlier load: tried at the plugin start, one a day old dropped and said, and a malformed entry ignored;
+  - a slot's claim, busy: said, never owed;
+  - a switch taken back (its window refused) whose claim stays busy: owed, then released 3 seconds later.
+  - **The review round** (two Mediums, four of its five Lows, the Infos; L7, the release deleting through the handle that read the lock, is left for a PR of its own):
+    - one key each: another process settling one and a third owing one while a round runs, then a new failure: none lost;
+    - settling on a lock gone and on another launch's, each said so and never as released; a release that exits 1, owed and said with its code;
+    - a store that can't write: the 3 s and 30 s tries still run, and say so; past 50, the oldest dropped and named;
+    - a release dated ahead of the clock: dated now and tried on (a planted `Math.abs` of the age drops it, and fails this test);
+    - a resume start: the owed releases tried at once.
+
 ## 2026-11-16: self-check 0.2.8, self-exit 0.1.9, self-restart 0.4.5, self-switch 0.4.5, self-wake 0.3.6: a tab typed at a prompt is no longer stranded after 10 resumes, and a restart loop stops (#41)
 
 Merges after #47, whose numbers come first.
