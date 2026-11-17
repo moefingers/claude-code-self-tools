@@ -127,6 +127,10 @@ type Options = {
   wake?: { present: boolean; marker?: string }
   /** What the left record's script answers, in place of writing one: its output, its error output and its exit code. */
   leftOut?: { stdout: string; stderr: string; exitCode: number }
+  /** How many prompts the conversation's transcript holds (`$.session.turns()`); unread when not said. */
+  turns?: number
+  /** A user input of the process came before this load (a reload, a plugin enabled partway): its prompt's id. */
+  promptId?: string
 }
 
 /**
@@ -178,6 +182,8 @@ function engine(
     crons = [],
     markOn,
     leftOut,
+    turns,
+    promptId,
   }: Options = {},
 ) {
   const runs: Run[] = []
@@ -190,7 +196,7 @@ function engine(
   const screen: string[] = []
   const writes: { path: string; text: string }[] = []
   const described: string[] = []
-  const world = { id, agents, probe: probe ?? machine(), gate, worktrees: git.worktrees ?? [REPO], diffs: {} as Record<string, string>, untrackedTime: NOW - HOUR, cwd, wake, crons }
+  const world = { id, agents, probe: probe ?? machine(), gate, worktrees: git.worktrees ?? [REPO], diffs: {} as Record<string, string>, untrackedTime: NOW - HOUR, cwd, wake, crons, turns }
   /** The files the scripts wrote (a ticket, a slot's record, a left record) and the plugin wrote over, by path: what fs.read finds. */
   const files = new Map<string, string>()
   const key = (path: string) => path.replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase()
@@ -261,7 +267,10 @@ function engine(
     })
   }
   on('session.start', (_, e) => ({ cwd: e.cwd }))
+  on('session.end', (_, e) => ({ sessionId: e.sessionId }))
   on('session.id', () => answer({ value: world.id }))
+  on('session.turns', () => answer(world.turns === undefined ? { deny: 'not read here' } : { value: world.turns }))
+  on('session.info', () => answer({ value: { transcriptPath: '', ...(promptId === undefined ? {} : { promptId }) } }))
   on('command.register', (_, e) => {
     registered.push(e.name)
     return answer({ value: { command: e.name } })
@@ -2831,5 +2840,131 @@ describe('S3 final', () => {
     expect(made.screen.filter(line => /record/.test(line))).toEqual([
       `self-switch couldn't record that this session left conversation ${W.slice(0, 8)}: another writer (the coordinator, or self-switch in another session) held the lock on its record for 10 seconds; so for about 10 minutes after it leaves, a switch back to it is refused as if it were still open.`,
     ])
+  })
+})
+
+// #53: where Claude Code's built-in guard loads, the classic SessionStart never reaches the plugin. Its partner
+// (hooks/classic.ts) takes the process's start up 5 s after session.start (the arrival, a new conversation's baseline),
+// and an in-process /clear or /resume from session.end and the id read as another conversation: there, and only there.
+describe('#53: under the guard', () => {
+  /** The partner's take-up: 5 s for a classic hook, then the id read again 1 s later, the same, for an id a ticket waits for. */
+  const GRACE = 6000
+  /** For an id no ticket waits for, the second agreeing read comes past the id's 15 s lag. */
+  const LAG = 15_000
+  const SETTLE = 500
+  const ticket = { at: NOW - MINUTE, from: OTHER, by: LAUNCH, transport: 'window', reason: 'Billing is next.', notes: 'notes/billing.md', resume: 'Run the invoice tests.' }
+  const ends = (reason: 'clear' | 'resume', id: string) => ({ reason, sessionId: id, resume: { id } })
+
+  test('guarded: the process a switch placed takes its arrival up 5 s after session.start: the row, the claim released, the resume sent, once', async ($, on) => {
+    const { prompts, session, kinds, tickets, clock } = engine(on, { id: T, store: { switches: { [T]: ticket } }, turns: 2 })
+    await $.session.start(start)
+    await clock.advance(GRACE - 1)
+    expect(prompts).toEqual([])
+    await clock.advance(1 + SETTLE * 2)
+    expect(prompts).toHaveLength(1)
+    expect(prompts[0]?.text).toContain('It asks this conversation to: «Run the invoice tests.».')
+    expect(texts(session)).toHaveLength(1)
+    expect(tickets()).toEqual({})
+    expect(kinds()).toEqual(['release'])
+    await clock.advance(HOUR)
+    expect(prompts).toHaveLength(1)
+    expect(kinds()).toEqual(['release'])
+  })
+
+  test('unguarded: the classic SessionStart of the resume takes the arrival up as before, and the partner stands down: once', async ($, on) => {
+    const { prompts, kinds, tickets, clock } = engine(on, { id: T, store: { switches: { [T]: ticket } }, turns: 2 })
+    await $.session.start(start)
+    await $.classic.SessionStart({ source: 'resume', session_id: T })
+    await clock.advance(1000)
+    expect(prompts).toHaveLength(1)
+    expect(tickets()).toEqual({})
+    await clock.advance(HOUR)
+    expect(prompts).toHaveLength(1)
+    expect(kinds()).toEqual(['release'])
+  })
+
+  test("guarded: a new conversation's start keeps S11's baseline of the folder it started in, as a startup's SessionStart does", async ($, on) => {
+    const { held, clock } = engine(on, { turns: 0, git: { dirty: 2 } })
+    await $.session.start(start)
+    await clock.advance(LAG + SETTLE * 2)
+    const kept = held.get(`baseline:${W}`) as { folder?: string; fingerprint?: string } | undefined
+    expect(kept?.folder).toBe(REPO)
+    expect(kept?.fingerprint).toMatch(/^[0-9a-f]{64}$/)
+  })
+
+  test('guarded: a conversation that reads as new at session.start but has prompts by the take-up (its transcript counted late) is a resume: no baseline', async ($, on) => {
+    const { held, world, clock } = engine(on, { turns: 0, git: { dirty: 2 } })
+    await $.session.start(start)
+    world.turns = 3
+    await clock.advance(30_000)
+    expect(held.get(`baseline:${W}`)).toBeUndefined()
+  })
+
+  test('guarded: a resumed conversation (it has prompts) takes no baseline, so its start folder’s dirt holds', async ($, on) => {
+    const { held, clock } = engine(on, { turns: 4, git: { dirty: 2 } })
+    await $.session.start(start)
+    await clock.advance(LAG + SETTLE * 2)
+    expect(held.get(`baseline:${W}`)).toBeUndefined()
+  })
+
+  test('guarded: a /clear by hand, taken up once the id reads the new conversation: the left record of the one left, and its baseline carried', async ($, on) => {
+    const { held, lefts, world, toasts, clock } = engine(on, { turns: 0, git: { dirty: 1 } })
+    await $.session.start(start)
+    await clock.advance(LAG + SETTLE * 2)
+    expect(held.get(`baseline:${W}`)).toBeDefined()
+    await $.session.end(ends('clear', W))
+    // The id lags the move: nothing yet.
+    await clock.advance(2000)
+    expect(lefts()).toEqual([])
+    world.id = X
+    await clock.advance(1000)
+    expect((held.get(`baseline:${X}`) as { fingerprint?: string } | undefined)?.fingerprint).toBe((held.get(`baseline:${W}`) as { fingerprint?: string }).fingerprint)
+    await clock.advance(3000)
+    expect(lefts()).toHaveLength(1)
+    expect(lefts()[0]?.script).toContain(`$id = '${W}'`)
+    expect(toasts).toEqual([])
+  })
+
+  test('guarded: an armed switch of the conversation a /resume ends is taken back at its session end, as its SessionStart would take it back', async ($, on) => {
+    const { commands, kinds, toasts, clock } = engine(on)
+    await $.session.start(start)
+    await $.tool.call(call)
+    await $.turn.complete(answered)
+    await $.session.end(ends('resume', W))
+    await clock.advance(5000)
+    expect(kinds()).toEqual([])
+    expect(commands).toEqual([])
+    expect(toasts).toContain('Switch cancelled: this session became another conversation before it ran.')
+  })
+
+  test('guarded: a switch asked while a /clear moves the session, the id still on the conversation it ended, waits: refused, saying why', async ($, on) => {
+    const { held, clock } = engine(on)
+    await $.session.start(start)
+    await clock.advance(GRACE)
+    await $.session.end(ends('clear', W))
+    const asked = await $.tool.call(call)
+    expect(asked.deny).toMatch(/a \/clear or a \/resume has just ended that conversation.+moving between conversations/)
+    expect(held.get('switches')).toBeUndefined()
+  })
+
+  test('a reload into this version in an unguarded session (a user input came before it) takes no arrival: the ticket stays for the process it is for', async ($, on) => {
+    const { prompts, kinds, tickets, clock } = engine(on, { id: T, store: { switches: { [T]: ticket } }, turns: 2, promptId: '5d0c4f7e-1a2b-4c3d-9e8f-001122334455' })
+    await $.session.start(start)
+    // Within the ticket's 15 minutes, past which the heartbeat prunes it.
+    await clock.advance(10 * MINUTE)
+    expect(prompts).toEqual([])
+    expect(kinds()).toEqual([])
+    expect(Object.keys(tickets())).toEqual([T])
+  })
+
+  test('unguarded: a session end leaves the move to the classic SessionStart; no move is looked for, and no left record is written twice', async ($, on) => {
+    const { lefts, world, clock } = engine(on, { turns: 0 })
+    await $.session.start(start)
+    await $.classic.SessionStart({ source: 'startup', session_id: W })
+    await $.session.end(ends('clear', W))
+    await $.classic.SessionStart({ source: 'clear', session_id: X })
+    world.id = X
+    await clock.advance(10_000)
+    expect(lefts()).toHaveLength(1)
   })
 })

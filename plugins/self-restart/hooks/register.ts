@@ -47,7 +47,13 @@
 // The first prompt never goes on a command line. It waits in the plugin's own store, under the
 // session's id, and the copy of this plugin in the process that resumes the session sends it, once,
 // at the classic SessionStart with `source: "resume"` for that id. One older than 15 minutes is
-// dropped: the window had given up, and the session was resumed later by hand.
+// dropped: the window had given up, and the session was resumed later by hand. Where Claude Code's
+// built-in guard passes over this plugin's classic hooks (#52, #53: managed settings, or a Team or
+// Enterprise login), no SessionStart reaches it: its partner (classic.ts, startPartner) takes the
+// restart up instead, on the process's own first start only, 5 seconds after session.start and once `$.session.id()` names one conversation on two reads a second apart,
+// unless a classic hook has arrived by then; an in-process /resume, from session.end and the id read
+// as another (moveLook). Whichever comes first takes the record out of the store, so the first prompt
+// is sent once.
 //
 // The pre-check (exitBlockers, in the shared machine code), as self-exit's: it refuses while anything
 // would make the exit stop at its confirmation, or end work still running: a session cron (the
@@ -90,6 +96,7 @@ import { launch as buildLaunch, parseLaunch, powershellPath, RELEASED, releaseSc
 import type { AgentLike, LaunchInput, LaunchWhere, Pane, PendingKind, Placement, Probe } from './machine'
 import { goAnswer, goRun, agentsHeld, agentsWayOut, blockersText, claimOf, exitBlockers, idLag, isBusyAgent, isSafeFolder, isWindowName, LAUNCH_DEADLINE_MS, LAUNCH_RETRY_MS, LAUNCH_RUN_MS, launchFolderFault, launchFolderSaid, loadPlacement, markPending, movesConversation, oneLine, paneAfter, paneFallback, paneTicketPath, pickLaunchTransport, plainOutput, powershellCall, quoted, readExit, readGit, readPane, resumeTitle, runProbe, safePoint, SLOT_SCRIPT_SHA256, idPathOrNone, TAB_LABEL } from './machine'
 import { checkTranscript, findTranscript, isProjectOf, type Transcript, transcriptFolder } from './start-folder'
+import { type ClassicIo, classicSeen, configureClassic, keepClassic, type Move, moveBegins, moveLook, movePending, startPartner, startTaken, takeOwedStart } from './classic'
 import { configureUpdateCheck, loadUpdateCheck, withUpdateNotice } from './update-check'
 
 const queued = { plugin: 'self-restart', key: 'queued' } as const
@@ -178,6 +185,9 @@ let sawMove = false
 
 /** The transcript the last main-loop classic SessionStart of a startup, a resume, a clear or a compact named: what the start folder is checked against. */
 let transcript: Transcript | undefined
+
+/** The conversations whose restart is being taken up now (welcome): the classic SessionStart's or its partner's, one at a time. */
+const welcoming = new Set<string>()
 
 /** Whether the log has said this tab's claude wrapper is an older one: once per process. */
 let toldOldWrapper = false
@@ -385,13 +395,19 @@ async function startFolderOf($: EngineInterface): Promise<string | undefined> {
     startFolder = kept
     startFolderFrom = 'state'
   }
-  else if (kept === undefined && startFolder !== undefined) await $.state.set(folder, startFolder)
+  else if (kept === undefined && startFolder !== undefined) {
+    await $.state.set(folder, startFolder)
+    // #53: the wipe took the word that classic hooks reach this process too: it goes back with the folder (classic.ts).
+    await keepClassic($, classicIo($))
+  }
   return startFolder
 }
 
 /** The start folder back in `$.state` from the module's copy, with a plain set: at a /clear's or a /resume's SessionStart, which may come before the wipe or after it. */
 async function restoreFolder($: EngineInterface): Promise<void> {
   if (startFolder !== undefined) await $.state.set(folder, startFolder)
+  // #53: and the word that classic hooks reach this process, which the wipe takes too (classic.ts).
+  await keepClassic($, classicIo($))
 }
 
 /** A folder this session is known by, and what it is to the session. */
@@ -502,6 +518,20 @@ async function plan($: EngineInterface): Promise<{ powershell: string; id: strin
     return { refusal: `this session's id can't be read: ${why(err)}` }
   }
   if (!SESSION_ID.test(id)) return { refusal: `this session's id (${JSON.stringify(id)}) is not one claude --resume takes` }
+  // #53: a /clear or a /resume a session end began, where no classic SessionStart named the conversation it moved to,
+  // and `$.session.id()` doesn't read that one yet: a restart now would resume the conversation left.
+  if (movePending()) {
+    await lookForMove($)
+    if (movePending()) {
+      return { refusal: `this session's id reads ${id}, but a /clear or a /resume has just ended that conversation, and the id doesn't name the one it moved to yet: which one a restart would resume is unclear. Try again in a moment` }
+    }
+    try {
+      id = await $.session.id()
+    } catch (err) {
+      return { refusal: `this session's id can't be read: ${why(err)}` }
+    }
+    if (!SESSION_ID.test(id)) return { refusal: `this session's id (${JSON.stringify(id)}) is not one claude --resume takes` }
+  }
   // Right after a move, `$.session.id()` may still read the conversation left: the SessionStart's id stands
   // for ID_LAG_MS, and a restart then would resume the wrong one. Past that, the id is the conversation.
   if (current !== undefined && current !== id) {
@@ -654,8 +684,10 @@ async function restartNow($: EngineInterface, value: Queued): Promise<void> {
   // This tab's claude wrapper, tried first; without a token, or with one it can't use, the launcher.
   const pane = await paneOf($, launch, judged.probe)
   const tabFallback = pane !== undefined && 'fallback' in pane ? oneLine(pane.fallback, 300) : undefined
-  // Kept before the window opens: the process it starts reads it once this one has exited.
+  // Kept before the window opens: the process it starts reads it once this one has exited. This process has taken its
+  // own start up: a reload of the plugin here never takes the record for a restart that arrived (#53, classic.ts).
   const kept: Restart = { at: await $.clock.now(), ...value }
+  await startTaken(classicIo($), launch.id)
   await keep($, launch.id, kept)
   let opened: string | undefined
   let slot: string | undefined
@@ -936,27 +968,102 @@ async function release($: EngineInterface, id: string, claim: string): Promise<v
 /** In the process that resumed a session: the restart's first prompt, if one waits for this session. */
 async function welcome($: EngineInterface, id: unknown): Promise<void> {
   if (typeof id !== 'string' || !SESSION_ID.test(id)) return
-  const stored = await $.store.get(RESTARTS)
-  if (!isRecord(stored) || !(id in stored)) return
-  const now = await $.clock.now()
-  const all = await restarts($, now)
-  const found = all[id]
-  await keep($, id, null)
-  if (found === undefined) {
-    $.ui.toast("A restart's first prompt was dropped: the session came back more than 15 minutes after it.")
-    return
+  // One take-up at a time, the classic SessionStart's or its partner's (#53): the one that comes second finds the
+  // record gone from the store.
+  if (welcoming.has(id)) return
+  welcoming.add(id)
+  try {
+    const stored = await $.store.get(RESTARTS)
+    if (!isRecord(stored) || !(id in stored)) return
+    const now = await $.clock.now()
+    const all = await restarts($, now)
+    const found = all[id]
+    await keep($, id, null)
+    if (found === undefined) {
+      $.ui.toast("A restart's first prompt was dropped: the session came back more than 15 minutes after it.")
+      return
+    }
+    $.ui.toast(`Restarted: ${found.reason}`)
+    // The claim lock the launcher took on this conversation: this process holds it now.
+    const claim = found.claim
+    if (claim !== undefined) $.clock.after(SETTLE_MS, () => void release($, id, claim))
+    const resume = found.resume
+    // Later, not awaited: a prompt submitted from the start's hook would wait on that hook.
+    if (resume !== undefined) $.clock.after(SETTLE_MS, () => void sendResume($, 'Restarted.', resume))
+  } finally {
+    welcoming.delete(id)
   }
-  $.ui.toast(`Restarted: ${found.reason}`)
-  // The claim lock the launcher took on this conversation: this process holds it now.
-  const claim = found.claim
-  if (claim !== undefined) $.clock.after(SETTLE_MS, () => void release($, id, claim))
-  const resume = found.resume
-  // Later, not awaited: a prompt submitted from the start's hook would wait on that hook.
-  if (resume !== undefined) $.clock.after(SETTLE_MS, () => void sendResume($, 'Restarted.', resume))
+}
+
+/** #52, #53: whether a restart waits for conversation `id` in the store: the start partner takes such an id up sooner. */
+async function restartWaits($: EngineInterface, id: string): Promise<boolean> {
+  const stored = await $.store.get(RESTARTS)
+  return isRecord(stored) && id in stored
+}
+
+/**
+ * The transcript of conversation `id`, which the start folder is checked against, as `$.session.info()` names it,
+ * where no classic SessionStart did (#53). Never throws.
+ */
+async function noteTranscript($: EngineInterface, id: string): Promise<void> {
+  try {
+    if (transcript?.id === id) return
+    const { transcriptPath } = await $.session.info()
+    if (typeof transcriptPath === 'string' && transcriptPath !== '') transcript = { id, path: transcriptPath }
+  } catch {
+    // The check finds the transcript by the conversation's id instead (findTranscript).
+  }
+}
+
+/**
+ * #52, #53: the classic SessionStart's work at this process's start, where no classic hook reached the plugin within
+ * START_GRACE_MS of session.start (classic.ts, startPartner): the conversation's transcript, and the restart that
+ * resumed it, taken up as the classic SessionStart with `source: "resume"` takes it (welcome): its toast, its claim
+ * released and its first prompt sent. A conversation no restart left a record for finds nothing.
+ */
+async function guardedStart($: EngineInterface, id: string): Promise<void> {
+  await noteTranscript($, id)
+  await welcome($, id)
+}
+
+/**
+ * #53: the classic SessionStart's work at an in-process /clear or /resume, where none reached the plugin: the move a
+ * session end began, taken up at the first read of `$.session.id()` as another conversation (classic.ts, moveLook).
+ * The start folder goes back into `$.state`, the new conversation's transcript is noted, and a /resume takes up a
+ * restart waiting for the conversation it resumed, as that SessionStart would.
+ */
+async function moved($: EngineInterface, move: Move): Promise<void> {
+  sawMove = true
+  try {
+    await restoreFolder($)
+  } catch {
+    // The next read that finds it empty puts it back.
+  }
+  await noteTranscript($, move.to)
+  if (move.reason === 'resume') await welcome($, move.to)
+}
+
+/** #53: the shared partner code's two keys (classic.ts), in this plugin's own $.state, read and written here by name. */
+const classicRef = { plugin: 'self-restart', key: 'classic' } as const
+const startedRef = { plugin: 'self-restart', key: 'started' } as const
+
+/** #53: this plugin's $.state, as the shared partner code reads and writes it (classic.ts, ClassicIo). */
+function classicIo($: EngineInterface): ClassicIo {
+  return {
+    get: async key => (key === 'classic' ? (await $.state.get(classicRef)).value : (await $.state.get(startedRef)).value),
+    set: (key, value) => (key === 'classic' ? $.state.set(classicRef, value === true) : $.state.set(startedRef, typeof value === 'string' ? value : null)),
+  }
+}
+
+/** #53: a move a session end began, looked for now (classic.ts, moveLook), and taken up here when found (moved). */
+function lookForMove($: EngineInterface): Promise<void> {
+  return moveLook($, classicIo($), move => moved($, move))
 }
 
 export const register: Register = (on, options) => {
   configureUpdateCheck('self-restart', options)
+  // #53: the classic SessionStart's partners, which act only where no classic hook reaches this process (classic.ts).
+  configureClassic()
 
   // First, so it is outermost on this plugin's tools: it sees each answer, and adds the update
   // notice when one is due. It never waits on the check; see update-check.ts.
@@ -1000,14 +1107,29 @@ export const register: Register = (on, options) => {
       isDeferred: false,
     })
     loadUpdateCheck($)
+    // #52, #53: where the classic SessionStart doesn't reach this plugin, its partner takes this process's start up (a
+    // restart's first prompt among it): only on the process's first start, never a reload or an enable partway through
+    // a session. Awaited for its bounded reads (whether this is the first start), which must come before turn one; its
+    // timers then wait START_GRACE_MS for a classic hook, and for the id to settle (sooner for an id a restart waits for).
+    await startPartner($, classicIo($), id => guardedStart($, id), id => restartWaits($, id))
     return started
   })
+
+  // #53: a /clear or a /resume, where no classic SessionStart will name the conversation it moves to: looked for from
+  // here (moveLook), and taken up as that SessionStart would take it (moved). Before the engine's end step: a memory
+  // read, a clock read and the look's timer, inside the session end's one short bound.
+  on('session.end', async ($, e, next) => {
+    await moveBegins($, classicIo($), e, move => moved($, move))
+    return next(e)
+  }).catch(($, e, next) => next(e))
 
   // The trampoline's handler. It never reads `next`: it answers its own command, and is no gate.
   on('command.run', { command: 'self-restart-go' }, ($, e) => goAnswer($, go, e.args)).catch(() => ({ text: "self-restart: the restart's step failed, so it did not run." }))
 
-  // The process that resumed a session this plugin restarted: send that restart's first prompt.
+  // The process that resumed a session this plugin restarted: send that restart's first prompt. #53: first, before
+  // anything is awaited, it says classic hooks reach this process, and the partners stand down (classic.ts).
   on('classic.SessionStart', async ($, e, next) => {
+    void classicSeen($, classicIo($), e)
     const done = await next(e)
     // The conversation this process holds from here, by the event's own id: a startup's, a resume's or a clear's.
     if (e.agent_id === undefined && movesConversation(e.source) && typeof e.session_id === 'string' && SESSION_ID.test(e.session_id)) {
@@ -1094,6 +1216,8 @@ export const register: Register = (on, options) => {
   on('turn.start', async ($, e, next) => {
     const started = await next(e)
     if (e.agentId === undefined) go.turnStarted()
+    // #52, #53: a start whose id never settled (classic.ts): its restart is taken up now, its first prompt after this turn.
+    if (e.agentId === undefined) void takeOwedStart($, classicIo($))
     if (e.agentId !== undefined || armed === undefined) return started
     armed = undefined
     $.ui.status(undefined)

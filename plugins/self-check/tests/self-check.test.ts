@@ -34,13 +34,17 @@ type Options = {
   env?: Record<string, string>
   /** The words a tool's error, a hook's refusal and a probe's error carry, in place of the plain ones. */
   text?: string
+  /** How many prompts the conversation's transcript holds (`$.session.turns()`): a resumed one has some. */
+  turns?: number
+  /** A user input of the process came before this load (a reload, a plugin enabled partway): its prompt's id. */
+  promptId?: string
 }
 
 const TOOLS = ['Bash', 'PowerShell', 'Read', 'mcp__linear__whoami', 'mcp__linear__list_issues', 'mcp__coordinator__lanes_list']
 
 /** The engine beneath the plugin, and what the plugin asked of it. */
-function engine(on: On, { bash = 'echoes', powershell = 'echoes', verdicts = {}, tools = TOOLS, probes = {}, env = { LOCALAPPDATA: LOCAL }, text }: Options = {}) {
-  const world = { bash, powershell, verdicts, tools, probes }
+function engine(on: On, { bash = 'echoes', powershell = 'echoes', verdicts = {}, tools = TOOLS, probes = {}, env = { LOCALAPPDATA: LOCAL }, text, turns = 0, promptId }: Options = {}) {
+  const world = { bash, powershell, verdicts, tools, probes, id: ID, turns }
   const commands: { tool: string; command: string }[] = []
   const checked: string[] = []
   /** Each permission check and each call, in order (the kit may check again inside a call). */
@@ -56,7 +60,10 @@ function engine(on: On, { bash = 'echoes', powershell = 'echoes', verdicts = {},
   const session = mock.session(on)
   mock.env(on, env)
   on('session.start', (_, e) => ({ cwd: e.cwd }))
-  on('session.id', () => ({ value: ID }))
+  on('session.id', () => ({ value: world.id }))
+  on('session.turns', () => ({ value: world.turns }))
+  on('session.info', () => ({ value: { transcriptPath: '', ...(promptId === undefined ? {} : { promptId }) } }))
+  on('session.end', (_, e) => ({ sessionId: e.sessionId }))
   on('tool.register', () => ({ value: { tool: TOOL } }))
   on('ui.status', () => ({ value: undefined }))
   on('ui.toast', (_, e) => {
@@ -502,4 +509,82 @@ test('with checkAtResume off, nothing runs at resume', { options: { checkAtResum
   await clock.advance(60_000)
   expect(commands).toEqual([])
   expect(toasts).toEqual([])
+})
+
+// #53: where Claude Code's built-in guard loads, the classic SessionStart never reaches the plugin. Its partner
+// (hooks/classic.ts) takes the start up 5 s after session.start, and an in-process /resume from session.end and the id
+// read as another conversation: the quiet check at resume runs there, and only there, once.
+const GRACE = 5000
+/** The partner's take-up: two reads of the id that agree, the second past the id's 15 s lag (no work waits for it here). */
+const START = 15_000
+const OTHER = '7c9e6679-7425-40de-944b-e07fc1f90ae7'
+
+test('#53, guarded: a resumed process (its transcript holds prompts) gets the quiet check 10 s after the partner takes its start up, once', async ($, on) => {
+  const { commands, toasts, writes, clock } = engine(on, { turns: 3 })
+  await $.session.start(start)
+  await clock.advance(START + 9_999)
+  expect(commands).toEqual([])
+  await clock.advance(1)
+  expect(commands.map(c => c.tool)).toEqual(['Bash', 'PowerShell'])
+  expect(toasts).toEqual([])
+  expect(writes).toEqual([{ path: RECORD, text: '{"v":1,"at":1025000,"failed":[]}' }])
+  await clock.advance(HOUR)
+  expect(commands).toHaveLength(2)
+})
+
+test('#53, guarded: a new conversation (no prompt yet) is no resume, and checks nothing', async ($, on) => {
+  const { commands, clock } = engine(on, { turns: 0 })
+  await $.session.start(start)
+  await clock.advance(HOUR)
+  expect(commands).toEqual([])
+})
+
+test('#53, unguarded: the classic SessionStart of the resume schedules the check as before, and the partner stands down: once', async ($, on) => {
+  const { commands, clock } = engine(on, { turns: 3 })
+  await $.session.start(start)
+  await $.classic.SessionStart({ source: 'resume', session_id: ID })
+  await clock.advance(10_000)
+  expect(commands.map(c => c.tool)).toEqual(['Bash', 'PowerShell'])
+  await clock.advance(HOUR)
+  expect(commands).toHaveLength(2)
+})
+
+test('#53, unguarded, the classic SessionStart late (after the grace): the partner scheduled the check, and the classic SessionStart adds none: once', async ($, on) => {
+  const { commands, clock } = engine(on, { turns: 3 })
+  await $.session.start(start)
+  await clock.advance(START + 1000)
+  await $.classic.SessionStart({ source: 'resume', session_id: ID })
+  await clock.advance(HOUR)
+  expect(commands.map(c => c.tool)).toEqual(['Bash', 'PowerShell'])
+})
+
+test('#53, guarded: an in-process /resume, taken up once the id reads the conversation resumed, gets the quiet check 10 s later, once', async ($, on) => {
+  const w = engine(on, { turns: 0 })
+  w.world.id = OTHER
+  await $.session.start(start)
+  await w.clock.advance(GRACE)
+  await $.session.end({ reason: 'resume', sessionId: OTHER, resume: { id: OTHER } })
+  w.world.id = ID
+  await w.clock.advance(1000 + 10_000)
+  expect(w.commands.map(c => c.tool)).toEqual(['Bash', 'PowerShell'])
+  expect(w.writes.map(x => x.path)).toEqual([RECORD])
+  await w.clock.advance(HOUR)
+  expect(w.commands).toHaveLength(2)
+})
+
+test('#53, a reload in an unguarded process reads that classic hooks run here: its start is no resume of the partner’s, and checks nothing', async ($, on) => {
+  const { commands, clock } = engine(on, { turns: 3 })
+  // The session state a reload finds: an earlier load's word that classic hooks reach this process.
+  on('state.get', (_, e) => ({ value: { value: e.key === 'classic' ? true : undefined, version: 1 } }))
+  on('state.set', () => ({ value: { isSet: true, version: 2 } }))
+  await $.session.start(start)
+  await clock.advance(HOUR)
+  expect(commands).toEqual([])
+})
+
+test('#53: a reload into this version in an unguarded session (a user input came before it, no classic hook since) checks nothing', async ($, on) => {
+  const { commands, clock } = engine(on, { turns: 3, promptId: '5d0c4f7e-1a2b-4c3d-9e8f-001122334455' })
+  await $.session.start(start)
+  await clock.advance(HOUR)
+  expect(commands).toEqual([])
 })

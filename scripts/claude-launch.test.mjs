@@ -284,13 +284,21 @@ test('nothing but claude-launch.ps1 starts claude, but the claude wrapper; the s
   }
 })
 
-test('self-switch writes a left record only from its SessionStart (in place) and right before its own /exit; it hooks no session end (LR11)', () => {
-  // A typed /exit, a crash or a kill never reaches either: the 10-minute rule stands for those.
+test('self-switch writes a left record only from its SessionStart (in place), its partner at the take-up of an in-place move, and right before its own /exit; never at a session end (LR11)', () => {
+  // A typed /exit, a crash or a kill never reaches any of them: the 10-minute rule stands for those.
   const text = readFileSync(join(ROOT, 'plugins', 'self-switch', 'hooks', 'register.ts'), 'utf8')
-  assert.ok(!/on\('session\.end'|classic\.SessionEnd/.test(text))
-  assert.equal(text.split('writeLeft($, ').length - 1, 2)
+  assert.ok(!/classic\.SessionEnd/.test(text))
+  assert.equal(text.split('writeLeft($, ').length - 1, 3)
   assert.ok(text.includes("$.clock.after(LEFT_SETTLE_MS, () => void writeLeft($, left, 'in-place'))"))
   assert.ok(text.includes("await writeLeft($, ctx.own, 'exit', own)"))
+  // #53: where Claude Code's built-in guard keeps the classic SessionStart from the plugin, its partner writes the in-place
+  // record once `$.session.id()` names the conversation a /clear or /resume moved to (tookMove), as that SessionStart would.
+  const took = text.slice(text.indexOf('async function tookMove('))
+  assert.ok(took.slice(0, took.indexOf('\n}\n')).includes("$.clock.after(LEFT_SETTLE_MS, () => void writeLeft($, previous, 'in-place'))"))
+  // Its session.end hook only notes the move (and takes back an armed switch): it writes no record itself.
+  const ends = text.slice(text.indexOf("on('session.end'"))
+  const end = ends.slice(0, ends.indexOf('}).catch('))
+  assert.ok(end.length > 0 && !end.includes('writeLeft') && !end.includes('leftScript'))
   // self-restart writes none (review gap 5).
   const restart = readFileSync(join(ROOT, 'plugins', 'self-restart', 'hooks', 'register.ts'), 'utf8')
   assert.ok(!restart.includes('leftScript'))

@@ -2,6 +2,79 @@
 
 Each entry names a plugin and its version, as `version` in `plugins/<name>/.claude-plugin/plugin.json` has it.
 
+## 2026-11-17: self-check 0.2.11, self-color 0.1.3, self-reload 0.1.6, self-remote-control 0.4.4, self-restart 0.4.8, self-switch 0.4.9, self-wake 0.3.9: review round 2 on the guard-safe partners (#53, #52)
+
+- **The id's known lag.** `$.session.id()` may still read the conversation before for up to 15 s (`ID_LAG_MS` in the shared machine code), steadily, so two reads that agree prove nothing before then.
+  - The start partner now counts two agreeing reads only when the second comes at least 15 s after `session.start` (`START_LAG_MS`).
+  - It counts them sooner only when the conversation the id names has work of the plugin's own waiting: a restart's record for that very id (self-restart), or a switch's ticket (self-switch).
+  - So a restart's first prompt still goes about 6 s after the start when the id reads the conversation resumed at once.
+  - A stale id, one no work waits for, is never taken.
+  - **Tested on the test kit's engine:** an id that stays on another conversation until 12 s, then reads the right one. The resume goes once, to the conversation resumed, at about 13.5 s.
+  - **Not shown:** that Claude Code's id behaves this way in a `claude --resume` process under the guard. That is a live check still to come.
+- **Whether a start is the process's first is read inside `session.start`.** The engine awaits that hook before turn one, and the read is bounded. So a first prompt that lands as the start returns can't make a genuine first start read as a reload: a command-line prompt, a `-p` run, the SDK, Remote Control, or another plugin's delivery to the resumed session. Tested: a first prompt right after the start, and the start still taken once.
+- **A start counts as a resume when either read says so,** the one at `session.start` or the one at the take-up. A transcript not yet counted at the start would otherwise make a resumed conversation read as new, and self-switch would take a fresh S11 baseline that lets its earlier changes through. Tested: a conversation that reads as new at the start and has prompts by the take-up takes no baseline.
+- **Timing:** self-check's start work and self-switch's baseline wait for the 15 s, since no record or ticket waits for them. The quiet resume check now runs about 25 s after the start.
+- **The static check:** a `session.append` matcher held in a name, or one with a spread or a quoted key, counts as guarded, since its door can't be read off it.
+- **self-color, self-reload and self-remote-control** carry the shared `hooks/classic.ts`, which changed, so their versions move too. Their behaviour doesn't change.
+
+## 2026-11-17: self-check 0.2.10, self-color 0.1.2, self-reload 0.1.5, self-remote-control 0.4.3, self-restart 0.4.7, self-switch 0.4.8, self-wake 0.3.8: review round 1 on the guard-safe partners (#53, #52)
+
+- **A start partner runs only on the process's own first start.** Before, the reload that brings this version into a running session, where the guard isn't loaded, ran every start partner once. So did a plugin turned on partway through a session. Then self-restart could show "Restarted" and release the claim of a restart that an older version had stopped before its exit.
+  - Now a start partner runs only while `$.session.info().promptId` is absent. That is Claude Code's own word that no user input has come in the process's lifetime yet.
+  - A reload, or a plugin turned on partway through, comes after input, so no start partner runs then.
+- **#52: the id is read until it settles.** The start partner no longer trusts `$.session.id()` at the end of the grace.
+  - It reads the id every second until two reads in a row name the same conversation, and takes that conversation's start up then. On the plugin test kit's engine, an id that reads another conversation at the grace and then settles sends the restart's first prompt once, to the conversation resumed, about 7 s after the start; a live check under the guard is still to come.
+  - An id that hasn't settled within 20 s leaves the start owed to the first main-loop turn, never dropped.
+  - A move that a session end begins within the grace stands the start partner down. So does one taken up within it. The move's take-up does that conversation's work.
+- **Two looks for one move.** A look that loses the race to take a move up now settles only once the winner's take-up has. Before, self-wake could fire a wake-up that a `/resume` was dropping, into the conversation the session moved to.
+- **The move begins before the engine's end step**, inside `session.end`'s one short bound, not after it. And a classic hook that arrives while a move begins takes it up alone.
+- **self-remote-control:** under the guard, a rate-limit window counts as used up only when it resets more than a minute later. A reading past its reset is stale.
+- **self-switch:** the left record of an in-place move under the guard names the conversation `session.end` named as ending.
+- **The static check fails closed.** These now count as guarded:
+  - a `session.append` door that isn't one string (a list, a pattern, a name), and one in a nested matcher;
+  - a wildcard or negated event (`*`, `prompt.*`, `!…`);
+  - `tool.describe`, which the guard passes over for an organization's own tools.
+
+  It also fails on `on` handed to anything but a call, and on a `register` whose first parameter isn't `on`.
+
+  The guarded lists are read out of the docs' table cells (`DOCS_ROWS`, event names only, since this public repository vendors no copy of the docs' text). They are checked row by row against a copy of the docs when `CLAUDE_MODS_ADMIN_DOCS` names one.
+- **Tests:**
+  - a shared test of the partner code (`shared/tests/classic.test.ts`, copied to the seven): two looks in flight, the loser settling only after the winner's take-up; a look that reads the conversation left takes nothing;
+  - self-restart:
+    - an id that reads another conversation at the grace, then settles: the resume once, to the right conversation, the other's record kept;
+    - an id that never settles: the resume at the first turn, once;
+    - a reload into this version in an unguarded session: no prompt, no toast, no claim released;
+  - self-check and self-switch: that reload runs no check and takes no arrival;
+  - self-remote-control: a stale 100% reading, past its reset or within a minute of it, gives no error kind.
+- **Docs:** the root README's section says which starts count and how long a start partner waits; the per-plugin sections give the new timing; two wording slips are fixed.
+- **Left for a follow-up:** a second move while one is pending replaces it; and a live check of the id's settling, and of `promptId`, under the guard.
+
+## 2026-11-17: self-check 0.2.9, self-color 0.1.1, self-reload 0.1.4, self-remote-control 0.4.2, self-restart 0.4.6, self-switch 0.4.7, self-wake 0.3.7: the classic hooks' work, where Claude Code's built-in guard keeps them from running (#53, #52)
+
+- **The problem (#53, #52).** Claude Code loads a built-in guard ahead of every plugin a person installs on a machine with managed settings, or in a session signed in with `/login` to a Team or Enterprise plan. Where it loads, a person's plugin's hooks on `classic.<Event>` never run. Seven plugins here hook `classic.SessionStart`, and self-remote-control `classic.UserPromptSubmit` and `classic.StopFailure` too, so their work silently didn't happen there. Most visibly, a restart's `resume` prompt was never sent: the restarted session sat idle until someone typed (#52).
+- **Now** each classic hook stays exactly as it was, for every session the guard isn't loaded in. Beside it, a partner on the engine's own events, which the guard lets through, does that hook's work only where the guard is loaded: only while no classic hook has reached the process. The first classic hook to arrive stands every partner down for the life of the process, so nothing is done twice. Each partner's take is once, whichever path comes first.
+  - **At a process's start**, the partner waits 5 seconds after `session.start` for a classic hook, then does the start's work, once per conversation in a process.
+  - **At an in-process `/clear` or `/resume`**, `session.end` says a move began, and the partner takes it up at the first read of `$.session.id()` that names another conversation: every second for two minutes, and whenever the plugin looks first.
+- **Per plugin**, under the guard:
+  - **self-restart:** the restart that resumed the process is taken up 5 s after its start: its first prompt sent, its claim released, its toast (#52). An in-process `/resume` to a conversation a restart waits for takes it up too. A restart asked while a move is pending is refused, saying why.
+  - **self-switch:** the arrival in the process a switch placed; a new conversation's S11 baseline; at a `/clear` or `/resume`, an armed switch of the conversation ending taken back, then the start folder back in state, the conversation held, the left record, a `/resume`'s heartbeat and arrival, a `/clear`'s baseline carried. A switch asked while a move is pending waits.
+  - **self-wake:** a `/clear` carries the wake-up on and a `/resume` to another conversation drops it, as before. A wake-up due while the move is pending waits for it; one armed meanwhile goes with the move.
+  - **self-reload:** a `/clear` or `/resume` before the queued reload drops its resume at the session end; the record is marked, and the reload's report tells the model.
+  - **self-check:** the env guard at the start and at each move; the quiet check after a resume, 10 s after the partner's take-up.
+  - **self-color:** the waiting change dropped at the session end of a `/resume` or `/clear`.
+  - **self-remote-control:** the title from a `/rename` typed and from its own rename; the last turn forgotten at a `/clear` or `/resume`; a turn dead on an API error while a rate-limit window reads used up kept as `rate_limit`.
+- **Whether classic hooks reach the process** is kept in each plugin's session state (`classic`, with `started`, the conversation whose start was taken up), so a reload knows it. Claude Code empties that state at a `/clear` or a `/resume`, now or a moment after: every classic hook writes it, each SessionStart writes it again 5 s later, and each plugin writes it back wherever it puts its own state back after a wipe. A read of it is bounded (2 s) and goes into a local first, so a classic hook arriving meanwhile stands.
+- **Decided on principle:**
+  - Keep each classic hook, and add a partner that acts only where the guard is loaded (rests on: nothing may regress where the guard isn't loaded; each classic hook carries more than any engine event).
+  - The guard is detected by whether a classic hook has reached the process, as the coordinator's own fix does (rests on: the guard passes over every classic hook alike, and no API names the guard).
+  - #52's delivery: the resumed process's own `session.start`, 5 s on, rather than the reason row or a wrapper argument (rests on: the reason row is appended to the old conversation and starts no turn; a `claude --resume <id> "<prompt>"` from the wrapper would change the shared launcher, the wrapper and every slot and window, and put the prompt on a command line, which this plugin never does).
+  - The 5-second grace (rests on: the classic SessionStart of a start comes within a moment of it, and correctness doesn't rest on it: whichever path comes first takes the work, once).
+- **self-switch's LR11** still holds: no left record is written at a session end. Under the guard, the in-place record is the partner's, written once the move is taken up, as the classic SessionStart writes it; `scripts/claude-launch.test.mjs` allows that third writer and checks the `session.end` hook writes none.
+- **What the guard still can't give** is in each plugin's README and in the root README's new section, "Under Claude Code's built-in guard".
+- **Shared code:** `shared/hooks/classic.ts`, copied to the seven plugins (`Copies:`). A module reads `$.state` only by refs written in its own file, so each plugin hands it a reader and writer of its two keys, declared in its types. `shared/hooks/machine.ts` is unchanged.
+- **The static check:** `scripts/guarded-hooks.mjs` keeps the guarded events (the mods admin docs' table) and the kept hooks with their partners; `scripts/guarded-hooks.test.mjs` reads every hook the plugins register and fails on any other hook on a guarded event, on a computed event name, on a kept hook whose partner's events aren't hooked, and on a kept hook that doesn't say first that it ran.
+- **Tests:** each plugin, with the classic event raised (the old behaviour, once; the partner never acts beside it, a late classic hook included) and never raised (the partner does the work); a `/clear` whose wipe lands after its SessionStart writes the word back, and a load that reads it acts on nothing.
+
 ## 2026-11-16: self-switch 0.4.6: a launch claim not confirmed released is tried again until it is (#40)
 
 Merges after #47 and #48, whose numbers for self-switch (0.4.4, 0.4.5) come before this one.

@@ -29,6 +29,14 @@
 // moment later, the wake-up still armed and pinned; one that sends nothing leaves the status line
 // pinned to a wake-up still armed, else clear.
 //
+// Where Claude Code's built-in guard passes over this plugin's classic hooks (#53: managed settings, or a Team or
+// Enterprise login), no SessionStart names the conversation a move goes to. A partner on the engine's own events does
+// that hook's work there instead, and only there (classic.ts): session.end says a /clear or a /resume began, and the
+// first read of `$.session.id()` as another conversation takes the move up (moved), as that SessionStart would, with
+// follow's rule. Until it has, a wake-up that comes due waits for it, so it never fires into a conversation a /resume
+// moved to; and one armed meanwhile, in a turn of the conversation moved to, goes with the move. At the process's
+// start, the conversation `$.session.id()` names is the one held, so a /branch is seen as it is where the event names it.
+//
 // The wake marker (S10w's read, for self-switch and the coordinator): %LOCALAPPDATA%\claude-self-tools\
 // wake\<conversation>.json = { v: 1, armed, due?, at }, `armed` true only while this process holds a
 // timer for that conversation's wake-up. Written at the start of each conversation this process holds
@@ -45,6 +53,7 @@
 // switch may not see the wake-up.
 import type { EngineInterface, Register, Timer } from 'claude-code'
 import type { Wake } from '../types'
+import { type ClassicIo, classicSeen, configureClassic, keepClassic, type Move, moveBegins, moveLook, movePending, startPartner, takeOwedStart } from './classic'
 import { ID_LAG_MS, idLag, isSafeFolder, movesConversation, powershellPath, removeWakeMarker, SESSION_ID, stateFolder, SYSTEM_ROOT, wakeMarker, wakePath } from './machine'
 import { configureUpdateCheck, loadUpdateCheck, withUpdateNotice } from './update-check'
 
@@ -97,6 +106,12 @@ let held: { conversation: string | undefined; readonly id: string; readonly dueA
  */
 let kept: Wake | null | undefined
 
+/**
+ * #53: a wake-up armed while a move a session end began was pending (classic.ts, movePending): the turn that armed it
+ * ran in the conversation moved to, which `$.session.id()` didn't name yet, so the move takes it there.
+ */
+let adoptOnMove: string | undefined
+
 /** Whether two armed wake-ups are one, as $.state would hold them. */
 const sameWake = (a: Wake | null, b: Wake | null): boolean =>
   a === null || b === null ? a === b : a.id === b.id && a.dueAt === b.dueAt && a.note === b.note && a.conversation === b.conversation
@@ -110,6 +125,8 @@ let warned = false
  * id is the conversation, from here (a /branch, whose fork's SessionStart names nothing here).
  */
 async function conversation($: EngineInterface): Promise<string | undefined> {
+  // #53: a /clear or a /resume no classic SessionStart named, taken up first, once the id reads the conversation it moved to.
+  if (movePending()) await lookForMove($)
   let own: string | undefined
   try {
     const id = await $.session.id()
@@ -224,6 +241,8 @@ async function armedWake($: EngineInterface): Promise<{ readonly value: Wake | n
   }
   if (sameWake(value, kept)) return { value: kept, version: stored.version }
   const back = await $.state.set(armed, kept)
+  // #53: the wipe took the word that classic hooks reach this process too: it goes back with the wake-up (classic.ts).
+  await keepClassic($, classicIo($))
   return { value: kept, version: back.version }
 }
 
@@ -260,6 +279,15 @@ async function letGo($: EngineInterface, id: string): Promise<void> {
 }
 
 async function fire($: EngineInterface, id: string, tries = 1): Promise<void> {
+  // #53: a /clear or a /resume no classic SessionStart named, not yet taken up: what becomes of the wake-up waits for it
+  // (the look settles it within seconds), so it never fires into a conversation a /resume moved to.
+  if (movePending()) {
+    await lookForMove($)
+    if (movePending()) {
+      timer = $.clock.after(FIRE_RETRY_MS, () => void fire($, id, tries))
+      return
+    }
+  }
   const stored = await armedWake($)
   const wake = stored.value
   if (wake?.id !== id) {
@@ -358,8 +386,63 @@ async function follow($: EngineInterface, source: 'clear' | 'resume', previous: 
   await $.state.set(armed, null)
 }
 
+/**
+ * #53: the classic SessionStart's work at this process's start, where no classic hook reached the plugin within
+ * START_GRACE_MS of session.start (classic.ts, startPartner): the conversation `$.session.id()` names is the one held,
+ * so a later id that names another without a move (a /branch) carries the wake-up there (conversation), as it does
+ * where the event names it. session.start armed the wake-up and wrote the marker already.
+ */
+async function guardedStart(id: string): Promise<void> {
+  if (current !== undefined) return
+  current = id
+  currentAt = undefined
+}
+
+/**
+ * #53: the classic SessionStart's work at an in-process /clear or /resume, where none reached the plugin: the move a
+ * session end began, taken up at the first read of `$.session.id()` as another conversation (classic.ts, moveLook).
+ * The conversation held moves; a /clear carries the armed wake-up on and a /resume to another conversation drops it
+ * (follow), except one armed in a turn of the conversation moved to while the move was pending, which goes with it;
+ * and both conversations' markers say so.
+ */
+async function moved($: EngineInterface, move: Move): Promise<void> {
+  const previous = current ?? move.from
+  current = move.to
+  currentAt = undefined
+  const adopted = adoptOnMove
+  adoptOnMove = undefined
+  try {
+    const value = kept !== undefined ? kept : (await armedWake($)).value
+    if (value !== null && value.id === adopted) await carry($, ownerOf(value, previous), move.to, value)
+    else await follow($, move.reason, previous, move.to)
+  } catch {
+    // The next read puts $.state right; the timer goes by the module's copy.
+  }
+  void mark($, move.to)
+  if (previous !== move.to) void mark($, previous)
+}
+
+/** #53: the shared partner code's two keys (classic.ts), in this plugin's own $.state, read and written here by name. */
+const classicRef = { plugin: 'self-wake', key: 'classic' } as const
+const startedRef = { plugin: 'self-wake', key: 'started' } as const
+
+/** #53: this plugin's $.state, as the shared partner code reads and writes it (classic.ts, ClassicIo). */
+function classicIo($: EngineInterface): ClassicIo {
+  return {
+    get: async key => (key === 'classic' ? (await $.state.get(classicRef)).value : (await $.state.get(startedRef)).value),
+    set: (key, value) => (key === 'classic' ? $.state.set(classicRef, value === true) : $.state.set(startedRef, typeof value === 'string' ? value : null)),
+  }
+}
+
+/** #53: a move a session end began, looked for now (classic.ts, moveLook), and taken up here when found (moved). */
+function lookForMove($: EngineInterface): Promise<void> {
+  return moveLook($, classicIo($), move => moved($, move))
+}
+
 export const register: Register = (on, options) => {
   configureUpdateCheck('self-wake', options)
+  // #53: the classic SessionStart's partners, which act only where no classic hook reaches this process (classic.ts).
+  configureClassic()
 
   // First, so it is outermost on this plugin's tools: it sees each answer, and adds the update
   // notice when one is due. It never waits on the check; see update-check.ts.
@@ -398,8 +481,19 @@ export const register: Register = (on, options) => {
     // The marker of the conversation this process starts in: armed or not, as its timer says.
     else void mark($, here)
     loadUpdateCheck($)
+    // #53: where the classic SessionStart doesn't reach this plugin, its partner takes this process's start up.
+    // Awaited for its bounded reads (whether this is the first start), which must come before turn one.
+    await startPartner($, classicIo($), guardedStart)
     return started
   })
+
+  // #53: a /clear or a /resume, where no classic SessionStart will name the conversation it moves to: looked for from
+  // here (moveLook), and taken up as that SessionStart would take it (moved). Before the engine's end step: a memory
+  // read, a clock read and the look's timer, inside the session end's one short bound.
+  on('session.end', async ($, e, next) => {
+    await moveBegins($, classicIo($), e, move => moved($, move))
+    return next(e)
+  }).catch(($, e, next) => next(e))
 
   // Each conversation this process comes to holds its marker, by the event's own id: at a startup, a
   // resume or a clear. A timer armed at session.start belongs to the conversation its wake-up names (a
@@ -412,7 +506,9 @@ export const register: Register = (on, options) => {
   // that conversation's, or a switch from it would read none and drop the wake-up.
   // It answers what the chain beneath answered, always, and quickly (the markers are written after,
   // unawaited); a failure here passes the start through unchanged (the .catch).
+  // #53: first, before anything is awaited, it says classic hooks reach this process, and the partners stand down.
   on('classic.SessionStart', async ($, e, next) => {
+    void classicSeen($, classicIo($), e)
     const done = await next(e)
     if (e.agent_id !== undefined || typeof e.session_id !== 'string' || !SESSION_ID.test(e.session_id)) return done
     if (!movesConversation(e.source)) {
@@ -490,6 +586,10 @@ export const register: Register = (on, options) => {
   on('turn.complete', async ($, e, next) => {
     const done = await next(e)
     if (e.agentId !== undefined) return done
+    // #53: the word that classic hooks reach this process, put back after a /clear's or a /resume's wipe (classic.ts);
+    // and a start whose id never settled, taken up now.
+    await keepClassic($, classicIo($))
+    await takeOwedStart($, classicIo($))
     // The conversation as the id now reads it: a /branch past its lag carries the wake-up to the fork.
     if (held !== undefined) await conversation($).catch(() => undefined)
     const { value } = await $.state.get(queued)
@@ -503,6 +603,8 @@ export const register: Register = (on, options) => {
     }
     const now = await $.clock.now()
     const here = await conversation($)
+    // #53: a move no SessionStart named, pending still: this turn ran in the conversation it moves to, and the wake-up goes there with it.
+    const isMoving = movePending()
     const wake: Wake = {
       id: `${now}-${Math.random().toString(36).slice(2, 10)}`,
       dueAt: now + value.minutes * MINUTE,
@@ -510,6 +612,7 @@ export const register: Register = (on, options) => {
       ...(here === undefined ? {} : { conversation: here }),
     }
     kept = wake
+    adoptOnMove = isMoving ? wake.id : undefined
     await $.state.set(armed, wake)
     await arm($, wake, now, here)
     return done

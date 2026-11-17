@@ -10,8 +10,13 @@ export type Color = 'red' | 'blue' | 'green' | 'yellow' | 'purple' | 'orange' | 
  */
 export type Queued = { color: Color }
 
+/**
+ * The plugin's session state. #53, shared/hooks/classic.ts: `classic`, true once a classic hook reached this process
+ * (Claude Code's built-in guard isn't loaded here); `started`, the conversation whose start this process took up,
+ * so a reload doesn't take it again.
+ */
 declare module 'claude-code' {
   interface PluginState {
-    'self-color': { queued: Queued | null }
+    'self-color': { queued: Queued | null; classic: boolean | null; started: string | null }
   }
 }

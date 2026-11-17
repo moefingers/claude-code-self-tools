@@ -68,6 +68,8 @@ function engine(on: On, { description = NOT_CONNECTED, remoteControl = 'false', 
   on('turn.complete', () => ({ text: 'done' }))
   on('classic.SessionStart', () => ({}))
   on('classic.UserPromptSubmit', () => ({}))
+  on('classic.StopFailure', () => ({}))
+  on('session.end', (_, e) => ({ sessionId: e.sessionId }))
   on('session.surfaces', () => ({ value: surfaces }))
   on('config.list', () => ({
     value: [
@@ -767,4 +769,120 @@ test("no prompt text is kept: the person's words reach no state, toast, note, lo
   const everything = [...w.seen, ...w.toasts, ...w.commands, JSON.stringify(w.session.appended())].join('\n')
   expect(everything).not.toContain(words)
   expect(everything).not.toContain(dropped)
+})
+
+// #53: where Claude Code's built-in guard loads, none of the plugin's classic hooks runs: SessionStart,
+// UserPromptSubmit, StopFailure. Their partners (hooks/classic.ts) do their work there, and only there: a /rename's
+// title, the plugin's own rename's, the last turn forgotten at a /clear or a /resume, and a turn's death on an API error
+// while a rate-limit window reads used up read as `rate_limit`.
+const presentation = { isFullscreen: false, columns: 120 } as const
+const ENDED = '0f8fad5b-d9cb-469f-a165-70867728950e'
+/** The rate-limit windows `$.session.usage()` reads, the five-hour one at `used` percent, resetting at `resets` (an hour on, by default). */
+const usage = (on: On, used: number, resets = '1970-01-01T01:00:00.000Z') =>
+  on('session.usage', () => ({ value: { startedAt: 0, context: {}, rateLimits: [{ kind: 'five_hour', percentUsed: used, resetsAt: resets }] } }) as never)
+/** The plugin's writes of its last turn, from what it handed the engine. */
+const turnWrites = (seen: readonly string[]) =>
+  seen
+    .map(line => JSON.parse(line) as { key?: unknown; value?: unknown })
+    .filter(e => e.key === 'turn')
+    .map(e => e.value as { outcome?: string; error?: string } | null)
+
+test('#53, guarded: a /rename typed sets the session title, as the next prompt would have carried it', async ($, on) => {
+  engine(on)
+  await $.session.start(start)
+  await $.command.run({ command: 'rename', args: '  billing export  ', origin: { kind: 'composer' }, presentation })
+  expect((await $.tool.call({ tool: TOOL, action: 'status' })).result).toMatch(/ Session title: "billing export"\. /)
+  // A /rename with no title (Claude Code names the session itself) leaves it as it was.
+  await $.command.run({ command: 'rename', args: '', origin: { kind: 'composer' }, presentation })
+  expect((await $.tool.call({ tool: TOOL, action: 'status' })).result).toMatch(/ Session title: "billing export"\. /)
+})
+
+test('#53, guarded: the plugin’s own rename is the title, which its own command passes no hook of its own to say', async ($, on) => {
+  const { clock } = engine(on)
+  await $.session.start(start)
+  await $.tool.call({ tool: TOOL, action: 'rename', name: 'auth refactor' })
+  await $.turn.complete({ ...answered, turnId: 't1' })
+  await clock.advance(1000)
+  expect((await $.tool.call({ tool: TOOL, action: 'status' })).result).toMatch(/ Session title: "auth refactor"\. /)
+})
+
+test('#53, unguarded: the title is the one the prompts carry, as before; a /rename typed sets nothing of the partner’s', async ($, on) => {
+  engine(on)
+  await $.session.start(start)
+  await $.classic.UserPromptSubmit({ prompt: 'go', session_title: 'from the prompt' })
+  await $.command.run({ command: 'rename', args: 'typed', origin: { kind: 'composer' }, presentation })
+  expect((await $.tool.call({ tool: TOOL, action: 'status' })).result).toMatch(/ Session title: "from the prompt"\. /)
+})
+
+test('#53, guarded: a main-loop turn dead on an API error while a rate-limit window reads used up is kept as `rate_limit`, which a login change may resume', async ($, on) => {
+  const { seen } = engine(on)
+  usage(on, 100)
+  await $.session.start(start)
+  await $.turn.start({ text: 'go', turnId: 't1' })
+  await $.turn.complete({ ...answered, turnId: 't1', reason: 'error' })
+  expect(turnWrites(seen).at(-1)).toMatchObject({ outcome: 'error', error: 'rate_limit' })
+})
+
+test('#53, guarded: a turn dead on an API error with no window used up keeps no error kind, so no resume follows it', async ($, on) => {
+  const { seen } = engine(on)
+  usage(on, 40)
+  await $.session.start(start)
+  await $.turn.start({ text: 'go', turnId: 't1' })
+  await $.turn.complete({ ...answered, turnId: 't1', reason: 'error' })
+  const last = turnWrites(seen).at(-1)
+  expect(last?.outcome).toBe('error')
+  expect(last?.error).toBeUndefined()
+})
+
+for (const [name, resets] of [
+  ['resets within a minute', '1970-01-01T00:00:30.000Z'],
+  ['has passed its reset', '1969-12-31T23:00:00.000Z'],
+] as const) {
+  test(`#53, guarded: a used-up reading that ${name} is stale: no error kind`, async ($, on) => {
+    const { seen } = engine(on)
+    usage(on, 100, resets)
+    await $.session.start(start)
+    await $.turn.start({ text: 'go', turnId: 't1' })
+    await $.turn.complete({ ...answered, turnId: 't1', reason: 'error' })
+    const last = turnWrites(seen).at(-1)
+    expect(last?.outcome).toBe('error')
+    expect(last?.error).toBeUndefined()
+  })
+}
+
+test('#53, unguarded: StopFailure names the error as before, and the partner adds nothing, a used-up window or not', async ($, on) => {
+  const { seen } = engine(on)
+  usage(on, 100)
+  await $.session.start(start)
+  await $.classic.SessionStart({ source: 'startup' })
+  await $.turn.start({ text: 'go', turnId: 't1' })
+  await $.classic.StopFailure({ error: 'overloaded' })
+  await $.turn.complete({ ...answered, turnId: 't1', reason: 'error' })
+  expect(turnWrites(seen).at(-1)).toMatchObject({ outcome: 'error', error: 'overloaded' })
+})
+
+test('#53, guarded: the session end of a /clear forgets the last turn; unguarded, the classic SessionStart does', async ($, on) => {
+  const { seen } = engine(on)
+  await $.session.start(start)
+  await $.turn.start({ text: 'go', turnId: 't1' })
+  await $.turn.complete({ ...answered, turnId: 't1' })
+  expect(turnWrites(seen).at(-1)).not.toBeNull()
+  await $.session.end({ reason: 'clear', sessionId: ENDED, resume: { id: ENDED } })
+  expect(turnWrites(seen).at(-1)).toBeNull()
+  // An exit's session end forgets nothing of the partner's.
+  const before = turnWrites(seen).length
+  await $.session.end({ reason: 'prompt_input_exit', sessionId: ENDED, resume: { id: ENDED } })
+  expect(turnWrites(seen)).toHaveLength(before)
+})
+
+test('#53, unguarded: a session end leaves the last turn to the classic SessionStart of the move', async ($, on) => {
+  const { seen } = engine(on)
+  await $.session.start(start)
+  await $.classic.SessionStart({ source: 'startup' })
+  await $.turn.start({ text: 'go', turnId: 't1' })
+  await $.turn.complete({ ...answered, turnId: 't1' })
+  await $.session.end({ reason: 'clear', sessionId: ENDED, resume: { id: ENDED } })
+  expect(turnWrites(seen).at(-1)).not.toBeNull()
+  await $.classic.SessionStart({ source: 'clear' })
+  expect(turnWrites(seen).at(-1)).toBeNull()
 })

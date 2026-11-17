@@ -48,6 +48,7 @@ function engine(on: On, { color = 'silent', says = '' }: { color?: 'silent' | 's
   const session = mock.session(on)
   on('session.start', (_, e) => ({ cwd: e.cwd }))
   on('classic.SessionStart', () => ({}))
+  on('session.end', (_, e) => ({ sessionId: e.sessionId }))
   on('tool.register', (_, e) => (registered.push({ description: String(e.description), inputSchema: e.inputSchema }), { value: { tool: TOOL } }))
   on('ui.status', (_, e) => (statuses.push(e.text), { value: undefined }))
   on('ui.toast', (_, e) => (toasts.push(String(e.text)), { value: undefined }))
@@ -530,4 +531,59 @@ test('the description says what it does, when to use it, that it lasts for the s
       "It runs once the session is idle, after anything already waiting, and a /resume or /clear that runs first drops it; you don't need to end your turn for it.",
     ].join(' '),
   )
+})
+
+// #53: where Claude Code's built-in guard loads, the classic SessionStart never reaches the plugin. Its partner, the
+// session end of the /resume or /clear (hooks/classic.ts), drops the waiting change there instead, and only there.
+const ENDED = '0f8fad5b-d9cb-469f-a165-70867728950e'
+
+test('#53, guarded: no classic SessionStart reaches the plugin, and the session end of a /clear drops the waiting change: once, never run', async ($, on) => {
+  const w = engine(on)
+  w.hold('clear')
+  await $.session.start(start)
+
+  await $.tool.call({ tool: TOOL, color: 'green' })
+  await $.turn.complete(answered)
+  const cleared = $.command.run({ command: 'clear', args: '', origin: { kind: 'plugin', name: 'self-clear' }, presentation })
+  await w.clock.advance(SETTLE)
+  await $.session.end({ reason: 'clear', sessionId: ENDED, resume: { id: ENDED } })
+  expect(w.toasts).toEqual([DROPPED('green')])
+  w.end('clear')
+  await cleared
+  await w.clock.advance(SETTLE * 4)
+  expect(w.commands).toEqual([])
+  expect(w.toasts).toEqual([DROPPED('green')])
+  expect(w.notes()).toBe('[]')
+})
+
+test('#53, unguarded: the session end of a /resume leaves the drop to the classic SessionStart, as before: one toast', async ($, on) => {
+  const w = engine(on)
+  w.hold('resume')
+  await $.session.start(start)
+  await $.classic.SessionStart({ source: 'startup' })
+
+  await $.tool.call({ tool: TOOL, color: 'blue' })
+  await $.turn.complete(answered)
+  const resumed = $.command.run({ command: 'resume', args: '', origin: { kind: 'composer' }, presentation })
+  await w.clock.advance(SETTLE)
+  await $.session.end({ reason: 'resume', sessionId: ENDED, resume: { id: ENDED } })
+  expect(w.toasts).toEqual([])
+  await $.classic.SessionStart({ source: 'resume' })
+  w.end('resume')
+  await resumed
+  await w.clock.advance(SETTLE * 4)
+  expect(w.commands).toEqual([])
+  expect(w.toasts).toEqual([DROPPED('blue')])
+})
+
+test('#53, guarded: a session end that is no move (an exit) drops nothing', async ($, on) => {
+  const w = engine(on)
+  await $.session.start(start)
+
+  await $.tool.call({ tool: TOOL, color: 'cyan' })
+  await $.turn.complete({ ...answered, turnId: 't2' })
+  await $.session.end({ reason: 'prompt_input_exit', sessionId: ENDED, resume: { id: ENDED } })
+  await w.clock.advance(SETTLE)
+  expect(w.commands).toEqual(['color cyan'])
+  expect(w.toasts).not.toContain(DROPPED('cyan'))
 })
