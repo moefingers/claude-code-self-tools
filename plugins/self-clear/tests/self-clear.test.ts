@@ -1,5 +1,5 @@
 import { expect, mock, test } from 'claude-code/testing'
-import type { AgentStatus, On } from 'claude-code'
+import type { AgentInfo, AgentStatus, On } from 'claude-code'
 
 const TOOL = 'mcp__self-clear__clear_after_turn'
 
@@ -11,6 +11,26 @@ type Options = {
   /** Why the engine drops a prompt a plugin submits; left out, it enters. */
   dropped?: string
 }
+
+/**
+ * An agent as `$.agent.list()` answers it (AgentInfo, Claude Code 2.1.326): a subagent with the test's
+ * description and status; its task's status by the engine's rule (`waiting` is a subagent whose turn
+ * ended, `idle` a teammate between turns); zeros for its start and readings. The plugin reads its
+ * status, description, type and id alone.
+ */
+const listed = (a: { description: string; status: AgentStatus }, i: number): AgentInfo => ({
+  id: `a${i}`,
+  type: 'general-purpose',
+  ...a,
+  kind: 'local_agent',
+  taskStatus: a.status === 'waiting' ? 'completed' : a.status === 'idle' ? 'running' : a.status,
+  label: a.description,
+  startTime: 0,
+  cwd: '/',
+  tokenCount: 0,
+  tokenSamples: [0],
+  hasRow: false,
+})
 
 /** The engine beneath the plugin: its session id, its agents, and the commands and prompts it was asked for. */
 function engine(on: On, { clear = 'clears', agents = [], dropped }: Options = {}) {
@@ -33,7 +53,7 @@ function engine(on: On, { clear = 'clears', agents = [], dropped }: Options = {}
     return { value: undefined }
   })
   on('agent.list', () => ({
-    value: world.agents.map((a, i) => ({ id: `a${i}`, type: 'general-purpose', ...a })),
+    value: world.agents.map(listed),
   }))
   on('prompt.submit', (_, e) => {
     if (dropped !== undefined) return { drop: dropped }
