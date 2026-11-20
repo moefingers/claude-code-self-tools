@@ -1,5 +1,6 @@
 import { expect, mock, test } from 'claude-code/testing'
 import type { On, RenderSurface } from 'claude-code'
+import { atIdle, GO_IDLE, WHY_IDLE } from '../hooks/at-idle'
 
 const TOOL = 'mcp__self-remote-control__remote_control'
 const ENGINE = { plugin: 'engine', tier: 'core' } as const
@@ -480,10 +481,11 @@ test("the owner's A: a rename starts the moment the turn's end returns, with no 
   expect(commands).toHaveLength(1)
 })
 
-test("the owner's note: the description says, after connect or rename, to end the turn and do nothing more until it has run, then carry on", async ($, on) => {
+test("the owner's note (#67): the description ends with the shared words, to go idle at once after connect or rename, and why", async ($, on) => {
   const { described } = engine(on)
   await $.session.start(start)
-  expect(described.join(' ')).toContain('After `connect` or `rename`, end your turn and do nothing more until it has run; then carry on.')
+  expect(described.join(' ')).toContain(atIdle('After `connect` or `rename`'))
+  expect(described.join(' ')).toContain(`${GO_IDLE} ${WHY_IDLE}`)
 })
 
 test("the person's turn after a rename was queued, before it ran: the rename runs, and its resume goes to the model as a note, never as a turn", async ($, on) => {

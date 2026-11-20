@@ -7,7 +7,10 @@ import type { Engine } from 'claude-code/testing'
 import type { On } from 'claude-code'
 import { CLAIM_SCRIPT } from '../hooks/claim-script'
 import { RELEASE_SCRIPT, TAKE_SCRIPT } from '../hooks/rc-lock'
-import { CHROME_LOOK_MS, fingerprintOf, isCutOff, jitterOf, RC_WAIT_MS, resumedSaid, RESUME, RUN_WAIT_MS } from '../hooks/relogin'
+import { CHROME_LOOK_MS, fingerprintOf, FOLLOW_MS, IDLE_FIRST, IDLE_TURN_MS, isCutOff, jitterOf, RC_WAIT_MS, resumedSaid, RESUME_NOW, resumeText, RUN_WAIT_MS, WAKE_TOOL } from '../hooks/relogin'
+
+/** The resume as a session without self-wake's timer gets it: the idle step (#67). */
+const RESUME = resumeText(false)
 
 const CONNECTED = 'Disconnect Remote Control'
 const NOT_CONNECTED = 'Control this session from your phone or claude.ai/code'
@@ -31,6 +34,8 @@ const CLAIM_FILE = `${LOCAL}\\claude-self-tools\\resumed\\${SESSION}.${T1}.json`
 /** Claude in Chrome's tools, and the coordinator plugin's, as $.tool.list names them. */
 const CHROME_TOOL = { name: 'mcp__claude-in-chrome__navigate', description: 'Opens a page.', mcp: true }
 const COORDINATOR_TOOL = { name: 'mcp__coordinator__ask_owner', description: 'Posts a question.', mcp: true }
+/** self-wake's timer, as $.tool.list names it. */
+const WAKE = { name: WAKE_TOOL, description: 'Wakes this session later.', mcp: true }
 
 type Options = {
   /** What the remote-control command's description reads at the start; null: no such command. */
@@ -46,6 +51,10 @@ type Options = {
   /** Whether Claude in Chrome's tools, and the coordinator's, are listed at the start. */
   chrome?: boolean
   coordinator?: boolean
+  /** Whether self-wake's timer (wake_after) is listed. */
+  wake?: boolean
+  /** A timer the plugin starts for a wait of this length never fires, as a module a reload replaced never does. */
+  reloadedAfter?: number
   /** What /mcp reconnect does: answers, is refused, or answers only after RUN_WAIT_MS. */
   mcp?: 'answers' | 'refused' | 'slow'
   /** Why the engine drops a prompt a plugin submits; left out, it enters. */
@@ -69,7 +78,7 @@ type Options = {
  * the account-switch tool does; Remote Control then stops `stopsAfterMs` later, as Claude Code's
  * own owner check does. `refresh` rewrites the login alone, as a token refresh does.
  */
-function machine(on: On, { description = CONNECTED, remoteControl = 'false', stopsAfterMs = 12_000, record, runTakesMs = 0, chrome = false, coordinator = false, mcp = 'answers', drops, claimTakesMs = 0, submitTakesMs = 0, submitThrows = false, offWindows = false, state, conflictOn }: Options = {}) {
+function machine(on: On, { description = CONNECTED, remoteControl = 'false', stopsAfterMs = 12_000, record, runTakesMs = 0, chrome = false, coordinator = false, wake = false, reloadedAfter, mcp = 'answers', drops, claimTakesMs = 0, submitTakesMs = 0, submitThrows = false, offWindows = false, state, conflictOn }: Options = {}) {
   if (state !== undefined) {
     on('state.get', (_, e) => ({ value: state.get(`${e.plugin}/${e.key}`) ?? { value: undefined, version: 0 } }))
     on('state.set', (_, e) => {
@@ -88,8 +97,9 @@ function machine(on: On, { description = CONNECTED, remoteControl = 'false', sto
   on('tool.list', () => {
     tools.looks += 1
     if (tools.fails) return { deny: 'the tool list is being rebuilt' }
-    return { value: [...(tools.chrome ? [CHROME_TOOL] : []), ...(tools.coordinator ? [COORDINATOR_TOOL] : [])] }
+    return { value: [...(tools.chrome ? [CHROME_TOOL] : []), ...(tools.coordinator ? [COORDINATOR_TOOL] : []), ...(wake ? [WAKE] : [])] }
   })
+  if (reloadedAfter !== undefined) on('clock.after', { ms: reloadedAfter }, () => ({ deny: 'the module was reloaded' }))
   const clock = mock.clock(on, { now: 100 * HOUR })
   mock.env(on, offWindows ? { USERPROFILE: HOME } : { USERPROFILE: HOME, LOCALAPPDATA: LOCAL, SystemRoot: 'C:\\Windows' })
   const commands: string[] = []
@@ -1608,4 +1618,138 @@ test('a SessionStart that finds the login record and the servers seen as the mir
   expect(state.get(LOGIN_KEY)?.value).toMatchObject({ account: fingerprint('account-a') })
   expect(state.get(SERVERS_KEY)?.value).toEqual({ chrome: true })
   void w
+})
+
+// #67: the resume idles first. Its first turn is a short one that ends at once, so what is queued for the session's
+// idle moment gets its slot; the session carries on about 100 seconds later, by the timer it sets, or else by the
+// plain resume this plugin sends itself. The test's own prompt.submit starts no turn: each test starts the turns.
+
+/** The idle step's own turn: it starts with the resume's text and ends with an answer, `ms` after it started. */
+async function idleTurn($: Engine, text: string = RESUME, turnId = T2, ms = 8000) {
+  await $.turn.start({ text, turnId })
+  await $.turn.complete({ ...answered, durationMs: ms, turnId })
+}
+
+/** A change after the limit, run until its resume has gone. */
+async function resumed($: Engine, w: World) {
+  await begin($, w)
+  await cutOff($, w)
+  w.switchTo('account-b')
+  await w.clock.advance(FLOW)
+}
+
+test("#67: the resume opens with the owner's words, word for word, then names the timer, or says the session is resumed for it", async () => {
+  expect(IDLE_FIRST).toBe(
+    'There was a small interruption. Please go idle, setting a 100 second timer to resume, for tools to reset, after which point you should resume normally.',
+  )
+  expect(resumeText(true)).toBe(
+    `${IDLE_FIRST} To set the timer, call wake_after (mcp__self-wake__wake_after) with seconds: 100 and a note to resume from your last turn, then end your turn at once. If no timer can be set, just end your turn: the session is resumed for you 150 seconds after this turn ends.`,
+  )
+  expect(resumeText(false)).toBe(`${IDLE_FIRST} This session has no timer tool, so just end your turn at once: the session is resumed for you 150 seconds after this turn ends.`)
+  expect(RESUME_NOW).toBe('There was a small interruption. Please resume from your last turn normally.')
+  // Past the 100 seconds asked for, and past a 2-minute timer a self-wake without `seconds` might be given.
+  expect(FOLLOW_MS).toBe(150_000)
+})
+
+test('#67: in a session that lists self-wake, the resume names its timer, wake_after with seconds: 100', async ($, on) => {
+  const w = machine(on, { wake: true })
+  await resumed($, w)
+  expect(w.prompts).toEqual([resumeText(true)])
+})
+
+test("#67: the idle step's turn ends at once and no turn starts after it: the plain resume goes 150 s later, once, and is never followed itself", async ($, on) => {
+  const w = machine(on)
+  await resumed($, w)
+  expect(w.prompts).toEqual([RESUME])
+  await idleTurn($)
+  await w.clock.advance(FOLLOW_MS - 1000)
+  expect(w.prompts).toEqual([RESUME])
+  await w.clock.advance(2000)
+  expect(w.prompts).toEqual([RESUME, RESUME_NOW])
+  expect(w.toasts.at(-1)).toBe('Login changed; resumed after the idle step: no turn had started 150 s after it.')
+  // The plain resume's own turn, short as it may be, owes nothing more.
+  await $.turn.start({ text: RESUME_NOW, turnId: T3 })
+  await $.turn.complete({ ...answered, durationMs: 3000, turnId: T3 })
+  await w.clock.advance(30 * 60_000)
+  expect(w.prompts).toEqual([RESUME, RESUME_NOW])
+})
+
+test('#67: the timer the session set wakes it first: no plain resume after it', async ($, on) => {
+  const w = machine(on, { wake: true })
+  await resumed($, w)
+  await idleTurn($, resumeText(true))
+  await w.clock.advance(100_000)
+  await $.turn.start({ text: 'Wake-up: resume from your last turn', turnId: T3 })
+  await $.turn.complete({ ...answered, durationMs: 60_000, turnId: T3 })
+  await w.clock.advance(30 * 60_000)
+  expect(w.prompts).toEqual([resumeText(true)])
+})
+
+test('#67: a message the person sends during the wait resumes the session: no plain resume after it', async ($, on) => {
+  const w = machine(on)
+  await resumed($, w)
+  await idleTurn($)
+  await w.clock.advance(30_000)
+  await $.prompt.submit({ text: 'carry on', wait: false, origin: { kind: 'composer' } })
+  await $.turn.start({ text: 'carry on', turnId: T3 })
+  await w.clock.advance(30 * 60_000)
+  expect(w.prompts.filter(t => t === RESUME_NOW)).toEqual([])
+})
+
+test("#67: an idle step's turn that ran 10 minutes or more did the work itself, and one interrupted was the person's: neither is followed", async ($, on) => {
+  const w = machine(on)
+  await resumed($, w)
+  await idleTurn($, RESUME, T2, IDLE_TURN_MS)
+  await w.clock.advance(30 * 60_000)
+  expect(w.prompts).toEqual([RESUME])
+
+  // The next change resumes again; this time the person stops the idle step's turn.
+  await cutOff($, w, T3)
+  w.switchTo('account-c')
+  await w.clock.advance(FLOW)
+  expect(w.prompts).toEqual([RESUME, RESUME])
+  await $.turn.start({ text: RESUME, turnId: '00000000-0000-4000-8000-0000000000a4' })
+  await $.turn.complete({ answer: '', durationMs: 2000, isAborted: true, reason: 'aborted', turnId: '00000000-0000-4000-8000-0000000000a4' })
+  await w.clock.advance(30 * 60_000)
+  expect(w.prompts).toEqual([RESUME, RESUME])
+})
+
+test('#67: whoever wins the claim, the idle step goes once: the coordinator won it, so nothing goes from here, not even after its idle step in the same words', async ($, on) => {
+  const w = machine(on)
+  await begin($, w)
+  await cutOff($, w)
+  w.raceClaim('coordinator')
+  w.switchTo('account-b')
+  await w.clock.advance(FLOW)
+  expect(w.prompts).toEqual([])
+  // The coordinator's own idle step: its turn starts and ends at once, and no turn follows it here.
+  await idleTurn($, IDLE_FIRST)
+  await w.clock.advance(FOLLOW_MS + 60_000)
+  expect(w.prompts).toEqual([])
+})
+
+test('#67: a /clear during the wait makes the session another conversation: no plain resume goes into it', async ($, on) => {
+  const w = machine(on)
+  await resumed($, w)
+  await idleTurn($)
+  await w.clock.advance(30_000)
+  await $.classic.SessionStart({ source: 'clear', session_title: TITLE })
+  await w.clock.advance(FOLLOW_MS)
+  expect(w.prompts).toEqual([RESUME])
+})
+
+test('#67: a reload during the wait arms the plain resume again for the time left, and it goes once', async ($, on) => {
+  const w = machine(on, { reloadedAfter: FOLLOW_MS })
+  await resumed($, w)
+  await idleTurn($)
+  await w.clock.advance(60_000)
+  // The reloaded module starts; the timer of the one before never fires.
+  await $.session.start(start)
+  await w.clock.advance(FOLLOW_MS - 60_000 - 1000)
+  expect(w.prompts).toEqual([RESUME])
+  await w.clock.advance(2000)
+  expect(w.prompts).toEqual([RESUME, RESUME_NOW])
+  await $.session.start(start)
+  await w.clock.advance(30 * 60_000)
+  expect(w.prompts).toEqual([RESUME, RESUME_NOW])
 })

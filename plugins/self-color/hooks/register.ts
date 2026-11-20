@@ -26,6 +26,7 @@
 // the module holds it until it runs or is dropped, so nothing here needs to outlive a /clear or a /resume.
 import type { EngineInterface, Register, Timer } from 'claude-code'
 import type { Color, Queued } from '../types'
+import { NO_WAIT, WHY_IDLE } from './at-idle'
 import { type ClassicIo, classicSeen, configureClassic, keepClassic, moveBegins } from './classic'
 import { didntRun, oneLine, text, why } from './text'
 import { configureUpdateCheck, loadUpdateCheck, withUpdateNotice } from './update-check'
@@ -53,7 +54,11 @@ const DESCRIPTION = [
   "Sets this session's prompt bar color once the current turn ends, as /color does.",
   "Use it to mark the session's role, so the person can tell sessions apart at a glance: for example, one color for a coordinating session, another for workers.",
   'The color lasts for the session; `default` resets it.',
-  "It runs once the session is idle, after anything already waiting, and a /resume or /clear that runs first drops it; you don't need to end your turn for it.",
+  'It runs once the session is idle, after anything already waiting, and a /resume or /clear that runs first drops it.',
+  // #67: the shared words of every tool that queues for the idle moment, but for going idle: a color change has no
+  // resume, so a turn that ended for it would leave the session halted with nothing to bring it back.
+  WHY_IDLE,
+  NO_WAIT,
 ].join(' ')
 
 const SUBAGENT = "A subagent can't set the session's prompt bar color. Finish your piece and return its result; the main session can set it."

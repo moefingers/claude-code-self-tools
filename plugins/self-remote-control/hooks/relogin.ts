@@ -47,12 +47,17 @@
 //      group over. It runs inside the login watch, so with both settings above off it doesn't run either.
 //   3. The resume, when resumeAfterLoginChange is on and the main conversation's last turn ended,
 //      within CUT_OFF_MS, on an API error a login can clear (the usage limit, a failed sign-in, ...)
-//      with no turn since: RESUME, once, after the reconnect has settled, Claude in Chrome's step and
-//      the session's own delay (0 to JITTER_MS, so the sessions of one switch don't all start at
-//      once). Only under the resume claim (resume-claim.ts): the coordinator's auto-resume, or the
-//      owner's Resume on its page, may resume the same stop, and whichever claims it first sends;
-//      the other sends nothing. A turn still running at the change is waited for. A session at a
-//      finished break gets nothing. A resume whose turn ends on an error at once (no usage, or under QUICK_MS) isn't
+//      with no turn since: the idle step (resumeText: IDLE_FIRST, the owner's words, then how to set
+//      the 100-second timer here), so the first turn after the interruption is short and every command
+//      queued for the idle moment runs before the work goes on. Nobody is left asleep: when that turn
+//      ends with an answer and no turn has started FOLLOW_MS after it (no timer was set, or it never
+//      came), the plain RESUME_NOW goes, once (followUp). The idle step goes once, after the
+//      reconnect has settled, Claude in Chrome's step and the session's own delay (0 to JITTER_MS, so
+//      the sessions of one switch don't all start at once). Only under the resume claim
+//      (resume-claim.ts): the coordinator's auto-resume, or the owner's Resume on its page, may resume
+//      the same stop, and whichever claims it first sends; the other sends nothing, and owes no
+//      follow-up, which only the idle step this plugin sent arms. A turn still running at the change
+//      is waited for. A session at a finished break gets nothing. A resume whose turn ends on an error at once (no usage, or under QUICK_MS) isn't
 //      followed by another until a person types: the loop-breaker. A rewind past the cut-off turn
 //      isn't seen (the API gives no cheap mark of the newest message, and $.session.messages()
 //      copies up to 4096 of them): the 6-hour limit bounds it.
@@ -83,8 +88,35 @@ const turnRef = { plugin: 'self-remote-control', key: 'turn' } as const
 const resumesRef = { plugin: 'self-remote-control', key: 'resumes' } as const
 const serversRef = { plugin: 'self-remote-control', key: 'servers' } as const
 
-/** The message that resumes a turn a login change, or the limit before it, cut off. */
-export const RESUME = 'There was a small interruption. Please resume from your last turn normally.'
+/**
+ * #67: how long after the idle step's turn ended, with no turn since, the plain resume (RESUME_NOW) goes: past the 100
+ * seconds the idle step asks for, and past a 2-minute timer a self-wake without `seconds` might be given, so it never
+ * races the wake-up it stands in for.
+ */
+export const FOLLOW_MS = 150_000
+/** #67: an idle step's turn that ran this long or longer did the work itself, so it resumed already: no follow-up after it. */
+export const IDLE_TURN_MS = 10 * 60_000
+
+/**
+ * #67: the owner's words, which the resume of a turn a login change (or the limit before it) cut off opens with. The
+ * first turn after the interruption is a short one that ends at once, so every command queued for the session's idle
+ * moment (a reconnect, a reload) gets its slot; the session carries on about 100 seconds later.
+ */
+export const IDLE_FIRST =
+  'There was a small interruption. Please go idle, setting a 100 second timer to resume, for tools to reset, after which point you should resume normally.'
+/** self-wake's timer, as $.tool.list names it: where it is listed, the idle step names it. */
+export const WAKE_TOOL = 'mcp__self-wake__wake_after'
+/** What the idle step adds where self-wake's timer is listed: exactly what to call, and what to do when it can't be set. */
+export const WITH_TIMER = `To set the timer, call wake_after (${WAKE_TOOL}) with seconds: 100 and a note to resume from your last turn, then end your turn at once. If no timer can be set, just end your turn: the session is resumed for you ${FOLLOW_MS / 1000} seconds after this turn ends.`
+/** What the idle step adds where no timer is listed: the session is resumed all the same (followUp). */
+export const WITHOUT_TIMER = `This session has no timer tool, so just end your turn at once: the session is resumed for you ${FOLLOW_MS / 1000} seconds after this turn ends.`
+/** The resume message, for a session with self-wake's timer or without it. */
+export const resumeText = (hasTimer: boolean): string => `${IDLE_FIRST} ${hasTimer ? WITH_TIMER : WITHOUT_TIMER}`
+/**
+ * #67: the plain resume, sent once when no turn has started FOLLOW_MS after the idle step's turn ended: the timer it
+ * asked for was never set, or never came. Never the idle step again.
+ */
+export const RESUME_NOW = 'There was a small interruption. Please resume from your last turn normally.'
 
 /** How often the login watch looks at the login file. */
 export const POLL_MS = 5000
@@ -175,6 +207,8 @@ let logins: number[] = []
 let connectedAtLogin: number | undefined
 let watchTimer: Timer | undefined
 let tickTimer: Timer | undefined
+/** #67: the timer for the plain resume after the idle step (followUp); a reload drops it, and startFollow arms it again. */
+let followTimer: Timer | undefined
 /**
  * The login record and the servers seen as this module last wrote them, or first read them: undefined until
  * loaded, null when known to be none. Once loaded, each stands over $.state: the copy a /clear or a /resume
@@ -203,6 +237,7 @@ export function configureRelogin(options: PluginOptions): void {
   connectedAtLogin = undefined
   watchTimer = undefined
   tickTimer = undefined
+  followTimer = undefined
   loginMirror = undefined
   serversMirror = undefined
   conversation = undefined
@@ -723,13 +758,30 @@ function agoText(ms: number): string {
 /** A resume's words: the error kind its turn ended on, and how long ago, so a resume can be checked after the fact. */
 export const resumedSaid = (error: string | undefined, ms: number): string => `resumed: the turn ended on ${error ?? 'an error'} ${agoText(ms)} ago`
 
-/** The resume step: sends RESUME to a turn that was cut off; says what it did, in the toast's words and the debug log. */
+/**
+ * Whether this session has listed self-wake's timer, at its start or a main-loop turn's end (noteServers), as Claude in
+ * Chrome's server is known: the cut-off turn's own end looked. Never throws.
+ */
+async function hasTimer($: EngineInterface): Promise<boolean> {
+  try {
+    return (await getServers($)).wake === true
+  } catch {
+    return false
+  }
+}
+
+/**
+ * The resume step: sends the idle step (resumeText) to a turn that was cut off; says what it did, in the toast's words
+ * and the debug log. The plain resume after it is followUp's.
+ */
 async function resume($: EngineInterface, held: Login, p: Pending, now: number): Promise<string> {
   if (!settings.resume) return 'no resume (resumeAfterLoginChange is off)'
   if (p.resumed === true) return 'the interrupted turn was resumed'
   if ((await getResumes($))?.blocked === true) return 'no resume: the last one ended on an error at once, so it waits for you to type'
   const turn = await getTurn($)
   if (!isCutOff(turn, now)) return 'no turn was cut off'
+  // Read before the claim, so that the claim and the submit stay as close as they were.
+  const text = resumeText(await hasTimer($))
   await setLogin($, { ...held, pending: { ...p, resumed: true } })
   // The claim, right before the submit: whoever claims this stop first resumes it, and no one else. Keyed by
   // the conversation the stop was recorded in, never by `$.session.id()` now, which may lag a move.
@@ -752,7 +804,7 @@ async function resume($: EngineInterface, held: Login, p: Pending, now: number):
   }
   await $.state.set(resumesRef, { ...((await getResumes($)) ?? {}), sentAt: now })
   const said = resumedSaid(turn?.error, now - (turn?.at ?? now))
-  const submitting = $.prompt.submit({ text: RESUME })
+  const submitting = $.prompt.submit({ text })
   let wasLate = false
   // However the submit ends, even after the wait below has given up on it: a drop or a refusal gives the claim
   // back, and one after the toast said it was queued is told.
@@ -790,8 +842,9 @@ async function rememberServers($: EngineInterface, tools: readonly { name: strin
     ...known,
     ...(tools.some(tool => tool.name.startsWith(`mcp__${CHROME}__`)) ? { chrome: true as const } : {}),
     ...(tools.some(tool => tool.name.startsWith(COORDINATOR_TOOLS)) ? { coordinator: true as const } : {}),
+    ...(tools.some(tool => tool.name === WAKE_TOOL) ? { wake: true as const } : {}),
   }
-  if (seen.chrome !== known.chrome || seen.coordinator !== known.coordinator) {
+  if (seen.chrome !== known.chrome || seen.coordinator !== known.coordinator || seen.wake !== known.wake) {
     serversMirror = seen
     await $.state.set(serversRef, seen).catch(() => undefined)
   }
@@ -799,8 +852,9 @@ async function rememberServers($: EngineInterface, tools: readonly { name: strin
 }
 
 /**
- * Notes which of Claude in Chrome and the coordinator this session lists tools of, so that a login change that drops
- * Claude in Chrome's server still finds it was there: at the session's start and each main-loop turn's end. Never throws.
+ * Notes which of Claude in Chrome, the coordinator and self-wake's timer this session lists tools of, so that a login
+ * change that drops Claude in Chrome's server still finds it was there, and the idle step knows whether to name the
+ * timer: at the session's start and each main-loop turn's end. Never throws.
  */
 export async function noteServers($: EngineInterface): Promise<void> {
   try {
@@ -1008,17 +1062,31 @@ export async function move($: EngineInterface): Promise<void> {
 
 /**
  * On a main-loop turn's start: running, its error kind cleared. The first turn after the resume was
- * sent whose text holds it is the resume's own; a continuation (no text) is not.
+ * sent whose text holds it is the resume's own; a continuation (no text) is not. The idle step's own
+ * turn (IDLE_FIRST) is marked so; the plain resume's (RESUME_NOW) is a resume's turn, never the idle
+ * step's. Any turn that starts after the idle step's has ended takes the follow-up back: the session
+ * has resumed, whatever started it (its own timer, the person, a message).
  */
 export async function noteTurnStart($: EngineInterface, text: string, turnId?: string): Promise<void> {
   try {
     const now = await $.clock.now()
     const resumes = await getResumes($)
     const sentAt = resumes?.sentAt
-    const isResumeTurn = sentAt !== undefined && now - sentAt < SENT_MS && text.includes(RESUME)
-    if (resumes !== null && sentAt !== undefined && (isResumeTurn || now - sentAt >= SENT_MS)) await $.state.set(resumesRef, without(resumes, 'sentAt'))
+    const isSent = sentAt !== undefined && now - sentAt < SENT_MS
+    const isIdleTurn = isSent && text.includes(IDLE_FIRST)
+    const isResumeTurn = isIdleTurn || (isSent && text.includes(RESUME_NOW))
+    const drop: (keyof Resumes)[] = [...(sentAt !== undefined && (isResumeTurn || now - sentAt >= SENT_MS) ? (['sentAt'] as const) : []), ...(resumes?.follow !== undefined ? (['follow'] as const) : [])]
+    if (resumes !== null && drop.length > 0) await $.state.set(resumesRef, without(resumes, ...drop))
+    if (resumes?.follow !== undefined) stopFollow()
     const session = await conversationOf($)
-    await $.state.set(turnRef, { running: true, at: now, ...(isResumeTurn ? { fromResume: true as const } : {}), ...(turnId === undefined ? {} : { turnId }), ...(session === undefined ? {} : { session }) })
+    await $.state.set(turnRef, {
+      running: true,
+      at: now,
+      ...(isResumeTurn ? { fromResume: true as const } : {}),
+      ...(isIdleTurn ? { fromIdle: true as const } : {}),
+      ...(turnId === undefined ? {} : { turnId }),
+      ...(session === undefined ? {} : { session }),
+    })
   } catch {
     // The turn's end sets it again.
   }
@@ -1042,9 +1110,10 @@ export async function noteTurnEnd($: EngineInterface, end: TurnEnd): Promise<voi
     // in, else the one held now: the resume claim's key.
     const turnId = end.turnId ?? (isThisTurn ? prior.turnId : undefined)
     const session = (isThisTurn ? prior.session : undefined) ?? (await conversationOf($))
+    const at = await $.clock.now()
     await $.state.set(turnRef, {
       running: false,
-      at: await $.clock.now(),
+      at,
       outcome: end.reason,
       ...(error === undefined ? {} : { error }),
       ...(fromResume ? { fromResume: true as const } : {}),
@@ -1056,8 +1125,86 @@ export async function noteTurnEnd($: EngineInterface, end: TurnEnd): Promise<voi
       const hasTypedSince = resumes.personAt !== undefined && prior !== null && resumes.personAt >= prior.at
       if (!hasTypedSince) await $.state.set(resumesRef, { ...resumes, blocked: true })
     }
+    // #67: the idle step's turn ended as it asked, with an answer and soon: the plain resume is owed if no turn starts
+    // within FOLLOW_MS. One that ended otherwise (an error, which the loop-breaker has; an interruption, which the
+    // person made) or ran long (it did the work) is owed none.
+    const isIdleDone = isThisTurn && prior.fromIdle === true && end.reason === 'answer' && end.durationMs < IDLE_TURN_MS
+    if (isIdleDone && settings.resume) {
+      await $.state.set(resumesRef, { ...((await getResumes($)) ?? {}), follow: { at, ...(turnId === undefined ? {} : { turnId }) } })
+      armFollow($, FOLLOW_MS)
+    }
   } catch {
     // Without it, no resume follows a change.
+  }
+}
+
+/** Starts the timer for the plain resume, `ms` from now, in place of any it had. */
+function armFollow($: EngineInterface, ms: number): void {
+  followTimer?.cancel()
+  followTimer = $.clock.after(Math.max(0, ms), () => void followUp($))
+}
+
+/** Stops the timer for the plain resume. */
+function stopFollow(): void {
+  followTimer?.cancel()
+  followTimer = undefined
+}
+
+/**
+ * At a start or a reload: arms the plain resume again that an idle step left owed, for the time left (at once when it
+ * has passed). The record lives in $.state, which a reload keeps; the timer doesn't. Never throws.
+ */
+export async function startFollow($: EngineInterface): Promise<void> {
+  try {
+    if (!settings.resume) return
+    const follow = (await getResumes($))?.follow
+    if (follow === undefined) return
+    armFollow($, follow.at + FOLLOW_MS - (await $.clock.now()))
+  } catch {
+    // Nothing is armed: the session waits for the next message, as it would have before the idle step.
+  }
+}
+
+/**
+ * Sends the plain resume (RESUME_NOW), once, when no turn has started since the idle step's turn ended FOLLOW_MS ago.
+ * Only this plugin's own idle step owes one: it is armed at that step's turn's end, and that step went only after this
+ * plugin won the stop's claim. A turn since, a /clear or a /resume (forgetTurn), or the setting turned off, owes none.
+ * Never throws.
+ */
+async function followUp($: EngineInterface): Promise<void> {
+  followTimer = undefined
+  try {
+    if (!settings.resume) return
+    const resumes = await getResumes($)
+    const follow = resumes?.follow
+    if (resumes === null || follow === undefined) return
+    const now = await $.clock.now()
+    if (now < follow.at + FOLLOW_MS) {
+      armFollow($, follow.at + FOLLOW_MS - now)
+      return
+    }
+    // Still the idle step's turn, ended at the same moment: no turn has started since.
+    const turn = await getTurn($)
+    const isAsleep = turn !== null && !turn.running && turn.at === follow.at && turn.turnId === follow.turnId
+    // Taken first, and sentAt with it (its turn is a resume's, for the loop-breaker): a reload never sends it twice.
+    await $.state.set(resumesRef, { ...without(resumes, 'follow'), ...(isAsleep ? { sentAt: now } : {}) })
+    if (!isAsleep) return
+    const said = `resumed after the idle step: no turn had started ${FOLLOW_MS / 1000} s after it`
+    try {
+      const sent = await $.prompt.submit({ text: RESUME_NOW })
+      if (sent.drop === undefined) {
+        $.ui.log(`self-remote-control: ${said}`, { to: 'debug' })
+        $.ui.toast(`Login changed; ${said}.`)
+        return
+      }
+      $.ui.log(`self-remote-control: the resume after the idle step was dropped: ${sent.drop}`, { to: 'debug' })
+      $.ui.toast(`The resume after the idle step was dropped (${sent.drop}): the session waits for the next message.`)
+    } catch (err) {
+      $.ui.log(`self-remote-control: the resume after the idle step wasn't sent: ${why(err)}`, { to: 'debug' })
+      $.ui.toast("The resume after the idle step wasn't sent: the session waits for the next message.")
+    }
+  } catch {
+    // Nothing more to try: the session waits for the next message.
   }
 }
 

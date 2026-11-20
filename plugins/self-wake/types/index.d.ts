@@ -1,5 +1,8 @@
-/** A wake-up asked for this turn, armed once the turn ends with an answer: how long after, and its note. */
-export type QueuedWake = { minutes: number; note: string }
+/**
+ * A wake-up asked for this turn, armed once the turn ends with an answer: how long after, in minutes or (#67) in
+ * seconds, and its note. One queued by a version before seconds has `minutes`.
+ */
+export type QueuedWake = { minutes: number; note: string } | { seconds: number; note: string }
 
 /**
  * A wake-up armed: its id, when it is due in `$.clock.now()` milliseconds, the note it sends, and the

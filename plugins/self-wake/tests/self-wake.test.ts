@@ -1,5 +1,6 @@
 import { describe, expect, mock, test } from 'claude-code/testing'
 import type { On } from 'claude-code'
+import { atIdle, GO_IDLE, WHY_IDLE } from '../hooks/at-idle'
 import { readWakeMarker, WAKE_REMOVED, wakeMarker, wakePath, wakeRemoveScript } from '../hooks/machine'
 
 const WAKE = 'mcp__self-wake__wake_after'
@@ -13,10 +14,15 @@ const MINUTE = 60 * 1000
 function engine(on: On, { reloadedAfter }: { reloadedAfter?: number } = {}) {
   const prompts: string[] = []
   const toasts: string[] = []
+  /** Each tool's description as registered, by its name. */
+  const described = new Map<string, string>()
   if (reloadedAfter !== undefined) on('clock.after', { ms: reloadedAfter }, () => ({ deny: 'the module was reloaded' }))
   const clock = mock.clock(on)
   on('session.start', (_, e) => ({ cwd: e.cwd }))
-  on('tool.register', (_, e) => ({ value: { tool: `mcp__self-wake__${e.name}` } }))
+  on('tool.register', (_, e) => {
+    described.set(e.name, e.description)
+    return { value: { tool: `mcp__self-wake__${e.name}` } }
+  })
   on('ui.status', () => ({ value: undefined }))
   on('ui.toast', (_, e) => {
     toasts.push(String(e.text))
@@ -27,7 +33,7 @@ function engine(on: On, { reloadedAfter }: { reloadedAfter?: number } = {}) {
     return { text: e.text }
   })
   on('turn.complete', () => ({ text: 'done' }))
-  return { prompts, toasts, clock }
+  return { prompts, toasts, clock, described }
 }
 
 const start = { cwd: '/', surface: 'terminal', isInteractive: true } as const
@@ -60,6 +66,43 @@ test('minutes are brought within 1 to 1440, and a wake-up needs a number and a n
   expect((await $.tool.call({ tool: WAKE, minutes: 5000, note: 'a' })).result).toMatch(/^Queued: 1440 minutes after this turn ends \(5000 is outside/)
   expect((await $.tool.call({ tool: WAKE, minutes: 'soon', note: 'a' })).deny).toMatch(/minutes/)
   expect((await $.tool.call({ tool: WAKE, minutes: 5, note: '  ' })).deny).toMatch(/note/)
+})
+
+test('#67: a wake-up in seconds fires that many seconds after the turn ends, once; a call with minutes works as before', async ($, on) => {
+  const { prompts, clock } = engine(on)
+  await $.session.start(start)
+
+  const queued = await $.tool.call({ tool: WAKE, seconds: 100, note: 'resume from your last turn' })
+  expect(queued.result).toBe('Queued: 100 seconds after this turn ends, the session sends itself "Wake-up: resume from your last turn".')
+  await $.turn.complete({ ...answered, turnId: 't1' })
+  await clock.advance(99 * 1000)
+  expect(prompts).toEqual([])
+  await clock.advance(2 * 1000)
+  expect(prompts).toEqual(['Wake-up: resume from your last turn'])
+  await clock.advance(60 * MINUTE)
+  expect(prompts).toHaveLength(1)
+})
+
+test('#67: seconds are brought within 30 to 86400; minutes and seconds together are refused, and so is neither', async ($, on) => {
+  engine(on)
+  await $.session.start(start)
+
+  expect((await $.tool.call({ tool: WAKE, seconds: 5, note: 'a' })).result).toMatch(/^Queued: 30 seconds after this turn ends \(5 is outside 30 to 86400\)/)
+  expect((await $.tool.call({ tool: WAKE, seconds: 100_000, note: 'a' })).result).toMatch(/^Queued: 86400 seconds after this turn ends \(100000 is outside/)
+  expect((await $.tool.call({ tool: WAKE, seconds: 'soon', note: 'a' })).deny).toBe('`seconds` is a number from 30 to 86400.')
+  expect((await $.tool.call({ tool: WAKE, seconds: 100, minutes: 2, note: 'a' })).deny).toBe('Give `minutes` or `seconds`, not both.')
+  expect((await $.tool.call({ tool: WAKE, note: 'a' })).deny).toBe('`minutes` is a number from 1 to 1440, or give `seconds` (30 to 86400).')
+})
+
+test("#67: wake_after's description says how to give seconds, and ends with the shared words to go idle at once after the call, and why", async ($, on) => {
+  const { described } = engine(on)
+  await $.session.start(start)
+  const said = described.get('wake_after') ?? ''
+  expect(said).toContain('`seconds` (30 to 86400, for a wait of under a few minutes, such as seconds: 100)')
+  expect(said).toContain(atIdle('After calling it'))
+  expect(said).toContain(`${GO_IDLE} ${WHY_IDLE}`)
+  // cancel_wake queues nothing: it takes the wake-up back at once.
+  expect(described.get('cancel_wake') ?? '').not.toContain(GO_IDLE)
 })
 
 test('a new wake-up replaces the one before it, and says so', async ($, on) => {

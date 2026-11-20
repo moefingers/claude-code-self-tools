@@ -6,7 +6,7 @@ The long form of [SKILL.md](SKILL.md): each self tool in detail, how to launch a
 
 - **It acts on the session that calls it.** No self tool acts on another session. To restart a lane, the coordinator asks it to, and the lane calls the tool.
 - **Subagents are refused.** A subagent that calls one is told to finish its piece and say what it needs. The session that launched it calls the tool.
-- **It waits for the turn to end.** The `_after_turn` tools and `wake_after` queue their action, and it runs once the turn ends with Claude's answer. End the turn after calling one.
+- **It waits for the turn to end, so the session goes idle for it.** The `_after_turn` tools, `wake_after`, `remote_control`'s `connect` and `rename`, and `chrome_ensure`'s reconnect queue their action, and it runs once the turn ends with Claude's answer. Each says so in the same words: After calling it, go idle at once: end your turn, and do nothing more until it has run and your next turn starts with word that it ran; then carry on. What it queues runs only once your turn has ended and the session is idle, so anything done meanwhile pushes it back. `color_after_turn` alone has no resume, and says instead: Nothing waits on it, though, and nothing resumes the session after it: you need not end your turn for it; it runs at the next idle moment.
 - **An interrupted turn cancels it.** Stopping the turn drops what that turn queued, with a notice.
 - **A new turn cancels a queued restart, switch, exit or clear.** A message from a peer starts a new turn. A restart or a switch cancelled this way leaves a row the next turn reads; from the third cancel in a row, the row says the session is busy, and to queue it again when it is idle or ask the merger or the owner.
 - **Commands run when the session is idle.** Claude Code queues a plugin's command (`/exit`, `/clear`, `/resume`, `/reload-plugins`, `/mcp`, `/rename`) behind anything already waiting. Under a steady stream of messages and notifications, it can wait a long time. Only a compaction can run between turns, ahead of what is queued.
@@ -67,8 +67,8 @@ Claude sees each tool as `mcp__<plugin>__<tool>`.
 
 ### `wake_after` and `cancel_wake` (self-wake)
 
-- Inputs: `minutes` (1 to 1440) and `note` (what to check on waking). `cancel_wake` takes no input.
-- Sends the session "Wake-up: <note>" some minutes after the turn ends, starting a turn of its own. If a turn is running then, it waits until the session is idle.
+- Inputs: `minutes` (1 to 1440) or `seconds` (30 to 86400), and `note` (what to check on waking). `cancel_wake` takes no input.
+- Sends the session "Wake-up: <note>" that long after the turn ends, starting a turn of its own. If a turn is running then, it waits until the session is idle.
 - One wake-up at a time: a new one replaces the old.
 - It survives a plugin reload. A `/clear` carries it to the new conversation. A switch, or a `/resume` to another conversation, drops it. Quitting Claude Code drops it.
 - A wake-up pending holds a restart, an exit and a switch. Cancel it first if it was only for this process.
@@ -98,6 +98,7 @@ Claude sees each tool as `mcp__<plugin>__<tool>`.
 - Inputs: `action` (`status`, `connect` or `rename`), `name` (the title; required for `rename`), `resume` (optional).
 - `status` reports. `connect` connects the session under a title, once the turn ends, only if it isn't connected. `rename` sets the session's title. It never disconnects: that is the owner's.
 - In a hierarchy: rename each session for its role, so the owner finds it in the app's session list.
+- After an account change that cut a turn off, it resumes that turn with an idle step first: a short turn that sets a 100-second timer (`wake_after` with `seconds: 100`) and ends, so what was queued for the idle moment runs before the work goes on. When no turn has started 150 seconds after that short turn, it sends a plain resume itself, once.
 
 ## Launching a session
 

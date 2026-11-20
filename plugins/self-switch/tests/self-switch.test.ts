@@ -1,6 +1,7 @@
 // self-switch's plugin, against a fake engine: the probe, the launcher, git and the release answer
 // from fixtures; /resume and /exit are recorded, never run. Nothing here starts a process.
 import { describe, expect, mock, test } from 'claude-code/testing'
+import { atIdle, GO_IDLE, WHY_IDLE } from '../hooks/at-idle'
 import { go } from '../hooks/go'
 import type { AgentInfo, AgentStatus, On } from 'claude-code'
 import { claimPath, gatePath, goAnswer, GO_NOTHING, GO_VIA, launchScriptText, placementPath, type LaunchInput, leftPath, MAX_UNTRACKED, paneNoLeft, panePath, paneTicketPath, quoted, SLOT_NOT_RECOGNISED, SLOT_SCRIPT_SHA256, slotRecordPath, STDIN_BOOTSTRAP, wakeMarker, wakePath } from '../hooks/machine'
@@ -962,10 +963,11 @@ describe('refusals, before and at the run', () => {
     expect(texts(session)).toEqual([`self-switch: your queued switch to \u00ab${T}\u00bb was cancelled because a new turn started; queue it again at the next finished break.`])
   })
 
-  test("the owner's note: the description says to end the turn and do nothing more until it has run, then carry on", async ($, on) => {
+  test("the owner's note (#67): the description ends with the shared words, to go idle at once after the call, and why", async ($, on) => {
     const { described } = engine(on)
     await $.session.start(start)
-    expect(described.join(' ')).toContain('After calling it, end your turn and do nothing more until it has run; then carry on.')
+    expect(described.join(' ')).toContain(atIdle('After calling it'))
+    expect(described.join(' ')).toContain(`${GO_IDLE} ${WHY_IDLE}`)
   })
 
   test('a new turn takes the queued switch back, and an interrupted turn cancels it', async ($, on) => {

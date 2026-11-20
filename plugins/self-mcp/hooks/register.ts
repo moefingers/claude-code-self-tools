@@ -9,6 +9,7 @@
 // typed; the toast and the resume, or a note the model reads, point to it.
 import type { EngineInterface, Register } from 'claude-code'
 import type { Queued } from '../types'
+import { atIdle } from './at-idle'
 import { configureUpdateCheck, loadUpdateCheck, withUpdateNotice } from './update-check'
 
 const queued = { plugin: 'self-mcp', key: 'queued' } as const
@@ -104,7 +105,7 @@ const DESCRIPTION = [
   '`resume` is the message that starts your next turn once the reconnect has run, with what the reconnect said: what to try again.',
   'Give it whenever you have a next step of your own; leave it out only when the next step waits on someone else (the user, another session, a check).',
   "It runs when the session is idle: Claude Code queues a plugin's command behind anything already waiting (a message typed during this turn, a background task's notification) and has no slot between turns ahead of them, so under a nonstop stream of work and notifications it may run in the distant future. Nothing waiting is lost.",
-  'After calling it, end your turn and do nothing more until it has run; then carry on.',
+  atIdle(),
 ].join(' ')
 
 /** Trimmed text, or undefined when it is not a string or is blank. */
