@@ -1770,24 +1770,43 @@ test("#67: the owner's ping from Slack is the person's too: no AFTER_PAUSE after
   expect(afterPause(w)).toBe(0)
 })
 
-test("#67: an idle step's turn of 10 minutes, and one that ended aborted, are still followed by AFTER_PAUSE", async ($, on) => {
+test("#67: a long idle step's turn (10 minutes) is still followed by AFTER_PAUSE", async ($, on) => {
   const w = machine(on)
   await resumed($, w)
   expect(w.prompts).toEqual([RESUME])
   await idleTurn($, RESUME, T2, 10 * 60_000)
   await w.clock.advance(PAUSE_MS + 1000)
   expect(afterPause(w)).toBe(1)
+})
 
-  // The next change resumes again; this time the idle step's turn ends aborted, which is not always the person's.
-  await cutOff($, w, T3)
-  w.switchTo('account-c')
-  await w.clock.advance(FLOW)
-  expect(w.prompts.filter(text => text === RESUME)).toHaveLength(2)
-  const T4 = '00000000-0000-4000-8000-0000000000a4'
-  await $.turn.start({ text: RESUME, turnId: T4 })
-  await $.turn.complete({ answer: '', durationMs: 2000, isAborted: true, reason: 'aborted', turnId: T4 })
-  await w.clock.advance(PAUSE_MS + 1000)
-  expect(afterPause(w)).toBe(2)
+test("#67: an idle step's turn that ends aborted is read as the person's Stop: the pause ends, and no AFTER_PAUSE follows", async ($, on) => {
+  const state = new Map<string, { value: unknown; version: number }>()
+  const w = machine(on, { state })
+  await resumed($, w)
+  // The idle step was sent, and its turn named the pause's own.
+  expect(w.prompts).toEqual([RESUME])
+  await $.turn.start({ text: RESUME, turnId: T2 })
+  expect(state.get('self-remote-control/pause')?.value).toMatchObject({ turnId: T2 })
+  await $.turn.complete({ answer: '', durationMs: 2000, isAborted: true, reason: 'aborted', turnId: T2 })
+  expect(state.get('self-remote-control/pause')?.value ?? null).toBeNull()
+  await w.clock.advance(PAUSE_MS + 60_000)
+  expect(afterPause(w)).toBe(0)
+})
+
+test("#67: a later turn in the pause that ends aborted (a notification's) ends the pause too: no AFTER_PAUSE", async ($, on) => {
+  const state = new Map<string, { value: unknown; version: number }>()
+  const w = machine(on, { state })
+  await resumed($, w)
+  expect(w.prompts).toEqual([RESUME])
+  await idleTurn($)
+  // The pause's clock runs.
+  expect(state.get('self-remote-control/pause')?.value).toMatchObject({ endedAt: expect.any(Number) })
+  await w.clock.advance(30_000)
+  await $.prompt.submit({ text: 'A background task finished.', wait: false, origin: { kind: 'task-notification' } })
+  await $.turn.start({ text: 'A background task finished.', turnId: T3 })
+  await $.turn.complete({ answer: '', durationMs: 3000, isAborted: true, reason: 'aborted', turnId: T3 })
+  await w.clock.advance(PAUSE_MS)
+  expect(afterPause(w)).toBe(0)
 })
 
 test("#67: a new stop ends the pause: the idle step's own turn ending on an error is followed by nothing, and left to what resumes stops", async ($, on) => {

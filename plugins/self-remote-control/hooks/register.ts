@@ -607,8 +607,8 @@ export const register: Register = (on, options) => {
         if (kind !== undefined) await noteFailure($, kind)
       }
       await noteTurnEnd($, { reason: e.reason, durationMs: e.durationMs, turnId: e.turnId, ...(e.usage === undefined ? {} : { usage: e.usage }) })
-      // #67: a turn ended: the idle step's own starts the pause's clock, and one that ended on an error (a new stop) ends the pause.
-      await settlePause($, { turnId: e.turnId, reason: e.reason })
+      // #67: a turn ended: the idle step's own starts the pause's clock, and one that ended on an error (a new stop) or aborted ends the pause.
+      await settlePause($, { turnId: e.turnId, reason: e.reason, isAborted: e.isAborted })
       void noteServers($)
       const { value } = await $.state.get(queued)
       if (!value) return done
