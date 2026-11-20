@@ -1,5 +1,6 @@
 import { expect, mock, test } from 'claude-code/testing'
 import type { On } from 'claude-code'
+import { GO_IDLE, idleWords, WHY_IDLE } from '../hooks/at-idle'
 
 const TOOL = 'mcp__self-compact__compact_after_turn'
 
@@ -158,8 +159,9 @@ test('R3: between turns, a compaction the engine rejects (the turn still counted
   expect(compactions).toEqual(['the PR queue'])
 })
 
-test("the owner's note: the description says to end the turn and do nothing more until it has run, then carry on", async ($, on) => {
+test("the owner's note (#67): the description ends with the shared words, to go idle at once after the call, and why", async ($, on) => {
   const { described } = engine(on)
   await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
-  expect(described.join(' ')).toContain('After calling it, end your turn and do nothing more until it has run; then carry on.')
+  expect(described.join(' ')).toContain(idleWords('After calling it'))
+  expect(described.join(' ')).toContain(`${GO_IDLE} ${WHY_IDLE}`)
 })

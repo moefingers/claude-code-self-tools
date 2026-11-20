@@ -1,5 +1,6 @@
 import { expect, mock, test } from 'claude-code/testing'
 import type { On } from 'claude-code'
+import { GO_IDLE, NO_WAIT, WHY_IDLE } from '../hooks/at-idle'
 import { didntRun, oneLine, sentence, text, why } from '../hooks/text'
 
 const TOOL = 'mcp__self-color__color_after_turn'
@@ -528,9 +529,20 @@ test('the description says what it does, when to use it, that it lasts for the s
       "Sets this session's prompt bar color once the current turn ends, as /color does.",
       "Use it to mark the session's role, so the person can tell sessions apart at a glance: for example, one color for a coordinating session, another for workers.",
       'The color lasts for the session; `default` resets it.',
-      "It runs once the session is idle, after anything already waiting, and a /resume or /clear that runs first drops it; you don't need to end your turn for it.",
+      'It runs once the session is idle, after anything already waiting, and a /resume or /clear that runs first drops it.',
+      WHY_IDLE,
+      NO_WAIT,
     ].join(' '),
   )
+})
+
+test('#67: it says, in the shared words, that it waits for the idle moment, and that nothing waits on it, so the turn need not end for it', async ($, on) => {
+  const { registered } = engine(on)
+  await $.session.start(start)
+  const said = registered.at(-1)?.description ?? ''
+  expect(said).toContain(`${WHY_IDLE} ${NO_WAIT}`)
+  // Never the words to go idle: with no resume, a turn that ended for a color change would leave the session halted.
+  expect(said).not.toContain(GO_IDLE)
 })
 
 // #53: where Claude Code's built-in guard loads, the classic SessionStart never reaches the plugin. Its partner, the

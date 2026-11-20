@@ -19,6 +19,7 @@
 // The rules are in chrome.ts, pure; this file runs them. It hooks no event Claude Code's built-in guard passes over.
 import type { EngineInterface, Register } from 'claude-code'
 import type { Queued } from '../types'
+import { idleWords } from './at-idle'
 import {
   answer,
   type Browser,
@@ -164,7 +165,8 @@ const DESCRIPTION = [
   "It never quits, kills or restarts Chrome, which would close every session's tabs and tab groups: when Chrome runs without the flag the person opted in to, it says how the person can fix it. It never opens a profile in a Chrome that runs, signs in, or types anything into Chrome.",
   "`profile` (optional) is the profile folder a start opens, by its folder's name (Default, Profile 2), never an account, and only one that is in Chrome's user data folder; left out, the plugin's setting, else none, so Chrome opens the profile it used last. `reconnect` (default true) queues the reconnect. `resume` is the message that starts your next turn once the reconnect has run: what to try again.",
   "The reconnect runs when the session is idle: Claude Code queues a plugin's command behind anything already waiting (a message typed during this turn, a background task's notification), so under a nonstop stream of work and notifications it may run in the distant future. Nothing waiting is lost.",
-  'Windows and macOS. When it says the reconnect is queued, end your turn and do nothing more until it has run; then carry on. When it says to ask the person, ask them; don\'t call it again.',
+  "Windows and macOS. When it says to ask the person, ask them; don't call it again.",
+  idleWords('When it says the reconnect is queued'),
 ].join(' ')
 
 const SUBAGENT =

@@ -164,7 +164,7 @@ export type Turn = {
   outcome?: 'answer' | 'aborted' | 'refusal' | 'error'
   /** The API error kind StopFailure gave for it (`rate_limit`, `authentication_failed`, ...). */
   error?: string
-  /** The turn the resume message started. */
+  /** The turn a resume message started: the idle step's, or AFTER_PAUSE's (#67). */
   fromResume?: true
   /** Its id, as turn.start and turn.complete carried it: the resume claim's key for a turn that ended on an error. */
   turnId?: string
@@ -186,6 +186,13 @@ export type Resumes = {
 }
 
 /**
+ * #67: the pause after this plugin's idle step, until AFTER_PAUSE is sent or the pause is cancelled. `sentAt`: when the
+ * idle step was submitted (ms). `turnId`: the idle step's own turn, once it started (its text holds IDLE_MARK).
+ * `endedAt`: when that turn ended (ms); AFTER_PAUSE is due PAUSE_MS after it.
+ */
+export type Pause = { sentAt: number; turnId?: string; endedAt?: number }
+
+/**
  * The plugin's session state. #53, shared/hooks/classic.ts: `classic`, true once a classic hook reached this process
  * (Claude Code's built-in guard isn't loaded here); `started`, the conversation whose start this process took up,
  * so a reload doesn't take it again.
@@ -198,6 +205,7 @@ declare module 'claude-code' {
       login: Login | null
       turn: Turn | null
       resumes: Resumes | null
+      pause: Pause | null
       rcLock: MemoryLock | null
       servers: Servers | null
       resumeClaims: string[] | null

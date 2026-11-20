@@ -1,5 +1,5 @@
-// A session wakes itself later: `minutes` after the current turn ends, it sends itself
-// "Wake-up: <note>" as a prompt, a turn of its own. The model calls wake_after; the wake is armed
+// A session wakes itself later: `minutes` (or `seconds`, for a wait of under a few minutes) after the current turn
+// ends, it sends itself "Wake-up: <note>" as a prompt, a turn of its own. The model calls wake_after; the wake is armed
 // once the turn ends with an answer and counts from there, and an interrupted turn drops it (a
 // wake armed before stands). One wake at a time: a new one replaces the one before it, and says
 // so. cancel_wake takes it back at once. Only the main conversation wakes this way, never a
@@ -52,7 +52,8 @@
 // reads as unknown and holds, and a toast says so; if it can't be removed either, the toast says a
 // switch may not see the wake-up.
 import type { EngineInterface, Register, Timer } from 'claude-code'
-import type { Wake } from '../types'
+import type { QueuedWake, Wake } from '../types'
+import { idleWords } from './at-idle'
 import { type ClassicIo, classicSeen, configureClassic, keepClassic, type Move, moveBegins, moveLook, movePending, startPartner, takeOwedStart } from './classic'
 import { ID_LAG_MS, idLag, isSafeFolder, movesConversation, powershellPath, removeWakeMarker, SESSION_ID, stateFolder, SYSTEM_ROOT, wakeMarker, wakePath } from './machine'
 import { configureUpdateCheck, loadUpdateCheck, withUpdateNotice } from './update-check'
@@ -66,18 +67,27 @@ const FIRE_RETRY_MS = 1000
 const FIRE_TRIES = 3
 const MIN_MINUTES = 1
 const MAX_MINUTES = 1440
+/**
+ * #67: a wait shorter than a few minutes, in seconds. Its floor keeps a wake-up from standing in for a wait within a
+ * turn; its ceiling is a day, as `minutes`' is.
+ */
+const MIN_SECONDS = 30
+const MAX_SECONDS = 86_400
 
 const WAKE_DESCRIPTION = [
-  'Wakes this session later: `minutes` after the current turn ends, the session sends itself "Wake-up: <note>", which starts a turn of its own.',
+  'Wakes this session later: `minutes` or `seconds` after the current turn ends, the session sends itself "Wake-up: <note>", which starts a turn of its own.',
   'Call it when the next step has to wait for something that takes time (a deploy, a long job, a check that reports later) and nothing will tell you when it is done, so you can check back without the user prompting you.',
-  'Not for waiting within a turn, and not when a message or notification will arrive on its own.',
+  'Not for waiting within a turn, not when a message or notification will arrive on its own, and not when a message says another plugin keeps the timer for you.',
+  `Give one of \`minutes\` (${MIN_MINUTES} to ${MAX_MINUTES}) or \`seconds\` (${MIN_SECONDS} to ${MAX_SECONDS}, for a wait of under a few minutes).`,
   '`note` is what to check or do on waking, with where its details are.',
   'One wake-up at a time: a new one replaces the one before. A wake-up lasts as long as the session stays in this conversation: a /clear carries it into the new one, and a /resume or a switch to another conversation drops it, and says so.',
-  'End the turn after calling it; the wait starts once your answer is shown.',
+  'The wait starts once your answer is shown.',
+  idleWords(),
 ].join(' ')
 
-const CANCEL_DESCRIPTION =
-  'Cancels the wake-up set with wake_after, if there is one. Call it when what you were waiting for has arrived or no longer matters.'
+const CANCEL_DESCRIPTION = [
+  'Cancels the wake-up set with wake_after, if there is one. Call it when what you were waiting for has arrived or no longer matters.',
+].join(' ')
 
 const SUBAGENT =
   "A subagent can't set or cancel the session's wake-ups. Finish your piece and return its result, saying what to check later and when: the main session can set the wake-up."
@@ -219,6 +229,9 @@ function text(raw: unknown): string | undefined {
 }
 
 const plural = (n: number, one: string): string => `${n} ${one}${n === 1 ? '' : 's'}`
+
+/** Whether a call gave a field: anything but undefined or null. */
+const isGiven = (raw: unknown): boolean => raw !== undefined && raw !== null
 
 /** How long until `dueAt`, in whole minutes, at least one. */
 const dueIn = (dueAt: number, now: number): string => plural(Math.max(1, Math.ceil((dueAt - now) / MINUTE)), 'minute')
@@ -458,11 +471,15 @@ export const register: Register = (on, options) => {
         properties: {
           minutes: {
             type: 'number',
-            description: 'How long after this turn ends, in minutes: 1 to 1440 (a day); a number outside that is brought within it.',
+            description: `How long after this turn ends, in minutes: ${MIN_MINUTES} to ${MAX_MINUTES} (a day); a number outside that is brought within it. Give this or \`seconds\`.`,
+          },
+          seconds: {
+            type: 'number',
+            description: `How long after this turn ends, in seconds: ${MIN_SECONDS} to ${MAX_SECONDS} (a day); a number outside that is brought within it. Give this or \`minutes\`.`,
           },
           note: { type: 'string', description: 'What to check or do on waking, and where its details are.' },
         },
-        required: ['minutes', 'note'],
+        required: ['note'],
         additionalProperties: false,
       },
       isDeferred: false,
@@ -541,23 +558,31 @@ export const register: Register = (on, options) => {
 
   on('tool.call', { tool: 'mcp__self-wake__wake_after' }, async ($, e) => {
     if (e.agentId !== undefined) return { deny: SUBAGENT }
-    const input = e as { minutes?: unknown; note?: unknown }
-    const asked = typeof input.minutes === 'number' ? input.minutes : Number(text(input.minutes) ?? Number.NaN)
-    if (!Number.isFinite(asked)) return { deny: '`minutes` is a number from 1 to 1440.' }
+    const input = e as { minutes?: unknown; seconds?: unknown; note?: unknown }
+    // #67: `seconds` beside `minutes`, for a wait of under a few minutes; a call of before, with `minutes`, works as it did.
+    // A field given as null is read as left out, as a caller that sends every field may send the other.
+    const inSeconds = isGiven(input.seconds)
+    if (inSeconds && isGiven(input.minutes)) return { deny: 'Give `minutes` or `seconds`, not both.' }
+    const range: readonly [number, number, 'second' | 'minute'] = inSeconds ? [MIN_SECONDS, MAX_SECONDS, 'second'] : [MIN_MINUTES, MAX_MINUTES, 'minute']
+    const [low, high, unit] = range
+    const raw = inSeconds ? input.seconds : input.minutes
+    const asked = typeof raw === 'number' ? raw : Number(text(raw) ?? Number.NaN)
+    if (!Number.isFinite(asked)) return { deny: `\`${unit}s\` is a number from ${low} to ${high}${inSeconds ? '' : `, or give \`seconds\` (${MIN_SECONDS} to ${MAX_SECONDS})`}.` }
     const note = text(input.note)
     if (note === undefined) return { deny: 'Say what to wake up to (`note`).' }
-    const minutes = Math.min(MAX_MINUTES, Math.max(MIN_MINUTES, asked))
+    const amount = Math.min(high, Math.max(low, asked))
     const [before, earlier, now] = await Promise.all([$.state.get(queued), armedWake($), $.clock.now()])
-    await $.state.set(queued, { minutes, note })
+    const wait: QueuedWake = inSeconds ? { seconds: amount, note } : { minutes: amount, note }
+    await $.state.set(queued, wait)
     $.ui.status(`wake-up queued for when this turn ends: ${note.length > 40 ? `${note.slice(0, 39)}…` : note}`)
-    const clamped = minutes === asked ? '' : ` (${asked} is outside 1 to 1440)`
+    const clamped = amount === asked ? '' : ` (${asked} is outside ${low} to ${high})`
     const replaces = before.value
       ? ` It replaces the wake-up queued earlier this turn ("${before.value.note}").`
       : earlier.value
         ? ` It replaces the wake-up due in ${dueIn(earlier.value.dueAt, now)} ("${earlier.value.note}").`
         : ''
     return {
-      result: `Queued: ${plural(minutes, 'minute')} after this turn ends${clamped}, the session sends itself "Wake-up: ${note}".${replaces}`,
+      result: `Queued: ${plural(amount, unit)} after this turn ends${clamped}, the session sends itself "Wake-up: ${note}".${replaces}`,
     }
   }).catch(($, e, next) => (next.called ? next(e) : { deny: 'self-wake: queuing the wake-up failed; nothing is queued.' }))
 
@@ -607,7 +632,7 @@ export const register: Register = (on, options) => {
     const isMoving = movePending()
     const wake: Wake = {
       id: `${now}-${Math.random().toString(36).slice(2, 10)}`,
-      dueAt: now + value.minutes * MINUTE,
+      dueAt: now + ('seconds' in value ? value.seconds * 1000 : value.minutes * MINUTE),
       note: value.note,
       ...(here === undefined ? {} : { conversation: here }),
     }

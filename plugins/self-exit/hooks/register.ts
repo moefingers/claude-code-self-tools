@@ -27,6 +27,7 @@
 // command has started cancels the exit, as an interrupted turn does.
 import type { EngineInterface, Register } from 'claude-code'
 import type { Queued } from '../types'
+import { idleWords } from './at-idle'
 import { blockersText, exitBlockers, isSafeFolder, markPending, powershellPath, readExit, SESSION_ID, stateFolder, SYSTEM_ROOT } from './machine'
 import type { PendingKind } from './machine'
 import { configureUpdateCheck, loadUpdateCheck, withUpdateNotice } from './update-check'
@@ -52,7 +53,7 @@ const DESCRIPTION = [
   "It refuses while anything would make /exit stop at its confirmation or cut work off, naming each with how to stop it: a session cron (delete it with CronDelete), a background Bash, PowerShell or Monitor job (stop it with TaskStop), a subagent still running, a wake-up from wake_after still pending (cancel it with cancel_wake); and while any of that can't be read. Stop them, then call again.",
   'What still ends with the session: Remote Control (the phone and browser lose the session).',
   "It can run only when the session is idle: Claude Code queues a plugin's command behind anything already waiting (a message typed during this turn, a background task's notification) and has no slot between turns ahead of them. A turn that starts first cancels the exit, and you are told, so nothing waiting is lost or carried into another conversation; under a nonstop stream of work and notifications it may not run for a long time, so call it again when the stream pauses.",
-  'After calling it, end your turn and do nothing more until it has run.',
+  idleWords(),
 ].join(' ')
 
 const SUBAGENT =

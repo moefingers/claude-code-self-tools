@@ -1,5 +1,6 @@
 import { expect, mock, test } from 'claude-code/testing'
 import type { On } from 'claude-code'
+import { GO_IDLE, idleWords, WHY_IDLE } from '../hooks/at-idle'
 
 const TOOL = 'mcp__self-reload__reload_plugins_after_turn'
 const HOUR = 60 * 60 * 1000
@@ -242,10 +243,11 @@ test("the owner's A: the step starts the moment the turn's end returns, with no 
   expect(commands).toHaveLength(1)
 })
 
-test("the owner's note: the description says to end the turn and do nothing more until it has run", async ($, on) => {
+test("the owner's note (#67): the description ends with the shared words, to go idle at once after the call, and why", async ($, on) => {
   engine(on)
   await $.session.start(start)
-  expect(registeredDescriptions.at(-1) ?? '').toContain("After calling it, end your turn and do nothing more until it has run; then carry on.")
+  expect(registeredDescriptions.at(-1) ?? '').toContain(idleWords('After calling it'))
+  expect(registeredDescriptions.at(-1) ?? '').toContain(`${GO_IDLE} ${WHY_IDLE}`)
 })
 
 test("the person's turn after the reload was queued, before it ran: the reload runs, and its resume goes to the model as a note, never as a turn", async ($, on) => {
