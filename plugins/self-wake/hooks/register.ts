@@ -53,7 +53,7 @@
 // switch may not see the wake-up.
 import type { EngineInterface, Register, Timer } from 'claude-code'
 import type { QueuedWake, Wake } from '../types'
-import { atIdle } from './at-idle'
+import { idleWords } from './at-idle'
 import { type ClassicIo, classicSeen, configureClassic, keepClassic, type Move, moveBegins, moveLook, movePending, startPartner, takeOwedStart } from './classic'
 import { ID_LAG_MS, idLag, isSafeFolder, movesConversation, powershellPath, removeWakeMarker, SESSION_ID, stateFolder, SYSTEM_ROOT, wakeMarker, wakePath } from './machine'
 import { configureUpdateCheck, loadUpdateCheck, withUpdateNotice } from './update-check'
@@ -68,8 +68,8 @@ const FIRE_TRIES = 3
 const MIN_MINUTES = 1
 const MAX_MINUTES = 1440
 /**
- * #67: a wait shorter than a few minutes, in seconds (a resume after an interruption asks for 100). Its floor keeps a
- * wake-up from standing in for a wait within a turn; its ceiling is a day, as `minutes`' is.
+ * #67: a wait shorter than a few minutes, in seconds. Its floor keeps a wake-up from standing in for a wait within a
+ * turn; its ceiling is a day, as `minutes`' is.
  */
 const MIN_SECONDS = 30
 const MAX_SECONDS = 86_400
@@ -77,16 +77,17 @@ const MAX_SECONDS = 86_400
 const WAKE_DESCRIPTION = [
   'Wakes this session later: `minutes` or `seconds` after the current turn ends, the session sends itself "Wake-up: <note>", which starts a turn of its own.',
   'Call it when the next step has to wait for something that takes time (a deploy, a long job, a check that reports later) and nothing will tell you when it is done, so you can check back without the user prompting you.',
-  'Not for waiting within a turn, and not when a message or notification will arrive on its own.',
-  `Give one of \`minutes\` (${MIN_MINUTES} to ${MAX_MINUTES}) or \`seconds\` (${MIN_SECONDS} to ${MAX_SECONDS}, for a wait of under a few minutes, such as seconds: 100).`,
+  'Not for waiting within a turn, not when a message or notification will arrive on its own, and not when a message says another plugin keeps the timer for you.',
+  `Give one of \`minutes\` (${MIN_MINUTES} to ${MAX_MINUTES}) or \`seconds\` (${MIN_SECONDS} to ${MAX_SECONDS}, for a wait of under a few minutes).`,
   '`note` is what to check or do on waking, with where its details are.',
   'One wake-up at a time: a new one replaces the one before. A wake-up lasts as long as the session stays in this conversation: a /clear carries it into the new one, and a /resume or a switch to another conversation drops it, and says so.',
-  atIdle(),
   'The wait starts once your answer is shown.',
+  idleWords(),
 ].join(' ')
 
-const CANCEL_DESCRIPTION =
-  'Cancels the wake-up set with wake_after, if there is one. Call it when what you were waiting for has arrived or no longer matters.'
+const CANCEL_DESCRIPTION = [
+  'Cancels the wake-up set with wake_after, if there is one. Call it when what you were waiting for has arrived or no longer matters.',
+].join(' ')
 
 const SUBAGENT =
   "A subagent can't set or cancel the session's wake-ups. Finish your piece and return its result, saying what to check later and when: the main session can set the wake-up."
@@ -228,6 +229,9 @@ function text(raw: unknown): string | undefined {
 }
 
 const plural = (n: number, one: string): string => `${n} ${one}${n === 1 ? '' : 's'}`
+
+/** Whether a call gave a field: anything but undefined or null. */
+const isGiven = (raw: unknown): boolean => raw !== undefined && raw !== null
 
 /** How long until `dueAt`, in whole minutes, at least one. */
 const dueIn = (dueAt: number, now: number): string => plural(Math.max(1, Math.ceil((dueAt - now) / MINUTE)), 'minute')
@@ -556,8 +560,9 @@ export const register: Register = (on, options) => {
     if (e.agentId !== undefined) return { deny: SUBAGENT }
     const input = e as { minutes?: unknown; seconds?: unknown; note?: unknown }
     // #67: `seconds` beside `minutes`, for a wait of under a few minutes; a call of before, with `minutes`, works as it did.
-    const inSeconds = input.seconds !== undefined
-    if (inSeconds && input.minutes !== undefined) return { deny: 'Give `minutes` or `seconds`, not both.' }
+    // A field given as null is read as left out, as a caller that sends every field may send the other.
+    const inSeconds = isGiven(input.seconds)
+    if (inSeconds && isGiven(input.minutes)) return { deny: 'Give `minutes` or `seconds`, not both.' }
     const range: readonly [number, number, 'second' | 'minute'] = inSeconds ? [MIN_SECONDS, MAX_SECONDS, 'second'] : [MIN_MINUTES, MAX_MINUTES, 'minute']
     const [low, high, unit] = range
     const raw = inSeconds ? input.seconds : input.minutes

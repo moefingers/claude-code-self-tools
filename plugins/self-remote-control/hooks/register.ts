@@ -42,10 +42,10 @@
 // hook, the app) or carried by a resumed conversation, an error kind other than a used-up window's, and a fork's start.
 import type { EngineInterface, Register } from 'claude-code'
 import type { Held, Queued } from '../types'
-import { atIdle } from './at-idle'
+import { idleWords } from './at-idle'
 import { read, readNow, runRemoteControl, sessionTitle, why, type Reading } from './connection'
 import { LOCK_HOLD_MS, releaseLock, takeLock } from './rc-lock'
-import { aroundLogin, configureRelogin, forgetTurn, noteFailure, notePersonPrompt, noteServers, noteTurnEnd, noteTurnStart, restoreAfterMove, startFollow, startWatch } from './relogin'
+import { aroundLogin, cancelPause, configureRelogin, forgetTurn, noteFailure, notePersonPrompt, noteServers, noteTurnEnd, noteTurnStart, openPause, rearmPause, restoreAfterMove, settlePause, startWatch } from './relogin'
 import { type ClassicIo, classicRuns, classicSeen, configureClassic, moveBegins } from './classic'
 import { configureUpdateCheck, loadUpdateCheck, withUpdateNotice } from './update-check'
 
@@ -152,7 +152,7 @@ const DESCRIPTION = [
   "It never disconnects, and never runs /remote-control while connected; disconnecting is the user's to do from its panel.",
   '`resume` is the message that starts your next turn once the action has run, after what happened: what to do next. Leave it out when the next step waits on someone else (the user, another session, a check).',
   "`connect` and `rename` run when the session is idle: Claude Code queues a plugin's command behind anything already waiting (a message typed during this turn, a background task's notification) and has no slot between turns ahead of them, so under a nonstop stream of work and notifications they may run in the distant future. Nothing waiting is lost.",
-  atIdle('After `connect` or `rename`'),
+  idleWords('After `connect` or `rename`'),
 ].join(' ')
 
 const SUBAGENT =
@@ -483,8 +483,8 @@ export const register: Register = (on, options) => {
     })
     loadUpdateCheck($)
     startWatch($)
-    // #67: a plain resume an idle step left owed before a reload, armed again for the time left.
-    void startFollow($)
+    // #67: the pause an idle step left running before a reload, its timer armed again for the time left.
+    void rearmPause($)
     void noteServers($)
     return started
   })
@@ -505,7 +505,11 @@ export const register: Register = (on, options) => {
   // The main conversation's turns, for whether a login change cut one off.
   on('turn.start', async ($, e, next) => {
     const started = await next(e)
-    if (e.agentId === undefined) await noteTurnStart($, e.text, e.turnId)
+    if (e.agentId === undefined) {
+      // #67: the idle step's own turn, named by this plugin's mark and the pause's record.
+      await openPause($, e.text, e.turnId)
+      await noteTurnStart($, e.text, e.turnId)
+    }
     return started
   })
 
@@ -528,6 +532,8 @@ export const register: Register = (on, options) => {
     }
     personEntered(typed)
     await notePersonPrompt($)
+    // #67: the person's own prompt takes the session up again: the pause after an idle step is cancelled.
+    await cancelPause($)
     return done
   }).catch(($, e, next) => next(e))
 
@@ -556,6 +562,8 @@ export const register: Register = (on, options) => {
     const begun = await moveBegins($, classicIo($), e)
     const ended = await next(e)
     if (begun !== undefined) await forgetTurn($)
+    // #67: the session ends, whatever its reason (an exit, a /clear, a /resume): no message ends a pause after it.
+    await cancelPause($)
     return ended
   }).catch(($, e, next) => next(e))
 
@@ -593,6 +601,8 @@ export const register: Register = (on, options) => {
         if (kind !== undefined) await noteFailure($, kind)
       }
       await noteTurnEnd($, { reason: e.reason, durationMs: e.durationMs, turnId: e.turnId, ...(e.usage === undefined ? {} : { usage: e.usage }) })
+      // #67: the idle step's own turn ended: the pause's clock starts, or the pause is dropped.
+      await settlePause($, { turnId: e.turnId, reason: e.reason, isAborted: e.isAborted, durationMs: e.durationMs })
       void noteServers($)
       const { value } = await $.state.get(queued)
       if (!value) return done

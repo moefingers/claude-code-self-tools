@@ -1,6 +1,6 @@
 import { describe, expect, mock, test } from 'claude-code/testing'
 import type { AgentInfo, AgentStatus, On } from 'claude-code'
-import { atIdle, GO_IDLE, WHY_IDLE } from '../hooks/at-idle'
+import { GO_IDLE, idleWords, WHY_IDLE } from '../hooks/at-idle'
 import { encodeCommand, launchScriptText, SESSION_MARKERS } from '../hooks/launcher'
 import { LAUNCH_ENV_CLEAR, LAUNCH_SCRIPT_SHA256, type LaunchInput, STDIN_BOOTSTRAP } from '../hooks/machine'
 
@@ -542,7 +542,7 @@ test('input already waiting at the turn\'s end: its turn starts after a step at 
 test("the owner's note (#67): the description ends with the shared words, to go idle at once after the call, and why", async ($, on) => {
   const { described } = engine(on)
   await $.session.start(start)
-  expect(described.join(' ')).toContain(atIdle('After calling it'))
+  expect(described.join(' ')).toContain(idleWords('After calling it'))
   expect(described.join(' ')).toContain(`${GO_IDLE} ${WHY_IDLE}`)
 })
 

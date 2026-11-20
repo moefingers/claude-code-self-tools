@@ -91,7 +91,7 @@
 // and so does one while `$.session.id()` lags the move a SessionStart named (the id would be the left one's).
 import type { EngineInterface, Register } from 'claude-code'
 import type { Queued, Restart } from '../types'
-import { atIdle } from './at-idle'
+import { idleWords } from './at-idle'
 import { go } from './go'
 import { launch as buildLaunch, parseLaunch, powershellPath, RELEASED, releaseScript, SESSION_ID, stateFolder, SYSTEM_ROOT } from './launcher'
 import type { AgentLike, LaunchInput, LaunchWhere, Pane, PendingKind, Placement, Probe } from './machine'
@@ -142,7 +142,7 @@ const DESCRIPTION = [
   '`reason` (required) says why; it is recorded in the transcript. `resume` is the message that starts your first turn in the restarted session: what to check or do next. Give it whenever you have a next step of your own; leave it out only when the next step waits on someone else.',
   'It refuses unless the session is at a safe point: while a session cron is set (delete it with CronDelete), while subagents you started are still running, while a wake-up from wake_after is pending (cancel it with cancel_wake), while anything runs under this session (a background Bash, PowerShell or Monitor job, git, a build, test or lint, a dev server or Playwright, a heavy-slot job), while a git operation is in flight in the repo, and while any of that can\'t be read; each is named with how to stop it. It refuses a second restart within 2 minutes of the last. What still ends with this process: Remote Control (with Remote Control on for all sessions, the resumed session connects again).',
   "It can run only when the session is idle: Claude Code queues a plugin's command behind anything already waiting (a message typed during this turn, a background task's notification) and has no slot between turns ahead of them. A turn that starts first cancels the restart, and you are told, so nothing waiting is lost or carried into another conversation; under a nonstop stream of work and notifications it may not run for a long time, so call it again when the stream pauses.",
-  atIdle(),
+  idleWords(),
 ].join(' ')
 
 const SUBAGENT =

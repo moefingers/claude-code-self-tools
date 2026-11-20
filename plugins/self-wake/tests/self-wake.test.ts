@@ -1,6 +1,6 @@
 import { describe, expect, mock, test } from 'claude-code/testing'
 import type { On } from 'claude-code'
-import { atIdle, GO_IDLE, WHY_IDLE } from '../hooks/at-idle'
+import { GO_IDLE, idleWords, WHY_IDLE } from '../hooks/at-idle'
 import { readWakeMarker, WAKE_REMOVED, wakeMarker, wakePath, wakeRemoveScript } from '../hooks/machine'
 
 const WAKE = 'mcp__self-wake__wake_after'
@@ -92,14 +92,20 @@ test('#67: seconds are brought within 30 to 86400; minutes and seconds together 
   expect((await $.tool.call({ tool: WAKE, seconds: 'soon', note: 'a' })).deny).toBe('`seconds` is a number from 30 to 86400.')
   expect((await $.tool.call({ tool: WAKE, seconds: 100, minutes: 2, note: 'a' })).deny).toBe('Give `minutes` or `seconds`, not both.')
   expect((await $.tool.call({ tool: WAKE, note: 'a' })).deny).toBe('`minutes` is a number from 1 to 1440, or give `seconds` (30 to 86400).')
+  // A field given as null is left out: the other one stands alone.
+  expect((await $.tool.call({ tool: WAKE, minutes: null, seconds: 100, note: 'a' })).result).toMatch(/^Queued: 100 seconds after this turn ends,/)
+  expect((await $.tool.call({ tool: WAKE, minutes: 2, seconds: null, note: 'a' })).result).toMatch(/^Queued: 2 minutes after this turn ends,/)
+  expect((await $.tool.call({ tool: WAKE, minutes: null, seconds: null, note: 'a' })).deny).toBe('`minutes` is a number from 1 to 1440, or give `seconds` (30 to 86400).')
 })
 
 test("#67: wake_after's description says how to give seconds, and ends with the shared words to go idle at once after the call, and why", async ($, on) => {
   const { described } = engine(on)
   await $.session.start(start)
   const said = described.get('wake_after') ?? ''
-  expect(said).toContain('`seconds` (30 to 86400, for a wait of under a few minutes, such as seconds: 100)')
-  expect(said).toContain(atIdle('After calling it'))
+  expect(said).toContain('`seconds` (30 to 86400, for a wait of under a few minutes)')
+  // Never a second timer beside the one a plugin keeps after an interruption (#67).
+  expect(said).toContain('not when a message says another plugin keeps the timer for you')
+  expect(said.endsWith(idleWords('After calling it'))).toBe(true)
   expect(said).toContain(`${GO_IDLE} ${WHY_IDLE}`)
   // cancel_wake queues nothing: it takes the wake-up back at once.
   expect(described.get('cancel_wake') ?? '').not.toContain(GO_IDLE)

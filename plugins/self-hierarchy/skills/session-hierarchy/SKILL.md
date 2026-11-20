@@ -103,7 +103,7 @@ Some projects name protected paths, where every head needs an explicit acceptanc
 
 Each self tool acts on the session that calls it, never on another. So the coordinator asks a lane to restart, and the lane calls `restart_after_turn` itself.
 
-Most of the tools act once the turn ends, and each says so in the same words: After calling it, go idle at once: end your turn, and do nothing more until it has run and your next turn starts with word that it ran; then carry on. What it queues runs only once your turn has ended and the session is idle, so anything done meanwhile pushes it back. The one exception is `color_after_turn` (self-color), which has no resume: Nothing waits on it, though, and nothing resumes the session after it: you need not end your turn for it; it runs at the next idle moment.
+Most of the tools act once the turn ends, and each says so in the same words: After calling it, go idle at once: end your turn, and do nothing more until it has run; then carry on in the turn that follows it, started by its resume message when it sends one, else by the next message. What it queues runs only once your turn has ended and the session is idle, so anything done meanwhile pushes it back. The one exception is `color_after_turn` (self-color), which has no resume: Nothing waits on it, though, and nothing resumes the session after it: you need not end your turn for it; it runs at the next idle moment.
 
 | Tool | What it costs | When |
 | :- | :- | :- |
@@ -112,7 +112,7 @@ Most of the tools act once the turn ends, and each says so in the same words: Af
 | `clear_after_turn` | Loses the whole story. Only the `handoff` survives. | Only when the work is `complete` and its notes are written, or the context is `contaminated`. |
 | `switch_after_turn` | Moves this terminal to another conversation. This one's context is kept for later. Pending wake-ups are dropped. Windows only. | Only when the owner asks. Where a coordinator plugin runs switches, it refuses. |
 | `exit_after_turn` | Ends the session and its Remote Control. Someone must resume it by hand. | When the owner asks, or the brief says to close when the work is done. |
-| `wake_after` | A note to itself, some minutes (or seconds) after the turn ends. One at a time. | A slow wait that nothing will announce; the 100-second timer after an interruption. |
+| `wake_after` | A note to itself, some minutes (or seconds) after the turn ends. One at a time. | A slow wait that nothing will announce; never beside a resume that says another plugin keeps the timer. |
 | `reload_plugins_after_turn` | Replaces plugin code. Plugin state stays; plugin timers and variables start over. | A plugin was updated or edited. |
 | `tools_check` | Reads; writes only its own record (and on Windows may dedupe Bash's env files). | A tool seems dead, before you work around it. |
 
@@ -142,7 +142,7 @@ When the coordinator pauses every session:
 - Stop your background jobs, and confirm by command line that they have stopped.
 - Write your notes, then tell the coordinator you're ready.
 
-After an interruption (an account change that cut a turn off), the resume asks the session to go idle first, setting a 100 second timer. Do just that: call `wake_after` with `seconds: 100` and a note to resume from your last turn, then end the turn. What was queued for the idle moment (a reconnect, a reload) runs in that pause, and the session carries on when the timer fires. Without `wake_after`, just end the turn: self-remote-control resumes the session itself 150 seconds later.
+After an interruption (an account change that cut a turn off), the resume asks the session to go idle first, so what was queued for the idle moment (a reconnect, a reload) runs in that pause. End the turn at once, with no tool call and no timer of your own: the plugin that sent the resume keeps the timer, and sends the message to carry on about 100 seconds later. A `wake_after` beside it would only start a second turn.
 
 When work resumes, on the coordinator's word:
 - Check where things stand: git status, a fetch, your open PRs, your notes. Other sessions may have moved.

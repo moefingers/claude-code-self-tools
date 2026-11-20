@@ -66,11 +66,8 @@ export type RcOutcome =
  */
 export type ChromeOutcome = 'ran' | 'queued' | 'reloaded' | 'failed' | 'none' | 'coordinator' | 'unread' | 'unsure' | 'capped'
 
-/**
- * The MCP servers this session has listed tools of, at any look: one the login change dropped lists none. `wake`
- * (#67): self-wake's timer, which the idle step after a login change names when it is there.
- */
-export type Servers = { chrome?: true; coordinator?: true; wake?: true }
+/** The MCP servers this session has listed tools of, at any look: one the login change dropped lists none. */
+export type Servers = { chrome?: true; coordinator?: true }
 
 /** A login change being handled, from when it was confirmed until its toast. */
 export type Pending = {
@@ -167,10 +164,8 @@ export type Turn = {
   outcome?: 'answer' | 'aborted' | 'refusal' | 'error'
   /** The API error kind StopFailure gave for it (`rate_limit`, `authentication_failed`, ...). */
   error?: string
-  /** The turn the resume message started: the idle step's, or the plain resume after it. */
+  /** The turn a resume message started: the idle step's, or AFTER_PAUSE's (#67). */
   fromResume?: true
-  /** #67: the turn the idle step started (IDLE_FIRST): asked to set a timer and end at once. Only while it runs. */
-  fromIdle?: true
   /** Its id, as turn.start and turn.complete carried it: the resume claim's key for a turn that ended on an error. */
   turnId?: string
   /**
@@ -188,12 +183,14 @@ export type Resumes = {
   blocked?: true
   /** When the person last typed a prompt (ms): a resume's turn that started before it doesn't block. */
   personAt?: number
-  /**
-   * #67: the idle step's turn ended, at `at` (ms), as its turn record says, with `turnId`: if no turn has started by
-   * FOLLOW_MS after it, the plain resume goes. Gone once any turn starts, or the plain resume is sent.
-   */
-  follow?: { at: number; turnId?: string }
 }
+
+/**
+ * #67: the pause after this plugin's idle step, until AFTER_PAUSE is sent or the pause is cancelled. `sentAt`: when the
+ * idle step was submitted (ms). `turnId`: the idle step's own turn, once it started (its text holds IDLE_MARK).
+ * `endedAt`: when that turn ended (ms); AFTER_PAUSE is due PAUSE_MS after it.
+ */
+export type Pause = { sentAt: number; turnId?: string; endedAt?: number }
 
 /**
  * The plugin's session state. #53, shared/hooks/classic.ts: `classic`, true once a classic hook reached this process
@@ -208,6 +205,7 @@ declare module 'claude-code' {
       login: Login | null
       turn: Turn | null
       resumes: Resumes | null
+      pause: Pause | null
       rcLock: MemoryLock | null
       servers: Servers | null
       resumeClaims: string[] | null

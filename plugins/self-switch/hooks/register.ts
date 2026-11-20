@@ -109,7 +109,7 @@
 // (the folder is taken once the conversation's transcript is there, at its first prompt).
 import type { EngineInterface, Register, Timer } from 'claude-code'
 import type { Heartbeat, Queued, Ticket } from '../types'
-import { atIdle } from './at-idle'
+import { idleWords } from './at-idle'
 import { type ClassicIo, classicRuns, classicSeen, configureClassic, keepClassic, type Move, moveBegins, moveLook, movePending, startPartner, type StartSource, takeOwedStart } from './classic'
 import { go } from './go'
 import type { AgentLike, LaunchInput, LaunchWhere, LeftStat, Pane, Placement, Probe, ProcessRef, Transport } from './machine'
@@ -255,7 +255,7 @@ const DESCRIPTION = [
   'Before anything runs it checks, and refuses saying why: when `to` is open, or may be open, anywhere on this machine; when anything still runs under this session (subagents, background Bash or Monitor jobs, git, builds, dev servers, a heavy slot); when an in-place switch would leave changes made since this conversation started uncommitted in the checkout both share; when a worktree named in `trees`, or the one this session works in, has uncommitted changes; within 2 minutes of a switch. Windows only, in a terminal.',
   '`trees` (optional): the git worktrees you worked in, absolute paths, each a worktree of the repository this session started in; each must be clean.',
   "It can run only when the session is idle: Claude Code queues a plugin's command behind anything already waiting (a message typed during this turn, a background task's notification) and has no slot between turns ahead of them. A turn that starts first cancels the switch, and you are told, so nothing waiting is lost or carried into another conversation; under a nonstop stream of work and notifications it may not run for a long time, so call it again when the stream pauses.",
-  atIdle(),
+  idleWords(),
 ].join(' ')
 
 const SUBAGENT =

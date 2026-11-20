@@ -1,6 +1,6 @@
 import { expect, mock, test } from 'claude-code/testing'
 import type { AgentInfo, AgentStatus, On } from 'claude-code'
-import { atIdle, GO_IDLE, WHY_IDLE } from '../hooks/at-idle'
+import { GO_IDLE, idleWords, WHY_IDLE } from '../hooks/at-idle'
 import { wakeMarker } from '../hooks/machine'
 
 const TOOL = 'mcp__self-exit__exit_after_turn'
@@ -556,6 +556,6 @@ test('with nothing waiting, the exit starts half a second after the turn\'s end'
 test("the owner's note (#67): the description ends with the shared words, to go idle at once after the call, and why", async ($, on) => {
   const { described } = engine(on)
   await $.session.start(start)
-  expect(described.join(' ')).toContain(atIdle('After calling it'))
+  expect(described.join(' ')).toContain(idleWords('After calling it'))
   expect(described.join(' ')).toContain(`${GO_IDLE} ${WHY_IDLE}`)
 })

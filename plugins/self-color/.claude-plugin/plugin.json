@@ -1,6 +1,6 @@
 {
   "name": "self-color",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "description": "Lets a session set its own prompt bar color once the current turn ends, as /color does, to mark its role so sessions are told apart at a glance.",
   "author": { "name": "moefingers", "url": "https://github.com/moefingers" },
   "homepage": "https://github.com/moefingers/claude-code-self-tools/tree/main/plugins/self-color#readme",

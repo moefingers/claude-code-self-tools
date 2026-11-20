@@ -1,7 +1,7 @@
 import { expect, mock, test } from 'claude-code/testing'
 import type { Engine } from 'claude-code/testing'
 import type { On } from 'claude-code'
-import { atIdle, GO_IDLE, WHY_IDLE } from '../hooks/at-idle'
+import { GO_IDLE, idleWords, WHY_IDLE } from '../hooks/at-idle'
 import {
   answer,
   chooseProfile,
@@ -815,7 +815,7 @@ test('the description says it never quits Chrome, to end the turn once the recon
   const said = described.at(-1) ?? ''
   expect(said).toContain("It never quits, kills or restarts Chrome, which would close every session's tabs and tab groups")
   // #67: the shared words of every tool that queues for the idle moment.
-  expect(said).toContain(atIdle('When it says the reconnect is queued'))
+  expect(said).toContain(idleWords('When it says the reconnect is queued'))
   expect(said).toContain(`${GO_IDLE} ${WHY_IDLE}`)
   expect(said).toContain("When it says to ask the person, ask them; don't call it again.")
 })

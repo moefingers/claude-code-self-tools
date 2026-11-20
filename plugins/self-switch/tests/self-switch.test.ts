@@ -1,7 +1,7 @@
 // self-switch's plugin, against a fake engine: the probe, the launcher, git and the release answer
 // from fixtures; /resume and /exit are recorded, never run. Nothing here starts a process.
 import { describe, expect, mock, test } from 'claude-code/testing'
-import { atIdle, GO_IDLE, WHY_IDLE } from '../hooks/at-idle'
+import { GO_IDLE, idleWords, WHY_IDLE } from '../hooks/at-idle'
 import { go } from '../hooks/go'
 import type { AgentInfo, AgentStatus, On } from 'claude-code'
 import { claimPath, gatePath, goAnswer, GO_NOTHING, GO_VIA, launchScriptText, placementPath, type LaunchInput, leftPath, MAX_UNTRACKED, paneNoLeft, panePath, paneTicketPath, quoted, SLOT_NOT_RECOGNISED, SLOT_SCRIPT_SHA256, slotRecordPath, STDIN_BOOTSTRAP, wakeMarker, wakePath } from '../hooks/machine'
@@ -966,7 +966,7 @@ describe('refusals, before and at the run', () => {
   test("the owner's note (#67): the description ends with the shared words, to go idle at once after the call, and why", async ($, on) => {
     const { described } = engine(on)
     await $.session.start(start)
-    expect(described.join(' ')).toContain(atIdle('After calling it'))
+    expect(described.join(' ')).toContain(idleWords('After calling it'))
     expect(described.join(' ')).toContain(`${GO_IDLE} ${WHY_IDLE}`)
   })
 

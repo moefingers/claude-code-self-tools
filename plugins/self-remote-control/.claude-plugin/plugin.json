@@ -1,6 +1,6 @@
 {
   "name": "self-remote-control",
-  "version": "0.4.5",
+  "version": "0.4.6",
   "description": "Lets a session report on its own Remote Control, turn it on under a title, and rename itself. After a login change it reconnects Remote Control and resumes a turn the change cut off. It runs /remote-control only when the session reads as not connected, so it never opens the Remote Control panel or disconnects.",
   "author": { "name": "moefingers", "url": "https://github.com/moefingers" },
   "homepage": "https://github.com/moefingers/claude-code-self-tools/tree/main/plugins/self-remote-control#readme",
@@ -18,7 +18,7 @@
     "resumeAfterLoginChange": {
       "type": "boolean",
       "title": "Resume after a login change",
-      "description": "When the account changes and this session's last turn ended, within 6 hours, on an error a new login can clear (the usage limit, a failed sign-in), send it, idle first: There was a small interruption. Please go idle, setting a 100 second timer to resume, for tools to reset, after which point you should resume normally. Then, if no turn has started 150 seconds after that short turn ended, a plain resume, once. Once per change, after the Remote Control reconnect and a delay of up to a minute, never to a session at a finished break, and not again after a resume that failed at once until you type.",
+      "description": "When the account changes and this session's last turn ended, within 6 hours, on an error a new login can clear (the usage limit, a failed sign-in), send it, idle first: There was a small interruption. Please go idle, setting a 100 second timer to resume, for tools to reset, after which point you should resume normally. The plugin keeps that timer, and 100 seconds after that short turn ended sends the message to resume, once, unless you typed meanwhile. Once per change, after the Remote Control reconnect and a delay of up to a minute, never to a session at a finished break, and not again after a resume that failed at once until you type.",
       "default": true
     },
     "reconnectChromeOnLoginChange": {

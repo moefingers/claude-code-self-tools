@@ -1,6 +1,6 @@
 import { expect, mock, test } from 'claude-code/testing'
 import type { On } from 'claude-code'
-import { atIdle, GO_IDLE, WHY_IDLE } from '../hooks/at-idle'
+import { GO_IDLE, idleWords, WHY_IDLE } from '../hooks/at-idle'
 
 const TOOL = 'mcp__self-mcp__reconnect_mcp_after_turn'
 
@@ -181,7 +181,7 @@ test("the owner's A: the step starts the moment the turn's end returns, with no 
 test("the owner's note (#67): the description ends with the shared words, to go idle at once after the call, and why", async ($, on) => {
   engine(on)
   await $.session.start(start)
-  expect(registeredDescriptions.at(-1) ?? '').toContain(atIdle('After calling it'))
+  expect(registeredDescriptions.at(-1) ?? '').toContain(idleWords('After calling it'))
   expect(registeredDescriptions.at(-1) ?? '').toContain(`${GO_IDLE} ${WHY_IDLE}`)
 })
 
