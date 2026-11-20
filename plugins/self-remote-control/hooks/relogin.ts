@@ -51,8 +51,8 @@
 //      this plugin's own: it keeps the timer), so the first turn after the interruption is short and
 //      every command queued for the idle moment runs before the work goes on. This plugin keeps the
 //      timer itself: PAUSE_MS after the idle step's own turn ended, it sends AFTER_PAUSE, once
-//      (endPause), unless the person's own prompt, the person's interrupt, a long idle turn or the
-//      session's end cancelled the pause first. The idle step goes once, after the
+//      (endPause), unless the pause ended first: the person's own prompt, a new stop, the session's
+//      end (the pause block below lists all of it). The idle step goes once, after the
 //      reconnect has settled, Claude in Chrome's step and the session's own delay (0 to JITTER_MS, so
 //      the sessions of one switch don't all start at once). Only under the resume claim
 //      (resume-claim.ts): the coordinator's auto-resume, or the owner's Resume on its page, may resume
@@ -96,10 +96,10 @@ const pauseRef = { plugin: 'self-remote-control', key: 'pause' } as const
  * The plugin keeps the timer itself, so the session resumes whether or not the model could set one.
  */
 export const PAUSE_MS = 100_000
-/** #67: an idle step's turn that ran this long or longer did the work itself, so it resumed already: no pause after it. */
-export const IDLE_TURN_MS = 10 * 60_000
-/** #67: while a turn runs when AFTER_PAUSE is due, how often to look again for the next idle moment. */
+/** #67: while a turn runs, or a draft is in the prompt box, when AFTER_PAUSE is due: how often to look again. */
 export const PAUSE_LOOK_MS = 5000
+/** #67: the prompt box is read this long at most; one that doesn't answer in time holds AFTER_PAUSE, as a draft does. */
+const BOX_WAIT_MS = 5000
 
 /**
  * #67: the owner's words, which the resume of a turn a login change (or the limit before it) cut off opens with. The
@@ -767,7 +767,8 @@ async function forgetSend($: EngineInterface, at: number): Promise<void> {
   try {
     const resumes = await getResumes($)
     if (resumes !== null && resumes.sentAt === at) await $.state.set(resumesRef, without(resumes, 'sentAt'))
-    if ((await getPause($))?.sentAt === at) await $.state.set(pauseRef, null)
+    const { value: pause, version } = await readPause($)
+    if (pause?.sentAt === at) await $.state.set(pauseRef, null, { ifVersion: version })
   } catch {
     // SENT_MS ages the send out.
   }
@@ -1076,7 +1077,8 @@ export async function noteTurnStart($: EngineInterface, text: string, turnId?: s
     const now = await $.clock.now()
     const resumes = await getResumes($)
     const sentAt = resumes?.sentAt
-    const isResumeTurn = sentAt !== undefined && now - sentAt < SENT_MS && (text.includes(IDLE_MARK) || text.includes(AFTER_PAUSE))
+    // This plugin's own words are its own whatever the send's age (a submit can wait for the session's idle moment).
+    const isResumeTurn = sentAt !== undefined && (text.includes(IDLE_MARK) || text.includes(AFTER_PAUSE))
     if (resumes !== null && sentAt !== undefined && (isResumeTurn || now - sentAt >= SENT_MS)) await $.state.set(resumesRef, without(resumes, 'sentAt'))
     const session = await conversationOf($)
     await $.state.set(turnRef, { running: true, at: now, ...(isResumeTurn ? { fromResume: true as const } : {}), ...(turnId === undefined ? {} : { turnId }), ...(session === undefined ? {} : { session }) })
@@ -1123,14 +1125,26 @@ export async function noteTurnEnd($: EngineInterface, end: TurnEnd): Promise<voi
 }
 
 // #67: the pause after this plugin's idle step. Its record (pauseRef) lives from the idle step's submit until
-// AFTER_PAUSE is sent, or the pause is cancelled: by a person's own prompt, a person's interrupt of the idle step's
-// turn, an idle step's turn of IDLE_TURN_MS or more, or the session's end (an exit, a /clear, a /resume). Nothing else
-// cancels it: a background task's notification, a peer's message, a wake-up or another plugin's prompt starts a turn
-// of its own and leaves the pause running, since none of them means the session took up its work again.
+// AFTER_PAUSE is sent, or the pause ends without it. What ends it, in full:
+//   - the person's own prompt, from the terminal, the app (Remote Control) or the owner's Slack ping (origin
+//     `composer`, `bridge` or `slack-ping`), once it entered (register.ts, cancelPause);
+//   - the session's end, whatever its reason: an exit, a /clear, a /resume, a logout, a signal (register.ts);
+//   - a new stop: any main-loop turn that ends on an error while the pause is open, the idle step's own or a later
+//     one (settlePause). That stop is left to what resumes stops: the next login change, with its loop-breaker, and
+//     the coordinator plugin where it runs;
+//   - the idle step's submit dropped or refused (forgetSend), or a newer idle step's send, whose record replaces it;
+//   - a send whose turn never came: aged out at the next turn's start SENT_MS or more after it (openPause);
+//   - at the due time: resumeAfterLoginChange turned off, a turn or a draft still holding it CUT_OFF_MS past due, or
+//     another writer taking the record first (endPause's compare-and-set).
+// Nothing else ends it. A background task's notification, a peer's message, a channel's, a wake-up or another
+// plugin's prompt starts a turn of its own and leaves the pause running: none of them means the session took up its
+// work again. Neither does the person's Stop, which only session.stop tells apart, an event the Claude Code builds
+// this plugin supports don't all have (the README's Not built).
 
-/** The pause as it stands; null when there is none. */
-async function getPause($: EngineInterface): Promise<Pause | null> {
-  return (await $.state.get(pauseRef)).value ?? null
+/** The pause as it stands, with the version $.state holds it at; null when there is none. */
+async function readPause($: EngineInterface): Promise<{ value: Pause | null; version: number }> {
+  const got = await $.state.get(pauseRef)
+  return { value: got.value ?? null, version: got.version }
 }
 
 /** Starts the pause's timer, `ms` from now, in place of any it had. */
@@ -1140,51 +1154,59 @@ function armPause($: EngineInterface, ms: number): void {
 }
 
 /**
- * On a main-loop turn's start: names the turn this plugin's idle step started as the pause's own. Its text holds
- * IDLE_MARK, and the pause's send is under SENT_MS old; a send older than that, whose turn never came, is dropped.
- * Never throws.
+ * On a main-loop turn's start: names the turn this plugin's idle step started as the pause's own, by IDLE_MARK in its
+ * text, whatever the record's age. A send whose turn never came is aged out instead, at a turn without the mark that
+ * starts SENT_MS or more after it. Each write is a compare-and-set against the version read. Never throws.
  */
 export async function openPause($: EngineInterface, text: string, turnId: string | undefined): Promise<void> {
   try {
-    const pause = await getPause($)
+    const { value: pause, version } = await readPause($)
     if (pause === null || pause.turnId !== undefined) return
-    const age = (await $.clock.now()) - pause.sentAt
-    if (age >= SENT_MS) await $.state.set(pauseRef, null)
-    else if (text.includes(IDLE_MARK) && turnId !== undefined) await $.state.set(pauseRef, { ...pause, turnId })
+    if (text.includes(IDLE_MARK) && turnId !== undefined) {
+      await $.state.set(pauseRef, { ...pause, turnId }, { ifVersion: version })
+      return
+    }
+    if ((await $.clock.now()) - pause.sentAt >= SENT_MS) await $.state.set(pauseRef, null, { ifVersion: version })
   } catch {
     // The idle step's turn goes unnamed, and no message ends a pause: the session waits for the next message.
   }
 }
 
-/** How the idle step's own turn ended, as turn.complete says. */
-export type PauseEnd = { turnId: string; reason: NonNullable<Turn['outcome']>; isAborted: boolean; durationMs: number }
+/** How a main-loop turn ended, as turn.complete says, for the pause. */
+export type PauseEnd = { turnId: string; reason: NonNullable<Turn['outcome']> }
 
 /**
- * On a main-loop turn's end: settles the pause by how the idle step's own turn ended. Its clock starts for PAUSE_MS,
- * whether the turn ended with an answer or on an error; the pause is dropped when the person interrupted the turn, or
- * when the turn ran IDLE_TURN_MS or more, doing the work itself. Never throws.
+ * On a main-loop turn's end: settles the pause by how the turn ended. A turn that ended on an error is a new stop,
+ * which ends the pause, whichever turn it was; the idle step's own turn that ended otherwise starts the pause's clock
+ * for PAUSE_MS. Each write is a compare-and-set against the version read. Never throws.
  */
 export async function settlePause($: EngineInterface, end: PauseEnd): Promise<void> {
   try {
-    const pause = await getPause($)
-    if (pause === null || pause.turnId !== end.turnId || pause.endedAt !== undefined) return
-    if (end.isAborted || end.reason === 'aborted' || end.durationMs >= IDLE_TURN_MS) {
-      await $.state.set(pauseRef, null)
+    const { value: pause, version } = await readPause($)
+    if (pause === null) return
+    if (end.reason === 'error') {
+      const ended = await $.state.set(pauseRef, null, { ifVersion: version })
+      if (ended.isSet) {
+        pauseTimer?.cancel()
+        pauseTimer = undefined
+        $.ui.log('self-remote-control: a turn ended on an error in the pause for tools to reset, a new stop: the pause ends, and the stop is left to what resumes stops', { to: 'debug' })
+      }
       return
     }
-    await $.state.set(pauseRef, { ...pause, endedAt: await $.clock.now() })
-    armPause($, PAUSE_MS)
+    if (pause.turnId !== end.turnId || pause.endedAt !== undefined) return
+    const started = await $.state.set(pauseRef, { ...pause, endedAt: await $.clock.now() }, { ifVersion: version })
+    if (started.isSet) armPause($, PAUSE_MS)
   } catch {
     // No clock: the session waits for the next message.
   }
 }
 
-/** Cancels the pause: AFTER_PAUSE is not sent. A person's own prompt, or the session's end. Never throws. */
+/** Cancels the pause: AFTER_PAUSE is not sent. The person's own prompt, or the session's end. Never throws. */
 export async function cancelPause($: EngineInterface): Promise<void> {
   pauseTimer?.cancel()
   pauseTimer = undefined
   try {
-    if ((await getPause($)) !== null) await $.state.set(pauseRef, null)
+    if ((await readPause($)).value !== null) await $.state.set(pauseRef, null)
   } catch {
     // endPause reads the record again, and finds what is there.
   }
@@ -1197,7 +1219,7 @@ export async function cancelPause($: EngineInterface): Promise<void> {
 export async function rearmPause($: EngineInterface): Promise<void> {
   try {
     if (!settings.resume) return
-    const endedAt = (await getPause($))?.endedAt
+    const endedAt = (await readPause($)).value?.endedAt
     if (endedAt === undefined) return
     armPause($, endedAt + PAUSE_MS - (await $.clock.now()))
   } catch {
@@ -1206,18 +1228,33 @@ export async function rearmPause($: EngineInterface): Promise<void> {
 }
 
 /**
+ * Whether the person's prompt box holds a draft, or doesn't answer within BOX_WAIT_MS, as the coordinator plugin's
+ * carry-on reads it. False on a build with no box to read: `$.prompt.read` missing throws where it is called. Never throws.
+ */
+async function isDraftHeld($: EngineInterface): Promise<boolean> {
+  let reading: Promise<{ text: string }>
+  try {
+    reading = $.prompt.read()
+  } catch {
+    return false
+  }
+  const box = await within($, reading, BOX_WAIT_MS).catch(() => 'late' as const)
+  return box === 'late' || box.text.trim() !== ''
+}
+
+/**
  * Sends AFTER_PAUSE, once, at the first idle moment from PAUSE_MS after the idle step's own turn ended. A turn still
- * running then (one the pause doesn't cancel) is waited out, looking every PAUSE_LOOK_MS, up to CUT_OFF_MS. When the
- * last turn ended on an error, that stop is resumed only under its claim, as any resume is: an idle step's turn that
- * hit the limit again is such a stop, and so is a later one; whoever claims it first resumes it. Never throws.
+ * running then, or a draft in the prompt box, holds it, looked at again every PAUSE_LOOK_MS, up to CUT_OFF_MS past
+ * due. It takes the record by one compare-and-set against the version it read: when another writer got there first (a
+ * cancel, a newer idle step, a copy of this module a reload left running), nothing is sent. Never throws.
  */
 async function endPause($: EngineInterface): Promise<void> {
   pauseTimer = undefined
   try {
-    const pause = await getPause($)
+    const { value: pause, version } = await readPause($)
     if (pause?.endedAt === undefined) return
     if (!settings.resume) {
-      await $.state.set(pauseRef, null)
+      await $.state.set(pauseRef, null, { ifVersion: version })
       return
     }
     const now = await $.clock.now()
@@ -1226,25 +1263,14 @@ async function endPause($: EngineInterface): Promise<void> {
       armPause($, due - now)
       return
     }
-    const last = await getTurn($)
-    if (last?.running === true) {
+    if ((await getTurn($))?.running === true || (await isDraftHeld($))) {
       if (now - due < CUT_OFF_MS) armPause($, PAUSE_LOOK_MS)
-      else await $.state.set(pauseRef, null)
+      else await $.state.set(pauseRef, null, { ifVersion: version })
       return
     }
-    let giveBack: (() => Promise<void>) | undefined
-    if (last?.outcome === 'error') {
-      const claim = await claimResume($, last.turnId, last.session, now)
-      if ('lost' in claim) {
-        await $.state.set(pauseRef, null)
-        $.ui.log(`self-remote-control: after the pause, ${claim.lost}`, { to: 'debug' })
-        $.ui.toast(`After the pause for tools to reset, ${claim.lost}.`)
-        return
-      }
-      giveBack = claim.giveBack
-    }
-    // Taken first, with sentAt (its turn is a resume's, for the loop-breaker): a reload never sends it twice.
-    await $.state.set(pauseRef, null)
+    const taken = await $.state.set(pauseRef, null, { ifVersion: version })
+    if (!taken.isSet) return
+    // sentAt: its turn is a resume's, for the loop-breaker.
     await $.state.set(resumesRef, { ...((await getResumes($)) ?? {}), sentAt: now })
     try {
       const sent = await $.prompt.submit({ text: AFTER_PAUSE })
@@ -1254,12 +1280,10 @@ async function endPause($: EngineInterface): Promise<void> {
         return
       }
       await forgetSend($, now)
-      await giveBack?.()
       $.ui.log(`self-remote-control: the resume after the pause was dropped: ${sent.drop}`, { to: 'debug' })
       $.ui.toast(`The resume after the pause for tools to reset was dropped (${sent.drop}): the session waits for the next message.`)
     } catch (err) {
       await forgetSend($, now)
-      await giveBack?.()
       $.ui.log(`self-remote-control: the resume after the pause wasn't sent: ${why(err)}`, { to: 'debug' })
       $.ui.toast("The resume after the pause for tools to reset wasn't sent: the session waits for the next message.")
     }

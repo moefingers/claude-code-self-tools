@@ -523,6 +523,12 @@ export const register: Register = (on, options) => {
   // A prompt the person typed, at the terminal or from the app: it marks the arms it comes after (see Typed), and a
   // resume the loop-breaker held may go again. No text is kept.
   on('prompt.submit', async ($, e, next) => {
+    // #67: the owner's own ping from Slack is the person's too, for the pause alone: once it entered, the pause ends.
+    if (e.origin.kind === 'slack-ping') {
+      const pinged = await next(e)
+      if (pinged.drop === undefined) await cancelPause($)
+      return pinged
+    }
     if (e.origin.kind !== 'composer' && e.origin.kind !== 'bridge') return next(e)
     const typed = personTyped(e.turnId)
     const done = await next(e)
@@ -601,8 +607,8 @@ export const register: Register = (on, options) => {
         if (kind !== undefined) await noteFailure($, kind)
       }
       await noteTurnEnd($, { reason: e.reason, durationMs: e.durationMs, turnId: e.turnId, ...(e.usage === undefined ? {} : { usage: e.usage }) })
-      // #67: the idle step's own turn ended: the pause's clock starts, or the pause is dropped.
-      await settlePause($, { turnId: e.turnId, reason: e.reason, isAborted: e.isAborted, durationMs: e.durationMs })
+      // #67: a turn ended: the idle step's own starts the pause's clock, and one that ended on an error (a new stop) ends the pause.
+      await settlePause($, { turnId: e.turnId, reason: e.reason })
       void noteServers($)
       const { value } = await $.state.get(queued)
       if (!value) return done

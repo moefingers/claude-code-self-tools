@@ -11,6 +11,11 @@
 // with `const <NAME> = [ ... ].join(' ')` in the same file. Of that declaration, with its comment lines left out, the
 // last part must be idleWords(...) (a tool that queues), or WHY_IDLE then NO_WAIT (one nothing waits on). So a tool
 // written any other way, or in any other file of the plugin, fails here rather than slip past.
+//
+// What it can't see, so a registration written so goes uncounted: one not spelled `tool.register(` (as
+// `$.tool['register'](`, a destructured `register(`, `tool.register?.(` or `tool.register.call(`); one in a file that
+// carries the text "Canonical copy: shared/" (a shared copy, skipped whole); and one under shared/, which it doesn't
+// read. None is in the repository today; write a registration as the house form above.
 import assert from 'node:assert/strict'
 import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'

@@ -98,7 +98,7 @@ Claude sees each tool as `mcp__<plugin>__<tool>`.
 - Inputs: `action` (`status`, `connect` or `rename`), `name` (the title; required for `rename`), `resume` (optional).
 - `status` reports. `connect` connects the session under a title, once the turn ends, only if it isn't connected. `rename` sets the session's title. It never disconnects: that is the owner's.
 - In a hierarchy: rename each session for its role, so the owner finds it in the app's session list.
-- After an account change that cut a turn off, it resumes that turn with an idle step first: a short turn that ends at once, with no tool call, so what was queued for the idle moment runs before the work goes on. The plugin keeps the timer itself: 100 seconds after that short turn ended, it sends the message to resume, once. A notification or a wake-up in the pause doesn't stop it; the person's own message, the person's interrupt, or the session's end does.
+- After an account change that cut a turn off, it resumes that turn with an idle step first: a short turn that ends at once, with no tool call, so what was queued for the idle moment runs before the work goes on. The plugin keeps the timer itself: 100 seconds after that short turn ended, it sends the message to resume, once, at the next idle moment with the prompt box empty. A notification, a peer's message or a wake-up in the pause doesn't stop it. The person's own message, a new stop (any turn in the pause that ends on an error, left to what resumes stops) and the session's end do, and so do a few rarer ends its README lists. A restart during the pause loses it.
 
 ## Launching a session
 
