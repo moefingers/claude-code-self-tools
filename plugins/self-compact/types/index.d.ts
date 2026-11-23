@@ -8,10 +8,12 @@ export type Queued = { keep: string; resume?: string; when?: 'idle' }
 declare module 'claude-code' {
   interface PluginState {
     /**
-     * `queued`: the compaction waiting for its turn to end. `reminded`: the keys of the `compactReminder` levels the
-     * window had reached at the last answered turn end (`40%`, or a token count as digits), each reminded once.
-     * `warned`: the `compactReminder` value the session was last told is not levels, so it is said once.
+     * `queued`: the compaction waiting for its turn to end. `reminded`: the keys of the reminder levels in force (the
+     * conversation's own, set with compact_reminder, else the `compactReminder` setting's) that the window had passed at
+     * the last answered turn end or when the levels changed (`40%`, or a token count as digits). `warned`: the
+     * `compactReminder` value the session was last told is not levels, so it is said once. `started`: true once this
+     * process has started, so a reload's session.start isn't taken for the process's first.
      */
-    'self-compact': { queued: Queued | null; reminded: string[] | null; warned: string | null }
+    'self-compact': { queued: Queued | null; reminded: string[] | null; warned: string | null; started: boolean | null }
   }
 }

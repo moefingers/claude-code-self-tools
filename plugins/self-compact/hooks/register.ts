@@ -11,12 +11,14 @@
 // Compacting is the one step here Claude Code lets a plugin take between turns: a command (/exit, /clear,
 // /resume, /reload-plugins, /mcp, /rename) is queued behind what is waiting, at the lowest priority.
 //
-// The compact reminder (#72, reminder.ts), off unless `compactReminder` sets context levels, adds one line to the
-// session's next turn at a turn's end past a level, so a session that finished a piece compacts at that break.
+// The compact reminder (#72, reminder.ts), off unless `compactReminder` sets context levels, adds one polite line to
+// the session's next turn at a turn's end past a level, in case a session that finished a piece forgot to compact.
+// compact_reminder (#76) sets a conversation's own levels in place of the setting's, or says where they stand.
 import type { EngineInterface, Register } from 'claude-code'
 import type { Queued } from '../types'
 import { idleWords } from './at-idle'
-import { configureReminder, forgetReminded, remind, sayWhyOff } from './reminder'
+import { configureMoving, moveBegins, startBegins } from './moving'
+import { configureReminder, forgetReminded, MAX_LEVELS, NOTE_MAX, remind, reminderTool, sayWhyOff } from './reminder'
 import { configureUpdateCheck, loadUpdateCheck, withUpdateNotice } from './update-check'
 
 const queued = { plugin: 'self-compact', key: 'queued' } as const
@@ -34,6 +36,19 @@ const DESCRIPTION = [
   "`when` chooses when it runs. 'between-turns' (the default) compacts right as this turn ends, ahead of anything queued meanwhile (a message typed during this turn, a background task's notification), which then runs on the compacted conversation: nothing is lost. If a turn queued during this one has started by then, it compacts at that turn's end instead.",
   "'idle' compacts half a second after a turn ends, and only if no turn has started by then, so anything queued goes first: under a nonstop stream of work and notifications that may be the distant future.",
   idleWords(),
+].join(' ')
+
+/** compact_reminder: it answers at once and queues nothing, so it ends with no words about going idle. */
+const REMINDER_DESCRIPTION = [
+  "Sets this conversation's own compact reminder levels, in place of the compactReminder setting's, or says what they are now.",
+  'The reminder is one polite line added to your next turn when the context window passes a level, pointing to compact_after_turn; nothing is required.',
+  `\`levels\`: a comma-separated list of at most ${MAX_LEVELS}, each a percentage of the window (40%) or a token count (300k or 300000), such as "40%, 70%". "off" or "" drops this conversation's own levels, and the setting's stand again.`,
+  'They last across a compaction, a restart and a resume of this conversation, and apply to no other.',
+  `\`notes\` (optional, with \`levels\`): a note of your own for a level, one line of plain text (no angle brackets) of at most ${NOTE_MAX} characters, shown back to you with that level's reminder, such as {"60%": "write the notes file first"}.`,
+  'Levels the window already stands past are marked reminded, with no line.',
+  "In a process's first seconds (every new session included) and in the seconds after a /clear or a /resume, while the session's id may still name another conversation, it sets nothing and says how long to wait.",
+  'With no arguments it says the levels, where they come from (this conversation or the setting), which have passed since the last compaction, and where the window stands.',
+  'It answers at once and queues nothing.',
 ].join(' ')
 
 /** When a compaction runs: as the turn ends (the default), or once the session is idle. */
@@ -81,6 +96,7 @@ async function compactNow($: EngineInterface, { keep, resume, when }: Queued, re
 export const register: Register = (on, options) => {
   configureUpdateCheck('self-compact', options)
   configureReminder(options.compactReminder)
+  configureMoving()
 
   // First, so it is outermost on this plugin's tools: it sees each answer, and adds the update
   // notice when one is due. It never waits on the check; see update-check.ts.
@@ -112,7 +128,29 @@ export const register: Register = (on, options) => {
       },
       isDeferred: false,
     })
+    // Behind ToolSearch: a session sets its levels once in a while, and its name stays listed.
+    await $.tool.register({
+      name: 'compact_reminder',
+      description: REMINDER_DESCRIPTION,
+      inputSchema: {
+        type: 'object',
+        properties: {
+          levels: {
+            type: 'string',
+            description: 'This conversation\'s own levels, such as "40%, 70%" or "300k"; "off" or "" goes back to the setting. Leave it out to see where the levels stand.',
+          },
+          notes: {
+            type: 'object',
+            additionalProperties: { type: 'string' },
+            description: `With \`levels\`: a note of your own by level, as written in \`levels\`, one line of at most ${NOTE_MAX} characters each.`,
+          },
+        },
+        additionalProperties: false,
+      },
+      isDeferred: true,
+    })
     loadUpdateCheck($)
+    await startBegins($)
     await sayWhyOff($, options.compactReminder)
     return started
   })
@@ -136,6 +174,23 @@ export const register: Register = (on, options) => {
     const at = when === 'idle' ? 'once the session is idle after this turn' : 'as this turn ends, ahead of anything queued meanwhile'
     return { result: `Queued. This conversation compacts ${at}, keeping: ${keep}. It ${then}` }
   }).catch(($, e, next) => (next.called ? next(e) : { deny: 'self-compact: queuing the compaction failed; nothing is queued.' }))
+
+  on('tool.call', { tool: 'mcp__self-compact__compact_reminder' }, async ($, e) => {
+    if (e.agentId !== undefined) {
+      return {
+        deny: "A subagent has no reminder levels of its own: the levels and the window's reading are the main conversation's. A subagent compacts on its own near its context limit; to close a piece cleanly, finish it and return its result.",
+      }
+    }
+    return reminderTool($, e as { levels?: unknown; notes?: unknown })
+  }).catch(($, e, next) =>
+    next.called ? next(e) : { deny: 'self-compact: reading or writing the reminder levels failed. Call compact_reminder with no arguments to see where they stand.' },
+  )
+
+  // A /clear or a /resume: the id may read the conversation left for a few seconds (moving.ts).
+  on('session.end', async ($, e, next) => {
+    await moveBegins($, e)
+    return next(e)
+  }).catch(($, e, next) => next(e))
 
   on('turn.complete', async ($, e, next) => {
     const done = await next(e)

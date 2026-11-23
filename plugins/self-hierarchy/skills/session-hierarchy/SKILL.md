@@ -108,6 +108,7 @@ Most of the tools act once the turn ends, and each says so in the same words: Af
 | Tool | What it costs | When |
 | :- | :- | :- |
 | `compact_after_turn` | Keeps a summary and loses detail. The process and the conversation go on. | At a break between two pieces of work, when the window is filling (`context_usage` says how full). |
+| `compact_reminder` | Nothing: it sets or reads this conversation's own reminder levels and answers at once. | When the setting's levels don't fit the work: a coordinator wants an early one, a builder with one big piece a late one. |
 | `restart_after_turn` | A fresh process on the same conversation. The context stays; plugins, MCP servers and shells start fresh. Windows only. | A dead tool, an account switch, a setting read at startup, a plugin that won't reload. |
 | `clear_after_turn` | Loses the whole story. Only the `handoff` survives. | Only when the work is `complete` and its notes are written, or the context is `contaminated`. |
 | `switch_after_turn` | Moves this terminal to another conversation. This one's context is kept for later. Pending wake-ups are dropped. Windows only. | Only when the owner asks. Where a coordinator plugin runs switches, it refuses. |
