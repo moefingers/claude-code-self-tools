@@ -102,7 +102,7 @@ Claude sees each tool as `mcp__<plugin>__<tool>`.
 
 ## Launching a session
 
-Start each session in its own terminal tab with self-switch's launch script, `claude-launch.ps1`. Every launch that opens a window keeps a copy for you at `%LOCALAPPDATA%\claude-self-tools\claude-launch.ps1`, and the claude wrapper's verified copy beside it. With `-Wrapper`, the session's later restarts come back to the same tab. By hand, from any shell:
+Start each session in its own terminal tab with self-switch's launch script, `claude-launch.ps1`. Every launch that opens a window keeps a copy for you at `%LOCALAPPDATA%\claude-self-tools\claude-launch.ps1`, and the claude wrapper's verified copy beside it. With `-Wrapper`, the session's later restarts come back to the same tab. By hand, from cmd or the Run box (in PowerShell, write `wt --%` for `wt`, so that PowerShell hands the rest on as written and a space in your profile's path stays quoted):
 
 ```
 wt -w 0 new-tab --title lane-a powershell.exe -NoExit -ExecutionPolicy Bypass -File "%LOCALAPPDATA%\claude-self-tools\claude-launch.ps1" -Wrapper -Start <uuid> -Name lane-a -Dir <folder> -RemoteControl -PromptFile <file>
@@ -110,7 +110,7 @@ wt -w 0 new-tab --title lane-a powershell.exe -NoExit -ExecutionPolicy Bypass -F
 
 - `-Start <uuid> -Name lane-a` starts a new conversation with that id, under the role's name. `-Resume <id>` resumes one instead, and `-Lane <name>` resumes a session's current conversation in its own folder, from `lanes.json`.
 - `-RemoteControl` turns Remote Control on at launch, under the session's name, so the owner can reach it from the phone at once. `-RemoteControl <name>` names it otherwise.
-- `-PromptFile <file>` briefs it: the file's UTF-8 text is its first prompt, sent once. A restart later resumes it with `--resume` alone. The script refuses a prompt it can't deliver whole, saying why; its header lists the rules.
+- `-PromptFile <file>` briefs it: the file's UTF-8 text is its first prompt, sent once. A restart later resumes it with `--resume` alone. The script refuses a prompt it can't deliver whole, saying why; its header lists the rules. It needs the native build's `claude.exe`: an npm install's `claude.cmd` runs through cmd.exe, which would read the prompt's `%` and `&` as its own, so a prompt is refused there.
 - `wt` splits its command line at every `;`, even inside quotes: keep `;` out of everything after `new-tab` (use `-File`, never `-Command "a; b"`).
 - A `-File` launch needs an execution policy that runs local scripts. Windows' default, `Restricted`, refuses it, and a hidden or closing window never shows why: pass `-ExecutionPolicy Bypass`. The script clears it again before claude.
 

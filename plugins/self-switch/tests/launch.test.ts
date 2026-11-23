@@ -13,6 +13,9 @@ import {
   launchScriptPath,
   LAUNCH_SCRIPT_VERSION,
   PANE_VERSION,
+  FIND_CLAUDE,
+  PROMPT_CHECK,
+  PROMPT_REFUSED_EXIT,
   launchFolderFault,
   launchFolderSaid,
   LAUNCH_SCRIPT_TEXT,
@@ -659,14 +662,39 @@ describe('launch(): Remote Control and a first prompt at launch (#63), for a pla
     }
   })
 
-  test("the launch refuses 'prompt' when the file is not there, before the claim is taken; its text is claude-launch.ps1's to check", () => {
+  test("M1: the launch runs claude-launch.ps1's own checks before the claim, as the window's interpreter will hand the prompt on, and refuses 'prompt' with the reason", () => {
     const script = launchScriptText(input({ promptFile: PROMPT }))
-    const check = script.indexOf("if (-not (Test-Path -LiteralPath $promptFile -PathType Leaf)) { Refuse 'prompt' ($tool + ': the first prompt''s file is not a file that is there: ' + $promptFile) }")
-    expect(check).toBeGreaterThan(0)
-    expect(check).toBeLessThan(script.indexOf('function New-Claim('))
-    expect(script.slice(0, check)).toContain(`$promptFile = '${PROMPT}'\r\n`)
-    // Never read here: no ReadAll of it, no Get-Content.
-    expect(script).not.toMatch(/ReadAll\w*\(\$promptFile|Get-Content[^\r\n]*\$promptFile/)
+    // One list, in both: the script holds it line for line.
+    expect(LAUNCH_SCRIPT_TEXT).toContain(`${PROMPT_CHECK.join('\n')}\n`)
+    expect(LAUNCH_SCRIPT_TEXT).toContain(`${FIND_CLAUDE.join('\n')}\n`)
+    expect(script).toContain(PROMPT_CHECK.join('\r\n'))
+    expect(script).toContain(FIND_CLAUDE.join('\r\n'))
+    const claim = script.indexOf('function New-Claim(')
+    const rule = script.indexOf('$pwshOk = $null -ne $pwsh')
+    const read = script.indexOf('$promptRead = Read-Prompt $promptFile (-not $pwshOk)')
+    const refused = script.indexOf("if ($null -ne $promptRead.why) { Refuse 'prompt' ($tool + ': the first prompt ' + $promptFile + ' ' + $promptRead.why) }")
+    const exe = script.indexOf("if ($null -ne $exe) { $exeWhy = Get-PromptExeFault $exe; if ($null -ne $exeWhy) { Refuse 'prompt'")
+    expect(rule).toBeGreaterThan(0)
+    expect(read).toBeGreaterThan(rule)
+    expect(refused).toBeGreaterThan(read)
+    expect(exe).toBeGreaterThan(refused)
+    expect(exe).toBeLessThan(claim)
+    // The interpreter rule is read once in the run, here, and the window's choice rests on it.
+    expect(script.split("GetFolderPath('ProgramFiles').TrimEnd").length - 1).toBe(1)
+    expect(script.indexOf('if ($pwshOk) { $windowShell = $pwsh }')).toBeGreaterThan(claim)
+  })
+
+  test('M1: the window records a prompt refused after the launch as that, with its claim given back and no by-hand line', () => {
+    const inner = innerOf(launchScriptText(input({ promptFile: PROMPT })))
+    expect(PROMPT_REFUSED_EXIT).toBe(4)
+    expect(inner).toContain('$global:ClaudeLaunchPromptRefused = $null\r\n')
+    const from = inner.indexOf('if ($code -eq 4 -and $null -ne $global:ClaudeLaunchPromptRefused) {')
+    expect(from).toBeGreaterThan(inner.indexOf('  & $launchPath'))
+    const branch = inner.slice(from, inner.indexOf('  exit 4\r\n', from))
+    expect(branch).toContain('Write-Refused ("claude-launch.ps1 refused the first prompt "')
+    expect(branch).toContain('  Release-Claim\r\n')
+    expect(branch).not.toContain('$handPath')
+    expect(innerOf(launchScriptText(input()))).not.toContain('ClaudeLaunchPromptRefused')
   })
 
   test('a name is a session name, a path the launch folder rule\'s; anything else throws before a script is built', () => {

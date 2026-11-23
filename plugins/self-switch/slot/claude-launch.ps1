@@ -30,13 +30,17 @@
 # as the file holds it, line breaks too. It refuses, starting nothing, a file that is not an absolute
 # path of the shape -Dir takes, is not there, is over 64 KB or not UTF-8, is empty or holds only spaces
 # and line breaks, holds over 15,000 characters (so that, every character escaped, claude's whole command
-# line stays under Windows' 32,767), holds a control character but tab, CR and LF, starts (past spaces
+# line stays under Windows' 32,767), holds a control character but tab, CR and LF or a second byte order
+# mark, starts (past spaces
 # and line breaks) with '/' or '!', which claude reads at its prompt as a slash command or a shell
 # command, or is one word of letters, digits, hyphens and underscores, which claude reads as one of its
-# own commands when it names one (claude update, claude help). Under Windows PowerShell 5.1 alone, it
-# also refuses a prompt in which every space, tab and line break comes after an odd number of '"' (one
-# quoted whole, say): 5.1 can't hand it on whole (step 6); PowerShell 7 delivers it. With -Resume or
-# -Lane too: it is how a resumed session is told why it was brought back.
+# own commands when it names one (claude update, claude help; a second word or a full stop gets past it).
+# It refuses when the claude found is not an .exe: a .cmd or .bat (an npm install's) runs through cmd.exe,
+# which reads % & | < > ^ in a prompt as its own. Under Windows PowerShell 5.1 alone, it also refuses a
+# prompt in which every whitespace character comes after an odd number of '"' (one quoted whole, say):
+# 5.1 can't hand it on whole (step 6); PowerShell 7 delivers it. A prompt refused ends this script with
+# exit 4, the reason left for the window that ran it ($ClaudeLaunchPromptRefused). With -Resume or -Lane
+# too: it is how a resumed session is told why it was brought back.
 # With -Resume, -Start or -Lane, -ConfigDir <folder>[,<folder>...] names other config folders whose
 # session registries the last look reads too (a launch's window names every one it read). With -Resume,
 # -LeftSize <bytes> -LeftMtime <ms>, or -LeftExitAt <ms>, is a left record's stat, which the last look
@@ -92,10 +96,10 @@
 #    which claude.exe reads back as the text itself. $PSNativeCommandArgumentPassing is 'Legacy' for this
 #    script's calls, so PowerShell 7 hands it on as it is built (7's own escaping, on top of these rules,
 #    would escape it twice). Windows PowerShell 5.1 puts quotes of its own around an argument where it
-#    meets a space, tab or line break after an even number of '"', counting the escaped ones too; so
-#    where it would, it is given the argument without its outer quotes, and its own put them back. A
-#    prompt in which every space, tab and line break comes after an odd number of '"' is refused under
-#    5.1: no argument it hands on is that prompt.
+#    meets a whitespace character after an even number of '"', counting the escaped ones too; so where
+#    it would, it is given the argument without its outer quotes, and its own put them back. A prompt
+#    in which every whitespace character comes after an odd number of '"' is refused under 5.1: no
+#    argument it hands on is that prompt.
 #    With the wrapper loaded, it calls the wrapper's `claude` function, the one it just made (never by
 #    the name, which an alias would take), with those arguments, in this process: the wrapper gives
 #    claude a fresh CLAUDE_PANE_TOKEN and a pane file naming this PowerShell, claude.exe's own parent,
@@ -127,11 +131,6 @@ $PSNativeCommandUseErrorActionPreference = $false
 $SessionId = '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\z'
 $AreaName = '^[a-z0-9][a-z0-9-]{0,39}\z'
 $Whole = '^\d{1,16}\z'
-# A prompt file: at most 64 KB on disk, and its text at most 15,000 characters. Escaped by the C runtime's
-# rules, the prompt is then at most 30,002 characters, and claude's whole command line (its path, the
-# other arguments) stays under Windows' 32,767.
-$PromptBytes = 65536
-$PromptChars = 15000
 # The launch environment: LAUNCH_ENV_CLEAR, LAUNCH_ENV_DROP and LAUNCH_ENV_SET in the plugins' machine code.
 $Clear = 'CLAUDE_CODE_CHILD_SESSION', 'CLAUDECODE', 'CLAUDE_CODE_SESSION_ID', 'CLAUDE_PID', 'CLAUDE_EFFORT', 'CLAUDE_CODE_BRIDGE_SESSION_ID', 'CLAUDE_CODE_MESSAGING_SOCKET', 'CLAUDE_CODE_MESSAGING_TOKEN', 'CLAUDE_CODE_REMOTE', 'CLAUDE_CODE_REMOTE_SESSION_ID', 'CLAUDE_JOB_DIR', 'AI_AGENT', 'CLAUDE_CODE_ENTRYPOINT', 'CLAUDE_CODE_EXECPATH', 'CLAUDE_CODE_SESSION_ATTENDED', 'CLAUDE_CODE_SSE_PORT', 'NO_COLOR'
 $Drop = 'PSExecutionPolicyPreference', 'CLAUDE_PANE_TOKEN'
@@ -142,6 +141,14 @@ $WrapperSha256 = '20083123ff9850af6a743373b4e5b38cc3b03500a35447166687c40fc0a09b
 function Stop-Launch($why) {
   Write-Host ('claude-launch: ' + $why + ' Nothing was started.')
   exit 2
+}
+
+# A first prompt refused: its own exit code (PROMPT_REFUSED_EXIT in the plugins' machine code), never the last
+# look's 2, and why, left in this process for the window that ran this script.
+function Stop-Prompt($why) {
+  $global:ClaudeLaunchPromptRefused = $why
+  Write-Host ('claude-launch: -PromptFile ' + $PromptFile + ' ' + $why + '. Nothing was started.')
+  exit 4
 }
 
 # An absolute folder of the shape the plugins take (isSafeFolder in their machine code): a drive, a
@@ -223,9 +230,10 @@ function Test-Left($id, $configDirs, $leftSize, $leftMtime, $leftExitAt) {
   return $live
 }
 
-# Whether Windows PowerShell 5.1 puts quotes of its own around $text when it hands it to a native program: it
-# does when it meets a whitespace character while it has seen an even number of '"', each counted, escaped or
-# not. (PowerShell 7 skips a '"' after a backslash, so the argument the script builds never needs its quotes.)
+# A first prompt's checks: PROMPT_CHECK in the plugins' machine code, line for line, which a launch runs too,
+# before its claim. Test-Quoted51: whether Windows PowerShell 5.1 puts quotes of its own around $text when it
+# hands it to a native program: where it meets a whitespace character after an even number of '"', each
+# counted, escaped or not. (PowerShell 7 skips a '"' after a backslash, so the built argument never needs its.)
 function Test-Quoted51($text) {
   $quoted = $false
   foreach ($c in $text.ToCharArray()) {
@@ -233,6 +241,46 @@ function Test-Quoted51($text) {
     elseif ([char]::IsWhiteSpace($c) -and -not $quoted) { return $true }
   }
   return $false
+}
+function Read-Prompt($path, $as51) {
+  $why = $null
+  $prompt = $null
+  $arg = $null
+  if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { $why = 'is not a file that is there' }
+  else {
+    try {
+      $raw = $null
+      if ([IO.FileInfo]::new($path).Length -le 65536) { $raw = [IO.File]::ReadAllBytes($path) }
+      if ($null -eq $raw -or $raw.Length -gt 65536) { $why = 'is larger than 64 KB' }
+      elseif ($raw.Length -ge 2 -and (($raw[0] -eq 0xff -and $raw[1] -eq 0xfe) -or ($raw[0] -eq 0xfe -and $raw[1] -eq 0xff))) { $why = 'is UTF-16 text (as Windows PowerShell 5.1''s > and Out-File write it): save it as UTF-8' }
+      else { $prompt = [Text.UTF8Encoding]::new($false, $true).GetString($raw) }
+    } catch { if ($_.Exception -is [Text.DecoderFallbackException] -or $_.Exception.InnerException -is [Text.DecoderFallbackException]) { $why = 'is not UTF-8 text: save it as UTF-8' } else { $why = 'could not be read (' + $_.Exception.Message + ')' } }
+  }
+  if ($null -eq $why) {
+    # A byte order mark at the start says the file is UTF-8, and is no part of the prompt: compared as a character, since
+    # .NET Framework's StartsWith compares by culture, where U+FEFF is ignored and so starts every text. A second one is refused below.
+    if ($prompt.Length -gt 0 -and $prompt[0] -eq [char]0xfeff) { $prompt = $prompt.Substring(1) }
+    $lead = $prompt.TrimStart()
+    $odd = [regex]::Match($prompt, '[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f\ufeff]')
+    if ($lead.Length -eq 0) { $why = 'is empty, or holds only spaces and line breaks' }
+    elseif ($prompt.Length -gt 15000) { $why = 'holds ' + $prompt.Length + ' characters, over the 15000 a prompt may hold' }
+    elseif ($odd.Success) { $why = 'holds U+' + ([int][char]$odd.Value).ToString('X4') + ', a control character or a second byte order mark (a prompt may hold tabs and line breaks, and no other)' }
+    elseif ($lead[0] -eq [char]'/' -or $lead[0] -eq [char]'!') { $why = 'starts with ' + $lead[0] + ', which claude reads at its prompt as a command (/ a slash command, ! a shell command), not as a prompt' }
+    elseif ($prompt -cmatch '^[A-Za-z0-9_-]+\z') { $why = 'is one bare word, which claude runs as one of its own commands when it names one (claude update, claude help): add a second word or a full stop' }
+  }
+  if ($null -eq $why) {
+    $arg = '"' + (($prompt -replace '(\\*)"', '$1$1\"') -replace '(\\+)\z', '$1$1') + '"'
+    if ($as51 -and (Test-Quoted51 $arg)) {
+      $inner = $arg.Substring(1, $arg.Length - 2)
+      if (Test-Quoted51 $inner) { $arg = $inner }
+      else { $arg = $null; $why = 'can''t be handed to claude whole by Windows PowerShell 5.1: every whitespace character in it (a space, a tab, a line break, a no-break space) comes after an odd number of double quotes ("), and 5.1 would split it. Add or remove one double quote before its first space or line break, or run it under PowerShell 7 (pwsh)' }
+    }
+  }
+  return @{ why = $why; arg = $arg }
+}
+function Get-PromptExeFault($exe) {
+  if ([IO.Path]::GetExtension([string]$exe) -ieq '.exe') { return $null }
+  return 'goes to claude.exe alone, and the claude found here is ' + $exe + ', which Windows runs through cmd.exe, where % & | < > ^ in a prompt are commands of its own. Install Claude Code''s native build (claude install), which puts claude.exe in %USERPROFILE%\.local\bin'
 }
 
 # Why $path is not a folder of that shape, naming the class at fault (folderFault in the plugins'
@@ -301,45 +349,13 @@ if ($Start) {
   if (-not $Name -or $Name -cnotmatch $AreaName) { Stop-Launch '-Start takes -Name: lowercase letters, digits and hyphens.' }
 }
 if ($Dir -and -not (Test-Folder $Dir)) { Stop-Launch '-Dir takes an absolute folder that is there, with no quote, control character, semicolon, < > | ? * or /, and no . or .. part.' }
-# The first prompt: the file read once, as UTF-8 text, never run, and its text checked whole; then built
-# into one argument by the C runtime's quoting rules (step 6), or nothing is started.
+# The first prompt: read once and checked whole (Read-Prompt), as this PowerShell will hand it on, or nothing is started.
 $promptArg = $null
 if ($PromptFile) {
-  $promptWhy = $null
-  $prompt = $null
-  if (-not (Test-Shape $PromptFile) -or $PromptFile.IndexOf(';') -ge 0) { $promptWhy = 'is not an absolute path of the shape -Dir takes (no quote, control character, semicolon, < > | ? * or /, and no . or .. part)' }
-  elseif (-not (Test-Path -LiteralPath $PromptFile -PathType Leaf)) { $promptWhy = 'is not a file that is there' }
-  else {
-    try {
-      $promptRaw = $null
-      if ([IO.FileInfo]::new($PromptFile).Length -le $PromptBytes) { $promptRaw = [IO.File]::ReadAllBytes($PromptFile) }
-      if ($null -eq $promptRaw -or $promptRaw.Length -gt $PromptBytes) { $promptWhy = 'is larger than 64 KB' }
-      else { $prompt = [Text.UTF8Encoding]::new($false, $true).GetString($promptRaw) }
-    } catch { $promptWhy = 'could not be read as UTF-8 text (' + $_.Exception.Message + ')' }
-  }
-  if ($null -eq $promptWhy) {
-    # A byte order mark at the start says the file is UTF-8: it is no part of the prompt. Compared as a
-    # character: .NET Framework's StartsWith compares by culture, where U+FEFF is ignored and so starts every text.
-    if ($prompt.Length -gt 0 -and $prompt[0] -eq [char]0xfeff) { $prompt = $prompt.Substring(1) }
-    $promptLead = $prompt.TrimStart()
-    $promptControl = [regex]::Match($prompt, '[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]')
-    if ($promptLead.Length -eq 0) { $promptWhy = 'is empty, or holds only spaces and line breaks' }
-    elseif ($prompt.Length -gt $PromptChars) { $promptWhy = 'holds ' + $prompt.Length + ' characters, over the ' + $PromptChars + ' a prompt may hold' }
-    elseif ($promptControl.Success) { $promptWhy = 'holds a control character, U+' + ([int][char]$promptControl.Value).ToString('X4') + ' (a prompt may hold tabs and line breaks, no other)' }
-    elseif ($promptLead[0] -eq [char]'/' -or $promptLead[0] -eq [char]'!') { $promptWhy = 'starts with ' + $promptLead[0] + ', which claude reads at its prompt as a command (/ a slash command, ! a shell command), not as a prompt' }
-    elseif ($prompt -cmatch '^[A-Za-z0-9_-]+\z') { $promptWhy = 'is one word, which claude reads as one of its own commands when it names one (claude update, claude help)' }
-  }
-  if ($null -ne $promptWhy) { Stop-Launch ('-PromptFile ' + $PromptFile + ' ' + $promptWhy + '.') }
-  $promptArg = '"' + (($prompt -replace '(\\*)"', '$1$1\"') -replace '(\\+)\z', '$1$1') + '"'
-  # Windows PowerShell 5.1 counts the prompt's own escaped '"' as quotes: where it would put quotes around the
-  # built argument, it is given the argument without its outer ones, which 5.1's own then put back, the same
-  # text. Where it would quote that too (every space, tab and line break after an odd number of '"'), no
-  # argument 5.1 hands on is the prompt: refused, and PowerShell 7 delivers it.
-  if ($PSVersionTable.PSEdition -ne 'Core' -and (Test-Quoted51 $promptArg)) {
-    $promptInner = $promptArg.Substring(1, $promptArg.Length - 2)
-    if (Test-Quoted51 $promptInner) { $promptArg = $promptInner }
-    else { Stop-Launch ('-PromptFile ' + $PromptFile + ' can''t be handed to claude whole by Windows PowerShell 5.1: every space, tab and line break in it comes after an odd number of double quotes ("), and 5.1 would split it. Run this script under PowerShell 7 (pwsh), or change a double quote.') }
-  }
+  if (-not (Test-Shape $PromptFile) -or $PromptFile.IndexOf(';') -ge 0) { Stop-Prompt 'is not an absolute path of the shape -Dir takes (no quote, control character, semicolon, < > | ? * or /, and no . or .. part)' }
+  $promptRead = Read-Prompt $PromptFile ($PSVersionTable.PSEdition -ne 'Core')
+  if ($null -ne $promptRead.why) { Stop-Prompt $promptRead.why }
+  $promptArg = $promptRead.arg
 }
 # The arguments claude gets: the launch's own; Remote Control, under its name or the launch's; then '--',
 # quoted so that PowerShell hands it on (a bare -- is PowerShell's own, and a function never gets it),
@@ -380,6 +396,9 @@ if ($null -eq $exe) {
   if ($found.Count -gt 0) { $exe = $found[0].Source }
 }
 if ($null -eq $exe) { Stop-Launch 'no claude.exe was found (in %USERPROFILE%\.local\bin, or on PATH).' }
+# A prompt goes to an .exe alone: a .cmd or .bat (an npm install's claude) runs through cmd.exe, which reads the
+# prompt's % & | < > ^ as its own. The claude wrapper finds claude by this same rule, in this process, so this covers it.
+if ($null -ne $promptArg) { $exeWhy = Get-PromptExeFault $exe; if ($null -ne $exeWhy) { Stop-Prompt $exeWhy } }
 # With -Wrapper, the claude wrapper's verified copy: its bytes read once, their SHA-256 checked, and its
 # function defined from those same bytes, here at the script's own level (it defines `claude` and does
 # nothing else). $wrapperWhy says why it isn't used, when it isn't.

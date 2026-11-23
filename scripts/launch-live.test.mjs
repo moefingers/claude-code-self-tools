@@ -567,9 +567,9 @@ const ticketOf = (resume, by, dir, configDirs, at = '{NOW}') => {
  * same conversation, as self-restart would), `holdOther` (another claude.exe naming the second
  * conversation on its command line, all along), `enterAfter` (see openRecorded), `probe` (the stub runs
  * the probe under itself at each run), `exit` (each claude run's exit code), `more` (more of the launch's input,
- * given the run's folders: Remote Control and a first prompt, #63).
+ * given the run's folders: Remote Control and a first prompt, #63), `beforeOpen` (run between the launch and its window).
  */
-async function windowRun({ programFiles = 'real', restricted = false, copy = 'ok', plan = (r, input) => ({ 1: ticketOf(r.id, input.claim, r.dirs.folder, [r.dirs.config]) }), holdOther = false, enterAfter = undefined, probe = true, exit = '0', more = () => ({}) } = {}) {
+async function windowRun({ programFiles = 'real', restricted = false, copy = 'ok', plan = (r, input) => ({ 1: ticketOf(r.id, input.claim, r.dirs.folder, [r.dirs.config]) }), holdOther = false, enterAfter = undefined, probe = true, exit = '0', more = () => ({}), beforeOpen = () => {} } = {}) {
   const dirs = lab()
   const id = randomUUID()
   const other = randomUUID()
@@ -603,6 +603,7 @@ async function windowRun({ programFiles = 'real', restricted = false, copy = 'ok
     STUB_EXIT: exit,
     ...(probe ? { STUB_CHILD_EXE: call.argv[0], STUB_CHILD_ARGS: call.argv.slice(1).join(' '), STUB_CHILD_STDIN: probeIn, STUB_CHILD_OUT: join(dirs.root, 'probe-{RUN}.out'), STUB_CHILD_ERR: join(dirs.root, 'probe-{RUN}.err') } : {}),
   }
+  beforeOpen(dirs)
   const held = holdOther ? await holder({ stub, work, env: envOf(dirs), args: ['--resume', other], ms: 120_000 }) : undefined
   try {
     const opened = launched.window === undefined ? undefined : await openRecorded(launched.window, dirs, { ...extra, ...stubExtra }, enterAfter)
@@ -755,10 +756,59 @@ describe("a window's launch, end to end: the interpreter it chose, the wrapper's
     const id = randomUUID()
     const launched = await launchWindow(dirs, id, {}, undefined, { remoteControl: true, promptFile: join(dirs.root, 'gone.txt') })
     assert.equal(launched.answer.refused?.code, 'prompt', launched.ran.stdout + launched.ran.stderr)
-    assert.match(launched.answer.refused?.why ?? '', /the first prompt's file is not a file that is there: .+gone\.txt$/)
+    assert.match(launched.answer.refused?.why ?? '', /the first prompt .+gone\.txt is not a file that is there$/)
     assert.equal(launched.answer.claim, undefined, 'no claim was taken')
     assert.equal(launched.window, undefined, 'no window')
     assert.ok(!existsSync(machine.claimPath(dirs.state, id)))
+  })
+
+  test("#63, M1: a prompt the window would refuse (one bare word; a claude.cmd alone): the launch refuses 'prompt' with the real reason, before the claim, and opens no window", async () => {
+    const dirs = lab()
+    const id = randomUUID()
+    const word = join(dirs.root, 'word.txt')
+    writeFileSync(word, 'update')
+    const refused = await launchWindow(dirs, id, {}, undefined, { promptFile: word })
+    assert.equal(refused.answer.refused?.code, 'prompt', refused.ran.stdout + refused.ran.stderr)
+    assert.match(refused.answer.refused?.why ?? '', /the first prompt .+word\.txt is one bare word, which claude runs as one of its own commands/)
+    assert.equal(refused.answer.claim, undefined, 'no claim was taken')
+    assert.equal(refused.window, undefined, 'no window')
+    assert.ok(!existsSync(machine.claimPath(dirs.state, id)))
+    // The same checks, for a claude only a batch file runs: the stub is the session here, and no claude.exe is where the window would look.
+    const cmd = lab()
+    rmSync(join(cmd.home, '.local'), { recursive: true, force: true })
+    const bin = join(cmd.root, 'bin')
+    mkdirSync(bin)
+    writeFileSync(join(bin, 'claude.cmd'), '@exit /b 9\r\n')
+    const brief = join(cmd.root, 'brief.txt')
+    writeFileSync(brief, 'a brief of two lines\r\nand more')
+    const viaCmd = await launchWindow(cmd, randomUUID(), { PATH: [bin, join(SYSTEM_ROOT, 'System32'), SYSTEM_ROOT].join(';') }, undefined, { promptFile: brief })
+    assert.equal(viaCmd.answer.refused?.code, 'prompt', viaCmd.ran.stdout + viaCmd.ran.stderr)
+    assert.match(viaCmd.answer.refused?.why ?? '', /goes to claude\.exe alone, and the claude found here is .+claude\.cmd/)
+    assert.equal(viaCmd.window, undefined)
+  })
+
+  test("#63, M1: a prompt file changed after the launch checked it: the window refuses it, records a refused prompt (never the last look), gives the claim back, offers no line that starts the session unbriefed, and waits", async () => {
+    let file
+    const r = await windowRun({
+      more: dirs => {
+        file = join(dirs.root, 'brief.txt')
+        writeFileSync(file, 'a good brief of several words')
+        return { remoteControl: true, promptFile: file }
+      },
+      beforeOpen: () => writeFileSync(file, '/logout'),
+      plan: () => ({}),
+      probe: false,
+      enterAfter: /its first prompt was refused/,
+    })
+    assert.equal(r.launched.answer.launched?.transport, 'window', r.launched.ran.stdout + r.launched.ran.stderr)
+    const { opened } = r
+    assert.equal(opened.runs.length, 0, opened.out)
+    assert.equal(opened.code, machine.PROMPT_REFUSED_EXIT, opened.out)
+    assert.equal(opened.waited, true, 'the window waited for Enter')
+    assert.ok(!/yourself/.test(opened.out), opened.out)
+    const record = machine.readRefused(readFileSync(machine.refusedPath(r.dirs.state, r.id), 'utf8'))
+    assert.match(record?.why ?? '', /^claude-launch\.ps1 refused the first prompt .+brief\.txt, and started nothing: it starts with \//)
+    assert.ok(!existsSync(machine.claimPath(r.dirs.state, r.id)), 'the claim is given back')
   })
 
   test("a switch from the window into another project's conversation: resumed in the same window, in that conversation's folder; the closing lines name it, not the window's first", async () => {

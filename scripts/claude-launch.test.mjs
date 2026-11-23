@@ -89,7 +89,7 @@ test('WT_SESSION and WT_PROFILE_ID are never cleared or set; the REAP setting is
 test('the launch environment comes after the arguments, the module path, the folder and claude\'s path, and right before claude', () => {
   // The last check of the arguments (the first prompt's, after the folder's); claude's path, which can only
   // be looked for in the folder, is checked after it, and before the environment changes.
-  const lastCheck = script.indexOf("  if ($null -ne $promptWhy) { Stop-Launch ('-PromptFile ' + $PromptFile + ' ' + $promptWhy + '.') }")
+  const lastCheck = script.indexOf('  if ($null -ne $promptRead.why) { Stop-Prompt $promptRead.why }')
   assert.ok(script.indexOf("if ($Dir -and -not (Test-Folder $Dir)) { Stop-Launch") < lastCheck)
   const noClaude = script.indexOf("if ($null -eq $exe) { Stop-Launch 'no claude.exe was found")
   const look = script.indexOf('  $why = Get-Live $lookId $lookIn')
@@ -235,27 +235,34 @@ test("-RemoteControl and -PromptFile (#63): checked in step 1, before anything c
     "if ($args.Count -gt 0) { Stop-Launch ('it takes no argument ' + $args[0] + '.') }",
     "  if (-not $RemoteControl) { Stop-Launch ('a word on its own (' + $RemoteControlName + ') is a Remote Control name, and goes after -RemoteControl.') }",
     "  if ($RemoteControlName -cnotmatch $AreaName) { Stop-Launch '-RemoteControl takes a name of lowercase letters, digits and hyphens.' }",
-    "  if ($null -ne $promptWhy) { Stop-Launch ('-PromptFile ' + $PromptFile + ' ' + $promptWhy + '.') }",
+    '  if ($null -ne $promptRead.why) { Stop-Prompt $promptRead.why }',
     '$claudeArgs = @()',
   ]) {
     const at = script.indexOf(line)
     assert.ok(at > 0 && at < modules, `in step 1, before anything changes: ${line}`)
   }
+  // The first prompt's checks are PROMPT_CHECK, line for line, as is finding claude (FIND_CLAUDE): a launch's own run reads a prompt by these same lines.
+  const check = machine.PROMPT_CHECK.join('\n')
+  assert.ok(script.includes(`${check}\n`), 'run the machine code\'s PROMPT_CHECK into the script, line for line')
+  assert.ok(script.includes(`${machine.FIND_CLAUDE.join('\n')}\n`))
   // The file read as UTF-8 text, strictly (a byte that isn't UTF-8 throws), its size checked before it is read; never run.
-  assert.ok(script.includes('else { $prompt = [Text.UTF8Encoding]::new($false, $true).GetString($promptRaw) }'))
-  assert.ok(script.indexOf('[IO.FileInfo]::new($PromptFile).Length -le $PromptBytes') < script.indexOf('[IO.File]::ReadAllBytes($PromptFile)'))
-  assert.ok(script.includes('$PromptBytes = 65536\n$PromptChars = 15000\n'))
+  assert.ok(check.includes('else { $prompt = [Text.UTF8Encoding]::new($false, $true).GetString($raw) }'))
+  assert.ok(check.indexOf('[IO.FileInfo]::new($path).Length -le 65536') < check.indexOf('[IO.File]::ReadAllBytes($path)'))
+  assert.deepEqual([machine.PROMPT_BYTES, machine.PROMPT_CHARS, machine.PROMPT_REFUSED_EXIT], [65536, 15000, 4])
+  // A refused prompt has its own exit code, and leaves why for the window; never the last look's 2.
+  assert.ok(script.includes("function Stop-Prompt($why) {\n  $global:ClaudeLaunchPromptRefused = $why\n  Write-Host ('claude-launch: -PromptFile ' + $PromptFile + ' ' + $why + '. Nothing was started.')\n  exit 4\n}\n"))
+  // H1: a prompt goes to an .exe alone, checked once claude is found, before the environment changes.
+  const exeCheck = script.indexOf('if ($null -ne $promptArg) { $exeWhy = Get-PromptExeFault $exe; if ($null -ne $exeWhy) { Stop-Prompt $exeWhy } }')
+  assert.ok(exeCheck > script.indexOf("if ($null -eq $exe) { Stop-Launch 'no claude.exe was found") && exeCheck < script.indexOf('foreach ($n in $Clear)'))
   const code = script.split('\n').filter(line => !line.trimStart().startsWith('#'))
   assert.deepEqual(code.filter(line => /Invoke-Expression|\biex\b|\[scriptblock\]::Create\(\$prompt|& \$prompt|\. \$prompt/.test(line)), [], 'the prompt is never run')
   // By the C runtime's rules: in double quotes, a run of backslashes before a quote doubled and the quote escaped, a run at the end doubled.
-  assert.ok(script.includes(`  $promptArg = '"' + (($prompt -replace '(\\\\*)"', '$1$1\\"') -replace '(\\\\+)\\z', '$1$1') + '"'\n`))
+  assert.ok(check.includes(`    $arg = '"' + (($prompt -replace '(\\\\*)"', '$1$1\\"') -replace '(\\\\+)\\z', '$1$1') + '"'\n`))
   // Windows PowerShell 5.1 alone: where its own quotes would go around the built argument, it gets the argument without
   // its outer quotes (its own put them back); where it would quote that too, the prompt is refused. Before anything changes.
-  assert.ok(script.includes("function Test-Quoted51($text) {\n  $quoted = $false\n  foreach ($c in $text.ToCharArray()) {\n    if ($c -eq [char]'\"') { $quoted = -not $quoted }\n    elseif ([char]::IsWhiteSpace($c) -and -not $quoted) { return $true }\n  }\n  return $false\n}\n"))
-  const built = script.indexOf('  $promptArg = \'"\' + ')
-  const only51 = script.indexOf("  if ($PSVersionTable.PSEdition -ne 'Core' -and (Test-Quoted51 $promptArg)) {")
-  assert.ok(built > 0 && only51 > built && only51 < modules)
-  assert.ok(script.includes('    if (Test-Quoted51 $promptInner) { $promptArg = $promptInner }\n'))
+  assert.ok(check.includes("function Test-Quoted51($text) {\n  $quoted = $false\n  foreach ($c in $text.ToCharArray()) {\n    if ($c -eq [char]'\"') { $quoted = -not $quoted }\n    elseif ([char]::IsWhiteSpace($c) -and -not $quoted) { return $true }\n  }\n  return $false\n}\n"))
+  assert.ok(script.includes("  $promptRead = Read-Prompt $PromptFile ($PSVersionTable.PSEdition -ne 'Core')\n"))
+  assert.ok(check.includes('    if ($as51 -and (Test-Quoted51 $arg)) {\n      $inner = $arg.Substring(1, $arg.Length - 2)\n      if (Test-Quoted51 $inner) { $arg = $inner }\n'))
   // '--' only as a quoted string: a bare -- is PowerShell's own end of parameters, and a function (the wrapper) never gets it.
   assert.deepEqual(code.filter(line => /(^|\s)--(\s|$)/.test(line)), [])
   // Right before claude, after the launch environment: PowerShell 7 hands the arguments on as 5.1 does, unchanged.
@@ -592,6 +599,17 @@ async function inBatches(items, size, each) {
   for (let i = 0; i < items.length; i += size) await Promise.all(items.slice(i, i + size).map(each))
 }
 
+/** A lab with no claude.exe in .local\\bin and claude only as a claude.cmd on its PATH (`path`), as an npm install leaves it: the batch file runs the stub. */
+function cmdLab() {
+  const dirs = lab()
+  rmSync(join(dirs.home, '.local'), { recursive: true, force: true })
+  const bin = join(dirs.root, 'bin')
+  mkdirSync(bin)
+  copyFileSync(stub, join(bin, 'stub-of-claude.exe'))
+  writeFileSync(join(bin, 'claude.cmd'), `@"${join(bin, 'stub-of-claude.exe')}" %*\r\n`)
+  return { ...dirs, bin, path: [bin, join(SYSTEM_ROOT, 'System32'), SYSTEM_ROOT].join(';') }
+}
+
 /** A brief as a coordinator writes one: quotes, a line break, and what a shell would expand. */
 const BRIEF = 'Brief: build "#63", then report.\r\nKeep $env:USERPROFILE, %PATH% and `n as text -- all of it.'
 
@@ -623,6 +641,8 @@ const HARD = [
   ['a -- inside', 'before -- after'],
   ['a leading --', '--help is only text here'],
   ["a ' and a ! inside", "it's fine! and a /path/ too"],
+  ['one word and a full stop', 'continue.'],
+  ['one word and the line break an editor adds', 'continue\r\n'],
   ["&&, braces, '', $(1+1) and zero-width characters", "a && b { c } '' $(1+1) zero​width‍join"],
 ]
 
@@ -630,6 +650,7 @@ const HARD = [
 const ODD_QUOTED = [
   ['quoted whole', '"all of it quoted"'],
   ['a quote never closed', '"never closed, and\ta tab'],
+  ['no-break spaces alone', '"quoted\u00a0with\u00a0them'],
 ]
 
 describe('claude-launch.ps1, run for real against the stub', { skip: !isWindows && 'Windows only', concurrency: true }, () => {
@@ -1024,16 +1045,21 @@ describe('claude-launch.ps1, run for real against the stub', { skip: !isWindows 
           [['-PromptFile', promptIn(hand, ' \r\n\t \n', 'blank.txt')], /blank\.txt is empty, or holds only spaces and line breaks\./],
           [['-PromptFile', promptIn(hand, 'x '.repeat(32769), 'large.txt')], /large\.txt is larger than 64 KB\./],
           [['-PromptFile', promptIn(hand, big, 'long.txt')], /long\.txt holds 15001 characters, over the 15000 a prompt may hold\./],
-          [['-PromptFile', promptIn(hand, 'ring the \u0007 bell', 'bel.txt')], /bel\.txt holds a control character, U\+0007 \(a prompt may hold tabs and line breaks, no other\)\./],
+          [['-PromptFile', promptIn(hand, 'ring the \u0007 bell', 'bel.txt')], /bel\.txt holds U\+0007, a control character or a second byte order mark \(a prompt may hold tabs and line breaks, and no other\)\./],
           // Not nul.txt: NUL is a device name in every folder on Windows, and the file would never be written.
-          [['-PromptFile', promptIn(hand, 'a nul \u0000 here', 'zero.txt')], /zero\.txt holds a control character, U\+0000 /],
+          [['-PromptFile', promptIn(hand, 'a nul \u0000 here', 'zero.txt')], /zero\.txt holds U\+0000, /],
+          // L1: a second byte order mark, as concatenated files leave one: never past the '/' rule.
+          [['-PromptFile', promptIn(hand, Buffer.concat([Buffer.from([0xef, 0xbb, 0xbf, 0xef, 0xbb, 0xbf]), Buffer.from('/logout now', 'utf8')]), 'bom2.txt')], /bom2\.txt holds U\+FEFF, a control character or a second byte order mark/],
           [['-PromptFile', promptIn(hand, 'an escape \u001b[31m red', 'esc.txt')], /U\+001B/],
           [['-PromptFile', promptIn(hand, 'a next line \u0085 here', 'nel.txt')], /U\+0085/],
-          [['-PromptFile', promptIn(hand, Buffer.from([0x61, 0x20, 0xff, 0x62]), 'latin.txt')], /latin\.txt could not be read as UTF-8 text \(/],
+          [['-PromptFile', promptIn(hand, Buffer.from([0x61, 0x20, 0xff, 0x62]), 'latin.txt')], /latin\.txt is not UTF-8 text: save it as UTF-8\./],
+          // L3: UTF-16, as 5.1's > and Out-File write it, said in plain words, either byte order.
+          [['-PromptFile', promptIn(hand, Buffer.from('\ufeffa brief here', 'utf16le'), 'utf16.txt')], /utf16\.txt is UTF-16 text \(as Windows PowerShell 5\.1's > and Out-File write it\): save it as UTF-8\./],
+          [['-PromptFile', promptIn(hand, Buffer.from([0xfe, 0xff, 0x00, 0x61, 0x00, 0x20, 0x00, 0x62]), 'utf16be.txt')], /utf16be\.txt is UTF-16 text/],
           [['-PromptFile', promptIn(hand, '/compact and then go on', 'slash.txt')], /slash\.txt starts with \/, which claude reads at its prompt as a command \(\/ a slash command, ! a shell command\), not as a prompt\./],
           [['-PromptFile', promptIn(hand, ' \r\n !del everything', 'bang.txt')], /bang\.txt starts with !, which claude reads/],
-          [['-PromptFile', promptIn(hand, 'update', 'update.txt')], /update\.txt is one word, which claude reads as one of its own commands when it names one \(claude update, claude help\)\./],
-          [['-PromptFile', promptIn(hand, 'help', 'help.txt')], /help\.txt is one word/],
+          [['-PromptFile', promptIn(hand, 'update', 'update.txt')], /update\.txt is one bare word, which claude runs as one of its own commands when it names one \(claude update, claude help\): add a second word or a full stop\./],
+          [['-PromptFile', promptIn(hand, 'help', 'help.txt')], /help\.txt is one bare word/],
           [['-RemoteControl', 'Bad_Name'], /^claude-launch: -RemoteControl takes a name of lowercase letters, digits and hyphens\. Nothing was started\./m],
           [['-Resume', randomUUID(), 'stray'], /^claude-launch: a word on its own \(stray\) is a Remote Control name, and goes after -RemoteControl\. Nothing was started\./m],
           // Misspelt (a prefix, such as -PromptFil, is PowerShell's own shorthand for -PromptFile, and binds).
@@ -1043,10 +1069,28 @@ describe('claude-launch.ps1, run for real against the stub', { skip: !isWindows 
           const dirs = lab()
           const result = await run(shell, dirs, args)
           assert.equal(result.runs.length, 0, `${JSON.stringify(args)}: nothing started (${result.stdout})`)
-          assert.equal(result.code, 2, `${JSON.stringify(args)}: exit 2 (${result.stdout})`)
+          const code = args[0] === '-PromptFile' ? machine.PROMPT_REFUSED_EXIT : 2
+          assert.equal(result.code, code, `${JSON.stringify(args)}: exit ${code} (${result.stdout})`)
           assert.match(result.stdout, why, JSON.stringify(args))
           assert.match(result.stdout, /Nothing was started\./)
         }
+      })
+
+      test('H1: claude only as a .cmd on PATH (an npm install), no claude.exe: a prompt is refused, nothing runs, directly and through the claude wrapper; with no prompt it starts as before', async () => {
+        for (const viaWrapper of [false, true]) {
+          const dirs = cmdLab()
+          if (viaWrapper) placeWrapper(dirs)
+          const file = promptIn(dirs, 'x y a"b & echo this-ran-in-cmd')
+          const result = await run(shell, dirs, ['-PromptFile', file, ...(viaWrapper ? ['-Wrapper'] : [])], { extra: { PATH: dirs.path } })
+          assert.equal(result.runs.length, 0, result.stdout)
+          assert.equal(result.code, machine.PROMPT_REFUSED_EXIT, result.stdout)
+          assert.ok(result.stdout.includes(`claude-launch: -PromptFile ${file} goes to claude.exe alone, and the claude found here is ${join(dirs.bin, 'claude.cmd')}, which Windows runs through cmd.exe, where % & | < > ^ in a prompt are commands of its own. Install Claude Code's native build (claude install), which puts claude.exe in %USERPROFILE%\\.local\\bin. Nothing was started.`), result.stdout)
+          assert.ok(!result.stdout.includes('this-ran-in-cmd '), result.stdout)
+        }
+        const dirs = cmdLab()
+        const id = randomUUID()
+        const plain = await run(shell, dirs, ['-Resume', id], { extra: { PATH: dirs.path } })
+        assert.deepEqual(plain.runs.map(one => one.args), [['--resume', id]], plain.stdout)
       })
 
       test("self-hierarchy's reference.md, \"Launching a session\": its by-hand line, run as it stands after -File (the stub as claude), starts the session it says", async () => {
@@ -1077,8 +1121,8 @@ describe('claude-launch.ps1, run for real against the stub', { skip: !isWindows 
             const result = await run(shell, dirs, ['-PromptFile', file, ...(viaWrapper ? ['-Wrapper'] : [])])
             if (shell === WINDOWS_POWERSHELL) {
               assert.equal(result.runs.length, 0, `${what}: nothing started (${result.stdout})`)
-              assert.equal(result.code, 2)
-              assert.ok(result.stdout.includes(`claude-launch: -PromptFile ${file} can't be handed to claude whole by Windows PowerShell 5.1: every space, tab and line break in it comes after an odd number of double quotes ("), and 5.1 would split it. Run this script under PowerShell 7 (pwsh), or change a double quote. Nothing was started.`), `${what}: ${result.stdout}`)
+              assert.equal(result.code, machine.PROMPT_REFUSED_EXIT)
+              assert.ok(result.stdout.includes(`claude-launch: -PromptFile ${file} can't be handed to claude whole by Windows PowerShell 5.1: every whitespace character in it (a space, a tab, a line break, a no-break space) comes after an odd number of double quotes ("), and 5.1 would split it. Add or remove one double quote before its first space or line break, or run it under PowerShell 7 (pwsh). Nothing was started.`), `${what}: ${result.stdout}`)
             } else {
               const found = viaWrapper ? throughWrapper(result, ['--', text], dirs.start, shell) : launched(result, ['--', text], dirs.start)
               assert.deepEqual(found, [], `${what}${viaWrapper ? ', through the wrapper' : ''}: ${result.stdout.slice(0, 400)}`)
@@ -1089,7 +1133,7 @@ describe('claude-launch.ps1, run for real against the stub', { skip: !isWindows 
 
       test("Windows PowerShell 5.1's quotes left to it (planted: the argument always handed on as built): a space after an odd number of quotes splits the prompt", { skip: shell !== WINDOWS_POWERSHELL && 'PowerShell 7 hands the built argument on as it is: the planted copy would deliver it all the same' }, async () => {
         const dirs = lab()
-        const path = planted("  if ($PSVersionTable.PSEdition -ne 'Core' -and (Test-Quoted51 $promptArg)) {", "  if ($false) {")
+        const path = planted('    if ($as51 -and (Test-Quoted51 $arg)) {', '    if ($false) {')
         const text = HARD.find(([what]) => what === 'backslashes before a quote')[1]
         const result = await run(shell, dirs, ['-PromptFile', promptIn(dirs, text)], { script: path })
         assert.notDeepEqual(launched(result, ['--', text], dirs.start), [], result.stdout)
@@ -1097,7 +1141,7 @@ describe('claude-launch.ps1, run for real against the stub', { skip: !isWindows 
 
       test("without the C runtime's rules (planted), a prompt with a quote never arrives whole: the rules are what deliver it under this shell", async () => {
         const dirs = lab()
-        const path = planted(`  $promptArg = '"' + (($prompt -replace '(\\\\*)"', '$1$1\\"') -replace '(\\\\+)\\z', '$1$1') + '"'\n`, '  $promptArg = $prompt\n')
+        const path = planted(`    $arg = '"' + (($prompt -replace '(\\\\*)"', '$1$1\\"') -replace '(\\\\+)\\z', '$1$1') + '"'\n`, '    $arg = $prompt\n')
         const text = HARD[0][1]
         const result = await run(shell, dirs, ['-PromptFile', promptIn(dirs, text)], { script: path })
         assert.notDeepEqual(launched(result, ['--', text], dirs.start), [])
@@ -1208,12 +1252,12 @@ describe('planted faults in claude-launch.ps1, each caught', { skip: !isWindows 
     ["'Legacy' left out: PowerShell 7 escapes the built prompt a second time", "$PSNativeCommandArgumentPassing = 'Legacy'\n", '', HARD[0][1], [], 'arrives'],
     ["'--' left out: a prompt is no longer an operand (one that starts with '-' would be read as a flag)", "{ $claudeArgs += '--', $promptArg }", '{ $claudeArgs += $promptArg }', HARD.find(([what]) => what === 'a leading -')[1], [], 'arrives'],
     ['the byte order mark compared by culture (StartsWith): the first character of every prompt is dropped', '  if ($prompt.Length -gt 0 -and $prompt[0] -eq [char]0xfeff) {', '  if ($prompt.StartsWith([string][char]0xfeff)) {', BRIEF, [], 'arrives'],
-    ["the '/' rule left out: a slash command is sent as the first prompt", "elseif ($promptLead[0] -eq [char]'/' -or $promptLead[0] -eq [char]'!')", "elseif ($promptLead[0] -eq [char]'!')", '/compact and then go on', [], 'refused'],
-    ["the '!' rule left out: a shell command is sent as the first prompt", "elseif ($promptLead[0] -eq [char]'/' -or $promptLead[0] -eq [char]'!')", "elseif ($promptLead[0] -eq [char]'/')", '!del everything', [], 'refused'],
+    ["the '/' rule left out: a slash command is sent as the first prompt", "elseif ($lead[0] -eq [char]'/' -or $lead[0] -eq [char]'!')", "elseif ($lead[0] -eq [char]'!')", '/compact and then go on', [], 'refused'],
+    ["the '!' rule left out: a shell command is sent as the first prompt", "elseif ($lead[0] -eq [char]'/' -or $lead[0] -eq [char]'!')", "elseif ($lead[0] -eq [char]'/')", '!del everything', [], 'refused'],
     ['the one-word rule left out: claude would run its own command', "    elseif ($prompt -cmatch '^[A-Za-z0-9_-]+\\z') {", '    elseif ($false) {', 'update', [], 'refused'],
-    ['the control-character rule left out', '    elseif ($promptControl.Success) {', '    elseif ($false) {', 'ring the \u0007 bell', [], 'refused'],
-    ['the character cap left out', '    elseif ($prompt.Length -gt $PromptChars) {', '    elseif ($false) {', `${'ab '.repeat(5000)}c`, [], 'refused'],
-    ['the empty rule left out', '    if ($promptLead.Length -eq 0) {', '    if ($false) {', ' \r\n\t ', [], 'refused'],
+    ['the control-character rule left out', '    elseif ($odd.Success) {', '    elseif ($false) {', 'ring the \u0007 bell', [], 'refused'],
+    ['the character cap left out', '    elseif ($prompt.Length -gt 15000) {', '    elseif ($false) {', `${'ab '.repeat(5000)}c`, [], 'refused'],
+    ['the empty rule left out', '    if ($lead.Length -eq 0) {', '    if ($false) {', ' \r\n\t ', [], 'refused'],
     ['an argument it does not take let through', 'if ($args.Count -gt 0) {', 'if ($false) {', BRIEF, ['-PromtFile', 'C:\\x.txt'], 'refused'],
     ['a word on its own let through without -RemoteControl', '  if (-not $RemoteControl) { Stop-Launch', '  if ($false) { Stop-Launch', BRIEF, ['stray'], 'refused'],
     ["the Remote Control name's rule left out", '  if ($RemoteControlName -cnotmatch $AreaName) {', '  if ($false) {', BRIEF, ['-RemoteControl', 'Bad_Name'], 'refused'],
@@ -1226,10 +1270,16 @@ describe('planted faults in claude-launch.ps1, each caught', { skip: !isWindows 
       else assert.notEqual(result.runs.length, 0, `the planted copy starts claude: ${result.stdout}`)
     })
   }
+  test('#63, H1: the .exe check left out: a prompt goes to a claude.cmd, through cmd.exe', async () => {
+    const dirs = cmdLab()
+    const path = planted('if ($null -ne $promptArg) { $exeWhy = Get-PromptExeFault $exe; if ($null -ne $exeWhy) { Stop-Prompt $exeWhy } }\n', '')
+    const result = await run(shell, dirs, ['-PromptFile', promptIn(dirs, 'two plain words')], { script: path, extra: { PATH: dirs.path } })
+    assert.equal(result.runs.length, 1, result.stdout)
+  })
   test('#63: the 64 KB cap left out: a file of any size is read whole (refused only later, and for its characters)', async () => {
     const dirs = lab()
-    const path = planted('if ($null -eq $promptRaw -or $promptRaw.Length -gt $PromptBytes) {', 'if ($null -eq $promptRaw) {')
-    const text = readFileSync(path, 'utf8').split('[IO.FileInfo]::new($PromptFile).Length -le $PromptBytes').join('$true')
+    const path = planted('if ($null -eq $raw -or $raw.Length -gt 65536) {', 'if ($null -eq $raw) {')
+    const text = readFileSync(path, 'utf8').split('[IO.FileInfo]::new($path).Length -le 65536').join('$true')
     writeFileSync(path, text)
     const result = await run(shell, dirs, ['-PromptFile', promptIn(dirs, 'x '.repeat(32769))], { script: path })
     assert.equal(result.runs.length, 0)
