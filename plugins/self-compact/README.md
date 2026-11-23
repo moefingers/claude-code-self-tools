@@ -20,6 +20,27 @@ Lets a session compact its own conversation at the break between two pieces of w
 - **An interrupted turn cancels it**, with a notice.
 - **Subagents can't use it.** A subagent compacts on its own near its context limit; one that calls the tool is told to finish its piece and return its result instead.
 
+## Compact reminder
+
+Off unless you turn it on. A session that finishes a piece of work and forgets to compact runs on until auto-compact, often in the middle of the next piece. With the `compactReminder` setting holding context levels, the session is reminded at the first break past each one.
+
+- **One line, at a turn's end.** When a turn of the main conversation ends with Claude's answer, and the context window has risen past a level since the plugin last saw it below that level, the plugin adds one line to the session's next turn:
+
+  > self-compact: the context window is at 62% (620,000 of 1,000,000 tokens). If the piece of work you just finished is complete, this is the break to call compact_after_turn, with keep (what the summary must hold) and resume (the next piece). If you are mid-piece, finish it first.
+
+  The words are fixed; only the three numbers vary. The line carries nothing from the conversation. It goes in as a row Claude reads and you don't see as typed, with the next turn that calls the model, whoever starts it.
+- **Once per level.** A level reminds once each time the window rises past it. Levels passed together make one line: a session that starts at 70% with `40%, 60%` set gets one line, not two.
+- **A compaction arms the levels again.** `compact_after_turn`, `/compact` and auto-compact all make the window fall, and a level it falls back below reminds again the next time the window passes it. A compaction that lands above a level leaves that level quiet, since compacting again would not take the window under it. The plugin tells this from the window itself, read as `context_usage` reads it: Claude Code has no compaction event a plugin can hook in every session (`session.compact` is one its built-in guard passes over).
+- **What it never does.** It never starts a turn of its own and never shows a toast for the line. It never reminds a subagent, a turn that was interrupted or ended on an error (the level waits for the next answered turn end), or the turn end at which a compaction is queued. With the setting empty, it doesn't read the window and says nothing. It sends nothing off the machine: the levels reminded are kept in the plugin's session state, so a `/reload-plugins` keeps them.
+- **Turn it on** with the plugin's `compactReminder` setting: a comma-separated list of levels, each a percentage of the window (`40%`, from 1% to 99%) or a token count (`400k` or `400000`, 1k or more). Empty, the default, is off. Set it in `/config`, or from your shell:
+
+  ```
+  echo '{"compactReminder":"40%, 60%, 80%"}' | claude plugin configure self-compact@claude-code-self-tools --values-stdin
+  ```
+
+  which saves it in settings.json as `"pluginConfigs": { "self-compact@claude-code-self-tools": { "options": { "compactReminder": "40%, 60%, 80%" } } }`. The plugin reads it when it loads: at the session's start, or at `/reload-plugins`.
+- **A value that isn't levels turns it off**, and says why once in a conversation: a toast and a line in the debug log, naming the first entry that isn't a level. A bare number under 1,000, such as `40`, is taken for a percentage without its `%`, and refused.
+
 ## Update check
 
 When Claude calls one of this plugin's tools, and the last check is 30 minutes old or there hasn't been one, the plugin checks whether a newer version is published. It fetches this plugin's `plugin.json` from the `main` branch of the repository its installed `plugin.json` names, [`plugins/self-compact/.claude-plugin/plugin.json`](https://raw.githubusercontent.com/moefingers/claude-code-self-tools/main/plugins/self-compact/.claude-plugin/plugin.json), and compares its `version` with the installed one.
