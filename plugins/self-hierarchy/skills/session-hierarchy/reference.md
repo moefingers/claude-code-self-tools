@@ -24,6 +24,15 @@ Claude sees each tool as `mcp__<plugin>__<tool>`.
 - `between-turns` compacts as the turn ends, ahead of anything queued; what was queued then runs on the compacted conversation. `idle` waits half a second after the turn ends, so anything queued goes first.
 - In a hierarchy: put your area's open threads, PR numbers and heads, decisions, and where your notes are in `keep`. Put the next piece in `resume`.
 
+### `compact_reminder` (self-compact)
+
+- Inputs: `levels` (optional: such as `"40%, 70%"` or `"300k"`, at most 20; `"off"` or `""` goes back to the setting), `notes` (optional, with `levels`: a note of your own per level, one line of plain text, at most 120 characters, no angle brackets).
+- Sets this conversation's own compact reminder levels, in place of the `compactReminder` setting's, for this conversation alone. They last across a compaction, a restart and a resume. With no inputs, it says the levels, where they come from, which have passed since the last compaction, and where the window stands.
+- The reminder is one polite line on the next turn when the window passes a level. Nothing is required: compact at a finished break, or carry on mid-piece.
+- Answers at once and queues nothing, with a toast for each change. Behind ToolSearch.
+- In a process's first seconds (every new session included) and in the seconds after a `/clear` or a `/resume`, while the session's id may still name another conversation, it sets nothing and says how long to wait.
+- In a hierarchy: a coordinator sets an early level, a builder with one big piece a late one, and a session about to start a large piece one just ahead of where it stands.
+
 ### `context_usage` (self-context)
 
 - No inputs. Read-only.

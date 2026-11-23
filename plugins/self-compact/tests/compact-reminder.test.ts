@@ -10,7 +10,7 @@ const WINDOW = 1_000_000
 
 /** The line at `at` percent (1 to 99) of a 1,000,000-token window, written out here so a change of words fails. */
 const line = (at: number) =>
-  `self-compact: the context window is at ${at}% (${at * 10},000 of 1,000,000 tokens). If the piece of work you just finished is complete, this is the break to call compact_after_turn, with keep (what the summary must hold) and resume (the next piece). If you are mid-piece, finish it first.`
+  `self-compact: a polite reminder, in case it slipped your mind: the context window is at ${at}% (${at * 10},000 of 1,000,000 tokens). Nothing is required. If the piece you just finished is complete, this could be a good break for compact_after_turn, with keep (what the summary must hold) and resume (the next piece); if you are mid-piece, carry on.`
 
 /**
  * The engine beneath the plugin: the window's reading, which a test moves (`at`) and a compaction empties, as Claude
@@ -25,6 +25,10 @@ function engine(on: On, { refuse = 0, skip }: { refuse?: number; skip?: string }
   const counts = { usage: 0, appends: 0 }
   const session = mock.session(on)
   const clock = mock.clock(on)
+  clockNow = clock
+  // The conversation, and the plugin's store, where a conversation's own levels would be: none here.
+  mock.store(on)
+  on('session.id', () => ({ value: 'conversation-1' }))
   on('session.append', { door: 'note' }, (_, e, next) => {
     counts.appends += 1
     return counts.appends > refuse ? next(e) : { deny: 'held by policy' }
@@ -65,6 +69,15 @@ function engine(on: On, { refuse = 0, skip }: { refuse?: number; skip?: string }
 }
 
 const start = { cwd: '/', surface: 'terminal', isInteractive: true } as const
+
+/** The clock of the test running now, for begin(). */
+let clockNow: { advance: (ms: number) => Promise<void> } | undefined
+
+/** The process's first start, and the seconds its conversation id may lag it gone by (hooks/moving.ts). */
+async function begin($: { session: { start: (e: typeof start) => Promise<unknown> } }): Promise<void> {
+  await $.session.start(start)
+  await clockNow?.advance(15_000)
+}
 let turns = 0
 /** A turn's end: the main loop's, answered, unless `ended` says otherwise. */
 function answered({ isAborted = false, reason = 'answer', agentId }: { isAborted?: boolean; reason?: 'answer' | 'aborted' | 'error' | 'refusal'; agentId?: string } = {}): TurnCompleteInput {
@@ -74,7 +87,7 @@ function answered({ isAborted = false, reason = 'answer', agentId }: { isAborted
 
 test('off by default: with the option empty, no line at any level, nothing said, and the window never read', async ($, on) => {
   const { lines, toasts, logs, counts, at } = engine(on)
-  await $.session.start(start)
+  await begin($)
   for (const percent of [45, 70, 99]) {
     at(percent)
     await $.turn.complete(answered())
@@ -87,7 +100,7 @@ test('off by default: with the option empty, no line at any level, nothing said,
 
 test('off when set to blanks: no line', { options: { compactReminder: '   ' } }, async ($, on) => {
   const { lines, toasts, at } = engine(on)
-  await $.session.start(start)
+  await begin($)
   at(99)
   await $.turn.complete(answered())
   expect(lines()).toEqual([])
@@ -96,7 +109,7 @@ test('off when set to blanks: no line', { options: { compactReminder: '   ' } },
 
 test('a level passed at a turn end: one line, in the exact words, with no toast; the same level again: nothing; a later level: one more', { options: { compactReminder: '40%, 60%, 80%' } }, async ($, on) => {
   const { lines, toasts, at } = engine(on)
-  await $.session.start(start)
+  await begin($)
 
   at(30)
   await $.turn.complete(answered())
@@ -105,7 +118,7 @@ test('a level passed at a turn end: one line, in the exact words, with no toast;
   at(45)
   await $.turn.complete(answered())
   expect(lines()).toEqual([
-    'self-compact: the context window is at 45% (450,000 of 1,000,000 tokens). If the piece of work you just finished is complete, this is the break to call compact_after_turn, with keep (what the summary must hold) and resume (the next piece). If you are mid-piece, finish it first.',
+    'self-compact: a polite reminder, in case it slipped your mind: the context window is at 45% (450,000 of 1,000,000 tokens). Nothing is required. If the piece you just finished is complete, this could be a good break for compact_after_turn, with keep (what the summary must hold) and resume (the next piece); if you are mid-piece, carry on.',
   ])
   expect(toasts).toEqual([])
 
@@ -122,7 +135,7 @@ test('a level passed at a turn end: one line, in the exact words, with no toast;
 
 test('several levels passed at once (a session that starts at 85%): one line, then nothing until a new level', { options: { compactReminder: '40%, 60%, 80%' } }, async ($, on) => {
   const { lines, at } = engine(on)
-  await $.session.start(start)
+  await begin($)
   at(85)
   await $.turn.complete(answered())
   expect(lines()).toEqual([line(85)])
@@ -133,7 +146,7 @@ test('several levels passed at once (a session that starts at 85%): one line, th
 
 test("a subagent's turn end: nothing, and the level waits for the main loop's", { options: { compactReminder: '40%' } }, async ($, on) => {
   const { lines, at } = engine(on)
-  await $.session.start(start)
+  await begin($)
   at(70)
   await $.turn.complete(answered({ agentId: 'a1' }))
   expect(lines()).toEqual([])
@@ -143,7 +156,7 @@ test("a subagent's turn end: nothing, and the level waits for the main loop's", 
 
 test('an interrupted turn, or one that ended on an error or a refusal, is no break: the level waits for the next answered turn end', { options: { compactReminder: '40%' } }, async ($, on) => {
   const { lines, at } = engine(on)
-  await $.session.start(start)
+  await begin($)
   at(45)
   await $.turn.complete(answered({ isAborted: true, reason: 'aborted' }))
   await $.turn.complete(answered({ reason: 'error' }))
@@ -155,7 +168,7 @@ test('an interrupted turn, or one that ended on an error or a refusal, is no bre
 
 test('after a compaction the levels remind again: by compact_after_turn, with no line at the turn end it compacts', { options: { compactReminder: '40%, 60%, 80%' } }, async ($, on) => {
   const { lines, compactions, clock, at } = engine(on)
-  await $.session.start(start)
+  await begin($)
   at(65)
   await $.turn.complete(answered())
   expect(lines()).toEqual([line(65)])
@@ -182,7 +195,7 @@ test('after a compaction the levels remind again: by compact_after_turn, with no
 
 test('after a /compact or an auto-compact, a level the window fell below reminds again, read off the window', { options: { compactReminder: '40%, 60%' } }, async ($, on) => {
   const { lines, at } = engine(on)
-  await $.session.start(start)
+  await begin($)
   at(85)
   await $.turn.complete(answered())
   expect(lines()).toEqual([line(85)])
@@ -198,7 +211,7 @@ test('after a /compact or an auto-compact, a level the window fell below reminds
 
 test('a /compact or an auto-compact that lands above a level: no line for it, and the levels above remind again', { options: { compactReminder: '10%, 50%' } }, async ($, on) => {
   const { lines, at } = engine(on)
-  await $.session.start(start)
+  await begin($)
   at(55)
   await $.turn.complete(answered())
   expect(lines()).toEqual([line(55)])
@@ -213,7 +226,7 @@ test('a /compact or an auto-compact that lands above a level: no line for it, an
 
 test('a token count is a level, and 400k and 400000 are the same one', { options: { compactReminder: '400k, 400000, 700000' } }, async ($, on) => {
   const { lines, at } = engine(on)
-  await $.session.start(start)
+  await begin($)
   at(39)
   await $.turn.complete(answered())
   expect(lines()).toEqual([])
@@ -227,20 +240,20 @@ test('a token count is a level, and 400k and 400000 are the same one', { options
 
 test('no reading yet (a new or just-compacted conversation): nothing', { options: { compactReminder: '1k' } }, async ($, on) => {
   const { lines } = engine(on)
-  await $.session.start(start)
+  await begin($)
   await $.turn.complete(answered())
   expect(lines()).toEqual([])
 })
 
 test('a malformed option: off, said once (a toast and a debug line), and no line at any level', { options: { compactReminder: '40%, soon' } }, async ($, on) => {
   const { lines, toasts, logs, at } = engine(on)
-  await $.session.start(start)
+  await begin($)
   const why = 'compactReminder is off: "soon" is not a level. Each level is a percentage of the window (40%) or a token count (400k or 400000), separated by commas, such as 40%, 60%, 80%.'
   expect(toasts).toEqual([why])
   expect(logs).toEqual([why])
 
   // A reload's start, the same value: not said again.
-  await $.session.start(start)
+  await begin($)
   expect(toasts).toEqual([why])
   expect(logs).toEqual([why])
 
@@ -251,7 +264,7 @@ test('a malformed option: off, said once (a toast and a debug line), and no line
 
 test("M1: after compact_after_turn, every level reminds again, one the compaction landed above too (the review's sequence)", { options: { compactReminder: '40%, 60%, 80%' } }, async ($, on) => {
   const { lines, compactions, clock, at } = engine(on)
-  await $.session.start(start)
+  await begin($)
   at(62)
   await $.turn.complete(answered())
   expect(lines()).toEqual([line(62)])
@@ -272,7 +285,7 @@ test("M1: after compact_after_turn, every level reminds again, one the compactio
 
 test('a skipped compaction arms nothing again', { options: { compactReminder: '40%' } }, async ($, on) => {
   const { lines, compactions, clock, at } = engine(on, { skip: 'nothing to compact' })
-  await $.session.start(start)
+  await begin($)
   at(45)
   await $.turn.complete(answered())
   await $.tool.call({ tool: TOOL, keep: 'the PR queue' })
@@ -285,7 +298,7 @@ test('a skipped compaction arms nothing again', { options: { compactReminder: '4
 
 test('the limit, pinned: after a /compact, a level the window is back above by the first answered turn end is not reminded that cycle', { options: { compactReminder: '40%, 60%' } }, async ($, on) => {
   const { lines, at, unread } = engine(on)
-  await $.session.start(start)
+  await begin($)
   at(62)
   await $.turn.complete(answered())
   expect(lines()).toEqual([line(62)])
@@ -302,7 +315,7 @@ test('the limit, pinned: after a /compact, a level the window is back above by t
 
 test('a line a hook above refuses: the levels are put back, one try per turn end, and the next answered turn end tries again', { options: { compactReminder: '40%, 60%' } }, async ($, on) => {
   const { lines, logs, counts, at } = engine(on, { refuse: 1 })
-  await $.session.start(start)
+  await begin($)
   at(45)
   await $.turn.complete(answered())
   expect(counts.appends).toBe(1)
@@ -317,7 +330,7 @@ test('a line a hook above refuses: the levels are put back, one try per turn end
 
 test('a turn end with no reading leaves the record as it was', { options: { compactReminder: '40%' } }, async ($, on) => {
   const { lines, at, unread } = engine(on)
-  await $.session.start(start)
+  await begin($)
   at(65)
   await $.turn.complete(answered())
   unread()
@@ -329,7 +342,7 @@ test('a turn end with no reading leaves the record as it was', { options: { comp
 
 test('percentages and token counts in one setting', { options: { compactReminder: '40%, 700k' } }, async ($, on) => {
   const { lines, at } = engine(on)
-  await $.session.start(start)
+  await begin($)
   at(45)
   await $.turn.complete(answered())
   at(69)
@@ -341,7 +354,7 @@ test('percentages and token counts in one setting', { options: { compactReminder
 
 test("a token level at or past this window's size: kept, never a line, and said once in the debug log", { options: { compactReminder: '1000k, 2000000' } }, async ($, on) => {
   const { lines, logs, at } = engine(on)
-  await $.session.start(start)
+  await begin($)
   at(99)
   await $.turn.complete(answered())
   await $.turn.complete(answered())
@@ -378,4 +391,18 @@ test('what is not a level, and what is', () => {
     ],
   })
   expect(parseReminder('400k, 400000')).toEqual({ levels: [{ key: '400000', tokens: 400000 }] })
+})
+
+test("the test kit keeps $.state across a compaction the test raises (a /compact): so the compact_after_turn tests prove forgetReminded", { options: { compactReminder: '40%' } }, async ($, on) => {
+  const { lines, compactions, at } = engine(on)
+  await begin($)
+  at(45)
+  await $.turn.complete(answered())
+  expect(lines()).toEqual([line(45)])
+  await $.session.compact({ trigger: 'manual', instructions: 'by hand', messages: [] })
+  expect(compactions).toEqual(['by hand'])
+  // Had the kit emptied the marks at the compaction, 40% would remind here, as it does after compact_after_turn.
+  at(47)
+  await $.turn.complete(answered())
+  expect(lines()).toEqual([line(45)])
 })

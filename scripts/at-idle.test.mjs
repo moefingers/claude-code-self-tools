@@ -32,6 +32,7 @@ const QUEUES_NOTHING = new Map([
   ['context_usage', 'answers at once, and only reads'],
   ['secret_run_command', 'answers at once with a command line, which the session then runs itself'],
   ['cancel_wake', 'takes the wake-up back at once'],
+  ['compact_reminder', "sets or reads this conversation's reminder levels at once"],
   ['update_status', 'answers at once, and only reads'],
 ])
 
@@ -48,6 +49,7 @@ const TOOLS = [
   'clear_after_turn',
   'color_after_turn',
   'compact_after_turn',
+  'compact_reminder',
   'context_usage',
   'exit_after_turn',
   'reconnect_mcp_after_turn',
