@@ -1,7 +1,7 @@
 # claude-launch.ps1: starts Claude Code as a top-level session. The one script in
 # claude-code-self-tools that runs claude: every launch (a restart's or a switch's window, the
 # coordinator's go, a steward's launch, a slot runner's every start, and you by hand) comes through it.
-# claude-launch version 6
+# claude-launch version 7
 #
 # Part of self-switch (claude-code-self-tools, plugins/self-switch/slot/claude-launch.ps1). Nobody
 # copies it: a launch that opens a window puts the copy it carries in %LOCALAPPDATA%\claude-self-tools,
@@ -18,6 +18,29 @@
 #   claude-launch.ps1 -Lane <name>                                        resume a session's current
 #                                                                         conversation, by its name
 #   claude-launch.ps1 [-Dir <folder>]                                     start a new session
+# Each of them takes -RemoteControl [<name>] and -PromptFile <file>, alone or together.
+# -RemoteControl [<name>] starts the session with Remote Control on (claude --remote-control): under
+# <name>; else under the launch's own name (-Name with -Start, the name with -Lane); else unnamed, and
+# Claude Code names it. A name is lowercase letters, digits and hyphens, as -Name's. PowerShell has no
+# parameter whose value may be left out, so the name is this script's first positional parameter
+# ($RemoteControlName): a word on the command line that follows no parameter of its own. Such a word
+# without -RemoteControl refuses, as does an argument the script doesn't take.
+# -PromptFile <file> gives the session its first prompt, once. The file is read as UTF-8 text and never
+# run; its text (a byte order mark at its start dropped) goes to claude as one argument, every character
+# as the file holds it, line breaks too. It refuses, starting nothing, a file that is not an absolute
+# path of the shape -Dir takes, is not there, is over 64 KB or not UTF-8, is empty or holds only spaces
+# and line breaks, holds over 15,000 characters (so that, every character escaped, claude's whole command
+# line stays under Windows' 32,767), holds a control character but tab, CR and LF or a second byte order
+# mark, starts (past spaces
+# and line breaks) with '/' or '!', which claude reads at its prompt as a slash command or a shell
+# command, or is one word of letters, digits, hyphens and underscores, which claude reads as one of its
+# own commands when it names one (claude update, claude help; a second word or a full stop gets past it).
+# It refuses when the claude found is not an .exe: a .cmd or .bat (an npm install's) runs through cmd.exe,
+# which reads % & | < > ^ in a prompt as its own. Under Windows PowerShell 5.1 alone, it also refuses a
+# prompt in which every whitespace character comes after an odd number of '"' (one quoted whole, say):
+# 5.1 can't hand it on whole (step 6); PowerShell 7 delivers it. A prompt refused ends this script with
+# exit 4, the reason left for the window that ran it ($ClaudeLaunchPromptRefused). With -Resume or -Lane
+# too: it is how a resumed session is told why it was brought back.
 # With -Resume, -Start or -Lane, -ConfigDir <folder>[,<folder>...] names other config folders whose
 # session registries the last look reads too (a launch's window names every one it read). With -Resume,
 # -LeftSize <bytes> -LeftMtime <ms>, or -LeftExitAt <ms>, is a left record's stat, which the last look
@@ -33,9 +56,10 @@
 # 1. It checks its arguments: a session id is a lowercase UUID; a name is lowercase letters, digits and
 #    hyphens; a folder is an absolute folder of the shape the plugins take (no quote, control character,
 #    < > | ? * / or ';', no '.' or '..' part, no empty part, no part with spaces at either end), and is
-#    there; an argument given empty refuses. -Lane reads lanes.json in the config folder
-#    (CLAUDE_CONFIG_DIR, else %USERPROFILE%\.claude), takes that name's conversation and folder from its
-#    entry, and says which; it never reads a transcript. Anything else stops it, saying why, before it
+#    there; an argument given empty, or one it doesn't take, refuses. -Lane reads lanes.json in the config
+#    folder (CLAUDE_CONFIG_DIR, else %USERPROFILE%\.claude), takes that name's conversation and folder
+#    from its entry, and says which; it never reads a transcript. A Remote Control name is a name; the
+#    prompt file is read, and its text checked, as above. Anything else stops it, saying why, before it
 #    changes anything.
 # 2. In Windows PowerShell 5.1, it sets PSModulePath to 5.1's own module folders: in a tab whose
 #    environment puts PowerShell 7's first, 5.1 loads 7's modules and loses cmdlets.
@@ -63,8 +87,19 @@
 #    session ran in: one resumed here has no tab of its own). It sets
 #    CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1 and CLAUDE_CODE_DISABLE_BG_SHELL_PRESSURE_REAP=1. It never
 #    touches WT_SESSION or WT_PROFILE_ID: Claude Code reads WT_SESSION to draw its prompt and its links.
-# 6. It runs claude with --resume <id>, or --session-id <id> --name <name>, or nothing else: never a
-#    permission flag, so the session starts in the mode a new one would. Its exit code is claude's.
+# 6. It runs claude with --resume <id>, or --session-id <id> --name <name>, or neither; then, as asked,
+#    --remote-control [<name>]; then '--' and the prompt. Never a permission flag, so the session starts
+#    in the mode a new one would. Its exit code is claude's. '--' ends claude's options: a prompt that
+#    starts with '-' is a prompt, and --remote-control or --resume, whose values may be left out, never
+#    take the prompt for theirs. The prompt is one argument built by the C runtime's quoting rules (the
+#    whole in double quotes, each '"' as '\"', a run of backslashes before one, or at the end, doubled),
+#    which claude.exe reads back as the text itself. $PSNativeCommandArgumentPassing is 'Legacy' for this
+#    script's calls, so PowerShell 7 hands it on as it is built (7's own escaping, on top of these rules,
+#    would escape it twice). Windows PowerShell 5.1 puts quotes of its own around an argument where it
+#    meets a whitespace character after an even number of '"', counting the escaped ones too; so where
+#    it would, it is given the argument without its outer quotes, and its own put them back. A prompt
+#    in which every whitespace character comes after an odd number of '"' is refused under 5.1: no
+#    argument it hands on is that prompt.
 #    With the wrapper loaded, it calls the wrapper's `claude` function, the one it just made (never by
 #    the name, which an alias would take), with those arguments, in this process: the wrapper gives
 #    claude a fresh CLAUDE_PANE_TOKEN and a pane file naming this PowerShell, claude.exe's own parent,
@@ -73,7 +108,10 @@
 #    switch left it, here. A
 #    ticket the wrapper doesn't use ends this script with exit 3, the reason left for the window that
 #    ran it ($ClaudeLaunchUnused), which records it and stays open; $ClaudeLaunchLast names the
-#    conversation the wrapper resumed last, for the window's closing lines.
+#    conversation the wrapper resumed last, for the window's closing lines. The wrapper gives these
+#    arguments to its first claude alone: a restart or a switch it takes later runs claude --resume <id>
+#    and nothing more, so the prompt and --remote-control are sent once. (Claude Code's docs say a
+#    conversation started with --remote-control has Remote Control back when it is resumed.)
 #
 # The threat model: this script is pinned by its SHA-256 (the plugins' LAUNCH_SCRIPT_SHA256), and the
 # wrapper's copy it loads by $WrapperSha256, inside this pinned text; the bytes it hashes are the bytes
@@ -82,7 +120,7 @@
 # the pins stop a stale or edited copy, not that user. The wrapper's copy runs at this process's own
 # level, as claude.exe does; it adds a function, not a power.
 
-param([string]$Resume, [string]$Start, [string]$Name, [string]$Dir, [string]$Lane, [string[]]$ConfigDir, [string]$LeftSize, [string]$LeftMtime, [string]$LeftExitAt, [switch]$Wrapper, [switch]$Hosted)
+param([string]$RemoteControlName, [string]$Resume, [string]$Start, [string]$Name, [string]$Dir, [string]$Lane, [string[]]$ConfigDir, [string]$LeftSize, [string]$LeftMtime, [string]$LeftExitAt, [switch]$Wrapper, [switch]$Hosted, [switch]$RemoteControl, [string]$PromptFile)
 
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
@@ -103,6 +141,14 @@ $WrapperSha256 = '20083123ff9850af6a743373b4e5b38cc3b03500a35447166687c40fc0a09b
 function Stop-Launch($why) {
   Write-Host ('claude-launch: ' + $why + ' Nothing was started.')
   exit 2
+}
+
+# A first prompt refused: its own exit code (PROMPT_REFUSED_EXIT in the plugins' machine code), never the last
+# look's 2, and why, left in this process for the window that ran this script.
+function Stop-Prompt($why) {
+  $global:ClaudeLaunchPromptRefused = $why
+  Write-Host ('claude-launch: -PromptFile ' + $PromptFile + ' ' + $why + '. Nothing was started.')
+  exit 4
 }
 
 # An absolute folder of the shape the plugins take (isSafeFolder in their machine code): a drive, a
@@ -184,6 +230,59 @@ function Test-Left($id, $configDirs, $leftSize, $leftMtime, $leftExitAt) {
   return $live
 }
 
+# A first prompt's checks: PROMPT_CHECK in the plugins' machine code, line for line, which a launch runs too,
+# before its claim. Test-Quoted51: whether Windows PowerShell 5.1 puts quotes of its own around $text when it
+# hands it to a native program: where it meets a whitespace character after an even number of '"', each
+# counted, escaped or not. (PowerShell 7 skips a '"' after a backslash, so the built argument never needs its.)
+function Test-Quoted51($text) {
+  $quoted = $false
+  foreach ($c in $text.ToCharArray()) {
+    if ($c -eq [char]'"') { $quoted = -not $quoted }
+    elseif ([char]::IsWhiteSpace($c) -and -not $quoted) { return $true }
+  }
+  return $false
+}
+function Read-Prompt($path, $as51) {
+  $why = $null
+  $prompt = $null
+  $arg = $null
+  if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { $why = 'is not a file that is there' }
+  else {
+    try {
+      $raw = $null
+      if ([IO.FileInfo]::new($path).Length -le 65536) { $raw = [IO.File]::ReadAllBytes($path) }
+      if ($null -eq $raw -or $raw.Length -gt 65536) { $why = 'is larger than 64 KB' }
+      elseif ($raw.Length -ge 2 -and (($raw[0] -eq 0xff -and $raw[1] -eq 0xfe) -or ($raw[0] -eq 0xfe -and $raw[1] -eq 0xff))) { $why = 'is UTF-16 text (as Windows PowerShell 5.1''s > and Out-File write it): save it as UTF-8' }
+      else { $prompt = [Text.UTF8Encoding]::new($false, $true).GetString($raw) }
+    } catch { if ($_.Exception -is [Text.DecoderFallbackException] -or $_.Exception.InnerException -is [Text.DecoderFallbackException]) { $why = 'is not UTF-8 text: save it as UTF-8' } else { $why = 'could not be read (' + $_.Exception.Message + ')' } }
+  }
+  if ($null -eq $why) {
+    # A byte order mark at the start says the file is UTF-8, and is no part of the prompt: compared as a character, since
+    # .NET Framework's StartsWith compares by culture, where U+FEFF is ignored and so starts every text. A second one is refused below.
+    if ($prompt.Length -gt 0 -and $prompt[0] -eq [char]0xfeff) { $prompt = $prompt.Substring(1) }
+    $lead = $prompt.TrimStart()
+    $odd = [regex]::Match($prompt, '[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f\ufeff]')
+    if ($lead.Length -eq 0) { $why = 'is empty, or holds only spaces and line breaks' }
+    elseif ($prompt.Length -gt 15000) { $why = 'holds ' + $prompt.Length + ' characters, over the 15000 a prompt may hold' }
+    elseif ($odd.Success) { $why = 'holds U+' + ([int][char]$odd.Value).ToString('X4') + ', a control character or a second byte order mark (a prompt may hold tabs and line breaks, and no other)' }
+    elseif ($lead[0] -eq [char]'/' -or $lead[0] -eq [char]'!') { $why = 'starts with ' + $lead[0] + ', which claude reads at its prompt as a command (/ a slash command, ! a shell command), not as a prompt' }
+    elseif ($prompt -cmatch '^[A-Za-z0-9_-]+\z') { $why = 'is one bare word, which claude runs as one of its own commands when it names one (claude update, claude help): add a second word or a full stop' }
+  }
+  if ($null -eq $why) {
+    $arg = '"' + (($prompt -replace '(\\*)"', '$1$1\"') -replace '(\\+)\z', '$1$1') + '"'
+    if ($as51 -and (Test-Quoted51 $arg)) {
+      $inner = $arg.Substring(1, $arg.Length - 2)
+      if (Test-Quoted51 $inner) { $arg = $inner }
+      else { $arg = $null; $why = 'can''t be handed to claude whole by Windows PowerShell 5.1: every whitespace character in it (a space, a tab, a line break, a no-break space) comes after an odd number of double quotes ("), and 5.1 would split it. Add or remove one double quote before its first space or line break, or run it under PowerShell 7 (pwsh)' }
+    }
+  }
+  return @{ why = $why; arg = $arg }
+}
+function Get-PromptExeFault($exe) {
+  if ([IO.Path]::GetExtension([string]$exe) -ieq '.exe') { return $null }
+  return 'goes to claude.exe alone, and the claude found here is ' + $exe + ', which Windows runs through cmd.exe, where % & | < > ^ in a prompt are commands of its own. Install Claude Code''s native build (claude install), which puts claude.exe in %USERPROFILE%\.local\bin'
+}
+
 # Why $path is not a folder of that shape, naming the class at fault (folderFault in the plugins'
 # machine code); $null when it is one.
 function Get-ShapeFault($path) {
@@ -198,8 +297,15 @@ function Get-ShapeFault($path) {
 }
 
 # 1. The arguments, each checked before anything changes.
-foreach ($k in 'Resume', 'Start', 'Name', 'Dir', 'Lane', 'LeftSize', 'LeftMtime', 'LeftExitAt') {
+foreach ($k in 'Resume', 'Start', 'Name', 'Dir', 'Lane', 'LeftSize', 'LeftMtime', 'LeftExitAt', 'RemoteControlName', 'PromptFile') {
   if ($PSBoundParameters.ContainsKey($k) -and [string]::IsNullOrEmpty($PSBoundParameters[$k])) { Stop-Launch ('-' + $k + ' was given empty.') }
+}
+# An argument it doesn't take (a parameter misspelt, say) refuses: never a launch without what was meant.
+if ($args.Count -gt 0) { Stop-Launch ('it takes no argument ' + $args[0] + '.') }
+# A word that follows no parameter is a Remote Control name, and goes with -RemoteControl.
+if ($RemoteControlName) {
+  if (-not $RemoteControl) { Stop-Launch ('a word on its own (' + $RemoteControlName + ') is a Remote Control name, and goes after -RemoteControl.') }
+  if ($RemoteControlName -cnotmatch $AreaName) { Stop-Launch '-RemoteControl takes a name of lowercase letters, digits and hyphens.' }
 }
 $modes = 0
 foreach ($given in $Resume, $Start, $Lane) { if ($given) { $modes++ } }
@@ -243,6 +349,24 @@ if ($Start) {
   if (-not $Name -or $Name -cnotmatch $AreaName) { Stop-Launch '-Start takes -Name: lowercase letters, digits and hyphens.' }
 }
 if ($Dir -and -not (Test-Folder $Dir)) { Stop-Launch '-Dir takes an absolute folder that is there, with no quote, control character, semicolon, < > | ? * or /, and no . or .. part.' }
+# The first prompt: read once and checked whole (Read-Prompt), as this PowerShell will hand it on, or nothing is started.
+$promptArg = $null
+if ($PromptFile) {
+  if (-not (Test-Shape $PromptFile) -or $PromptFile.IndexOf(';') -ge 0) { Stop-Prompt 'is not an absolute path of the shape -Dir takes (no quote, control character, semicolon, < > | ? * or /, and no . or .. part)' }
+  $promptRead = Read-Prompt $PromptFile ($PSVersionTable.PSEdition -ne 'Core')
+  if ($null -ne $promptRead.why) { Stop-Prompt $promptRead.why }
+  $promptArg = $promptRead.arg
+}
+# The arguments claude gets: the launch's own; Remote Control, under its name or the launch's; then '--',
+# quoted so that PowerShell hands it on (a bare -- is PowerShell's own, and a function never gets it),
+# and the prompt.
+$claudeArgs = @()
+if ($Resume) { $claudeArgs += '--resume', $Resume } elseif ($Start) { $claudeArgs += '--session-id', $Start, '--name', $Name }
+if ($RemoteControl) {
+  $claudeArgs += '--remote-control'
+  if ($RemoteControlName) { $claudeArgs += $RemoteControlName } elseif ($Start) { $claudeArgs += $Name } elseif ($Lane) { $claudeArgs += $Lane }
+}
+if ($null -ne $promptArg) { $claudeArgs += '--', $promptArg }
 # The config folders the last look reads: this one first, then each -ConfigDir, each once.
 $lookIn = @()
 if ($Resume -or $Start) {
@@ -272,6 +396,9 @@ if ($null -eq $exe) {
   if ($found.Count -gt 0) { $exe = $found[0].Source }
 }
 if ($null -eq $exe) { Stop-Launch 'no claude.exe was found (in %USERPROFILE%\.local\bin, or on PATH).' }
+# A prompt goes to an .exe alone: a .cmd or .bat (an npm install's claude) runs through cmd.exe, which reads the
+# prompt's % & | < > ^ as its own. The claude wrapper finds claude by this same rule, in this process, so this covers it.
+if ($null -ne $promptArg) { $exeWhy = Get-PromptExeFault $exe; if ($null -ne $exeWhy) { Stop-Prompt $exeWhy } }
 # With -Wrapper, the claude wrapper's verified copy: its bytes read once, their SHA-256 checked, and its
 # function defined from those same bytes, here at the script's own level (it defines `claude` and does
 # nothing else). $wrapperWhy says why it isn't used, when it isn't.
@@ -321,7 +448,9 @@ foreach ($n in $Drop) { [Environment]::SetEnvironmentVariable($n, [NullString]::
 foreach ($n in $Set.Keys) { [Environment]::SetEnvironmentVariable($n, $Set[$n], [EnvironmentVariableTarget]::Process) }
 
 # 6. claude, and its exit code: through the wrapper's `claude` when -Wrapper loaded it, run as from a
-# prompt (its own preferences, not this script's), else claude.exe itself.
+# prompt (its own preferences, not this script's), else claude.exe itself. Its arguments as they were
+# built, the prompt's quoting already done: PowerShell 7 must hand them on as 5.1 does, unchanged.
+$PSNativeCommandArgumentPassing = 'Legacy'
 if ($Wrapper -and $null -eq $wrapperWhy) {
   $ErrorActionPreference = 'Continue'
   # Read by the wrapper in the script scope it runs under (this script's, run as a file; the session's, run
@@ -335,9 +464,7 @@ if ($Wrapper -and $null -eq $wrapperWhy) {
   $global:ClaudeLaunchLast = $null
   $global:ClaudeLaunchUnused = $null
   try {
-    if ($Resume) { & $wrapperClaude --resume $Resume }
-    elseif ($Start) { & $wrapperClaude --session-id $Start --name $Name }
-    else { & $wrapperClaude }
+    & $wrapperClaude @claudeArgs
   } finally { $script:ClaudeWrapperHosted = $null }
   $code = $LASTEXITCODE
   # For the window that ran this script, in the same process: what the wrapper left. A ticket it didn't
@@ -349,7 +476,5 @@ if ($Wrapper -and $null -eq $wrapperWhy) {
   exit $code
 }
 if ($Wrapper) { Write-Host ('claude-launch: ' + $wrapperWhy + '. Claude starts directly, so a restart from this session opens in a new window or tab.') }
-if ($Resume) { & $exe --resume $Resume }
-elseif ($Start) { & $exe --session-id $Start --name $Name }
-else { & $exe }
+& $exe @claudeArgs
 exit $LASTEXITCODE
