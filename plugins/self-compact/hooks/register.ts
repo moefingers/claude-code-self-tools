@@ -16,7 +16,7 @@
 import type { EngineInterface, Register } from 'claude-code'
 import type { Queued } from '../types'
 import { idleWords } from './at-idle'
-import { parseReminder, remind, sayWhyOff } from './reminder'
+import { configureReminder, forgetReminded, remind, sayWhyOff } from './reminder'
 import { configureUpdateCheck, loadUpdateCheck, withUpdateNotice } from './update-check'
 
 const queued = { plugin: 'self-compact', key: 'queued' } as const
@@ -66,6 +66,8 @@ async function compactNow($: EngineInterface, { keep, resume, when }: Queued, re
     return
   }
   if (skipped !== undefined) $.ui.toast(`Compaction skipped: ${skipped}`)
+  // Its own compaction ran: every compact reminder level reminds again at its next passing.
+  else await forgetReminded($)
   if (resume === undefined) return
   const said = skipped === undefined ? 'Compacted.' : `Compaction was skipped (${skipped}).`
   try {
@@ -78,7 +80,7 @@ async function compactNow($: EngineInterface, { keep, resume, when }: Queued, re
 
 export const register: Register = (on, options) => {
   configureUpdateCheck('self-compact', options)
-  const reminder = parseReminder(options.compactReminder)
+  configureReminder(options.compactReminder)
 
   // First, so it is outermost on this plugin's tools: it sees each answer, and adds the update
   // notice when one is due. It never waits on the check; see update-check.ts.
@@ -111,7 +113,7 @@ export const register: Register = (on, options) => {
       isDeferred: false,
     })
     loadUpdateCheck($)
-    await sayWhyOff($, options.compactReminder, reminder)
+    await sayWhyOff($, options.compactReminder)
     return started
   })
 
@@ -141,7 +143,7 @@ export const register: Register = (on, options) => {
     const { value } = await $.state.get(queued)
     if (!value) {
       // Nothing to compact: the compact reminder's moment, at a turn the model finished (an interrupted one is no break).
-      if (!e.isAborted && e.reason === 'answer') await remind($, reminder.levels)
+      if (!e.isAborted && e.reason === 'answer') await remind($)
       return done
     }
     await $.state.set(queued, null)

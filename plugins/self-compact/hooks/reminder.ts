@@ -1,16 +1,16 @@
 // The compact reminder (#72), off unless the person sets `compactReminder`: context levels, each a percentage of the
 // window (40%) or a token count (400k, 400000). At a main-loop turn's end that the model answered, with no compaction
-// queued, the plugin reads the window as context_usage does. When it has risen past a level since the plugin last saw
-// it below that level, the session gets one line on its next turn: how full the window is, and that a finished piece
-// is the break to compact. One line per turn end, however many levels it passed. Never a turn of its own, never a toast
-// for the line, never to a subagent, nothing sent off the machine.
+// queued, the plugin reads the window as context_usage does. When it has risen past a level the session hasn't been
+// reminded of, the session gets one line on its next turn: how full the window is, and that a finished piece is the
+// break to compact. One line per turn end, however many levels it passed. Never a turn of its own, never a toast for
+// the line, never to a subagent, nothing sent off the machine.
 //
-// What counts as compacted is the reading itself. Claude Code has no compaction event a plugin can hook in every
-// session (`session.compact` is one its built-in guard passes over: scripts/guarded-hooks.mjs), and a compaction, by
-// compact_after_turn, /compact or auto-compact, is what makes the window fall. So the levels kept as reminded are the
-// ones the last reading had reached: a level the window falls back below reminds again the next time it is passed. A
-// compaction that lands below every level arms them all again; one that lands above a level leaves that level quiet,
-// since compacting again would not take the window under it.
+// When the levels remind again. After this plugin's own compaction (compact_after_turn), all of them: the plugin made
+// it, so it knows. A /compact or an auto-compact it can't hear: Claude Code has no compaction event a plugin can hook in
+// every session (`session.compact` is one its built-in guard passes over: scripts/guarded-hooks.mjs). So for those the
+// fall is read off the window: the levels kept as reminded are the ones the last answered turn end's reading had
+// reached, and a level the window falls back below reminds again the next time it is passed. A level the window is
+// back above by the first answered turn end after such a compaction stays quiet that cycle.
 import type { EngineInterface } from 'claude-code'
 
 /** The levels the window had reached at the last answered turn end, by key: the ones reminded. */
@@ -32,7 +32,6 @@ const HOW = 'Each level is a percentage of the window (40%) or a token count (40
 
 /** One entry of the list, or why it is not a level. */
 function level(item: string): Level | string {
-  if (item === '') return 'a level between two commas is empty.'
   const shown = JSON.stringify(item.length > 24 ? `${item.slice(0, 24)}...` : item)
   const percent = /^(\d{1,3})%$/.exec(item)
   if (percent) {
@@ -48,14 +47,31 @@ function level(item: string): Level | string {
   return `${shown} is not a level.`
 }
 
+/** Why an empty entry is there: a comma at either end, or two in a row. */
+function empty(at: number, of: number): string {
+  if (at === of - 1) return 'the list ends with a comma: leave the last comma out.'
+  if (at === 0) return 'the list starts with a comma: leave the first comma out.'
+  return 'two commas have no level between them: leave one out.'
+}
+
 /** Reads `compactReminder`: empty (the default) is off and says nothing; anything but levels is off, and says why. */
 export function parseReminder(raw: unknown): Reminder {
   const text = raw === undefined ? '' : String(raw).trim()
   if (text === '') return { levels: [] }
+  const items = text.split(',').map(part => part.trim())
   const levels: Level[] = []
-  for (const item of text.split(',').map(part => part.trim())) {
+  for (const [at, item] of items.entries()) {
+    const off = (said: string): Reminder => ({ levels: [], why: `compactReminder is off: ${said} ${HOW}` })
+    if (item === '') return off(empty(at, items.length))
+    // A token count written with a thousands separator (400,000): the commas split it into levels.
+    let runs = at + 1
+    while (runs < items.length && /^\d{3}$/.test(items[runs] ?? '')) runs += 1
+    if (/^\d{1,3}$/.test(item) && runs > at + 1) {
+      const written = items.slice(at, runs).join(',')
+      return off(`${JSON.stringify(written)} is not a level: commas separate levels, so a token count has none (write ${items.slice(at, runs).join('')} or ${items.slice(at, runs - 1).join('')}k).`)
+    }
     const read = level(item)
-    if (typeof read === 'string') return { levels: [], why: `compactReminder is off: ${read} ${HOW}` }
+    if (typeof read === 'string') return off(read)
     const { key } = read
     if (!levels.some(known => known.key === key)) levels.push(read)
   }
@@ -76,13 +92,37 @@ export function reminderLine(tokens: number, window: number, percent: number | u
   return `self-compact: the context window is at ${at}% (${grouped(tokens)} of ${grouped(window)} tokens). If the piece of work you just finished is complete, this is the break to call compact_after_turn, with keep (what the summary must hold) and resume (the next piece). If you are mid-piece, finish it first.`
 }
 
-/** Tells the model on its next turn, in a row it reads and the person doesn't see as typed. */
-async function tellModel($: EngineInterface, note: string): Promise<void> {
+/** What this load's `compactReminder` sets, from register (configureReminder). */
+let current: Reminder = { levels: [] }
+
+/** Token levels already said to be out of this window's reach, in this load, so each is said once. */
+const outOfReach = new Set<string>()
+
+/** At register: reads `compactReminder` for this load, and answers what it sets. */
+export function configureReminder(raw: unknown): Reminder {
+  current = parseReminder(raw)
+  outOfReach.clear()
+  return current
+}
+
+/** Tells the model on its next turn, in a row it reads and the person doesn't see as typed; false when it wasn't kept. */
+async function tellModel($: EngineInterface, note: string): Promise<boolean> {
   try {
-    await $.session.append({ message: { type: 'user', content: [{ type: 'text', text: note }] } })
+    const kept = await $.session.append({ message: { type: 'user', content: [{ type: 'text', text: note }] } })
+    if (kept.deny === undefined) return true
+    $.ui.log(`compact reminder: the line was refused (${kept.deny}); the next answered turn end tries again.`, { to: 'debug' })
   } catch {
-    // No toast for the line, so the debug log alone says it wasn't kept.
-    $.ui.log("compact reminder: the line wasn't added to the next turn.", { to: 'debug' })
+    $.ui.log("compact reminder: the line wasn't added; the next answered turn end tries again.", { to: 'debug' })
+  }
+  return false
+}
+
+/** A token level at or past the window's size never fires in this session: said once, in the debug log alone. */
+function sayOutOfReach($: EngineInterface, window: number): void {
+  for (const l of current.levels) {
+    if (!('tokens' in l) || l.tokens < window || outOfReach.has(l.key)) continue
+    outOfReach.add(l.key)
+    $.ui.log(`compact reminder: the level ${grouped(l.tokens)} is at or past this window's ${grouped(window)} tokens, so it never reminds in this session.`, { to: 'debug' })
   }
 }
 
@@ -90,26 +130,40 @@ async function tellModel($: EngineInterface, note: string): Promise<void> {
  * At a main-loop turn's end the model answered, with no compaction queued: reads the window, keeps the levels it has
  * reached as the ones reminded, and when one of them is new, tells the model once. Off with no levels.
  */
-export async function remind($: EngineInterface, levels: readonly Level[]): Promise<void> {
-  if (levels.length === 0) return
+export async function remind($: EngineInterface): Promise<void> {
+  if (current.levels.length === 0) return
   try {
     const { context } = await $.session.usage()
     // No reading yet (a new or just-compacted conversation, until its next response): nothing to compare.
     if (context.tokens === undefined || !(context.window > 0)) return
-    const reached = reachedKeys(levels, context.tokens, context.window)
+    sayOutOfReach($, context.window)
+    const reached = reachedKeys(current.levels, context.tokens, context.window)
     const before: readonly string[] = (await $.state.get(reminded)).value ?? []
     if (reached.length === before.length && reached.every(key => before.includes(key))) return
-    // Marked first, so a line is never sent twice for one passing.
+    // Marked before the send, and put back as they were when the line isn't kept, so the next answered turn end
+    // tries once more: one try per turn end.
     await $.state.set(reminded, reached.length === 0 ? null : reached)
-    if (reached.some(key => !before.includes(key))) await tellModel($, reminderLine(context.tokens, context.window, context.percent))
+    if (!reached.some(key => !before.includes(key))) return
+    const sent = await tellModel($, reminderLine(context.tokens, context.window, context.percent))
+    if (!sent) await $.state.set(reminded, before.length === 0 ? null : [...before])
   } catch {
-    $.ui.log("compact reminder: the context window wasn't read at this turn's end.", { to: 'debug' })
+    $.ui.log("compact reminder: this turn end's check failed; no line was sent.", { to: 'debug' })
+  }
+}
+
+/** After this plugin's own compaction ran: every level reminds again at its next passing. */
+export async function forgetReminded($: EngineInterface): Promise<void> {
+  if (current.levels.length === 0) return
+  try {
+    await $.state.set(reminded, null)
+  } catch {
+    $.ui.log("compact reminder: the levels weren't armed again after the compaction.", { to: 'debug' })
   }
 }
 
 /** Says why `compactReminder` is off, once per conversation and value: a toast and a line in the debug log. */
-export async function sayWhyOff($: EngineInterface, raw: unknown, reminder: Reminder): Promise<void> {
-  if (reminder.why === undefined) return
+export async function sayWhyOff($: EngineInterface, raw: unknown): Promise<void> {
+  if (current.why === undefined) return
   const value = String(raw).trim()
   try {
     if ((await $.state.get(warned)).value === value) return
@@ -117,6 +171,6 @@ export async function sayWhyOff($: EngineInterface, raw: unknown, reminder: Remi
   } catch {
     // Unread, it is said again rather than never.
   }
-  $.ui.log(reminder.why, { to: 'debug' })
-  $.ui.toast(reminder.why)
+  $.ui.log(current.why, { to: 'debug' })
+  $.ui.toast(current.why)
 }
