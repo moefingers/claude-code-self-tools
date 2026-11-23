@@ -8,7 +8,7 @@ Each plugin is separate. Install only the ones you want.
 
 | Plugin | Tools | What it does | When a session uses it |
 | :- | :- | :- | :- |
-| [self-compact](plugins/self-compact) | `compact_after_turn` | Compacts the conversation once the turn ends, keeping what the call says, then can resume on its own. | At the break between two pieces of work, so the next piece starts with room in the context window. |
+| [self-compact](plugins/self-compact) | `compact_after_turn` | Compacts the conversation once the turn ends, keeping what the call says, then can resume on its own. Opt in (`compactReminder`), it reminds the session in one line at the first turn end past each context level you set. | At the break between two pieces of work, so the next piece starts with room in the context window. |
 | [self-reload](plugins/self-reload) | `reload_plugins_after_turn` | Runs `/reload-plugins` once the turn ends, then can resume on its own. | After it has edited a plugin and needs the change live, for example to try a tool it just changed. |
 | [self-mcp](plugins/self-mcp) | `reconnect_mcp_after_turn` | Runs `/mcp reconnect <server>` (or `all`) once the turn ends, then can resume on its own. | When an MCP server's tools stop answering and a reconnect is all it needs, such as a browser extension that dropped. |
 | [self-context](plugins/self-context) | `context_usage` | Reports the tokens used, the window, the percentage and whether auto-compact is on. Read-only. | At a break between pieces of work, to decide whether to compact now. |
