@@ -15,6 +15,7 @@
 //
 // What it never does: quit, kill or restart Chrome (that closes every session's tabs and tab groups), open a profile in
 // a Chrome that runs, sign in, or type anything into Chrome.
+import { GO_IDLE, WHY_IDLE } from './at-idle'
 import { isSafeFolder, PSMODULEPATH_RESET, psQuote } from './machine'
 
 /** The flag that hides Chrome's "is debugging this browser" banner, for every extension and every profile in that Chrome. */
@@ -785,7 +786,8 @@ export function answer(o: Outcome): string {
   const r = o.reconnect
   if (r.kind === 'queued') {
     const then = r.resume === undefined ? 'waits for the next message' : `resumes with: ${r.resume}`
-    lines.push(`Reconnect: /mcp reconnect ${SERVER} runs once this turn ends: end your turn now, and do nothing more until it has run. Then the session ${then}`)
+    // #67: the shared words of every tool that queues for the idle moment, as the description has them.
+    lines.push(`Reconnect: /mcp reconnect ${SERVER} runs once this turn ends, so ${GO_IDLE} ${WHY_IDLE} Then the session ${then}`)
   } else if (r.kind === 'not-asked') lines.push('Reconnect: not asked for (reconnect is false).')
   else if (r.kind === 'not-running') lines.push("Reconnect: not queued: Chrome isn't known to run. reconnect_mcp_after_turn (self-mcp) reconnects Claude in Chrome by itself.")
   else if (r.kind === 'capped') {

@@ -39,7 +39,7 @@
     {
       "name": "self-wake",
       "source": "./plugins/self-wake",
-      "description": "Wakes the session some minutes after the turn ends with a note it sends itself, to check back on slow work."
+      "description": "Wakes the session some minutes (or seconds) after the turn ends with a note it sends itself, to check back on slow work."
     },
     {
       "name": "self-remote-control",

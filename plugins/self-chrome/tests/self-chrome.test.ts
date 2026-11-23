@@ -1,6 +1,7 @@
 import { expect, mock, test } from 'claude-code/testing'
 import type { Engine } from 'claude-code/testing'
 import type { On } from 'claude-code'
+import { GO_IDLE, idleWords, WHY_IDLE } from '../hooks/at-idle'
 import {
   answer,
   chooseProfile,
@@ -278,6 +279,8 @@ test('not running, opted in by the variable, no profile named: Chrome starts wit
   expect(said).toMatch(/^Flag: on: the silentDebugger setting is auto, and CLAUDE_CHROME_SILENT_DEBUGGER turns it on\.$/m)
   expect(said).toContain(`Did: started Chrome, with no profile folder named (Chrome opens the profile it used last), --restore-last-session and ${FLAG}. It runs as PID 4321, and the flag took.`)
   expect(said).toMatch(/^Reconnect: \/mcp reconnect claude-in-chrome runs once this turn ends/m)
+  // #67: the answer that says the reconnect is queued says what to do now in the shared words.
+  expect(said).toContain(`Reconnect: /mcp reconnect claude-in-chrome runs once this turn ends, so ${GO_IDLE} ${WHY_IDLE} Then the session `)
   expect(said).toMatch(/^Left for the person: nothing\.$/m)
   // The start: one short launch, then a look of its own; no --profile-directory, so Chrome picks its own last profile.
   expect(starts).toHaveLength(1)
@@ -811,7 +814,9 @@ test('the description says it never quits Chrome, to end the turn once the recon
   await $.session.start(START)
   const said = described.at(-1) ?? ''
   expect(said).toContain("It never quits, kills or restarts Chrome, which would close every session's tabs and tab groups")
-  expect(said).toContain('When it says the reconnect is queued, end your turn and do nothing more until it has run; then carry on.')
+  // #67: the shared words of every tool that queues for the idle moment.
+  expect(said).toContain(idleWords('When it says the reconnect is queued'))
+  expect(said).toContain(`${GO_IDLE} ${WHY_IDLE}`)
   expect(said).toContain("When it says to ask the person, ask them; don't call it again.")
 })
 

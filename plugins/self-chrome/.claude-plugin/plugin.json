@@ -1,6 +1,6 @@
 {
   "name": "self-chrome",
-  "version": "0.1.3",
+  "version": "0.1.5",
   "description": "Lets a session make sure Chrome runs for Claude in Chrome: it looks for your Chrome, starts it when it isn't running (the profile you name, or the one Chrome used last; the last session restored; and --silent-debugger-extension-api when you opt in), and reconnects Claude in Chrome once the turn ends. It never quits or restarts Chrome.",
   "author": { "name": "moefingers", "url": "https://github.com/moefingers" },
   "homepage": "https://github.com/moefingers/claude-code-self-tools/tree/main/plugins/self-chrome#readme",

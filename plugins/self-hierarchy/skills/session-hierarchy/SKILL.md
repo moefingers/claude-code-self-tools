@@ -97,11 +97,13 @@ Some projects name protected paths, where every head needs an explicit acceptanc
 
 - Every wait loop needs an exit: a timeout, a terminal state, or a cap on tries. So does every watch.
 - Before you start a wait, decide what you do when it ends and what you do when it times out.
-- When nothing will tell you a slow job is done, call `wake_after` and end the turn. Call `cancel_wake` if the answer comes first.
+- When nothing will tell you a slow job is done, call `wake_after` (in minutes, or in seconds for a short wait) and go idle at once: end the turn. Call `cancel_wake` if the answer comes first.
 
 ## The self tools in a hierarchy
 
-Each self tool acts on the session that calls it, never on another. So the coordinator asks a lane to restart, and the lane calls `restart_after_turn` itself. Most of the tools act once the turn ends: call one, then end the turn.
+Each self tool acts on the session that calls it, never on another. So the coordinator asks a lane to restart, and the lane calls `restart_after_turn` itself.
+
+Most of the tools act once the turn ends, and each says so in the same words: After calling it, go idle at once: end your turn, and do nothing more until it has run; then carry on in the turn that follows it, started by its resume message when it sends one, else by the next message. What it queues runs only once your turn has ended and the session is idle, so anything done meanwhile pushes it back. The one exception is `color_after_turn` (self-color), which has no resume: Nothing waits on it, though, and nothing resumes the session after it: you need not end your turn for it; it runs at the next idle moment.
 
 | Tool | What it costs | When |
 | :- | :- | :- |
@@ -110,7 +112,7 @@ Each self tool acts on the session that calls it, never on another. So the coord
 | `clear_after_turn` | Loses the whole story. Only the `handoff` survives. | Only when the work is `complete` and its notes are written, or the context is `contaminated`. |
 | `switch_after_turn` | Moves this terminal to another conversation. This one's context is kept for later. Pending wake-ups are dropped. Windows only. | Only when the owner asks. Where a coordinator plugin runs switches, it refuses. |
 | `exit_after_turn` | Ends the session and its Remote Control. Someone must resume it by hand. | When the owner asks, or the brief says to close when the work is done. |
-| `wake_after` | A note to itself, some minutes after the turn ends. One at a time. | A slow wait that nothing will announce. |
+| `wake_after` | A note to itself, some minutes (or seconds) after the turn ends. One at a time. | A slow wait that nothing will announce; never beside a resume that says another plugin keeps the timer. |
 | `reload_plugins_after_turn` | Replaces plugin code. Plugin state stays; plugin timers and variables start over. | A plugin was updated or edited. |
 | `tools_check` | Reads; writes only its own record (and on Windows may dedupe Bash's env files). | A tool seems dead, before you work around it. |
 
@@ -139,6 +141,8 @@ When the coordinator pauses every session:
 - Bring your subagents to a safe point too: no push, merge or install in flight, and no commit made only for the pause.
 - Stop your background jobs, and confirm by command line that they have stopped.
 - Write your notes, then tell the coordinator you're ready.
+
+After an interruption (an account change that cut a turn off), the resume asks the session to go idle first, so what was queued for the idle moment (a reconnect, a reload) runs in that pause. End the turn at once, with no tool call and no timer of your own: the plugin that sent the resume keeps the timer, and sends the message to carry on about 100 seconds later. A `wake_after` beside it would only start a second turn.
 
 When work resumes, on the coordinator's word:
 - Check where things stand: git status, a fetch, your open PRs, your notes. Other sessions may have moved.
