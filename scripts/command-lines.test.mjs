@@ -47,6 +47,8 @@ const launchFor = change => machine.launchScriptText({
 const window = launchFor({})
 const restart = launchFor({ where: 'auto', left: undefined })
 const start = launchFor({ kind: 'start', name: 'a'.repeat(40), checks: { fresh: true, floor: true, input: true }, waitForExit: undefined, left: undefined })
+/** A window launched with Remote Control under the longest name, and a first prompt by the longest path (#63). */
+const prompted = launchFor({ remoteControl: 'r'.repeat(40), promptFile: folder('G', 'prompt') })
 const TOKEN = '00000000-0000-4000-a000-000000000001'
 const scripts = [
   ["self-switch's probe: two ids, the claim, 8 config folders, a heavy-slot root", machine.probeScript({ ids: [W, T], take: T, configDirs, stateDir: state, heavySlotRoot: folder('F', 'heavy') })],
@@ -61,6 +63,7 @@ const scripts = [
   ['the launch to a window: 8 config folders, the longest folder, a left record, a deadline', window],
   ["the launch 'auto' (self-restart's): this pane's slot or a window", restart],
   ['the launch of a start: its id checked new in 8 config folders', start],
+  ['the launch to a window with Remote Control and a first prompt: the longest name and prompt path', prompted],
   ["the launch to this tab: a ticket naming 8 config folders", launchFor({ where: { pane: { token: TOKEN } }, now: Date.now(), left: undefined })],
   ["the launch to this pane's slot", launchFor({ where: { slot: '4294967295-99999999999999999999' }, claim: 'slot:4294967295-99999999999999999999', left: undefined })],
   ['the in-place check with a left record', machine.claimCheckScript({ stateDir: state, id: T, by: BY, configDirs, left: { size: 9007199254740991, mtime: 9007199254740991 } })],
@@ -108,6 +111,7 @@ test("the window's own command line, every argument Start-Process gives it: the 
     ["a switch's window", window, '& $launchPath -Resume $id -Dir $folder -ConfigDir $configDirs'],
     ["self-restart's window", restart, '& $launchPath -Resume $id -Dir $folder -ConfigDir $configDirs'],
     ['a start, its name the longest', start, '& $launchPath -Start $id -Name $name -Dir $folder -ConfigDir $configDirs'],
+    ['Remote Control and a first prompt, the longest of each (#63)', prompted, ' -Wrapper -Hosted -RemoteControl $rcName -PromptFile $promptFile'],
   ]) {
     const inner = innerOf(script)
     assert.ok(inner.includes(`$id = '${T}'`) && inner.includes(runs), `${name}: the inner script`)
