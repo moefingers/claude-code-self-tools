@@ -634,3 +634,66 @@ describe('every path named by an id is built by one helper, which refuses any ot
     }
   })
 })
+
+describe('launch(): Remote Control and a first prompt at launch (#63), for a plain window alone', () => {
+  const PROMPT = 'C:\\Users\\u\\briefs\\lane x.md'
+  const RUN = '  & $launchPath -Resume $id -Dir $folder -ConfigDir $configDirs -Wrapper -Hosted'
+
+  test('the window hands claude-launch.ps1 -RemoteControl [<name>] and -PromptFile <path>, after -Wrapper -Hosted, the prompt by its path alone', () => {
+    expect(innerOf(launchScriptText(input({ remoteControl: true })))).toContain(`${RUN} -RemoteControl\r\n`)
+    expect(innerOf(launchScriptText(input({ promptFile: PROMPT })))).toContain(`${RUN} -PromptFile $promptFile\r\n`)
+    const both = innerOf(launchScriptText(input({ remoteControl: 'lane-y', promptFile: PROMPT })))
+    expect(both).toContain(`${RUN} -RemoteControl $rcName -PromptFile $promptFile\r\n`)
+    expect(both).toContain("\r\n$rcName = 'lane-y'\r\n")
+    expect(both).toContain(`\r\n$promptFile = '${PROMPT}'\r\n`)
+    const start = innerOf(launchScriptText({ ...START, remoteControl: true, promptFile: PROMPT }))
+    expect(start).toContain('  & $launchPath -Start $id -Name $name -Dir $folder -ConfigDir $configDirs -Wrapper -Hosted -RemoteControl -PromptFile $promptFile\r\n')
+    // The by-hand lines name neither: a way back into the conversation, and a prompt goes once, by the launch.
+    for (const line of both.split('\r\n').filter(line => line.includes('$handPath + "'))) expect(line).not.toMatch(/RemoteControl|PromptFile|rcName|promptFile/)
+  })
+
+  test('without them, every script is what it was: no -RemoteControl, no -PromptFile, no prompt check', () => {
+    for (const [, script] of SCRIPTS) {
+      expect(script).not.toMatch(/RemoteControl|PromptFile|promptFile|rcName|Refuse 'prompt'/)
+      if (script.includes("$inner = '")) expect(innerOf(script)).not.toMatch(/RemoteControl|PromptFile|promptFile|rcName/)
+    }
+  })
+
+  test("the launch refuses 'prompt' when the file is not there, before the claim is taken; its text is claude-launch.ps1's to check", () => {
+    const script = launchScriptText(input({ promptFile: PROMPT }))
+    const check = script.indexOf("if (-not (Test-Path -LiteralPath $promptFile -PathType Leaf)) { Refuse 'prompt' ($tool + ': the first prompt''s file is not a file that is there: ' + $promptFile) }")
+    expect(check).toBeGreaterThan(0)
+    expect(check).toBeLessThan(script.indexOf('function New-Claim('))
+    expect(script.slice(0, check)).toContain(`$promptFile = '${PROMPT}'\r\n`)
+    // Never read here: no ReadAll of it, no Get-Content.
+    expect(script).not.toMatch(/ReadAll\w*\(\$promptFile|Get-Content[^\r\n]*\$promptFile/)
+  })
+
+  test('a name is a session name, a path the launch folder rule\'s; anything else throws before a script is built', () => {
+    for (const remoteControl of ['', 'Lane X', 'a'.repeat(41), 'x;y', false, 1] as unknown[]) expect(() => launchScriptText(input({ remoteControl } as unknown as Partial<LaunchInput>))).toThrow(/Remote Control at launch is true or a session name/)
+    for (const promptFile of ['relative\\brief.md', 'C:\\a;b.md', "C:\\o'brien.md", 'C:\\a\\..\\b.md', 'C:\\a/b.md', `C:\\${'x'.repeat(240)}`]) expect(() => launchScriptText(input({ promptFile }))).toThrow(/the prompt file .+ so a launch never takes it/)
+  })
+
+  test("only a plain window takes them: the claude wrapper's ticket, a slot's record, a tab, a named window and 'auto' throw", () => {
+    const places: [Partial<LaunchInput>, string][] = [
+      [{ where: { pane: { token: TOKEN } }, now: NOW }, 'this tab'],
+      [{ where: { slot: SLOT }, claim: `slot:${SLOT}` }, "this pane's slot"],
+      [{ where: { tab: { window: 'claude-1', title: 'tab one' } }, claim: `launch:${T}` }, 'a tab'],
+      [{ where: { window: { name: 'claude-overflow' } }, claim: `launch:${T}` }, 'a named window'],
+      [{ id: W, folder: REPO, where: 'auto' }, "'auto'"],
+    ]
+    for (const [place, name] of places) {
+      // The place itself is a launch it builds; only the two fields turn it away.
+      expect(launchScriptText(input(place))).toContain("$ErrorActionPreference = 'Stop'")
+      for (const asked of [{ remoteControl: true as const }, { promptFile: PROMPT }]) {
+        let said = ''
+        try {
+          launchScriptText(input({ ...place, ...asked }))
+        } catch (error) {
+          said = String(error)
+        }
+        expect([name, said]).toEqual([name, expect.stringMatching(/go to a plain window \(\{ window: true \}\) alone/)])
+      }
+    }
+  })
+})

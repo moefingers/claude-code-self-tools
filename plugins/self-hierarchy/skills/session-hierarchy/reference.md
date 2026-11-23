@@ -101,7 +101,19 @@ Claude sees each tool as `mcp__<plugin>__<tool>`.
 
 ## Launching a session
 
-Start each session in its own terminal tab, in PowerShell with the `claude` wrapper loaded. Then its later restarts come back to the same tab.
+Start each session in its own terminal tab with self-switch's launch script, `claude-launch.ps1`. Every launch that opens a window keeps a copy for you at `%LOCALAPPDATA%\claude-self-tools\claude-launch.ps1`, and the claude wrapper's verified copy beside it. With `-Wrapper`, the session's later restarts come back to the same tab. By hand, from any shell:
+
+```
+wt -w 0 new-tab --title lane-a powershell.exe -NoExit -ExecutionPolicy Bypass -File "%LOCALAPPDATA%\claude-self-tools\claude-launch.ps1" -Wrapper -Start <uuid> -Name lane-a -Dir <folder> -RemoteControl -PromptFile <file>
+```
+
+- `-Start <uuid> -Name lane-a` starts a new conversation with that id, under the role's name. `-Resume <id>` resumes one instead, and `-Lane <name>` resumes a session's current conversation in its own folder, from `lanes.json`.
+- `-RemoteControl` turns Remote Control on at launch, under the session's name, so the owner can reach it from the phone at once. `-RemoteControl <name>` names it otherwise.
+- `-PromptFile <file>` briefs it: the file's UTF-8 text is its first prompt, sent once. A restart later resumes it with `--resume` alone. The script refuses a prompt it can't deliver whole, saying why; its header lists the rules.
+- `wt` splits its command line at every `;`, even inside quotes: keep `;` out of everything after `new-tab` (use `-File`, never `-Command "a; b"`).
+- A `-File` launch needs an execution policy that runs local scripts. Windows' default, `Restricted`, refuses it, and a hidden or closing window never shows why: pass `-ExecutionPolicy Bypass`. The script clears it again before claude.
+
+The script does what the steps below do (with the wrapper's verified copy, never yours), then takes a last look (the conversation open nowhere else) and starts claude. By hand, without it:
 
 1. Copy `tools/claude-wrapper/claude-wrapper.ps1` from the claude-code-self-tools repository to `%LOCALAPPDATA%\claude-self-tools\claude-wrapper.ps1`.
 2. Dot-source it in the tab, or once in your PowerShell profile (`$PROFILE`), so `claude` runs the wrapper's function:
@@ -127,10 +139,10 @@ Start each session in its own terminal tab, in PowerShell with the `claude` wrap
    $env:CLAUDE_CODE_FORCE_SESSION_PERSISTENCE = '1'
    ```
 
-5. Start the session under its role's name, in the folder it works in:
+5. Start the session under its role's name, in the folder it works in, with Remote Control on:
 
    ```powershell
-   claude --name lane-a
+   claude --name lane-a --remote-control lane-a
    ```
 
 The wrapper resumes a restarted session in the same tab with the same environment rules: markers cleared, transcripts forced on. A restart or a switch out of a session started any other way opens a new window instead, or uses a slot pane where one is set up.
