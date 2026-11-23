@@ -32,6 +32,7 @@ const QUEUES_NOTHING = new Map([
   ['context_usage', 'answers at once, and only reads'],
   ['secret_run_command', 'answers at once with a command line, which the session then runs itself'],
   ['cancel_wake', 'takes the wake-up back at once'],
+  ['update_status', 'answers at once, and only reads'],
 ])
 
 /**
@@ -56,6 +57,7 @@ const TOOLS = [
   'secret_run_command',
   'switch_after_turn',
   'tools_check',
+  'update_status',
   'wake_after',
 ]
 

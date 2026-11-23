@@ -1,6 +1,6 @@
 {
   "name": "claude-code-self-tools",
-  "description": "Small Claude Code plugins that let a session act on itself: compact or clear its conversation, reload its plugins, reconnect an MCP server, read its context window, check its own tools, wake itself later, turn on Remote Control under a title, set its prompt bar color, exit or restart, switch to another conversation, run a command with a secret pasted at the machine that it never sees, and make sure Chrome runs for Claude in Chrome; and a skill for running several sessions as a hierarchy. Install only the ones you want.",
+  "description": "Small Claude Code plugins that let a session act on itself: compact or clear its conversation, reload its plugins, reconnect an MCP server, read its context window, check its own tools, wake itself later, turn on Remote Control under a title, set its prompt bar color, exit or restart, switch to another conversation, run a command with a secret pasted at the machine that it never sees, make sure Chrome runs for Claude in Chrome, and keep the machine's plugins current; and a skill for running several sessions as a hierarchy. Install only the ones you want.",
   "owner": {
     "name": "moefingers",
     "url": "https://github.com/moefingers"
@@ -75,6 +75,11 @@
       "name": "self-chrome",
       "source": "./plugins/self-chrome",
       "description": "Makes sure Chrome runs for Claude in Chrome: looks for your Chrome, starts it when it isn't running (the profile you name, or the one Chrome used last; the last session restored; and --silent-debugger-extension-api only when you opt in), and reconnects Claude in Chrome once the turn ends. It never quits or restarts Chrome."
+    },
+    {
+      "name": "self-update",
+      "source": "./plugins/self-update",
+      "description": "Keeps the plugins this machine already has from the marketplaces you name current, with Claude Code's own claude plugin commands, one look at a time, and reloads each session behind an update at its next idle moment. Off until you name a marketplace. Windows only."
     },
     {
       "name": "self-hierarchy",
