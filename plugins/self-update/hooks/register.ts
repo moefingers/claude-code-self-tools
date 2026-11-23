@@ -84,12 +84,17 @@ export const register: Register = (on, options) => {
 
   // A /reload-plugins a person or another plugin runs: once it has answered, and reloaded, what was installed before it
   // started is loaded, so the session is behind that update no more (reload.ts). Only watched: it is passed on as it is.
+  // Nothing of its own can throw once `next` has answered, and the repository's usual `.catch` passes the command on.
   on('command.run', { command: 'reload-plugins' }, async ($, e, next) => {
     const at = await $.clock.now().catch(() => undefined)
     const done = await next(e)
-    if (at !== undefined) reloadSeen(at, done.text)
+    try {
+      if (at !== undefined) reloadSeen(at, done.text)
+    } catch {
+      // The session's load time stays as it was; the command's own answer goes on untouched.
+    }
     return done
-  })
+  }).catch(($, e, next) => next(e))
 
   on('tool.call', { tool: 'mcp__self-update__update_status' }, async ($, e) => {
     if (e.agentId !== undefined) return { deny: "A subagent can't read self-update's status: it is the main session's. Finish your piece and return its result; the main session can call it." }

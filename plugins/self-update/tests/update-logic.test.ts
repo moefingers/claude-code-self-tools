@@ -6,7 +6,7 @@
 // one), what a failing command's line keeps of a secret, and what update_status says. The script that runs a command is
 // held to its text here; scripts/self-update.test.mjs runs it by a real Windows PowerShell where there is one.
 import { describe, expect, test } from 'claude-code/testing'
-import { COMMAND_MS, ENDED, INSIDE, NAME_SHAPE, NO_CLAUDE, REFUSED, STEP_LEAST_MS, STEP_MS, UPDATE_SCRIPT } from '../hooks/scripts'
+import { COMMAND_MS, ENDED, INSIDE, LOCK_STALE_MS, NAME_SHAPE, NO_CLAUDE, REFUSED, RENEW_AFTER_MS, RUN_GRACE_MS, STEP_LEAST_MS, STEP_MS, TAKE_SCRIPT, UPDATE_SCRIPT } from '../hooks/scripts'
 import {
   agoSaid,
   autoUpdateOf,
@@ -143,11 +143,13 @@ describe('when a look is due', () => {
     expect(floorHolds(NOW + 2 * 60 * MINUTE + 5 * MINUTE, NOW)).toBe(false)
   })
 
-  test('one step, the plugin’s backstop and its grace included, ends before a lock taken right before it is 90 s old', () => {
-    // scripts.ts: the script's own budget, then the plugin's timeout on the script; update.ts gives up 5 s after that.
+  test('one step, the plugin’s backstop and its grace included, ends before a lock at most RENEW_AFTER_MS old as it starts is as old as TAKE’s own figure', () => {
+    // scripts.ts: the script's own budget, the plugin's timeout on the script, the grace after it, and the renewal's age.
     expect(STEP_MS).toBe(55_000)
     expect(COMMAND_MS).toBe(75_000)
-    expect(COMMAND_MS + 5_000 + 5_000).toBeLessThan(90_000)
+    expect(RENEW_AFTER_MS + COMMAND_MS + RUN_GRACE_MS).toBeLessThan(LOCK_STALE_MS)
+    // The figure is TAKE's own: the lock script's bytes say it.
+    expect(TAKE_SCRIPT).toContain(`$staleMs = ${LOCK_STALE_MS}\n`)
   })
 
   test('looks that can’t reach a marketplace in a row stretch the wait: 5 minutes, then 10, 20, 40, and an hour at most, until one reaches them all', () => {
@@ -442,8 +444,30 @@ describe('what a failing command’s line keeps of a secret', () => {
     expect(masked('https://u:p@ss@git.example.com/x')).toBe(`https://${SECRET}@git.example.com/x`)
   })
 
+  test('a name led by `_`, as `.npmrc` writes them, and a flag with its value after a space', () => {
+    // Made at run time: a legacy npm token (a UUID, which no shape rule catches alone) and two short base64 values.
+    const uuid = ['1b2c3d4e', '5f60', '4a7b', '8c9d', '0e1f2a3b4c5d'].join('-')
+    const auth = ['dXNlcj', 'pwYXNz'].join('')
+    const password = ['aHVudG', 'VyMg=='].join('')
+    expect(masked(`//registry.npmjs.org/:_authToken=${uuid}`)).toBe(`//registry.npmjs.org/:_authToken=${SECRET}`)
+    expect(masked(`_auth=${auth}`)).toBe(`_auth=${SECRET}`)
+    expect(masked(`//npm.example.com/:_password=${password}`)).toBe(`//npm.example.com/:_password=${SECRET}`)
+    expect(masked(`npm ERR! config _auth = ${auth}; _password: "${password}"`)).toBe(`npm ERR! config _auth = ${SECRET}; _password: "${SECRET}"`)
+    // A flag with its value after a space; one with `=` already was; a flag's value is never another flag.
+    expect(masked('git clone --password hunter2 --depth 1')).toBe(`git clone --password ${SECRET} --depth 1`)
+    expect(masked(`claude login --token ${auth} -v`)).toBe(`claude login --token ${SECRET} -v`)
+    expect(masked('--password=hunter2')).toBe(`--password=${SECRET}`)
+    expect(masked('--token --verbose')).toBe('--token --verbose')
+    // Names and flags that say nothing secret are left as they are.
+    for (const plain of ['__dirname: /work/x', '--registry https://registry.npmjs.org/ --depth 1', 'self-update --scope user', '_comment = see the README', 'x_y=1']) expect(masked(plain), plain).toBe(plain)
+    // Masking twice changes nothing.
+    const once = masked(`:_authToken=${uuid} --password hunter2 _auth=${auth}`)
+    expect(masked(once)).toBe(once)
+    for (const left of [uuid, 'hunter2', auth]) expect(once).not.toContain(left)
+  })
+
   test('which names say their value is a secret, word by word', () => {
-    for (const name of ['password', 'GITHUB_TOKEN', 'access_token', 'client_secret', 'apiKey', 'X-Api-Key', 'PRIVATE-TOKEN', 'Set-Cookie', 'sessionId', 'key', 'passwd', 'Authorization']) expect(secretName(name), name).toBe(true)
+    for (const name of ['password', 'GITHUB_TOKEN', 'access_token', 'client_secret', 'apiKey', 'X-Api-Key', 'PRIVATE-TOKEN', 'Set-Cookie', 'sessionId', 'key', 'passwd', 'Authorization', '_authToken', '_auth', '_password']) expect(secretName(name), name).toBe(true)
     for (const name of ['author', 'signal', 'passing', 'keyboard', 'https', 'Error', 'monkey', 'primary_key', 'tokenizer', 'marketplace']) expect(secretName(name), name).toBe(false)
   })
 
@@ -681,10 +705,10 @@ describe('a session behind an install reloads', () => {
     expect(RESTART_LINE).toBe("self-update: a plugin was updated on this machine after this session loaded its plugins, and two tries at /reload-plugins didn't reload them (skipped, or not run), so it tries no more for that update; /reload-plugins --force, a restart of this session, or a new one loads it.")
   })
 
-  test('a reload took unless Claude Code says it skipped it', () => {
+  test('a reload took only when Claude Code’s own line says it reloaded: never a skip, no answer, or an answer of another shape', () => {
     expect(reloadTook('Reloaded: 4 plugins · 2 skills')).toBe(true)
-    expect(reloadTook(undefined)).toBe(true)
-    expect(reloadTook('Skipped: the MCP tools would change. Run /reload-plugins --force to reload them.')).toBe(false)
+    expect(reloadTook('  Reloaded 3 plugins')).toBe(true)
+    for (const odd of [undefined, '', 'Skipped: the MCP tools would change. Run /reload-plugins --force to reload them.', 'Reloaded, but run /reload-plugins --force for the MCP tools', 'done', 'unknown command reload-plugins', 'Not reloaded: refused by policy', 'ReloadedX']) expect(reloadTook(odd), String(odd)).toBe(false)
   })
 })
 

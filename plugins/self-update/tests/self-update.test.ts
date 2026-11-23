@@ -891,7 +891,23 @@ describe('more of a look’s edges', () => {
     expect(w.kept()!.failed).toContain(`https://${SECRET}`)
   })
 
-  test('a state file that is there but can’t be read: no look, not even the lock, and nothing written over it; once it reads, a look', { options: { autoUpdate: BOTH, reloadAfterUpdate: 'off' } }, async ($, on) => {
+  test('`.npmrc`’s secrets, names led by `_` (a legacy npm token, which is a UUID, and base64 values), and a flag’s value after a space, are masked in the state file, the debug log and update_status', { options: { autoUpdate: BOTH, reloadAfterUpdate: 'off' } }, async ($, on) => {
+    const w = world(on)
+    // Made at run time: no token-shaped literal sits in the source.
+    const uuid = ['1b2c3d4e', '5f60', '4a7b', '8c9d', '0e1f2a3b4c5d'].join('-')
+    const auth = ['dXNlcj', 'pwYXNz'].join('')
+    const password = ['aHVudG', 'VyMg=='].join('')
+    const flagged = ['s3cr', 'et9'].join('')
+    w.state.failing.add(MINE)
+    w.state.failingSays = `npm ERR! //registry.npmjs.org/:_authToken=${uuid} _auth=${auth} _password=${password} git --password ${flagged}\r\n`
+    await begin($, w)
+    await look(w, 1)
+    const status = String((await $.tool.call({ tool: 'mcp__self-update__update_status' })).result)
+    for (const where of [w.kept()!.failed ?? '', ...w.debug, status]) for (const secret of [uuid, auth, password, flagged]) expect(where).not.toContain(secret)
+    expect(w.kept()!.failed).toBe(`claude plugin marketplace update ${MINE}: npm ERR! //registry.npmjs.org/:_authToken=${SECRET} _auth=${SECRET} _password=${SECRET} git --password ${SECRET}`)
+  })
+
+  test('a state file that is there but can’t be read: no look, not even the lock, and nothing written over it; once it reads, a look',{ options: { autoUpdate: BOTH, reloadAfterUpdate: 'off' } }, async ($, on) => {
     const w = world(on)
     w.put({ at: START - 10 * MINUTE, installed: START - 20 * MINUTE })
     w.state.stateUnreadable = true
@@ -1065,7 +1081,7 @@ describe('sessions pick an install up: a reload of their own, at idle', () => {
     w.put({ at: installed, installed })
     await turn($, w)
     await w.soon(() => w.reloads() === 1, 'the first try')
-    expect(w.debug.some(l => l.startsWith('self-update: /reload-plugins was skipped: Reload skipped'))).toBe(true)
+    expect(w.debug.some(l => l.startsWith("self-update: /reload-plugins didn't say it reloaded: Reload skipped"))).toBe(true)
     // The reload was skipped: the session is still behind, and the next turns' ends wait out the 15 minutes.
     await turn($, w)
     await w.quiet()

@@ -56,7 +56,7 @@
 // and runs nothing more in this session. A command that couldn't be started is a failure like any other, tried again at
 // the next look.
 import type { EngineInterface, Timer } from 'claude-code'
-import { COMMAND_MS, isSafeFolder, pendingPath, powershellCall, powershellPath, readPending, RELEASE_SCRIPT, stateFolder, SYSTEM_ROOT, TAKE_SCRIPT, UPDATE_SCRIPT } from './scripts'
+import { COMMAND_MS, isSafeFolder, pendingPath, powershellCall, powershellPath, readPending, RELEASE_SCRIPT, RENEW_AFTER_MS, RUN_GRACE_MS, stateFolder, SYSTEM_ROOT, TAKE_SCRIPT, UPDATE_SCRIPT } from './scripts'
 import {
   configFolderOf,
   ENDED_SAID,
@@ -93,21 +93,17 @@ import {
 const READ_MS = 5_000
 /** One of the lock's scripts runs this long at most. */
 const LOCK_RUN_MS = 15_000
-/** A run is given up on this long after its own timeout. */
-const RUN_GRACE_MS = 5_000
 
 /** Where this machine keeps what a look needs: Windows PowerShell, the home folder, the install records, the self tools' state folder, the lock and the state file. */
 type Place = { powershell: string; home: string; installed: string; stateDir: string; lock: string; state: string }
 
-/** The lock as this look holds it: the text it was last taken with (undefined once it isn't held), and when. */
-type Held = { text: string | undefined; at: number }
-
 /**
- * A lock older than this when a command is about to start is given back and taken again first. One step takes 80 s at
- * the most (scripts.ts, COMMAND_MS, and the 5 s this gives up on a script after it), so a lock no older than this as the
- * step starts is still under the 90 s at which TAKE takes a lock over when the step ends.
+ * The lock as this look holds it: the text it was last taken with (undefined once it isn't held), and when. A lock older
+ * than RENEW_AFTER_MS (scripts.ts) when a command is about to start is given back and taken again first: one step takes
+ * COMMAND_MS + RUN_GRACE_MS at the most, so a lock no older than that as the step starts is still under LOCK_STALE_MS,
+ * at which TAKE takes a lock over, when the step ends.
  */
-const RENEW_AFTER_MS = 5_000
+type Held = { text: string | undefined; at: number }
 
 /**
  * What register.ts hands a look: whether a /reload-plugins this plugin runs is out in this session (no look starts

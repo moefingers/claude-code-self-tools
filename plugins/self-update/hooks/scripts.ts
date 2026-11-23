@@ -245,11 +245,17 @@ export const STEP_MS = 55_000
 export const STEP_LEAST_MS = 5_000
 /**
  * The plugin's own timeout on the script: 20 s above STEP_MS, room for Windows PowerShell's start before the script's
- * first line, ending a tree and the last waits (9 s at the most), so it is only the backstop. It is given up on 5 s
- * after that (update.ts), so one step takes 80 s at the most: a lock taken right before it (update.ts) is still under
- * the 90 s at which another taker may take it over.
+ * first line, ending a tree and the last waits (9 s at the most), so it is only the backstop. It is given up on
+ * RUN_GRACE_MS after that (update.ts), so one step takes 80 s at the most: a lock at most RENEW_AFTER_MS old as it
+ * starts is still under LOCK_STALE_MS, at which another taker may take it over, when it ends.
  */
 export const COMMAND_MS = 75_000
+/** How long after its own timeout a script's run is given up on (update.ts). */
+export const RUN_GRACE_MS = 5_000
+/** A lock older than this when a command is about to start is given back and taken again first (update.ts). */
+export const RENEW_AFTER_MS = 5_000
+/** TAKE_SCRIPT's own figure: a lock this old is taken over by the next taker, whether its holder is alive or not. */
+export const LOCK_STALE_MS = 90_000
 
 /** UPDATE_SCRIPT's inputs: the step's kind, its name, and its scope. */
 export const KIND_VAR = 'SELF_UPDATE_KIND'

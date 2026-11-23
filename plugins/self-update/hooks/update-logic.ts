@@ -69,10 +69,25 @@ export function secretName(name: string): boolean {
   return words.some((word, i) => SECRET_WORDS.has(word) || (word === 'key' && (words.length === 1 || KEY_WORDS.has(words[i - 1] ?? ''))))
 }
 
-/** A name and what joins it to its value: `name=`, `name:`, `"name":`, `'name':`. Only the name is matched, so a value is still read for names of its own (`https://host/x?access_token=…`). */
-const NAME_HEAD = /(["']?)\b([A-Za-z][A-Za-z0-9_.-]{0,63})\1(\s*[:=]\s*)/g
+/**
+ * A name and what joins it to its value: `name=`, `name:`, `"name":`, `'name':`. A name starts at a letter or a `_` that
+ * no letter or digit stands before, so `.npmrc`'s `//registry.npmjs.org/:_authToken=…`, `_auth=…` and `_password=…`
+ * are names too. Only the name is matched, so a value is still read for names of its own (`https://host/x?access_token=…`).
+ */
+const NAME_HEAD = /(["']?)(?<![A-Za-z0-9])([_A-Za-z][A-Za-z0-9_.-]{0,63})\1(\s*[:=]\s*)/g
 /** The value after a secret's name: a header's scheme kept apart (`Authorization: token …`), then a quoted value, or one up to a space or a separator. */
 const NAMED_VALUE = /^((?:Bearer|Basic|Token|Digest|Negotiate|Bot)\s+)?("[^"]*"|'[^']*'|[^\s,;&"'<>()[\]{}]+)/i
+/** A command-line flag and the value after it, a space between them (`--password hunter2`, `--token x`): never a value that is a flag of its own. */
+const FLAG_VALUE = /(?<![A-Za-z0-9-])(--?)([A-Za-z][A-Za-z0-9_-]{0,63})(\s+)(?!-)("[^"]*"|'[^']*'|[^\s,;&"'<>()[\]{}]+)/g
+
+/** A value masked whole: its quotes kept, one already masked left as it is. */
+const wrappedSecret = (value: string): string => {
+  const bare = value.replace(/^["']|["']$/g, '')
+  return bare === SECRET ? value : value.startsWith('"') ? `"${SECRET}"` : value.startsWith("'") ? `'${SECRET}'` : SECRET
+}
+
+/** `text` with the value after each flag that names a secret (secretName) masked whole: `--password ‹secret›`. */
+const maskFlags = (text: string): string => text.replace(FLAG_VALUE, (all, dashes: string, name: string, space: string, value: string) => (secretName(name) ? `${dashes}${name}${space}${wrappedSecret(value)}` : all))
 
 /** `text` with each value a secret's name gives masked whole (secretName), its quotes and a header's scheme kept. */
 function maskNamed(text: string): string {
@@ -85,9 +100,7 @@ function maskNamed(text: string): string {
     const found = NAMED_VALUE.exec(text.slice(from))
     if (found === null) continue
     const [whole, scheme = '', value = ''] = found
-    const bare = value.replace(/^["']|["']$/g, '')
-    const wrapped = bare === SECRET ? value : value.startsWith('"') ? `"${SECRET}"` : value.startsWith("'") ? `'${SECRET}'` : SECRET
-    out += `${text.slice(last, from)}${scheme}${wrapped}`
+    out += `${text.slice(last, from)}${scheme}${wrappedSecret(value)}`
     last = from + whole.length
     heads.lastIndex = last
   }
@@ -105,7 +118,8 @@ const tokenRandom = (run: string): boolean => run.split(/[-_]/).some(piece => pi
  * - a URL's user and password, up to the last `@` before its host (`https://user:p@ss@host`);
  * - the word after Bearer or Basic, and a cookie header's whole value;
  * - a value given by a name that says secret (secretName), however it is given: `name=value`, `name: value`, a quoted
- *   name and value, a header with its scheme (`Authorization: token …`, `PRIVATE-TOKEN: …`, `X-Api-Key: …`), of any
+ *   name and value, a name led by `_` (`.npmrc`'s `:_authToken=…`, `_auth=…`), a header with its scheme
+ *   (`Authorization: token …`, `PRIVATE-TOKEN: …`, `X-Api-Key: …`), a flag and its value (`--password …`), of any
  *   length;
  * - the tokens of the shapes their issuers give them, 8 characters on from their prefix: GitHub's (ghp_, gho_, ghu_,
  *   ghs_, ghr_, github_pat_), GitLab's (glpat-), Slack's (xox?-), Anthropic's and OpenAI's (sk-), AWS key ids (AKIA,
@@ -117,10 +131,12 @@ const tokenRandom = (run: string): boolean => run.split(/[-_]/).some(piece => pi
  */
 export function masked(text: string): string {
   const named = maskNamed(
-    text
-      .replace(/(\b[A-Za-z][A-Za-z0-9+.-]*:\/\/)[^\s/?#]*@/g, (_, scheme: string) => `${scheme}${SECRET}@`)
-      .replace(/\b(Bearer|Basic)\s+(?!‹secret›)[^\s"',;]+/gi, (_, word: string) => `${word} ${SECRET}`)
-      .replace(/\b((?:Set-)?Cookie\s*:\s*)(?!‹secret›)[^"'\r\n]+/gi, (_, head: string) => `${head}${SECRET}`),
+    maskFlags(
+      text
+        .replace(/(\b[A-Za-z][A-Za-z0-9+.-]*:\/\/)[^\s/?#]*@/g, (_, scheme: string) => `${scheme}${SECRET}@`)
+        .replace(/\b(Bearer|Basic)\s+(?!‹secret›)[^\s"',;]+/gi, (_, word: string) => `${word} ${SECRET}`)
+        .replace(/\b((?:Set-)?Cookie\s*:\s*)(?!‹secret›)[^"'\r\n]+/gi, (_, head: string) => `${head}${SECRET}`),
+    ),
   )
   return named
     .replace(/\b(?:gh[pousr]_[A-Za-z0-9]{8,}|github_pat_[A-Za-z0-9_]{8,}|glpat-[A-Za-z0-9_-]{8,}|xox[abposr]-[A-Za-z0-9-]{8,}|sk-[A-Za-z0-9_-]{8,}|(?:AKIA|ASIA)[A-Z0-9]{12,}|AIza[A-Za-z0-9_-]{8,}|eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}(?:\.[A-Za-z0-9_-]*)?)/g, SECRET)
@@ -314,8 +330,9 @@ export function installsOf(text: string): Install[] | undefined {
 export type Step = { kind: 'marketplace'; marketplace: string } | { kind: 'plugin'; plugin: string; marketplace: string; scope: 'user' | 'local' | 'project'; folder?: string }
 
 /**
- * A project's folder a step may run from: one on a drive (C:\... or C:/...). Never a network share, a device path or
- * one with no drive: nothing here reaches out to another machine for a folder.
+ * A project's folder a step may run from: one whose path starts with a drive letter (C:\... or C:/...). Never a path
+ * written as a network share, a device path or one with no drive; a mapped drive, a `subst` drive or a junction can
+ * still lead to another machine, which this string test can't see.
  */
 export const PROJECT_FOLDER = /^[A-Za-z]:[\\/]/
 
@@ -528,8 +545,15 @@ export function failuresNext(
 /** How /reload-plugins says it skipped the reload: it does when the reload would change which MCP tools are loaded, until it is run with --force. */
 export const RELOAD_SKIPPED = /\/reload-plugins --force/
 
-/** Whether a /reload-plugins that answered `text` reloaded: anything but the line that says it was skipped. */
-export const reloadTook = (text: string | undefined): boolean => !RELOAD_SKIPPED.test(text ?? '')
+/** How Claude Code's /reload-plugins answers when it reloaded: a line that begins `Reloaded` (`Reloaded: 4 plugins · 2 skills`). */
+export const RELOADED = /^\s*Reloaded\b/
+
+/**
+ * Whether a /reload-plugins that answered `text` reloaded: only Claude Code's own line saying so (RELOADED), never the
+ * one that says it was skipped. No answer, or one of another shape (a plugin's hook that answered in its place, a
+ * refusal), counts as not reloaded: the session stays behind, and is tried again within the two tries.
+ */
+export const reloadTook = (text: string | undefined): boolean => typeof text === 'string' && RELOADED.test(text) && !RELOAD_SKIPPED.test(text)
 
 /** A reload tried for one install this many times at most. */
 export const RELOAD_TRIES = 2

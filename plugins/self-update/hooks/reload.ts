@@ -18,8 +18,9 @@
 // end; it never interrupts a turn, and Claude Code runs a plugin's command only once the session is idle anyway.
 //
 // Never a loop: a try counts right before /reload-plugins runs, kept in the plugin's session state by the install's
-// time. A reload that took leaves the session behind no more. One that Claude Code skipped (it asks for
-// /reload-plugins --force) or that didn't run is tried once more, 15 minutes on at the soonest, then never again for
+// time. A reload that took (Claude Code's own `Reloaded …` line) leaves the session behind no more. One that Claude Code
+// skipped (it asks for /reload-plugins --force), one that didn't run, or one whose answer is of another shape is tried
+// once more, 15 minutes on at the soonest, then never again for
 // that install: the person reads one line in the transcript, once, and nothing is added to the conversation. A later
 // install starts its own two tries.
 // Never `/reload-plugins --force`: forcing a held reload re-reads the whole conversation without the prompt cache,
@@ -78,7 +79,7 @@ export function reloadLoaded($: EngineInterface): void {
 /**
  * A /reload-plugins that started at `at` answered `text` (this plugin's, or one register.ts saw a person or another
  * plugin run): when it reloaded, everything installed before it started is loaded now, so the session's load time moves
- * on to `at`. One that was skipped moves nothing.
+ * on to `at`. One that was skipped, or whose answer isn't Claude Code's own line saying it reloaded, moves nothing.
  */
 export function reloadSeen(at: number, text: string | undefined): void {
   if (!reloadTook(text)) return
@@ -232,7 +233,7 @@ async function run($: EngineInterface): Promise<void> {
     const said = (await $.command.run({ command: 'reload-plugins' })).text
     // This module runs on (a reload replaces only the plugins that changed): the reload's answer says whether it took.
     reloadSeen(ranAt, said)
-    if (!reloadTook(said)) $.ui.log(`self-update: /reload-plugins was skipped: ${oneLine(said ?? '', 200)}`, { to: 'debug' })
+    if (!reloadTook(said)) $.ui.log(`self-update: /reload-plugins didn't say it reloaded: ${said === undefined || oneLine(said, 200) === '' ? 'no answer' : oneLine(said, 200)}`, { to: 'debug' })
   } catch (error) {
     const said = (error instanceof Error ? error.message : String(error)).trim()
     $.ui.log(`self-update: /reload-plugins didn't run: ${said === '' ? 'no reason given' : said}.`, { to: 'debug' })
