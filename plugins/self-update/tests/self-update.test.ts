@@ -1,14 +1,16 @@
-// self-update against the engine's own test kit. With `autoUpdate` empty (the default) nothing of it runs, reads or
-// writes. Set, a session's start or a turn's end makes one look when the machine's last is five minutes old: the lock
-// taken, each named marketplace with a plugin installed here refreshed, every install record of it updated in its own
-// scope and from its own folder, the lock given back; one line and one toast per install, nothing when nothing changed.
-// It never runs for a marketplace that isn't named or a plugin with no record. A session whose plugins were loaded
-// before an install reloads itself at idle, twice at most for one install. Failures: tried again at the next look,
-// which comes later for each look in a row that couldn't reach a marketplace (never for a plugin's own update failing);
-// one toast after three. A command the script ended past its time, or that gave no answer at all, ends its
-// marketplace's steps for the look. A step that couldn't be started is a failure like any other. Another session's
-// fresh lock or fresh look: nothing; a lock a dead process left: taken over. Another plugin that keeps plugins current
-// shares the lock and never the state file. A reload this plugin runs and a look never overlap in the session.
+// self-update against the engine's own test kit. With `autoUpdate` empty (the default): no look, no lock, no state file
+// or install record read or written, no command, no reload. Set, a session's start or a turn's end makes one look when
+// the machine's last is five minutes old: the lock taken (and taken again before each command once it is 5 s old), each
+// named marketplace with a plugin installed here refreshed, every install record of it updated in its own scope and from
+// its own folder, the lock given back; one line and one toast per install, nothing when nothing changed. It never runs
+// for a marketplace that isn't named or a plugin with no record. A session whose plugins were loaded before an install
+// reloads itself at idle; a reload that ran ends that, whoever ran it, and a skipped one is tried twice at most.
+// Failures: tried again at the next look, which comes later for each look in a row that couldn't reach a marketplace
+// (never for a plugin's own update failing); one toast after three. A command the script ended past its time, or that
+// gave no answer at all, ends its marketplace's steps for the look. A step that couldn't be started is a failure like
+// any other. Another session's fresh lock or fresh look: nothing; a lock a dead process left: taken over; a lock taken
+// over mid-look: the look stops. Another plugin that keeps plugins current shares the lock and never the state file. An
+// exit or a restart pending here: no look. A reload this plugin runs and a look never overlap in the session.
 //
 // The hooks registered here sit beneath the plugin and stand for the engine (its files, its commands) and for the
 // machine: the lock's two scripts and UPDATE_SCRIPT are answered as their PowerShell would, the stand-in for `claude
@@ -16,8 +18,8 @@
 // are matched by their ends, so the file reads the same on any host.
 import { describe, expect, mock, test, type Engine } from 'claude-code/testing'
 import type { On } from 'claude-code'
-import { ENDED, NO_CLAUDE, RELEASE_SCRIPT, TAKE_SCRIPT, UPDATE_SCRIPT } from '../hooks/scripts'
-import { RELOAD_LINE, RESTART_LINE } from '../hooks/update-logic'
+import { ENDED, INSIDE, NO_CLAUDE, RELEASE_SCRIPT, TAKE_SCRIPT, UPDATE_SCRIPT } from '../hooks/scripts'
+import { RELOAD_LINE, RESTART_LINE, SECRET } from '../hooks/update-logic'
 
 const START = 1_700_000_000_000
 const MINUTE = 60_000
@@ -43,6 +45,8 @@ const norm = (path: string) => path.replace(/\\/g, '/').toLowerCase()
 const STATE_FILE = /auto-update[\\/][0-9a-f]{8}\.self-update\.json$/
 /** The state file another plugin that keeps plugins current keeps beside the same lock: never read or written here. */
 const OTHER_STATE = /auto-update[\\/][0-9a-f]{8}\.json$/
+/** This conversation's pending marker, which self-exit and self-restart write: read here, never written. */
+const PENDING_FILE = /claude-self-tools[\\/]pending[\\/][0-9a-f-]{36}\.json$/
 const LOCK_FILE = /auto-update[\\/][0-9a-f]{8}\.lock$/
 const rec = (plugin: string, marketplace: string, version: string, extra: Partial<Rec> = {}): Rec => ({ scope: 'user', installPath: `${CACHE}\\${marketplace}\\${plugin}\\${version}`, version, ...extra })
 
@@ -78,6 +82,23 @@ function world(on: On, how: { windows?: boolean } = {}) {
     agents: [] as Array<{ id: string; status: string }>,
     /** /reload-plugins answers only once released (the module it ran in is replaced, or it hangs); else at once. */
     reloadHangs: false,
+    /** /reload-plugins answers that it skipped the reload (it would change the MCP tools: --force is the person's). */
+    reloadSkips: false,
+    /** How long each command of a look takes, on the clock. */
+    stepMs: 0,
+    /** After this many commands, another updater has taken the lock over (as it would one over 90 s old). */
+    takeoverAfter: undefined as number | undefined,
+    /** At this release of the lock, another updater takes it in the moment before it is taken again. */
+    snatchAtRelease: undefined as number | undefined,
+    /** This conversation's pending marker, as self-exit or self-restart writes it; and after this many commands, one written meanwhile. */
+    pending: undefined as string | undefined,
+    pendingAfter: undefined as { runs: number; text: string } | undefined,
+    /** The state file is there but can't be read (a read that runs out of time, a file another program holds). */
+    stateUnreadable: false,
+    /** Names whose step finds only a claude inside the folder it runs from. */
+    inside: new Set<string>(),
+    /** A failing command's error line, in place of the usual one. */
+    failingSays: undefined as string | undefined,
   }
   /** The state file, as last written (or as a test puts it there, for another session's look). */
   let stateFile: string | undefined
@@ -88,6 +109,10 @@ function world(on: On, how: { windows?: boolean } = {}) {
   let openReload: () => void = () => undefined
   const locks = new Map<string, string>()
   const lockRuns: Array<{ op: 'take' | 'release'; answer: string }> = []
+  /** When each of lockRuns ran, on the clock: a release and a take at one moment are the lock renewed, not a look's end. */
+  const lockTimes: number[] = []
+  /** How old this plugin's lock was as each command started, in ms (undefined: no lock held). */
+  const ages: Array<number | undefined> = []
   const runs: Run[] = []
   /** Every program started that is not one of the three scripts by Windows PowerShell: its argument vector. */
   const others: string[][] = []
@@ -100,13 +125,16 @@ function world(on: On, how: { windows?: boolean } = {}) {
   /** The transcript's lines, and the debug log's. */
   const logs: string[] = []
   const debug: string[] = []
-  const looks = () => lockRuns.filter(r => r.op === 'release').length
+  /** The looks that ended: each release of the lock but one that the lock's renewal follows at the same moment. */
+  const looks = () => lockRuns.filter((r, i) => r.op === 'release' && !(lockRuns[i + 1]?.op === 'take' && lockTimes[i + 1] === lockTimes[i])).length
   // A Windows machine, unless told otherwise (then one with a home folder and none of Windows' variables).
   mock.env(on, how.windows === false ? { HOME: '/home/tester' } : { OS: 'Windows_NT', USERPROFILE: HOME, LOCALAPPDATA: LOCAL, SystemRoot: 'C:\\Windows' })
-  on('fs.exists', (_, e) => ({ value: norm(e.path).endsWith(norm(WEB)) }))
+  on('fs.exists', (_, e) => ({ value: norm(e.path).endsWith(norm(WEB)) || (PENDING_FILE.test(e.path) && state.pending !== undefined) || (STATE_FILE.test(e.path) && (stateFile !== undefined || state.stateUnreadable)) }))
   on('fs.read', (_, e) => {
     reads.push(e.path)
     if (e.path.endsWith('installed_plugins.json') && !state.recordsUnreadable) return { value: JSON.stringify({ version: 2, plugins: state.records }) }
+    if (STATE_FILE.test(e.path) && state.stateUnreadable) return { deny: `EBUSY: resource busy or locked, open '${e.path}'` }
+    if (PENDING_FILE.test(e.path) && state.pending !== undefined) return { value: state.pending }
     if (STATE_FILE.test(e.path) && stateFile !== undefined) return { value: stateFile }
     // The other plugin's state file is there, with an install of its own: never read by this plugin.
     if (OTHER_STATE.test(e.path)) return { value: JSON.stringify({ v: 1, at: START, fails: 0, told: false, installed: START + 999 * MINUTE }) }
@@ -142,6 +170,8 @@ function world(on: On, how: { windows?: boolean } = {}) {
           if (!locks.has(path)) return 'gone'
           if (locks.get(path) !== text) return 'kept'
           locks.delete(path)
+          // Another updater takes it in the moment before this one takes it again.
+          if (lockRuns.filter(r => r.op === 'release').length + 1 === state.snatchAtRelease) locks.set(path, JSON.stringify({ v: 1, by: 'another-updater', at: clock.now() }))
           return 'released'
         }
         const held = locks.get(path)
@@ -154,17 +184,25 @@ function world(on: On, how: { windows?: boolean } = {}) {
         return 'taken'
       })()
       lockRuns.push({ op: script === TAKE_SCRIPT ? 'take' : 'release', answer })
+      lockTimes.push(clock.now())
       return ran(0, `${answer}\r\n`)
     }
     // UPDATE_SCRIPT, as its PowerShell would answer with a `claude plugin` that updates only what is installed.
     const run: Run = { kind: String(env.SELF_UPDATE_KIND), name: String(env.SELF_UPDATE_NAME), scope: String(env.SELF_UPDATE_SCOPE), cwd: String(e.init?.cwd) }
     runs.push(run)
+    const mineLock = [...locks.values()].map(text => JSON.parse(text) as { by: string; at: number }).find(lock => lock.by === 'self-update')
+    ages.push(mineLock === undefined ? undefined : clock.now() - mineLock.at)
     if (state.unstartable.has(run.name) || (state.webUnstartable && norm(run.cwd).endsWith(norm(WEB)))) return { deny: 'spawn ENOTDIR' }
     if (gate !== undefined) await gate
     if (state.silent.has(run.name)) await new Promise(() => undefined)
+    if (state.stepMs > 0) await clock.sleep(state.stepMs)
+    // What happens on the machine while this command runs: another updater takes the lock over, an exit is queued.
+    if (runs.length === state.takeoverAfter) for (const path of locks.keys()) locks.set(path, JSON.stringify({ v: 1, by: 'another-updater', at: clock.now() }))
+    if (runs.length === state.pendingAfter?.runs) state.pending = state.pendingAfter.text
     if (state.noClaude) return ran(97, `${NO_CLAUDE}\r\n`)
+    if (state.inside.has(run.name)) return ran(94, `${INSIDE}\r\n`)
     if (state.ending.has(run.name)) return ran(95, `Updating ${run.name}...\r\n\r\n${ENDED}\r\n`)
-    if (state.failing.has(run.name)) return ran(1, 'Working...\r\n\r\nself-update: exit 1\r\n', `warning: one try left\r\nError: the ${run.kind} could not be ${run.kind === 'marketplace' ? 'refreshed' : 'updated'}\r\n`)
+    if (state.failing.has(run.name)) return ran(1, 'Working...\r\n\r\nself-update: exit 1\r\n', state.failingSays ?? `warning: one try left\r\nError: the ${run.kind} could not be ${run.kind === 'marketplace' ? 'refreshed' : 'updated'}\r\n`)
     if (run.kind === 'marketplace') return ran(0, `Updating marketplace: ${run.name}...\r\nSuccessfully updated marketplace: ${run.name}\r\n\r\nself-update: exit 0\r\n`)
     const mine = (state.records[run.name] ?? []).find(r => r.scope === run.scope && (r.scope === 'user' ? norm(run.cwd).endsWith(norm(HOME)) : r.projectPath !== undefined && norm(run.cwd).endsWith(norm(r.projectPath))))
     if (mine === undefined) return ran(1, '\r\nself-update: exit 1\r\n', `Plugin "${run.name}" is not installed in ${run.scope} scope\r\n`)
@@ -193,7 +231,7 @@ function world(on: On, how: { windows?: boolean } = {}) {
         reloadGate ??= new Promise<void>(resolve => (openReload = resolve))
         await reloadGate
       }
-      return { text: 'Reloaded: 4 plugins · 2 skills' }
+      return { text: state.reloadSkips ? 'Reload skipped: it would change which MCP tools are loaded. Run /reload-plugins --force to reload anyway.' : 'Reloaded: 4 plugins · 2 skills' }
     }
     return { text: `unknown command ${e.command}` }
   })
@@ -242,6 +280,7 @@ function world(on: On, how: { windows?: boolean } = {}) {
     clock,
     locks,
     lockRuns,
+    ages,
     runs,
     others,
     reads,
@@ -325,7 +364,7 @@ const updaterLike = (argv: string[]) => /(?:^|[\\/])(?:powershell|pwsh|cmd|claud
 const touched = (paths: readonly string[]) => paths.filter(p => p.endsWith('installed_plugins.json') || /auto-update/.test(p))
 
 describe('off by default', () => {
-  test('with autoUpdate empty nothing of it runs, reads or writes, at a start, at turns’ ends, or hours on, and update_status says so', async ($, on) => {
+  test('with autoUpdate empty: no look, no lock, no state file or install record read or written, no command and no reload, at a start, at turns’ ends, or hours on, and update_status says so', async ($, on) => {
     const w = world(on)
     w.state.available = { [`widget@${MINE}`]: '1.5.0', [`self-wake@${TOOLS}`]: '0.4.1' }
     // Another session's look installed something: with the setting empty, this one doesn't even read of it.
@@ -489,7 +528,7 @@ describe('on: one look per five minutes, only what is named and installed', () =
     await w.later(2 * MINUTE)
     const status = String((await $.tool.call({ tool: 'mcp__self-update__update_status' })).result)
     expect(status).toBe(
-      `autoUpdate names ${MINE}, ${TOOLS}. reloadAfterUpdate is off. Last look: 2 min ago; the next comes at a turn's end 5 minutes after it. 1 look in a row had a failure; the last: claude plugin update self-exit@${TOOLS} --scope user: Error: the plugin could not be updated. Last install: 2 min ago; this session loaded its plugins before it, and reloadAfterUpdate is off: /reload-plugins or a new session loads it.`,
+      `autoUpdate names ${MINE}, ${TOOLS}. reloadAfterUpdate is off. Last look: 2 min ago; the next comes at a turn's end 5 minutes after it. 1 look in a row had a failure; the last, quoted from its output: «claude plugin update self-exit@${TOOLS} --scope user: Error: the plugin could not be updated». Last install: 2 min ago; this session loaded its plugins before it, and reloadAfterUpdate is off: /reload-plugins or a new session loads it.`,
     )
     // A subagent is refused: the status is the main session's.
     expect((await $.tool.call({ tool: 'mcp__self-update__update_status', agentId: 'a1' })).deny).toContain("A subagent can't read self-update's status")
@@ -604,7 +643,7 @@ describe('failures: tried again at the next look; the wait stretches only while 
     await look(w, 1)
     // The user's scope ran past its time: the local scope of the same marketplace isn't tried in this look.
     expect(w.said()).toEqual([ONE_LOOK[0], ONE_LOOK[1], ...ONE_LOOK.slice(3)])
-    expect(w.kept()).toMatchObject({ fails: 1, failed: `claude plugin update widget@${MINE} --scope user: its 75 s ran out, and whatever it had started was ended with it` })
+    expect(w.kept()).toMatchObject({ fails: 1, failed: `claude plugin update widget@${MINE} --scope user: its 55 s ran out, and whatever it had started was ended with it` })
     // Its marketplace was reached (the refresh passed): the wait to the next look is not stretched.
     expect(w.kept()).not.toHaveProperty('unreached')
     expect(w.locks.size).toBe(0)
@@ -653,17 +692,25 @@ describe('failures: tried again at the next look; the wait stretches only while 
     expect(w.kept()).toMatchObject({ fails: 2, unreached: 2 })
   })
 
-  test('a script that never answers: the engine’s own timeout ends the wait, the marketplace’s steps are over for this look, and the look goes on and ends', { options: { autoUpdate: BOTH, reloadAfterUpdate: 'off' } }, async ($, on) => {
+  test('a script that never answers: the plugin’s own timeout ends the wait (80 s), the marketplace’s steps are over for this look, and the look goes on, its lock taken again first, and ends', { options: { autoUpdate: BOTH, reloadAfterUpdate: 'off' } }, async ($, on) => {
     const w = world(on)
     w.state.silent.add(MINE)
     await begin($, w)
     await w.until(() => w.runs.length === 1, 'the first command')
-    await w.later(80_000)
+    await w.later(70_000)
     expect(w.looks()).toBe(0)
     await w.later(20_000)
     await look(w, 1)
     expect(w.said()).toEqual([ONE_LOOK[0], ...ONE_LOOK.slice(3)])
-    expect(w.kept()).toMatchObject({ fails: 1, unreached: 1, failed: `claude plugin marketplace update ${MINE}: its script gave no answer in 90 s` })
+    expect(w.kept()).toMatchObject({ fails: 1, unreached: 1, failed: `claude plugin marketplace update ${MINE}: its script gave no answer in 75 s` })
+    // The lock was 80 s old after the silent step: given back and taken again before the next command, never older than 5 s at one's start.
+    expect(w.lockRuns).toEqual([
+      { op: 'take', answer: 'taken' },
+      { op: 'release', answer: 'released' },
+      { op: 'take', answer: 'taken' },
+      { op: 'release', answer: 'released' },
+    ])
+    expect(w.ages.every(age => age !== undefined && age <= 5_000)).toBe(true)
   })
 
   test('a step that can’t be started (its folder can’t be a working folder): a failure like any other, the rest of the look runs, and the next look tries again; the updater is never turned off for it', { options: { autoUpdate: BOTH, reloadAfterUpdate: 'off' } }, async ($, on) => {
@@ -720,6 +767,172 @@ describe('where it can’t run', () => {
     expect(w.debug.filter(l => l.includes('autoUpdate is set'))).toEqual(['self-update: autoUpdate is set, but it does nothing in this session: it runs on Windows only.'])
     expect(w.logs.filter(l => /autoUpdate|self-update/.test(l))).toEqual([])
     expect(String((await $.tool.call({ tool: 'mcp__self-update__update_status' })).result)).toBe(`autoUpdate names ${MINE}, ${TOOLS}. reloadAfterUpdate is on. It does nothing in this session: it runs on Windows only.`)
+  })
+})
+
+describe('the lock: never older than 5 s as a command starts; a look whose lock is lost stops at once', () => {
+  /** The clock moved 10 s at a time until `cond` holds, 60 times at most: for looks whose commands take time. */
+  async function through(w: World, cond: () => boolean, what: string) {
+    for (let i = 0; i < 60 && !cond(); i += 1) await w.later(10_000)
+    if (!cond()) throw new Error(`${what} didn't come`)
+  }
+
+  test('a look that runs for minutes gives the lock back and takes it again before each command: none starts under a lock more than 5 s old, so no taker ever finds it 90 s old', { options: { autoUpdate: BOTH, reloadAfterUpdate: 'off' } }, async ($, on) => {
+    const w = world(on)
+    w.state.stepMs = 40_000
+    await begin($, w)
+    await through(w, () => w.looks() >= 1, 'the look’s end')
+    expect(w.said()).toEqual(ONE_LOOK)
+    expect(w.ages).toHaveLength(ONE_LOOK.length)
+    expect(w.ages.every(age => age !== undefined && age <= 5_000)).toBe(true)
+    // The first take, then one take again before every command after the first; every one taken, every give-back its own.
+    expect(w.lockRuns.filter(r => r.op === 'take')).toHaveLength(ONE_LOOK.length)
+    expect(w.lockRuns.every(r => r.answer === 'taken' || r.answer === 'released')).toBe(true)
+    expect(w.locks.size).toBe(0)
+  })
+
+  test('another updater takes the lock over while a command runs: the look stops before its next command, runs nothing more, says so, leaves that lock alone, and records what it installed', { options: { autoUpdate: BOTH, reloadAfterUpdate: 'off' } }, async ($, on) => {
+    const w = world(on)
+    w.state.stepMs = 40_000
+    w.state.takeoverAfter = 2
+    w.state.available = { [`widget@${MINE}`]: '1.5.0' }
+    await begin($, w)
+    await through(w, () => w.debug.some(l => l.startsWith('self-update: the look stops')), 'the stop')
+    await w.quiet()
+    expect(w.said()).toEqual(ONE_LOOK.slice(0, 2))
+    expect(w.debug.filter(l => l.startsWith('self-update: the look stops'))).toEqual(['self-update: the look stops before its next command: another updater took the lock over.'])
+    expect(w.lockRuns).toEqual([
+      { op: 'take', answer: 'taken' },
+      { op: 'release', answer: 'released' },
+      { op: 'take', answer: 'taken' },
+      { op: 'release', answer: 'kept' },
+    ])
+    expect([...w.locks.values()].map(text => (JSON.parse(text) as { by: string }).by)).toEqual(['another-updater'])
+    // What its commands installed before the stop is recorded and said; the look's counts stay as they were.
+    expect(w.toasts.filter(t => t.startsWith('self-update: updated '))).toEqual([`self-update: updated widget 1.4.0 to 1.5.0 from ${MINE}; ${NO_RELOADS}`])
+    expect(w.kept()).toMatchObject({ fails: 0, told: false, installed: expect.any(Number) })
+  })
+
+  test('another updater takes the lock in the moment it is given back: this look doesn’t take it, stops, and says so', { options: { autoUpdate: BOTH, reloadAfterUpdate: 'off' } }, async ($, on) => {
+    const w = world(on)
+    w.state.stepMs = 40_000
+    w.state.snatchAtRelease = 1
+    await begin($, w)
+    await through(w, () => w.debug.some(l => l.startsWith('self-update: the look stops')), 'the stop')
+    await w.quiet()
+    expect(w.said()).toEqual(ONE_LOOK.slice(0, 1))
+    expect(w.lockRuns).toEqual([
+      { op: 'take', answer: 'taken' },
+      { op: 'release', answer: 'released' },
+      { op: 'take', answer: expect.stringMatching(/^held\|another-updater\|/) },
+    ])
+    expect(w.debug).toContain('self-update: the look stops before its next command: another updater took the lock as it was given back.')
+  })
+})
+
+describe('an exit or a restart pending in this session: no look meets its check', () => {
+  const marker = (at: number) => JSON.stringify({ v: 1, kind: 'exit', at })
+
+  test('this conversation’s marker says an exit is pending: no look at that turn’s end, not even the lock; once it says done, the next turn’s end looks; the marker is only read', { options: { autoUpdate: BOTH, reloadAfterUpdate: 'off' } }, async ($, on) => {
+    const w = world(on)
+    w.put({ at: START - MINUTE })
+    await begin($, w)
+    await w.later(5 * MINUTE)
+    w.state.pending = marker(w.clock.now())
+    await turn($, w)
+    await w.quiet()
+    expect(w.lockRuns).toEqual([])
+    expect(w.runs).toEqual([])
+    expect(w.debug).toContain('self-update: no look now: an exit or a restart is pending in this session.')
+    // The exit was cancelled, and self-exit marked it done: the next turn's end looks.
+    w.state.pending = JSON.stringify({ v: 1, done: true })
+    await turn($, w)
+    await look(w, 1)
+    expect(w.said()).toEqual(ONE_LOOK)
+    expect(w.writes.some(p => PENDING_FILE.test(p))).toBe(false)
+  })
+
+  test('a marker over 15 minutes old, or one dated ahead of the clock, holds nothing', { options: { autoUpdate: BOTH, reloadAfterUpdate: 'off' } }, async ($, on) => {
+    const w = world(on)
+    w.state.pending = marker(START - 16 * MINUTE)
+    await begin($, w)
+    await look(w, 1)
+    w.state.pending = marker(w.clock.now() + 10 * MINUTE)
+    await w.later(6 * MINUTE)
+    await turn($, w)
+    await look(w, 2)
+  })
+
+  test('a restart queued while a look runs: the look stops before its next command, and gives its lock back', { options: { autoUpdate: BOTH, reloadAfterUpdate: 'off' } }, async ($, on) => {
+    const w = world(on)
+    w.state.pendingAfter = { runs: 1, text: JSON.stringify({ v: 1, kind: 'restart', at: START }) }
+    await begin($, w)
+    await look(w, 1)
+    expect(w.said()).toEqual(ONE_LOOK.slice(0, 1))
+    expect(w.debug).toContain('self-update: the look stops before its next command: an exit or a restart is pending in this session.')
+    expect(w.locks.size).toBe(0)
+  })
+})
+
+describe('more of a look’s edges', () => {
+  test('a failing command’s secret is masked whole in the state file, the debug log and update_status, though it sits across the 200th character', { options: { autoUpdate: BOTH, reloadAfterUpdate: 'off' } }, async ($, on) => {
+    const w = world(on)
+    // Made at run time: no token-shaped literal sits in the source.
+    const random = ['Zx9', 'Qw8', 'Er7', 'Ty6', 'Ui5', 'Op4', 'As3', 'Df2', 'Gh1', 'Jk0', 'Lm9'].join('')
+    w.state.failing.add(MINE)
+    w.state.failingSays = `fatal: ${'x'.repeat(150)} unable to access 'https://oauth2:${random}@git.example.com/team/plugins.git/'\r\n`
+    await begin($, w)
+    await look(w, 1)
+    const status = String((await $.tool.call({ tool: 'mcp__self-update__update_status' })).result)
+    for (const where of [w.kept()!.failed ?? '', ...w.debug, status]) {
+      expect(where).not.toContain(random.slice(0, 6))
+      expect(where).not.toContain('oauth2')
+    }
+    expect(w.kept()!.failed).toContain(`https://${SECRET}`)
+  })
+
+  test('a state file that is there but can’t be read: no look, not even the lock, and nothing written over it; once it reads, a look', { options: { autoUpdate: BOTH, reloadAfterUpdate: 'off' } }, async ($, on) => {
+    const w = world(on)
+    w.put({ at: START - 10 * MINUTE, installed: START - 20 * MINUTE })
+    w.state.stateUnreadable = true
+    await begin($, w)
+    await turn($, w)
+    await w.quiet()
+    expect(w.lockRuns).toEqual([])
+    expect(w.writes).toEqual([])
+    expect(w.debug).toContain("self-update: no look now: its state file is there but can't be read.")
+    w.state.stateUnreadable = false
+    await turn($, w)
+    await look(w, 1)
+    // What it held survived: the install's time is kept.
+    expect(w.kept()).toMatchObject({ installed: START - 20 * MINUTE })
+  })
+
+  test('a subagent’s turn end starts no look and no reload; the main loop’s does', { options: { autoUpdate: BOTH } }, async ($, on) => {
+    const w = world(on)
+    w.put({ at: START - MINUTE })
+    await begin($, w)
+    await w.later(5 * MINUTE)
+    // Another session's look installed a minute ago, after this one loaded, and that look is six minutes old: both are due.
+    w.put({ at: w.clock.now() - 6 * MINUTE, installed: w.clock.now() - MINUTE })
+    await $.turn.start({ text: 'working', turnId: 's1', agentId: 'a1' })
+    await $.turn.complete({ answer: 'done', durationMs: 1, isAborted: false, turnId: 's1', reason: 'answer', agentId: 'a1' })
+    await w.quiet()
+    expect(w.lockRuns).toEqual([])
+    expect(w.reloads()).toBe(0)
+    await turn($, w)
+    await look(w, 1)
+    await w.soon(() => w.reloads() === 1, 'the main loop’s reload')
+  })
+
+  test('a step that finds only a claude inside its folder: a failure like any other, said so, the look goes on, and the wait is not stretched', { options: { autoUpdate: BOTH, reloadAfterUpdate: 'off' } }, async ($, on) => {
+    const w = world(on)
+    w.state.inside.add(`self-wake@${TOOLS}`)
+    await begin($, w)
+    await look(w, 1)
+    expect(w.said()).toEqual(ONE_LOOK)
+    expect(w.kept()).toMatchObject({ fails: 1, failed: `claude plugin update self-wake@${TOOLS} --scope user: the only claude on PATH is inside the folder it would run from, so it was not run` })
+    expect(w.kept()).not.toHaveProperty('unreached')
   })
 })
 
@@ -792,8 +1005,53 @@ describe('sessions pick an install up: a reload of their own, at idle', () => {
     await w.soon(() => w.reloads() === 1, 'the reload at the turn’s end')
   })
 
-  test('never a loop: a reload that leaves the session as it was is tried once more, 15 minutes on, then never again for that install; the person reads one line, once; a later install starts afresh', { options: { autoUpdate: 'not-installed-here' } }, async ($, on) => {
+  test('a reload that ran leaves the session current, though this plugin’s own module runs on (Claude Code reloads only what changed): no second reload for that install, no restart line, and update_status says so', { options: { autoUpdate: 'not-installed-here' } }, async ($, on) => {
     const w = world(on)
+    await begin($, w)
+    await look(w, 1)
+    await w.later(MINUTE)
+    const installed = w.clock.now()
+    w.put({ at: installed, installed })
+    await turn($, w)
+    await w.soon(() => w.reloads() === 1, 'the reload')
+    // Turns' ends, past the 15 minutes and on: the session is behind that install no more.
+    for (let i = 0; i < 4; i += 1) {
+      await w.later(20 * MINUTE)
+      await turn($, w)
+    }
+    await w.quiet()
+    expect(w.reloads()).toBe(1)
+    expect(w.logs.filter(l => l === RESTART_LINE)).toEqual([])
+    expect(String((await $.tool.call({ tool: 'mcp__self-update__update_status' })).result)).toContain('this session loaded its plugins after it.')
+  })
+
+  test('a /reload-plugins a person runs counts too: the session behind an install is behind it no more, and self-update runs none of its own', { options: { autoUpdate: 'not-installed-here' } }, async ($, on) => {
+    const w = world(on)
+    await begin($, w)
+    await look(w, 1)
+    await w.later(MINUTE)
+    w.put({ at: w.clock.now(), installed: w.clock.now() })
+    // The person is typing: self-update's reload waits; the person runs /reload-plugins themselves.
+    w.state.draft = 'half a sente'
+    await turn($, w)
+    await w.quiet()
+    expect(w.reloads()).toBe(0)
+    await w.later(MINUTE)
+    await $.command.run({ command: 'reload-plugins', args: '', origin: { kind: 'composer' }, presentation: { isFullscreen: false, columns: 120 } })
+    w.state.draft = ''
+    for (let i = 0; i < 3; i += 1) {
+      await turn($, w)
+      await w.later(MINUTE)
+    }
+    await w.quiet()
+    // The person's own reload alone: none of self-update's.
+    expect(w.reloads()).toBe(1)
+    expect(w.logs.filter(l => l === RELOAD_LINE)).toEqual([])
+  })
+
+  test('never a loop: a reload that Claude Code skipped is tried once more, 15 minutes on, then never again for that install; the person reads one line, once; a later install starts afresh', { options: { autoUpdate: 'not-installed-here' } }, async ($, on) => {
+    const w = world(on)
+    w.state.reloadSkips = true
     const kept: unknown[] = []
     on('state.set', { key: 'reload' }, async (_, e, next) => {
       kept.push(e.value)
@@ -807,7 +1065,8 @@ describe('sessions pick an install up: a reload of their own, at idle', () => {
     w.put({ at: installed, installed })
     await turn($, w)
     await w.soon(() => w.reloads() === 1, 'the first try')
-    // The reload left the session as it was (the same module runs on): the next turns' ends wait out the 15 minutes.
+    expect(w.debug.some(l => l.startsWith('self-update: /reload-plugins was skipped: Reload skipped'))).toBe(true)
+    // The reload was skipped: the session is still behind, and the next turns' ends wait out the 15 minutes.
     await turn($, w)
     await w.quiet()
     expect(w.reloads()).toBe(1)

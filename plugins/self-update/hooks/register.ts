@@ -1,6 +1,8 @@
 // Keeps the plugins this machine already has from the marketplaces the person names current, and reloads each session
-// behind an install at its next idle moment. Off by default: with `autoUpdate` empty, nothing of it runs, reads or
-// writes. The look is update.ts (the pure side update-logic.ts, the scripts scripts.ts); the reload is reload.ts.
+// behind an install at its next idle moment. Off by default: with `autoUpdate` empty, no look runs, no lock, state file
+// or install record is read or written, no command runs, and no session reloads for an update; the tool still answers,
+// and the update check every self tool has still rides on it. The look is update.ts (the pure side update-logic.ts, the
+// scripts scripts.ts); the reload is reload.ts.
 //
 // The two moments: a session's start and each main-loop turn's end, where a person is at the session (claude -p and SDK
 // hosts don't look). At each, a look when one is due (update.ts), then, at a turn's end, whether this session is behind
@@ -9,7 +11,7 @@
 // One tool, update_status, read-only: what self-update does on this machine and in this session. It is also the tool
 // the update check rides on, as every self tool's does (update-check.ts).
 import type { EngineInterface, Register } from 'claude-code'
-import { reloadCheck, reloadLoaded, reloadOn, reloadRunning, reloadStatusRead, reloadTurn, setReloadConf, setReloadInteractive } from './reload'
+import { reloadCheck, reloadLoaded, reloadOn, reloadRunning, reloadSeen, reloadStatusRead, reloadTurn, setReloadConf, setReloadInteractive } from './reload'
 import { setUpdateConf, updateConf, updateLook, updateStatusRead } from './update'
 import { autoUpdateOf, reloadAfterUpdateOf, statusText } from './update-logic'
 import { configureUpdateCheck, loadUpdateCheck, withUpdateNotice } from './update-check'
@@ -77,6 +79,15 @@ export const register: Register = (on, options) => {
     reloadTurn(false)
     // Neither waits on anything, nor throws: each runs in the background, one at a time.
     moment($, true)
+    return done
+  })
+
+  // A /reload-plugins a person or another plugin runs: once it has answered, and reloaded, what was installed before it
+  // started is loaded, so the session is behind that update no more (reload.ts). Only watched: it is passed on as it is.
+  on('command.run', { command: 'reload-plugins' }, async ($, e, next) => {
+    const at = await $.clock.now().catch(() => undefined)
+    const done = await next(e)
+    if (at !== undefined) reloadSeen(at, done.text)
     return done
   })
 

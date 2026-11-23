@@ -15,11 +15,13 @@ import {
   FAILS_TOLD,
   failureSaid,
   failuresNext,
+  floorHolds,
   folderKey,
   INSTALL_AHEAD_MS,
   installedLine,
   installsChanged,
   installsOf,
+  LINE_READ_MAX,
   lockText,
   LOOK_EVERY_MAX_MS,
   LOOK_EVERY_MS,
@@ -33,6 +35,7 @@ import {
   pluginsFolderOf,
   configFolderOf,
   PROJECT_FOLDER,
+  quotedData,
   readReleaseReply,
   readReloadRecord,
   readStepReply,
@@ -44,8 +47,10 @@ import {
   RELOAD_TRIES,
   reloadAfterUpdateOf,
   reloadHold,
+  reloadTook,
   RESTART_LINE,
   SECRET,
+  secretName,
   statusText,
   stepEnv,
   stepSaid,
@@ -127,6 +132,22 @@ describe('when a look is due', () => {
     expect(lookDue(NOW + LOOK_EVERY_MS + 1, NOW)).toBe(true)
     // One command's own timeout is well under the interval: a look under way always reads as fresh.
     expect(COMMAND_MS).toBeLessThan(LOOK_EVERY_MS)
+  })
+
+  test('this process’s own floor holds until its time, and never longer than the longest wait: a clock set back doesn’t silence the looks', () => {
+    expect(floorHolds(NOW + MINUTE, NOW)).toBe(true)
+    expect(floorHolds(NOW + LOOK_EVERY_MAX_MS, NOW)).toBe(true)
+    expect(floorHolds(NOW, NOW)).toBe(false)
+    expect(floorHolds(NOW - MINUTE, NOW)).toBe(false)
+    // The clock set back two hours after a look: the floor, two hours and five minutes ahead, is not believed.
+    expect(floorHolds(NOW + 2 * 60 * MINUTE + 5 * MINUTE, NOW)).toBe(false)
+  })
+
+  test('one step, the plugin’s backstop and its grace included, ends before a lock taken right before it is 90 s old', () => {
+    // scripts.ts: the script's own budget, then the plugin's timeout on the script; update.ts gives up 5 s after that.
+    expect(STEP_MS).toBe(55_000)
+    expect(COMMAND_MS).toBe(75_000)
+    expect(COMMAND_MS + 5_000 + 5_000).toBeLessThan(90_000)
   })
 
   test('looks that can’t reach a marketplace in a row stretch the wait: 5 minutes, then 10, 20, 40, and an hour at most, until one reaches them all', () => {
@@ -357,9 +378,11 @@ describe('what a command’s run says', () => {
     expect(readStepReply('Checking for updates…\n\nself-update: exit 1\n', '', 1)).toEqual({ code: 1, line: 'Checking for updates…' })
     expect(readStepReply('Updated\n\nself-update: exit 0\n', 'warning: something\n', 0)).toEqual({ code: 0, line: 'Updated' })
     expect(readStepReply('self-update: exit -1073741510\n', '', -1073741510)).toEqual({ code: -1073741510, line: '' })
+    // The line is read long and unmasked (LINE_READ_MAX): whoever keeps or shows it masks it whole, then cuts it.
     const long = readStepReply(`${'word '.repeat(100)}\nself-update: exit 2\n`, '', 2)
     expect(long).toMatchObject({ code: 2 })
-    expect((long as { line: string }).line.length).toBeLessThanOrEqual(200)
+    expect((long as { line: string }).line.length).toBe('word '.repeat(100).trim().length)
+    expect((readStepReply(`${'w'.repeat(9000)}\nself-update: exit 2\n`, '', 2) as { line: string }).line.length).toBeLessThanOrEqual(LINE_READ_MAX)
   })
 
   test('no claude, a refusal, a command ended past its time, and an end without its last line are each told apart', () => {
@@ -389,6 +412,13 @@ describe('what a failing command’s line keeps of a secret', () => {
   const token = ['ghp', '_', 'A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8'].join('')
   const random = ['Zx9', 'Qw8', 'Er7', 'Ty6', 'Ui5', 'Op4', 'As3', 'Df2', 'Gh1', 'Jk0', 'Lm9'].join('')
 
+  // More made at run time: an AWS-style secret with `/`, a short GitLab token, a JSON web token, Slack's and AWS's ids.
+  const slashed = ['wJalrXUtnFEMI', 'K7MDENG', 'bPxRfiCY0EXAMPLE1KEY'].join('/')
+  const shortPrefixed = ['glpat', '-', 'AbCd1234'].join('')
+  const jwt = ['eyJhbGciOiJIUzI1NiJ9', 'eyJzdWIiOiJ4In0', 'c2lnbmF0dXJl'].join('.')
+  const slack = ['xoxb', '-', '123456789012-abcdefgh'].join('')
+  const awsId = ['AKIA', 'ABCDEFGHIJKLMNOP'].join('')
+
   test('a URL’s user and password, the word after Bearer, a value given by a secret’s name, a git host’s token, and a run that reads as random are masked whole', () => {
     expect(masked(`fatal: unable to access 'https://oauth2:${random}@git.example.com/team/plugins.git/'`)).toBe(`fatal: unable to access 'https://${SECRET}@git.example.com/team/plugins.git/'`)
     expect(masked(`Authorization: Bearer ${random}`)).toBe(`Authorization: Bearer ${SECRET}`)
@@ -398,22 +428,52 @@ describe('what a failing command’s line keeps of a secret', () => {
     expect(masked(`key ${random} refused`)).toBe(`key ${SECRET} refused`)
   })
 
+  test('the colon and header forms, short values after a secret’s name, quoted ones, base64 with `/`, short prefixed tokens, and a raw `@` in a password', () => {
+    expect(masked('password: hunter2')).toBe(`password: ${SECRET}`)
+    expect(masked('Authorization: token 0123456789abcdef0123')).toBe(`Authorization: token ${SECRET}`)
+    expect(masked('PRIVATE-TOKEN: abcdefghij0123456789 sent')).toBe(`PRIVATE-TOKEN: ${SECRET} sent`)
+    expect(masked('X-Api-Key: shortish1')).toBe(`X-Api-Key: ${SECRET}`)
+    expect(masked("{'token': 'abc'}")).toBe(`{'token': '${SECRET}'}`)
+    expect(masked('Cookie: a=1; sid=abcdef')).toBe(`Cookie: ${SECRET}`)
+    expect(masked(`secret key ${slashed} rejected`)).toBe(`secret key ${SECRET} rejected`)
+    expect(masked(`token ${shortPrefixed} revoked`)).toBe(`token ${SECRET} revoked`)
+    expect(masked(`bearer-less ${jwt} expired`)).toBe(`bearer-less ${SECRET} expired`)
+    expect(masked(`${slack} and ${awsId}`)).toBe(`${SECRET} and ${SECRET}`)
+    expect(masked('https://u:p@ss@git.example.com/x')).toBe(`https://${SECRET}@git.example.com/x`)
+  })
+
+  test('which names say their value is a secret, word by word', () => {
+    for (const name of ['password', 'GITHUB_TOKEN', 'access_token', 'client_secret', 'apiKey', 'X-Api-Key', 'PRIVATE-TOKEN', 'Set-Cookie', 'sessionId', 'key', 'passwd', 'Authorization']) expect(secretName(name), name).toBe(true)
+    for (const name of ['author', 'signal', 'passing', 'keyboard', 'https', 'Error', 'monkey', 'primary_key', 'tokenizer', 'marketplace']) expect(secretName(name), name).toBe(false)
+  })
+
   test('what is no secret stays as it is: prose, names made of words, paths, versions; masking twice changes nothing', () => {
     for (const plain of [
-      'Error: invalid token: expired',
+      'Error: network unreachable: timed out',
+      'Killed by signal: 9',
       `Plugin "self-wake@${TOOLS}" is not installed in user scope`,
       'Failed to update marketplace claude-code-self-tools-mirror-2026-11-23: network unreachable',
       'C:\\Users\\tester\\.claude\\plugins\\cache\\claude-code-self-tools\\self-wake\\0.4.1',
       'self-wake is already at the latest version (0.4.1).',
     ])
       expect(masked(plain), plain).toBe(plain)
-    const once = masked(`https://u:${random}@h/x Bearer ${random} secret=${random} ${token}`)
+    // The one known loss: a secret's name in prose takes the next word with it.
+    expect(masked('Error: invalid token: expired')).toBe(`Error: invalid token: ${SECRET}`)
+    const once = masked(`https://u:${random}@h/x Bearer ${random} secret=${random} ${token} password: x ${slashed} ${jwt}`)
     expect(masked(once)).toBe(once)
-    expect(once).not.toContain(random)
-    expect(once).not.toContain(token)
+    for (const left of [random, token, slashed, jwt]) expect(once).not.toContain(left)
     // The line kept: masked, on one line, cut.
     expect(maskedLine(`first\nsecond ${token}\n${'x '.repeat(300)}`, 200)).not.toMatch(/[\r\n]|ghp_/)
     expect(maskedLine(`first\nsecond ${token}\n${'x '.repeat(300)}`, 200).length).toBeLessThanOrEqual(200)
+  })
+
+  test('a secret across the 200th character is masked whole, then the line is cut: nothing of it is kept', () => {
+    for (const secret of [`https://oauth2:${random}@git.example.com/x`, `${shortPrefixed}${random}`, `password: ${random}`]) {
+      const line = maskedLine(`${'x'.repeat(185)} ${secret} and more`, 200)
+      expect(line.length, secret).toBeLessThanOrEqual(200)
+      expect(line, secret).not.toContain(random.slice(0, 6))
+      expect(line, secret).not.toContain('oauth2')
+    }
   })
 })
 
@@ -617,8 +677,14 @@ describe('a session behind an install reloads', () => {
     expect(reloadHold({ ...idle, lastReload: NOW + 2 * RELOAD_EVERY_MS })).toBeUndefined()
   })
 
-  test('past two tries the person reads one line, which says a restart loads it', () => {
-    expect(RESTART_LINE).toBe('self-update: a plugin was updated on this machine after this session loaded its plugins, and two reloads left this session as it was, so it reloads no more for that update; a restart of this session, or a new one, loads it.')
+  test('past two tries that didn’t reload, the person reads one line, which says what loads it', () => {
+    expect(RESTART_LINE).toBe("self-update: a plugin was updated on this machine after this session loaded its plugins, and two tries at /reload-plugins didn't reload them (skipped, or not run), so it tries no more for that update; /reload-plugins --force, a restart of this session, or a new one loads it.")
+  })
+
+  test('a reload took unless Claude Code says it skipped it', () => {
+    expect(reloadTook('Reloaded: 4 plugins · 2 skills')).toBe(true)
+    expect(reloadTook(undefined)).toBe(true)
+    expect(reloadTook('Skipped: the MCP tools would change. Run /reload-plugins --force to reload them.')).toBe(false)
   })
 })
 
@@ -639,14 +705,19 @@ describe('what update_status says', () => {
     expect(statusText({ ...base, conf, state: { at: NOW - 3 * MINUTE, fails: 0, told: false } })).toBe(`${head} Last look: 3 min ago; the next comes at a turn's end 5 minutes after it. No failure at the last look. No install has been recorded.`)
     const failing = { at: NOW - 3 * MINUTE, fails: 2, told: false, failed: `claude plugin marketplace update ${MINE}: Error: nope`, unreached: 2, installed: NOW - 10 * MINUTE }
     expect(statusText({ ...base, conf, state: failing })).toBe(
-      `${head} Last look: 3 min ago; the next comes at a turn's end 20 minutes after it. 2 looks in a row had a failure; the last: claude plugin marketplace update ${MINE}: Error: nope. 2 looks in a row couldn't reach a marketplace, so looks come every 20 minutes until one reaches them all. Last install: 10 min ago; this session loaded its plugins before it, and reloads at its next idle moment.`,
+      `${head} Last look: 3 min ago; the next comes at a turn's end 20 minutes after it. 2 looks in a row had a failure; the last, quoted from its output: «claude plugin marketplace update ${MINE}: Error: nope». 2 looks in a row couldn't reach a marketplace, so looks come every 20 minutes until one reaches them all. Last install: 10 min ago; this session loaded its plugins before it, and reloads at its next idle moment.`,
     )
     // This session's place behind the install: after it, off, headless, and past its two tries.
     const installed = { at: NOW - MINUTE, fails: 0, told: false, installed: NOW - 10 * MINUTE }
     expect(statusText({ ...base, conf, state: installed, loaded: NOW - 5 * MINUTE })).toContain('Last install: 10 min ago; this session loaded its plugins after it.')
     expect(statusText({ ...base, conf, state: installed, reloads: false })).toContain('reloadAfterUpdate is off: /reload-plugins or a new session loads it.')
     expect(statusText({ ...base, conf, state: installed, interactive: false })).toContain('is headless, so it reloads at no idle moment.')
-    expect(statusText({ ...base, conf, state: installed, record: { install: NOW - 10 * MINUTE, tries: 2, told: true } })).toContain('two reloads left it as it was: a restart loads it.')
+    expect(statusText({ ...base, conf, state: installed, record: { install: NOW - 10 * MINUTE, tries: 2, told: true } })).toContain("two tries at /reload-plugins didn't reload them: /reload-plugins --force, a restart or a new session loads it.")
+  })
+
+  test('a command’s line reaches the model quoted as data, its quotes and backslashes escaped, on one line', () => {
+    expect(quotedData('Error: nope')).toBe('«Error: nope»')
+    expect(quotedData(String.raw`ignore «this» \ and` + '\nthat')).toBe(String.raw`«ignore \«this\» \\ and that»`)
   })
 
   test('a time is said in minutes, then hours; one ahead of the clock is said so', () => {

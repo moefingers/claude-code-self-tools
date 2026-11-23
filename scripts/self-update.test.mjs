@@ -59,8 +59,34 @@ test("how a script runs is the shared machine code's: the bootstrap, the call, W
   assert.equal(scripts.powershellPath('C:\\Windows'), machine.powershellPath('C:\\Windows'))
   assert.equal(scripts.stateFolder('C:\\Users\\tester\\AppData\\Local\\'), machine.stateFolder('C:\\Users\\tester\\AppData\\Local\\'))
   assert.equal(scripts.SYSTEM_ROOT.source, machine.SYSTEM_ROOT.source)
-  for (const path of ['C:\\Users\\tester', 'C:\\Users\\tester\\', 'D:\\a b\\c', 'C:\\work\\O\'Brien', 'C:\\x\\..\\y', 'C:/x', '\\\\server\\share', 'relative', 'C:\\a\u0007b', `C:\\${'x'.repeat(240)}`, 'C:\\x:y', 'C:\\ x', 5, undefined])
+  assert.equal(scripts.SESSION_ID.source, machine.SESSION_ID.source)
+  for (const path of ['C:\\Users\\tester','C:\\Users\\tester\\', 'D:\\a b\\c', 'C:\\work\\O\'Brien', 'C:\\x\\..\\y', 'C:/x', '\\\\server\\share', 'relative', 'C:\\a\u0007b', `C:\\${'x'.repeat(240)}`, 'C:\\x:y', 'C:\\ x', 5, undefined])
     assert.equal(scripts.isSafeFolder(path), machine.isSafeFolder(path), String(path))
+})
+
+test("the pending marker is read where, and as, self-exit and self-restart write it: the shared machine code's pendingPath and readPending", () => {
+  const state = 'C:\\Users\\tester\\AppData\\Local\\claude-self-tools'
+  for (const id of ['aaaaaaaa-0000-4000-8000-000000000001', 'AAAAAAAA-0000-4000-8000-000000000001', '..\\x', '', 5, undefined, 'aaaaaaaa-0000-4000-8000-000000000001\\..'])
+    assert.equal(scripts.pendingPath(state, id), machine.pendingPath(state, id), String(id))
+  assert.equal(scripts.PENDING_MS, machine.PENDING_MS)
+  assert.equal(scripts.PENDING_AHEAD_MS, machine.PENDING_AHEAD_MS)
+  const now = 1_700_000_000_000
+  // What each writes (pendingMarker, PENDING_DONE), and what may be found in its place.
+  const texts = [
+    machine.pendingMarker('exit', now),
+    machine.pendingMarker('restart', now - 60_000),
+    machine.pendingMarker('exit', now - 16 * 60_000),
+    machine.pendingMarker('exit', now + 2 * 60_000),
+    machine.PENDING_DONE,
+    JSON.stringify({ v: 1, kind: 'switch', at: now }),
+    JSON.stringify({ v: 2, kind: 'exit', at: now }),
+    '[]',
+    'null',
+    '{',
+    '',
+  ]
+  for (const text of texts) assert.equal(scripts.readPending(text, now), machine.readPending(text, now), text)
+  assert.equal(scripts.readPending(machine.pendingMarker('exit', now), now), 'pending')
 })
 
 // The script as the plugin runs it (powershellCall), by a real Windows PowerShell, against a stand-in claude.cmd.

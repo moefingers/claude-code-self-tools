@@ -1,8 +1,11 @@
 // A session behind an install reloads itself, at idle. A look that installed a newer version of a plugin (update.ts)
 // leaves the time in the machine's state file; every session already running keeps the plugins it loaded until it
 // reloads or restarts, and nothing in Claude Code tells it so. With `reloadAfterUpdate` on (the default) and `autoUpdate`
-// naming a marketplace, a session whose plugins were loaded before that time (`loaded`: this module's first moment, as
-// a session's start begins) runs /reload-plugins once, at an idle turn end.
+// naming a marketplace, a session whose plugins were loaded before that time runs /reload-plugins once, at an idle turn
+// end. When they were loaded (`loaded`): this module's first moment, as a session's start begins, moved on to the
+// moment any /reload-plugins that reloaded ran (this plugin's own, a person's, another plugin's). Claude Code reloads
+// only the plugins that changed, so after a reload that took this module may well run on: its first moment alone would
+// call the session behind an update it has already loaded.
 //
 // When it looks: at each main-loop turn's end (register.ts), and at the end of this session's own look, never from a
 // timer of its own. It reads one thing, the state file's install time, and only with both settings on and a person at
@@ -15,14 +18,15 @@
 // end; it never interrupts a turn, and Claude Code runs a plugin's command only once the session is idle anyway.
 //
 // Never a loop: a try counts right before /reload-plugins runs, kept in the plugin's session state by the install's
-// time. A reload that took starts a module loaded after the install, which is behind no more. One that left the session
-// as it was is tried once more, 15 minutes on at the soonest, then never again for that install: the person reads one
-// line in the transcript, once, and nothing is added to the conversation. A later install starts its own two tries.
+// time. A reload that took leaves the session behind no more. One that Claude Code skipped (it asks for
+// /reload-plugins --force) or that didn't run is tried once more, 15 minutes on at the soonest, then never again for
+// that install: the person reads one line in the transcript, once, and nothing is added to the conversation. A later
+// install starts its own two tries.
 // Never `/reload-plugins --force`: forcing a held reload re-reads the whole conversation without the prompt cache,
 // which is the person's to choose.
 import type { EngineInterface, Timer } from 'claude-code'
 import { updateConf, updateInstalledAt, updateRunning } from './update'
-import { behindInstall, readReloadRecord, recordFor, reloadHold, RELOAD_LINE, RELOAD_TRIES, RESTART_LINE, type ReloadRecord } from './update-logic'
+import { behindInstall, oneLine, readReloadRecord, recordFor, reloadHold, RELOAD_LINE, RELOAD_TRIES, reloadTook, RESTART_LINE, type ReloadRecord } from './update-logic'
 
 const reloadRef = { plugin: 'self-update', key: 'reload' } as const
 const lastRef = { plugin: 'self-update', key: 'lastReload' } as const
@@ -69,6 +73,17 @@ export function setReloadInteractive(value: boolean): void {
 /** register.ts, as a session's start begins, before anything is awaited: this load's moment. */
 export function reloadLoaded($: EngineInterface): void {
   loaded ??= $.clock.now().catch(() => undefined)
+}
+
+/**
+ * A /reload-plugins that started at `at` answered `text` (this plugin's, or one register.ts saw a person or another
+ * plugin run): when it reloaded, everything installed before it started is loaded now, so the session's load time moves
+ * on to `at`. One that was skipped moves nothing.
+ */
+export function reloadSeen(at: number, text: string | undefined): void {
+  if (!reloadTook(text)) return
+  const was = loaded ?? Promise.resolve(undefined)
+  loaded = was.then(before => (before === undefined || at > before ? at : before))
 }
 
 /** register.ts: a main-loop turn started (true) or ended. */
@@ -212,7 +227,12 @@ async function run($: EngineInterface): Promise<void> {
     await writeLast($, now)
     $.ui.log(RELOAD_LINE)
     $.ui.toast(RELOAD_LINE)
-    await $.command.run({ command: 'reload-plugins' })
+    // Read right before it runs: what was installed before this moment is what the reload loads.
+    const ranAt = await $.clock.now()
+    const said = (await $.command.run({ command: 'reload-plugins' })).text
+    // This module runs on (a reload replaces only the plugins that changed): the reload's answer says whether it took.
+    reloadSeen(ranAt, said)
+    if (!reloadTook(said)) $.ui.log(`self-update: /reload-plugins was skipped: ${oneLine(said ?? '', 200)}`, { to: 'debug' })
   } catch (error) {
     const said = (error instanceof Error ? error.message : String(error)).trim()
     $.ui.log(`self-update: /reload-plugins didn't run: ${said === '' ? 'no reason given' : said}.`, { to: 'debug' })

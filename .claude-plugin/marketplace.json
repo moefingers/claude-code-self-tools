@@ -79,7 +79,7 @@
     {
       "name": "self-update",
       "source": "./plugins/self-update",
-      "description": "Keeps the plugins this machine already has from the marketplaces you name current, with Claude Code's own claude plugin commands, one session at a time, and reloads each session behind an update at its next idle moment. Off until you name a marketplace. Windows only."
+      "description": "Keeps the plugins this machine already has from the marketplaces you name current, with Claude Code's own claude plugin commands, one look at a time, and reloads each session behind an update at its next idle moment. Off until you name a marketplace. Windows only."
     },
     {
       "name": "self-hierarchy",

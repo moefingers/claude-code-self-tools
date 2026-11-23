@@ -50,36 +50,90 @@ export function oneLine(text: string, max: number): string {
 /** What a masked value reads as. */
 export const SECRET = '‹secret›'
 
-/** A name that says its value is a secret, as a word of a longer name too (GITHUB_TOKEN, access_token, client_secret, apiKey). */
-const SECRET_NAME = '[A-Za-z0-9_.-]*(?:token|secret|password|passwd|api[_-]?key|access[_-]?key|private[_-]?key)[A-Za-z0-9_.-]*'
+/** The words that make a name a secret's (password, GITHUB_TOKEN, client_secret, Set-Cookie, sessionId, X-Auth). */
+const SECRET_WORDS: ReadonlySet<string> = new Set(['token', 'tokens', 'secret', 'secrets', 'password', 'passwords', 'passwd', 'passphrase', 'pass', 'pwd', 'apikey', 'credential', 'credentials', 'cookie', 'auth', 'authorization', 'session', 'sig', 'signature'])
+/** The words that make a name a secret's when `key` follows them (api_key, X-Api-Key, accessKey, private-key). */
+const KEY_WORDS: ReadonlySet<string> = new Set(['api', 'access', 'private', 'secret', 'client', 'signing', 'account', 'master'])
 
-/**
- * A run of a token's characters (letters, digits, `+ _ = . -`; a `/` ends it, so a path stays as it is) that reads as
- * random: 32 or more, with a piece of 16 or more (between `-`, `_` and `.`) that mixes letters and digits. A name made
- * of words and numbers (`claude-code-self-tools-2026`) is not one.
- */
-const randomRun = (run: string): boolean => run.split(/[-_.]/).some(piece => piece.length >= 16 && /[A-Za-z]/.test(piece) && /[0-9]/.test(piece))
+/** A name's words: split at `_`, `-` and `.`, and where a small letter or a digit meets a capital (apiKey), each in small letters. */
+const wordsOf = (name: string): string[] =>
+  name
+    .replace(/([a-z0-9])([A-Z])/g, '$1 $2')
+    .split(/[\s_.-]+/)
+    .filter(word => word !== '')
+    .map(word => word.toLowerCase())
+
+/** Whether a name says its value is a secret: one of its words is a secret's, or it is `key` after one of KEY_WORDS, or the whole name is `key`. */
+export function secretName(name: string): boolean {
+  const words = wordsOf(name)
+  return words.some((word, i) => SECRET_WORDS.has(word) || (word === 'key' && (words.length === 1 || KEY_WORDS.has(words[i - 1] ?? ''))))
+}
+
+/** A name and what joins it to its value: `name=`, `name:`, `"name":`, `'name':`. Only the name is matched, so a value is still read for names of its own (`https://host/x?access_token=…`). */
+const NAME_HEAD = /(["']?)\b([A-Za-z][A-Za-z0-9_.-]{0,63})\1(\s*[:=]\s*)/g
+/** The value after a secret's name: a header's scheme kept apart (`Authorization: token …`), then a quoted value, or one up to a space or a separator. */
+const NAMED_VALUE = /^((?:Bearer|Basic|Token|Digest|Negotiate|Bot)\s+)?("[^"]*"|'[^']*'|[^\s,;&"'<>()[\]{}]+)/i
+
+/** `text` with each value a secret's name gives masked whole (secretName), its quotes and a header's scheme kept. */
+function maskNamed(text: string): string {
+  let out = ''
+  let last = 0
+  const heads = new RegExp(NAME_HEAD.source, 'g')
+  for (let head = heads.exec(text); head !== null; head = heads.exec(text)) {
+    if (!secretName(head[2] ?? '')) continue
+    const from = head.index + head[0].length
+    const found = NAMED_VALUE.exec(text.slice(from))
+    if (found === null) continue
+    const [whole, scheme = '', value = ''] = found
+    const bare = value.replace(/^["']|["']$/g, '')
+    const wrapped = bare === SECRET ? value : value.startsWith('"') ? `"${SECRET}"` : value.startsWith("'") ? `'${SECRET}'` : SECRET
+    out += `${text.slice(last, from)}${scheme}${wrapped}`
+    last = from + whole.length
+    heads.lastIndex = last
+  }
+  return out + text.slice(last)
+}
+
+/** Whether a run of base64's characters reads as random: 32 or more, with capitals, small letters and digits. */
+const base64Random = (run: string): boolean => /[A-Z]/.test(run) && /[a-z]/.test(run) && /[0-9]/.test(run)
+/** Whether a run of a token's characters reads as random: a piece of 16 or more (between `-` and `_`) that mixes letters and digits. A name made of words and numbers (`claude-code-self-tools-2026`) is not one. */
+const tokenRandom = (run: string): boolean => run.split(/[-_]/).some(piece => piece.length >= 16 && /[A-Za-z]/.test(piece) && /[0-9]/.test(piece))
 
 /**
  * A command's line with the secrets of the shapes a failing `claude plugin` command can print masked, before it is
- * kept, logged or shown: a URL's user and password (`https://user:token@host`), the word after Bearer or Basic, a
- * value given by a name that says secret (`access_token=…`, `"password": "…"`), the prefixes of the tokens a git host
- * issues (GitHub's ghp_, gho_, ghu_, ghs_, ghr_ and github_pat_, GitLab's glpat-), and a run of characters that reads
- * as random (randomRun). A whole value, never a piece; masking again changes nothing. Prose is left as it is
- * (`invalid token: expired` keeps its words): a name masks only the value joined to it by `=`, or a quoted one's.
+ * kept, logged or shown, each value whole, never a piece:
+ * - a URL's user and password, up to the last `@` before its host (`https://user:p@ss@host`);
+ * - the word after Bearer or Basic, and a cookie header's whole value;
+ * - a value given by a name that says secret (secretName), however it is given: `name=value`, `name: value`, a quoted
+ *   name and value, a header with its scheme (`Authorization: token …`, `PRIVATE-TOKEN: …`, `X-Api-Key: …`), of any
+ *   length;
+ * - the tokens of the shapes their issuers give them, 8 characters on from their prefix: GitHub's (ghp_, gho_, ghu_,
+ *   ghs_, ghr_, github_pat_), GitLab's (glpat-), Slack's (xox?-), Anthropic's and OpenAI's (sk-), AWS key ids (AKIA,
+ *   ASIA), Google API keys (AIza), and JSON web tokens (eyJ…);
+ * - a run that reads as random: 20 or more letters and digits mixing capitals, small letters and digits; 32 or more of
+ *   base64's (`+` and `/` among them) of the same mix; or 32 or more of a token's (`-` and `_`) with a random piece.
+ * Masking again changes nothing. Prose next to a secret's name loses its next word (`invalid token: ‹secret›`): a
+ * name's value is masked whatever it reads as. Paths, versions and names made of words are left as they are.
  */
 export function masked(text: string): string {
-  return text
-    .replace(/(\b[A-Za-z][A-Za-z0-9+.-]*:\/\/)[^\s/@]+@/g, (_, scheme: string) => `${scheme}${SECRET}@`)
-    .replace(/\b(Bearer|Basic)\s+(?!‹secret›)[^\s"',;]+/gi, (_, word: string) => `${word} ${SECRET}`)
-    .replace(new RegExp(`(\\b${SECRET_NAME}=)(?!${SECRET})[^\\s,;&"']+`, 'gi'), (_, head: string) => `${head}${SECRET}`)
-    .replace(new RegExp(`("${SECRET_NAME}"\\s*:\\s*)"(?!${SECRET}")[^"]*"`, 'gi'), (_, head: string) => `${head}"${SECRET}"`)
-    .replace(/\b(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|glpat-[A-Za-z0-9_-]{20,})/g, SECRET)
-    .replace(/[A-Za-z0-9+_=.-]{32,}/g, run => (randomRun(run) ? SECRET : run))
+  const named = maskNamed(
+    text
+      .replace(/(\b[A-Za-z][A-Za-z0-9+.-]*:\/\/)[^\s/?#]*@/g, (_, scheme: string) => `${scheme}${SECRET}@`)
+      .replace(/\b(Bearer|Basic)\s+(?!‹secret›)[^\s"',;]+/gi, (_, word: string) => `${word} ${SECRET}`)
+      .replace(/\b((?:Set-)?Cookie\s*:\s*)(?!‹secret›)[^"'\r\n]+/gi, (_, head: string) => `${head}${SECRET}`),
+  )
+  return named
+    .replace(/\b(?:gh[pousr]_[A-Za-z0-9]{8,}|github_pat_[A-Za-z0-9_]{8,}|glpat-[A-Za-z0-9_-]{8,}|xox[abposr]-[A-Za-z0-9-]{8,}|sk-[A-Za-z0-9_-]{8,}|(?:AKIA|ASIA)[A-Z0-9]{12,}|AIza[A-Za-z0-9_-]{8,}|eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}(?:\.[A-Za-z0-9_-]*)?)/g, SECRET)
+    .replace(/[A-Za-z0-9+/]{32,}={0,2}/g, run => (base64Random(run) ? SECRET : run))
+    .replace(/[A-Za-z0-9_-]{32,}/g, run => (tokenRandom(run) ? SECRET : run))
+    .replace(/\b[A-Za-z0-9]{20,}\b/g, run => (base64Random(run) ? SECRET : run))
 }
 
-/** A command's line as it is kept and shown: masked (masked), one line of `max` characters at most. */
+/** A command's line as it is kept and shown: masked first (masked), then one line of `max` characters at most, so no cut ever splits a secret the rules would have caught. */
 export const maskedLine = (text: string, max: number): string => oneLine(masked(oneLine(text, 4_000)), max)
+
+/** Text from outside quoted as data, on one line: «…», each «, » and backslash inside escaped with a backslash. */
+export const quotedData = (text: string): string => `«${oneLine(text, 400).replace(/[\\«»]/g, c => `\\${c}`)}»`
 
 // ---------------------------------------------------------------------------------------------
 // The settings.
@@ -124,6 +178,12 @@ export function lookEveryMs(unreached: number): number {
   const n = Number.isFinite(unreached) ? Math.min(8, Math.max(0, Math.floor(unreached))) : 0
   return Math.min(LOOK_EVERY_MAX_MS, LOOK_EVERY_MS * 2 ** n)
 }
+
+/**
+ * Whether this process's own floor between looks (`nextAt`) still holds at `now`: before it, and not further ahead than
+ * the longest wait (a clock set back would otherwise hold this process's looks for as long as it moved).
+ */
+export const floorHolds = (nextAt: number, now: number): boolean => now < nextAt && nextAt - now <= LOOK_EVERY_MAX_MS
 
 /**
  * Whether a look is due: none yet, the last one a whole interval ago (lookEveryMs, by the looks in a row that couldn't
@@ -311,10 +371,13 @@ export const stepEnv = (step: Step): Record<string, string> => ({
 const EXIT_LINE = new RegExp(`^${EXIT_SAID.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(-?\\d{1,10})$`)
 const ANSI = new RegExp(`${String.fromCharCode(27)}\\[[0-9;?]*[ -/]*[@-~]`, 'g')
 
-/** The last line of a command's output that says something, colour codes dropped, one line of 200 characters at most; '' for none. */
+/** A command's line as read, before it is masked: never cut short enough to split a secret that is then shown (maskedLine masks it whole, then cuts it to 200). */
+export const LINE_READ_MAX = 4_000
+
+/** The last line of a command's output that says something, colour codes dropped, one line of LINE_READ_MAX characters at most, unmasked; '' for none. */
 function lastLine(lines: readonly string[]): string {
   for (let i = lines.length - 1; i >= 0; i -= 1) {
-    const line = oneLine((lines[i] ?? '').replace(ANSI, ''), 200)
+    const line = oneLine((lines[i] ?? '').replace(ANSI, ''), LINE_READ_MAX)
     if (line !== '') return line
   }
   return ''
@@ -324,7 +387,8 @@ function lastLine(lines: readonly string[]): string {
  * What UPDATE_SCRIPT's run says: the command ran (its exit code, and the last line it printed: on standard output, else
  * on standard error, and the other way round for one that failed), its time ran out (`ended`), no claude was found, the
  * only one found sits inside the folder it would run from (`inside`), the script refused its inputs, or (`broken`) it
- * ended without its last line. Nothing else of the output is read.
+ * ended without its last line. Nothing else of the output is read. The line is not masked yet: whoever keeps or shows
+ * it masks it first (maskedLine).
  */
 export function readStepReply(stdout: string, stderr: string, exitCode: number): { code: number; line: string } | 'ended' | 'no-claude' | 'inside' | 'refused' | { broken: string } {
   const out = stdout.split(/\r?\n/)
@@ -455,9 +519,17 @@ export function failuresNext(
 //
 // A look that installed a newer version of a plugin leaves the time in the state file, and a session whose plugins
 // were loaded before it is behind: one /reload-plugins loads what was installed. The session runs it at an idle turn
-// end, under the holds below, at most once every 15 minutes, and at most twice for one install: a reload that left the
-// session where it was is tried once more, then never again for that install. A reload that took starts a module loaded
-// after the install, which is behind no more; a later install is another key, with its own two tries.
+// end, under the holds below, at most once every 15 minutes, and at most twice for one install. A /reload-plugins that
+// ran and reloaded, this plugin's or anyone's, brings the session's load time to the moment it ran: Claude Code reloads
+// only the plugins that changed, so self-update's own module may run on, and its first load time alone would call the
+// session still behind. One that was skipped (Claude Code asks for /reload-plugins --force, the person's to choose) or
+// didn't run is tried once more, then never again for that install; a later install is another key, with its own two.
+
+/** How /reload-plugins says it skipped the reload: it does when the reload would change which MCP tools are loaded, until it is run with --force. */
+export const RELOAD_SKIPPED = /\/reload-plugins --force/
+
+/** Whether a /reload-plugins that answered `text` reloaded: anything but the line that says it was skipped. */
+export const reloadTook = (text: string | undefined): boolean => !RELOAD_SKIPPED.test(text ?? '')
 
 /** A reload tried for one install this many times at most. */
 export const RELOAD_TRIES = 2
@@ -547,9 +619,9 @@ export function reloadHold(input: ReloadInput, holds: readonly ReloadHold[] = RE
 /** The line a reload gets as it runs, in the transcript and as a toast. */
 export const RELOAD_LINE = 'self-update: running /reload-plugins: a plugin was updated on this machine after this session loaded its plugins.'
 
-/** The one line the person reads once two reloads left this session behind an install: the restart is theirs to do. */
+/** The one line the person reads once two tries at /reload-plugins didn't reload this session for an install: what loads it is theirs to choose. */
 export const RESTART_LINE =
-  'self-update: a plugin was updated on this machine after this session loaded its plugins, and two reloads left this session as it was, so it reloads no more for that update; a restart of this session, or a new one, loads it.'
+  "self-update: a plugin was updated on this machine after this session loaded its plugins, and two tries at /reload-plugins didn't reload them (skipped, or not run), so it tries no more for that update; /reload-plugins --force, a restart of this session, or a new one loads it."
 
 // ---------------------------------------------------------------------------------------------
 // What update_status says.
@@ -590,7 +662,8 @@ export function statusText(s: StatusInput): string {
   const every = lookEveryMs(st.unreached ?? 0)
   const lines = [head, `Last look: ${agoSaid(st.at, s.now)}; the next comes at a turn's end ${Math.round(every / 60_000)} minutes after it.`]
   if (st.fails === 0) lines.push('No failure at the last look.')
-  else lines.push(`${st.fails} look${st.fails === 1 ? '' : 's'} in a row had a failure${st.failed === undefined ? '' : `; the last: ${st.failed}`}.`)
+  // The failure's line is a command's output, as masked: quoted as data, never read as words of the plugin's.
+  else lines.push(`${st.fails} look${st.fails === 1 ? '' : 's'} in a row had a failure${st.failed === undefined ? '' : `; the last, quoted from its output: ${quotedData(st.failed)}`}.`)
   if ((st.unreached ?? 0) > 0) lines.push(`${st.unreached} look${st.unreached === 1 ? '' : 's'} in a row couldn't reach a marketplace, so looks come every ${Math.round(every / 60_000)} minutes until one reaches them all.`)
   if (st.installed === undefined) lines.push('No install has been recorded.')
   else {
@@ -603,7 +676,7 @@ export function statusText(s: StatusInput): string {
         : !s.interactive
           ? 'this session loaded its plugins before it, and is headless, so it reloads at no idle moment.'
           : tries >= RELOAD_TRIES
-            ? 'this session loaded its plugins before it, and two reloads left it as it was: a restart loads it.'
+            ? "this session loaded its plugins before it, and two tries at /reload-plugins didn't reload them: /reload-plugins --force, a restart or a new session loads it."
             : 'this session loaded its plugins before it, and reloads at its next idle moment.'
     lines.push(`Last install: ${agoSaid(st.installed, s.now)}; ${session}`)
   }

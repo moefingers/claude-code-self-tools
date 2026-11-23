@@ -8,8 +8,12 @@
 //   the script on standard input; its inputs in the environment.
 // - The lock's two scripts (TAKE_SCRIPT, RELEASE_SCRIPT): self-remote-control's Remote Control lock scripts
 //   (plugins/self-remote-control/hooks/rc-lock.ts), byte for byte, pinned by the same SHA-256s. self-update runs them on
-//   a lock file of its own, in the auto-update folder, which another plugin that keeps plugins current takes the same
-//   way, so the two never run commands at once.
+//   the auto-update folder's lock file, which another plugin that keeps plugins current takes the same way. TAKE takes
+//   over a lock over 90 s old, its holder alive or not, so a look gives the lock back and takes it again before each
+//   command (update.ts): the lock it runs a command under is always fresh.
+// - The pending marker self-exit and self-restart write while an exit or a restart is queued or armed (pendingPath,
+//   readPending): read, never written, so a look doesn't start, or go on, under an exit or a restart that is about to
+//   check this session for running processes.
 // - UPDATE_SCRIPT: the one script that runs a `claude plugin` command, its words fixed here.
 
 /** Windows' own folder, as %SystemRoot% names it: a drive, and one folder of plain characters. */
@@ -66,6 +70,49 @@ export const STDIN_BOOTSTRAP =
 /** How `$.process.run` runs `script`: Windows PowerShell by its known path, no profile, no prompts, STDIN_BOOTSTRAP as its command, and the script on standard input. */
 export function powershellCall(powershell: string, script: string): { readonly argv: readonly string[]; readonly stdin: string } {
   return { argv: [powershell, '-NoProfile', '-NonInteractive', '-EncodedCommand', encodeCommand(STDIN_BOOTSTRAP)], stdin: script }
+}
+
+/** A conversation's id, as Claude Code makes it: a lowercase UUID. */
+export const SESSION_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
+
+/** The folder of the pending markers, under the state folder. */
+const PENDING_FOLDER = 'pending'
+
+/**
+ * The pending marker of conversation `id`, as self-exit and self-restart write it (the shared machine code's
+ * pendingPath): `<state>\pending\<id>.json`, the id checked to be a conversation's before anything is joined.
+ * Undefined for any other id. scripts/self-update.test.mjs holds it equal to the machine code's.
+ */
+export function pendingPath(state: string, id: unknown): string | undefined {
+  if (typeof id !== 'string' || !SESSION_ID.test(id)) return undefined
+  return `${state}\\${PENDING_FOLDER}\\${id}.json`
+}
+
+/** A pending marker older than this is ignored: the exit or restart it stood for didn't run, or ran without saying so. */
+export const PENDING_MS = 15 * 60 * 1000
+/** A pending marker whose `at` is further ahead of the reader's clock than this is bad: no marker holds forever. */
+export const PENDING_AHEAD_MS = 60 * 1000
+
+/**
+ * A pending marker as the shared machine code's readPending reads it: `pending` (an exit or a restart is queued or
+ * armed, and the marker is at most 15 minutes old), `done` (it ran or was cancelled), `stale`, or `bad` (another
+ * shape, or an `at` more than a minute ahead of `now`). Only `pending` holds anything. scripts/self-update.test.mjs
+ * holds it equal to the machine code's.
+ */
+export function readPending(text: string, now: number): 'pending' | 'done' | 'stale' | 'bad' {
+  let raw: unknown
+  try {
+    raw = JSON.parse(text)
+  } catch {
+    return 'bad'
+  }
+  if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) return 'bad'
+  const marker = raw as Record<string, unknown>
+  if (marker.v !== 1) return 'bad'
+  if (marker.done === true) return 'done'
+  if (marker.kind !== 'exit' && marker.kind !== 'restart') return 'bad'
+  if (typeof marker.at !== 'number' || !Number.isFinite(marker.at) || marker.at > now + PENDING_AHEAD_MS) return 'bad'
+  return now - marker.at > PENDING_MS ? 'stale' : 'pending'
 }
 
 // The lock's two scripts: self-remote-control's Remote Control lock scripts (plugins/self-remote-control/hooks/rc-lock.ts),
@@ -193,14 +240,16 @@ export const NAME_SHAPE = '[A-Za-z0-9][A-Za-z0-9._-]{0,63}'
  * How long the script gives one command, counted from the script's own first line (not from the command's start): past
  * it the script ends the command, with every process it started.
  */
-export const STEP_MS = 75_000
+export const STEP_MS = 55_000
 /** With less than this left of STEP_MS when the command would start, the script doesn't start it at all. */
 export const STEP_LEAST_MS = 5_000
 /**
- * The engine's own timeout on the script: 15 s above STEP_MS, room for ending a tree and the last waits, so it is only
- * the backstop, and under the 5 minutes between looks, so a look under way always reads as fresh.
+ * The plugin's own timeout on the script: 20 s above STEP_MS, room for Windows PowerShell's start before the script's
+ * first line, ending a tree and the last waits (9 s at the most), so it is only the backstop. It is given up on 5 s
+ * after that (update.ts), so one step takes 80 s at the most: a lock taken right before it (update.ts) is still under
+ * the 90 s at which another taker may take it over.
  */
-export const COMMAND_MS = 90_000
+export const COMMAND_MS = 75_000
 
 /** UPDATE_SCRIPT's inputs: the step's kind, its name, and its scope. */
 export const KIND_VAR = 'SELF_UPDATE_KIND'
