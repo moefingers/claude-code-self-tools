@@ -3592,13 +3592,16 @@ export function pickTransport(
 // and moves it to the name its claim's uuid gives, then starts the window with -File, which reads it, and
 // the window deletes it before its first check. Unlike claude-launch.ps1, which is pinned and hashed again
 // right before it runs, this file is unpinned and unchecked between the write and the read (the window's
-// start: under a second, longer under an antivirus), and it is the code that makes the window's later
-// checks, the launcher's hash among them. That is acceptable under T20, not the same gap: only the same OS
-// user (or an administrator) can write there, and that user could as well replace the unpinned claude.exe
-// the window runs. It is made per launch, so there is nothing to pin. Its per-launch values (the id, the
-// claim, the pid, the folders) are in it as checked literals, as they were on the command line. It was a self-unpacking -EncodedCommand (GZip, base64,
-// [scriptblock]::Create) before, which an antivirus hooked into AMSI blocks as malicious content before a
-// line of it runs; the script itself on the command line is past Windows' 32,767 characters. The launch
+// start: estimated under a second, longer under an antivirus; not measured), and it is the code that makes
+// the window's later checks, the launcher's hash among them. That is not the same gap, and it is acceptable:
+// only the same OS user (or an administrator) can write there, and that user could as well replace the
+// unpinned claude.exe the window runs. The same holds when the session is elevated: its window runs
+// elevated, a file the same user's ordinary processes can write, as it runs claude.exe. It is made per
+// launch, so there is nothing to pin. Its per-launch values (the id, the claim, the pid, the folders) are in
+// it as checked literals, as they were on the command line. It was a self-unpacking -EncodedCommand (GZip,
+// base64, [scriptblock]::Create) before, which an antivirus hooked into AMSI blocks as malicious content
+// before a line of it runs; the script itself on the command line, as -EncodedCommand, is past Windows'
+// 32,767 characters. The launch
 // answers `launched` only once the window set its start signal (windowSignalName, its first line) within
 // WINDOW_START_MS: a window that ended without setting it, or hadn't set it by then (and was ended), is
 // refused `place`, so the caller's session goes on. The
