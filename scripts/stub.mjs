@@ -93,14 +93,22 @@ export function noWindow(script) {
  * and writes to `file` what the window would have been started with (`{ file, args }`: the program and
  * its argument list), so a test can read the interpreter chosen and run that very command hidden. It
  * throws when the script could reach the real cmdlet past the function (by its module's name, or .NET).
+ * The window it answers with is still starting (it has no HasExited), unless `window` says otherwise:
+ * `ended` (an exit code) gives one that has already ended; `began` deletes the script file named by the
+ * last argument first, as the window's first line does. Both together: a window that ran its first line,
+ * then ended.
  */
-export function recordWindow(script, file) {
+export function recordWindow(script, file, window = {}) {
   if (/\\Start-Process|Diagnostics\.Process\]::Start|ProcessStartInfo/.test(script)) throw new Error('the script reaches a process start past the recording function')
   if (/['"]/.test(file)) throw new Error('a record file without quotes')
+  const { ended, began = false } = window
+  if (ended !== undefined && !Number.isInteger(ended)) throw new Error('an exit code is a whole number')
+  const fields = ended === undefined ? 'Id = 0' : `Id = 0; HasExited = $true; ExitCode = ${ended}`
   const shadow = [
     'function Start-Process { param([string]$FilePath, [string[]]$ArgumentList, [switch]$PassThru)',
     `  [IO.File]::WriteAllText('${file}', (ConvertTo-Json -Compress -InputObject ([ordered]@{ file = $FilePath; args = @($ArgumentList) })))`,
-    '  [pscustomobject]@{ Id = 0 } | Add-Member -MemberType ScriptMethod -Name Kill -Value { } -PassThru',
+    ...(began ? ['  [IO.File]::Delete($ArgumentList[-1].Trim([char]34))'] : []),
+    `  [pscustomobject]@{ ${fields} } | Add-Member -MemberType ScriptMethod -Name Kill -Value { } -PassThru`,
     '}',
   ]
   return [...shadow, script].join('\r\n')
