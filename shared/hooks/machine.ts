@@ -3583,9 +3583,11 @@ export function pickTransport(
 // literals, as they were on the command line. It was a self-unpacking -EncodedCommand (GZip, base64,
 // [scriptblock]::Create) before, which an antivirus hooked into AMSI blocks as malicious content before a
 // line of it runs; the script itself on the command line is past Windows' 32,767 characters. The launch
-// deletes the file itself when Start-Process fails and when it withdraws a window it placed late; one left
-// behind all the same (a window killed by someone else first, or one a policy stopped) is deleted by a
-// later launch once it is older than a stale claim.
+// answers `launched` only once the window deleted its file, or is still starting after WINDOW_START_MS: a
+// window that ended with its file still there is refused `place`, so the caller's session goes on. The
+// launch deletes the file itself then, when Start-Process fails and when it withdraws a window it placed
+// late; one left behind all the same (a window killed by someone else first) is deleted by a later launch
+// once it is older than a stale claim.
 
 /** A launch's answer: `launched <transport> <label> [<pid>]`. */
 export const LAUNCH_ANSWER = /^launched (pane|slot|window|tab) ([A-Za-z0-9_.:-]{1,80})(?: (\d{1,10}))?\s*$/m
@@ -3747,6 +3749,18 @@ export function parseLaunch(stdout: string): LaunchAnswer {
  */
 export const LAUNCH_RUN_MS = 30_000
 export const LAUNCH_DEADLINE_MS = 20_000
+
+/**
+ * How long a launch watches a plain window it started, every 100 ms, for its script's first line (the window
+ * deletes its own file) before it answers `launched` (review SW-M-2). A window that ends with its file still
+ * there never ran a line (an antivirus, a Group Policy execution policy, an interpreter that failed to
+ * start): the launch is refused `place`, its claim given back, and the caller's session goes on. One still
+ * starting when this runs out is taken as placed, as before: a slow cold start, not a failure. 3 s: the
+ * deaths this guards against come within about a tenth of a second of the start (the measured AMSI block),
+ * or before PowerShell runs a line at all (a policy), and PowerShell 7 or 5.1 reaches a first line well
+ * within it; 3 s more still leaves the launch far inside LAUNCH_DEADLINE_MS.
+ */
+export const WINDOW_START_MS = 3000
 
 /** How long after a launch that failed its caller takes it back once more: a run killed at its timeout may have been writing still. */
 export const LAUNCH_RETRY_MS = 3000
@@ -4678,6 +4692,23 @@ export function launchScriptText(input: LaunchInput): string {
           // Start-Process joins the arguments into one command line as they are: the path goes in quotes (the
           // state folder holds none, and the path ends in .ps1, never a backslash).
           `$window = Start-Process -FilePath $windowShell -ArgumentList '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', ('"' + $windowFile + '"') -PassThru`,
+          // Did the window begin? Its first line deletes its file. Watched for WINDOW_START_MS: whether it has
+          // ended is read before whether its file is there, so an ended window with its file still there never
+          // ran a line, whatever the timing. That throws: the catch below deletes the file and refuses `place`,
+          // its claim given back, and the caller's session goes on. Still starting at the bound: placed, as
+          // before. The handle is taken at once, so its end and exit code are its own, never a later process's
+          // that took its id.
+          '$windowHeld = $false',
+          'try { [void]$window.Handle; $windowHeld = $true } catch { }',
+          '$windowWatch = [Diagnostics.Stopwatch]::StartNew()',
+          'while ($true) {',
+          '  $windowEnded = $false',
+          '  try { $windowEnded = $true -eq $window.HasExited } catch { $windowEnded = $false }',
+          '  if (-not [IO.File]::Exists($windowFile)) { break }',
+          '  if ($windowEnded) { $windowCode = "unknown"; if ($windowHeld) { try { $windowExit = $window.ExitCode; if ($null -ne $windowExit) { $windowCode = "" + $windowExit } } catch { } }; throw ("the window ended before its first line ran (exit code " + $windowCode + "; an antivirus or an execution policy may have stopped it)") }',
+          `  if ($windowWatch.ElapsedMilliseconds -ge ${WINDOW_START_MS}) { break }`,
+          '  Start-Sleep -Milliseconds 100',
+          '}',
           `$placed = "window - " + $window.Id`,
         ]
   /** A tab or a named window: its stamp set first (wt forwards it), the slot script's hash checked right before, then wt.exe with one string. */
@@ -4904,8 +4935,8 @@ export function launchScriptText(input: LaunchInput): string {
     ...(transport === 'auto'
       ? ['  if ($transport -eq "slot") {', ...writeRecord.map(line => `    ${line}`), '  } else {', ...openWindow.map(line => `    ${line}`), '  }']
       : []),
-    // A window's file the window never got to read (Start-Process threw once it was in place) goes with the
-    // refusal, never left for a later launch's sweep.
+    // A window's file the window never got to read (Start-Process threw once it was in place, or the window
+    // ended before its first line) goes with the refusal, never left for a later launch's sweep.
     usesWindow
       ? "} catch { $placeWhy = $_.Exception.Message; if ($null -ne $windowFile) { try { [IO.File]::Delete($windowFile) } catch { } }; Refuse 'place' ($tool + ': the launch could not be placed: ' + $placeWhy) }"
       : "} catch { Refuse 'place' ($tool + ': the launch could not be placed: ' + $_.Exception.Message) }",
