@@ -3575,12 +3575,15 @@ export function pickTransport(
 // claim, RECHECK, the left record), with the same caps as in a tab: 30 resumes within any hour, never a
 // fourth within 30 seconds. Hosted (-Hosted, which only the window's script passes), its pane file says
 // so: that is no power, and a -Wrapper run by hand is a profile's, as before.
-// The window's own script (windowScriptPath) is a file for the same reason, with the same gap: the launch
-// writes it whole under another name and moves it to the name its claim's uuid gives, then starts the
-// window with -File, which reads it, and the window deletes it before its first check. It is not pinned:
-// it is made per launch, and the one writer who could swap it in that gap is that same user, who could as
-// well run claude. Its per-launch values (the id, the claim, the pid, the folders) are in it as checked
-// literals, as they were on the command line. It was a self-unpacking -EncodedCommand (GZip, base64,
+// The window's own script (windowScriptPath) is a file too: the launch writes it whole under another name
+// and moves it to the name its claim's uuid gives, then starts the window with -File, which reads it, and
+// the window deletes it before its first check. Unlike claude-launch.ps1, which is pinned and hashed again
+// right before it runs, this file is unpinned and unchecked between the write and the read (the window's
+// start: under a second, longer under an antivirus), and it is the code that makes the window's later
+// checks, the launcher's hash among them. That is acceptable under T20, not the same gap: only the same OS
+// user (or an administrator) can write there, and that user could as well replace the unpinned claude.exe
+// the window runs. It is made per launch, so there is nothing to pin. Its per-launch values (the id, the
+// claim, the pid, the folders) are in it as checked literals, as they were on the command line. It was a self-unpacking -EncodedCommand (GZip, base64,
 // [scriptblock]::Create) before, which an antivirus hooked into AMSI blocks as malicious content before a
 // line of it runs; the script itself on the command line is past Windows' 32,767 characters. The launch
 // answers `launched` only once the window deleted its file, or is still starting after WINDOW_START_MS: a
@@ -4671,19 +4674,28 @@ export function launchScriptText(input: LaunchInput): string {
       ? []
       : [
           `$inner = ${literal(windowed.inner)}`,
-          // Window scripts no window ran (one killed first, or stopped by a policy): each window deletes its own
+          // Window scripts no window ran (one killed first, or one that ended before its first line after the
+          // launch stopped watching it, WINDOW_START_MS): each window deletes its own
           // as it starts, so one older than a stale claim is no one's. Only names of their shape (LAUNCH_ID's and
           // the ending idPath gives them, or the temporary's beside it), never refused on.
-          `$windowFile = ${literal(windowed.file)}`,
-          '$windowDir = [IO.Path]::GetDirectoryName($windowFile)',
+          `$windowPath = ${literal(windowed.file)}`,
+          '$windowDir = [IO.Path]::GetDirectoryName($windowPath)',
           String.raw`try { if ([IO.Directory]::Exists($windowDir)) { foreach ($staleFile in [IO.Directory]::GetFiles($windowDir)) { if ([IO.Path]::GetFileName($staleFile) -cmatch '${LAUNCH_ID.source.replace(/\$$/, '')}${ID_FILES.window.ending.replace(/\./g, '\\.')}(\.[0-9a-f]{32}\.tmp)?\z' -and ([DateTime]::UtcNow - [IO.File]::GetLastWriteTimeUtc($staleFile)).TotalMilliseconds -gt ${CLAIM_STALE_MS}) { try { [IO.File]::Delete($staleFile) } catch { } } } } } catch { }`,
-          // Written whole: a temporary file beside it, then moved to its name, never over another. UTF-8 with its
-          // byte order mark: Windows PowerShell 5.1 reads a script file without one in the ANSI code page, which
-          // would garble a folder's non-ASCII name.
-          '$windowTemp = $windowFile + "." + [guid]::NewGuid().ToString("N") + ".tmp"',
+          // Written whole: a temporary file beside it, created for this run alone (CreateNew, never a file or a
+          // link already there), written, flushed and closed as Install-Launcher writes its own, then moved to its
+          // name, never over another (an existing one refuses the move, and is left as it is). UTF-8 with its byte
+          // order mark: Windows PowerShell 5.1 reads a script file without one in the ANSI code page, which would
+          // garble a folder's non-ASCII name. A temporary this run created goes again on any failure.
+          '$windowTemp = $windowPath + "." + [guid]::NewGuid().ToString("N") + ".tmp"',
           '[void][IO.Directory]::CreateDirectory($windowDir)',
-          '[IO.File]::WriteAllText($windowTemp, $inner, [Text.UTF8Encoding]::new($true))',
-          'try { [IO.File]::Move($windowTemp, $windowFile) } catch { [IO.File]::Delete($windowTemp); throw }',
+          '[byte[]]$windowBytes = [Text.UTF8Encoding]::new($true).GetPreamble() + [Text.UTF8Encoding]::new($true).GetBytes($inner)',
+          '$windowStream = [IO.File]::Open($windowTemp, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)',
+          'try {',
+          '  try { $windowStream.Write($windowBytes, 0, $windowBytes.Length); $windowStream.Flush($true) } finally { $windowStream.Dispose() }',
+          '  [IO.File]::Move($windowTemp, $windowPath)',
+          '} catch { try { [IO.File]::Delete($windowTemp) } catch { }; throw }',
+          // In place, and this run's own: from here on, the file a failed place and a withdrawn window delete.
+          '$windowFile = $windowPath',
           // -ExecutionPolicy Bypass, for this window's scripts alone (claude-launch.ps1 clears it again before
           // claude): the window runs claude-launch.ps1 only with the SHA-256 it pins, checked right before, a
           // stronger check than RemoteSigned's; under RemoteSigned, a downloaded file's mark (Zone.Identifier)
@@ -4811,8 +4823,8 @@ export function launchScriptText(input: LaunchInput): string {
     '$taken = $false',
     '$final = $null',
     '$window = $null',
-    // The window's own file, once this run names it, right before it writes it: what a failed place and a
-    // withdrawn window delete.
+    // The window's own file, once this run has put it in place: what a failed place and a withdrawn window
+    // delete, and never a file this run didn't write.
     ...(usesWindow ? ['$windowFile = $null'] : []),
     ...RELEASE_CLAIM,
     // A refusal: the lock this run took given back first, then one line, and nothing else.
