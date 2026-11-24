@@ -1,0 +1,26 @@
+{
+  "name": "self-desktop",
+  "version": "0.1.0",
+  "description": "Lets a session read its own machine's desktop on Windows, read only: it lists the windows a person could see (program, rectangle, monitor, state, which is in front; a title only for Windows Terminal windows and the session's own), reads the session's own terminal window (its controls and its own pane's text), and captures that window to a local PNG. It never clicks, types, focuses, moves or closes anything. Off until you turn it on.",
+  "author": { "name": "moefingers", "url": "https://github.com/moefingers" },
+  "homepage": "https://github.com/moefingers/claude-code-self-tools/tree/main/plugins/self-desktop#readme",
+  "repository": "https://github.com/moefingers/claude-code-self-tools",
+  "license": "MIT",
+  "keywords": ["desktop", "windows", "ui-automation", "screenshot", "mod"],
+  "userConfig": {
+    "updateCheck": {
+      "type": "string",
+      "title": "Update check",
+      "description": "on: when a tool of this plugin is called and the last check is 30 minutes old, fetch this plugin's published plugin.json from GitHub (a plain GET of a public file) and say when a newer version is out. off: never check.",
+      "default": "on",
+      "options": ["on", "off"]
+    },
+    "enabled": {
+      "type": "string",
+      "title": "Read the desktop",
+      "description": "off (the default): every tool answers that self-desktop is off, and nothing is read. on: desktop_windows lists the windows a person could see (a title only for Windows Terminal windows and this session's own), desktop_read reads this session's own terminal window and its own pane's text, and desktop_capture saves a picture of that window to a local file. Windows only. Read only: nothing is clicked, typed, focused, moved or closed.",
+      "default": "off",
+      "options": ["off", "on"]
+    }
+  }
+}
