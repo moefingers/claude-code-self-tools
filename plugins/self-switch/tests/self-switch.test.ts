@@ -2699,18 +2699,17 @@ describe('placement.json: where the new window goes', () => {
     expect(toasts.join('\n')).toContain("Switch didn't run: no window opened (the launcher refused: self-switch: a Group Policy execution policy runs no unsigned script file")
   })
 
-  test('refused for a Group Policy execution policy: a later place that opens no window (a tab) is still tried', async ($, on) => {
-    const { runs, files, commands, clock } = engine(on, { probe: machine(noSlots), store: THERE, launcher: 'policy' })
+  test("refused for a Group Policy execution policy: a later tab isn't tried either (its slot runner runs a script file the same policy stops), and nothing switches", async ($, on) => {
+    const { runs, files, commands, toasts, clock } = engine(on, { probe: machine(noSlots), store: THERE, launcher: 'policy' })
     files.set(placementPath(STATE), JSON.stringify({ v: 1, layout: [], launch: { prefer: ['window', 'tab'], tab: { window: 'claude-4', maxTabs: 2 }, window: { name: 'claude-overflow' } } }))
     await $.session.start(start)
     await switchNow($, clock)
     const launches = runs.filter(r => r.kind === 'launcher').map(r => r.script)
-    // The named window refused, the tab placed; the plain window after them never tried.
-    expect(launches).toHaveLength(2)
+    // The named window refused; neither the tab nor the plain window after it tried.
+    expect(launches).toHaveLength(1)
     expect(launches[0]).toContain("Refuse 'policy'")
-    expect(launches[1]).not.toContain("Refuse 'policy'")
-    expect(launches[1]).toContain("$env:CLAUDE_SELF_TOOLS_WT_WINDOW = 'claude-4'")
-    expect(commands).toEqual([{ command: 'exit' }])
+    expect(commands).toEqual([])
+    expect(toasts.join('\n')).toContain("Switch didn't run: no window opened (the launcher refused: self-switch: a Group Policy execution policy runs no unsigned script file")
   })
 
   test('a bad file means no placement: the plain window, said in the log once', async ($, on) => {

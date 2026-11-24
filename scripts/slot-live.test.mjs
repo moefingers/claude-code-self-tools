@@ -15,7 +15,7 @@ import { freemem, tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { after, before, describe, test } from 'node:test'
 import { pathToFileURL } from 'node:url'
-import { compileStub, fence, holder, noWindow, underStub, WINDOWS_POWERSHELL, stubWork } from './stub.mjs'
+import { compileStub, fence, holder, noWindow, policySkip, underStub, WINDOWS_POWERSHELL, stubWork, withPolicy } from './stub.mjs'
 import { ROOT } from './sync-shared.mjs'
 
 const machine = await import(pathToFileURL(join(ROOT, 'shared', 'hooks', 'machine.ts')).href)
@@ -868,14 +868,16 @@ describe("the probe's slots mode, and the launch's own run, against a running ru
     }
   })
 
-  test('F6: a named window, its own run: the same runner by the same path; with no Windows Terminal there, the plain window', async () => {
+  // It runs the slot runner for real, by -File: skipped, saying why, where this machine's own Group Policy would
+  // stop that file. Its launches read Group Policy from the test's own empty hives, never this machine's.
+  test('F6: a named window, its own run: the same runner by the same path; with no Windows Terminal there, the plain window', { skip: isWindows && policySkip() }, async () => {
     const dirs = lab({ local: 'local app' })
     const id = randomUUID()
     transcript(dirs, id)
     const by = `launch:${randomUUID()}`
     const lineFile = join(dirs.root, 'wt-line.txt')
     const input = { powershell: WINDOWS_POWERSHELL, kind: 'resume', id, folder: dirs.folder, claim: by, configDirs: [dirs.config], stateDir: dirs.state, where: { window: { name: 'claude-overflow', pos: [1920, 0], size: [140, 60] } }, checks: { floor: true, input: true, live: true }, maxSessions: 40, heavySlotRoot: null, tool: 'coordinator' }
-    const ran = await underStub({ stub, work, env: envOf(dirs), script: () => noWindow(fakeWt(steady(machine.launchScriptText(input)), lineFile)) })
+    const ran = await underStub({ stub, work, env: envOf(dirs), script: () => noWindow(fakeWt(steady(withPolicy(machine.launchScriptText(input))), lineFile)) })
     assert.deepEqual(machine.parseLaunch(ran.stdout).launched, { transport: 'window', label: 'claude-overflow' }, ran.stdout + ran.stderr)
     const argv = argvOf(dirs, readFileSync(lineFile, 'utf8'))
     assert.deepEqual(argv.slice(0, 6), ['-w', 'claude-overflow', '--pos', '1920,0', '--size', '140,60'])
@@ -894,7 +896,7 @@ describe("the probe's slots mode, and the launch's own run, against a running ru
     rmSync(join(dirs.local, 'Microsoft', 'WindowsApps', 'wt.exe'))
     const other = randomUUID()
     transcript(dirs, other)
-    const plain = await underStub({ stub, work, env: envOf(dirs), script: () => noWindow(fakeWt(steady(machine.launchScriptText({ ...input, id: other })), lineFile)) })
+    const plain = await underStub({ stub, work, env: envOf(dirs), script: () => noWindow(fakeWt(steady(withPolicy(machine.launchScriptText({ ...input, id: other }))), lineFile)) })
     assert.equal(machine.parseLaunch(plain.stdout).refused?.code, 'place', plain.stdout + plain.stderr)
     assert.match(plain.stdout, /a test never opens a window/)
   })

@@ -4624,9 +4624,10 @@ const WINDOWS_POLICY_KEY = 'Software\\Policies\\Microsoft\\Windows\\PowerShell'
  * and 1 the ExecutionPolicy value beside it. PowerShell 7's key (`$core`) defers to Windows PowerShell's
  * in the same hive where its UseWindowsPowerShellPolicySetting is 1. A key or a value that isn't there, or
  * a read that fails, is Undefined: a launch is never refused on what it couldn't read. `$policyRoots` is
- * the one line naming the hives (a test puts its own in their place).
+ * the one line naming the hives (a test puts its own in their place). Exported for the tests, which read this
+ * machine's own with it to know whether a real window's script file could run here.
  */
-const READ_GROUP_POLICY = [
+export const READ_GROUP_POLICY = [
   '$policyRoots = @([Microsoft.Win32.Registry]::LocalMachine, [Microsoft.Win32.Registry]::CurrentUser)',
   'function Read-GroupPolicy($path, $core) {',
   '  foreach ($root in $policyRoots) {',

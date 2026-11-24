@@ -93,25 +93,82 @@ export function noWindow(script) {
  * and writes to `file` what the window would have been started with (`{ file, args }`: the program and
  * its argument list), so a test can read the interpreter chosen and run that very command hidden. It
  * throws when the script could reach the real cmdlet past the function (by its module's name, or .NET).
- * The window it answers with is still starting (it has no HasExited), unless `window` says otherwise:
- * `ended` (an exit code) gives one that has already ended; `began` deletes the script file named by the
- * last argument first, as the window's first line does. Both together: a window that ran its first line,
- * then ended.
+ * By default the window it answers with begins as a real one does: it sets the launch's start signal
+ * (the event named by the script file's own uuid, machine.WINDOW_SIGNAL_PREFIX), and leaves the file for the
+ * test, which may run it. `window` says otherwise: `signals: false`, one that never sets it; `ended` (an exit
+ * code), one that has already ended; `removesFile`, the script file removed by someone else first. Its
+ * Handle is one the launch can hold. It records what the launch's watch did, measured inside the script:
+ * each HasExited the watch reads is a look, and the first look's time is kept; `$placed` reading its Id
+ * writes `{ looks, ms }` to `<file>.placed`, and its Kill writes the same to `<file>.killed`.
  */
 export function recordWindow(script, file, window = {}) {
   if (/\\Start-Process|Diagnostics\.Process\]::Start|ProcessStartInfo/.test(script)) throw new Error('the script reaches a process start past the recording function')
   if (/['"]/.test(file)) throw new Error('a record file without quotes')
-  const { ended, began = false } = window
+  const { signals = true, ended, removesFile = false } = window
   if (ended !== undefined && !Number.isInteger(ended)) throw new Error('an exit code is a whole number')
-  const fields = ended === undefined ? 'Id = 0' : `Id = 0; HasExited = $true; ExitCode = ${ended}`
+  const path = '$ArgumentList[-1].Trim([char]34)'
+  const watched = '(ConvertTo-Json -Compress -InputObject ([ordered]@{ looks = [int]$global:recordedLooks; ms = [long]([DateTime]::UtcNow - $global:recordedFirstLook).TotalMilliseconds }))'
   const shadow = [
     'function Start-Process { param([string]$FilePath, [string[]]$ArgumentList, [switch]$PassThru)',
     `  [IO.File]::WriteAllText('${file}', (ConvertTo-Json -Compress -InputObject ([ordered]@{ file = $FilePath; args = @($ArgumentList) })))`,
-    ...(began ? ['  [IO.File]::Delete($ArgumentList[-1].Trim([char]34))'] : []),
-    `  [pscustomobject]@{ ${fields} } | Add-Member -MemberType ScriptMethod -Name Kill -Value { } -PassThru`,
+    ...(removesFile ? [`  [IO.File]::Delete(${path})`] : []),
+    ...(signals ? [`  $recordedSignal = [Threading.EventWaitHandle]::OpenExisting('${machine.WINDOW_SIGNAL_PREFIX}' + [IO.Path]::GetFileNameWithoutExtension(${path})); try { [void]$recordedSignal.Set() } finally { $recordedSignal.Dispose() }`] : []),
+    '  $global:recordedLooks = 0',
+    '  $global:recordedFirstLook = [DateTime]::UtcNow',
+    `  $recorded = [pscustomobject]@{ Handle = [IntPtr]::new(1)${ended === undefined ? '' : `; ExitCode = ${ended}`} }`,
+    `  $recorded | Add-Member -MemberType ScriptProperty -Name HasExited -Value { if ($global:recordedLooks -eq 0) { $global:recordedFirstLook = [DateTime]::UtcNow }; $global:recordedLooks++; ${ended === undefined ? '$false' : '$true'} }`,
+    `  $recorded | Add-Member -MemberType ScriptProperty -Name Id -Value { [IO.File]::WriteAllText('${file}.placed', ${watched}); 0 }`,
+    `  $recorded | Add-Member -MemberType ScriptMethod -Name Kill -Value { [IO.File]::WriteAllText('${file}.killed', ${watched}) }`,
+    '  $recorded | Add-Member -MemberType ScriptMethod -Name WaitForExit -Value { param($ms) $true }',
+    '  $recorded',
     '}',
   ]
   return [...shadow, script].join('\r\n')
+}
+
+/** Where Group Policy sets each PowerShell's execution policy, as the launch reads it. */
+export const CORE_KEY = 'Software\\Policies\\Microsoft\\PowerShellCore'
+export const WINDOWS_KEY = 'Software\\Policies\\Microsoft\\Windows\\PowerShell'
+/** The one line of a launch script naming the hives it reads Group Policy from. */
+export const HIVES = '$policyRoots = @([Microsoft.Win32.Registry]::LocalMachine, [Microsoft.Win32.Registry]::CurrentUser)'
+
+/**
+ * A launch script whose Group Policy comes from `machine` (HKLM) and `user` (HKCU) as given, not the registry:
+ * each a key's path to its values ({ [WINDOWS_KEY]: { EnableScripts: 1, ExecutionPolicy: 'AllSigned' } }), or a
+ * string, a hive whose every read throws it. Each fake answers OpenSubKey, GetValue and Dispose as a
+ * RegistryKey does: $null for a key or a value that isn't there. With no hives given: the test's own empty
+ * ones, so a test not about Group Policy never depends on this machine's.
+ */
+export function withPolicy(script, { machine: hklm = {}, user = {} } = {}) {
+  if (script.split(HIVES).length !== 2) throw new Error('the hives are named on one line, once')
+  const ps = value => (typeof value === 'number' ? String(value) : `'${String(value).split("'").join("''")}'`)
+  const hive = keys => (typeof keys === 'string' ? ps(keys) : `@{ ${Object.entries(keys).map(([path, values]) => `${ps(path)} = @{ ${Object.entries(values).map(([name, value]) => `${ps(name)} = ${ps(value)}`).join('; ')} }`).join('; ')} }`)
+  const fake = [
+    'function New-PolicyHive($keys) {',
+    '  $hive = [pscustomobject]@{ Keys = $keys }',
+    '  $hive | Add-Member -MemberType ScriptMethod -Name OpenSubKey -Value { param($path) if ($this.Keys -is [string]) { throw $this.Keys }; if (-not $this.Keys.ContainsKey($path)) { return $null }; $key = [pscustomobject]@{ Values = $this.Keys[$path] }; $key | Add-Member -MemberType ScriptMethod -Name GetValue -Value { param($name) $this.Values[$name] }; $key | Add-Member -MemberType ScriptMethod -Name Dispose -Value { }; return $key }',
+    '  return $hive',
+    '}',
+    `$policyRoots = @((New-PolicyHive ${hive(hklm)}), (New-PolicyHive ${hive(user)}))`,
+  ].join('\r\n')
+  return script.split(HIVES).join(fake)
+}
+
+/**
+ * Why a test that runs a real window's script by -File can't run on this machine, or false: this machine's
+ * own Group Policy, read as the launch reads it (machine.READ_GROUP_POLICY, in Windows PowerShell; only read),
+ * sets AllSigned or Restricted for Windows PowerShell or PowerShell 7, which would stop that file before its
+ * first line, whatever the test's -ExecutionPolicy. A read that fails counts as none, as the launch counts it.
+ */
+export function policySkip() {
+  if (process.platform !== 'win32') return false
+  const script = [...machine.READ_GROUP_POLICY, `[Console]::Out.WriteLine((Read-GroupPolicy '${WINDOWS_KEY}' $false) + ' ' + (Read-GroupPolicy '${CORE_KEY}' $true))`].join('\r\n')
+  const ran = spawnSync(WINDOWS_POWERSHELL, ['-NoProfile', '-NonInteractive', '-EncodedCommand', machine.encodeCommand(script)], { encoding: 'utf8', windowsHide: true, timeout: 60_000 })
+  const [windows, core] = `${ran.stdout ?? ''}`.trim().split(/\s+/)
+  const stops = policy => policy === 'AllSigned' || policy === 'Restricted'
+  if (stops(windows)) return `this machine's Group Policy sets Windows PowerShell's execution policy to ${windows}, which stops the window's script file this test runs`
+  if (stops(core)) return `this machine's Group Policy sets PowerShell 7's execution policy to ${core}, which stops the window's script file this test runs`
+  return false
 }
 
 /**

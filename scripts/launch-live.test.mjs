@@ -17,11 +17,16 @@ import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { after, before, describe, test } from 'node:test'
 import { pathToFileURL } from 'node:url'
-import { compileStub, fence, holder, noWindow, recordWindow, underStub, WINDOWS_POWERSHELL, stubWork } from './stub.mjs'
+import { compileStub, CORE_KEY, fence, HIVES, holder, noWindow, policySkip, recordWindow, underStub, WINDOWS_KEY, WINDOWS_POWERSHELL, stubWork, withPolicy } from './stub.mjs'
 import { ROOT } from './sync-shared.mjs'
 
 const machine = await import(pathToFileURL(join(ROOT, 'shared', 'hooks', 'machine.ts')).href)
 const isWindows = process.platform === 'win32'
+/**
+ * Why the tests that run a real window's script hidden, by -File, can't run here (this machine's own Group
+ * Policy would stop that file before its first line), or false; with the 'Windows only' skip.
+ */
+const realWindowSkip = !isWindows ? 'Windows only' : policySkip()
 
 let work
 let stub
@@ -200,7 +205,7 @@ describe('the launch script, run under a stub claude.exe', { skip: !isWindows &&
       stub,
       work,
       env: envOf(dirs),
-      script: self => noWindow(machine.launchScriptText(launchInput(dirs, { id, where: 'auto', waitForExit: { pid: self.pid, created: self.created }, now: Date.now(), deadline: Date.now() - 1000 }))),
+      script: self => noWindow(withPolicy(machine.launchScriptText(launchInput(dirs, { id, where: 'auto', waitForExit: { pid: self.pid, created: self.created }, now: Date.now(), deadline: Date.now() - 1000 })))),
     })
     assert.equal(machine.parseLaunch(ran.stdout).refused?.code, 'late', ran.stdout + ran.stderr)
     const installed = machine.launchScriptPath(dirs.state)
@@ -219,7 +224,7 @@ describe('the launch script, run under a stub claude.exe', { skip: !isWindows &&
       stub,
       work,
       env: envOf(dirs),
-      script: self => noWindow(machine.launchScriptText(launchInput(dirs, { id, where: 'auto', waitForExit: { pid: self.pid, created: self.created }, now: Date.now(), deadline: Date.now() + 60_000 }))),
+      script: self => noWindow(withPolicy(machine.launchScriptText(launchInput(dirs, { id, where: 'auto', waitForExit: { pid: self.pid, created: self.created }, now: Date.now(), deadline: Date.now() + 60_000 })))),
     })
     assert.equal(machine.parseLaunch(ran.stdout).refused?.code, 'claim', ran.stdout + ran.stderr)
     assert.ok(existsSync(machine.launchScriptPath(dirs.state)))
@@ -244,10 +249,13 @@ function innerOf(script) {
   return script.slice(from, end).split("''").join("'")
 }
 
-/** The file a window's script deletes first: its own, as the launch named it (windowScriptPath). */
+/**
+ * The file a window's script deletes as its second line, right after it sets its launch's start signal: its own,
+ * as the launch named it (windowScriptPath).
+ */
 function fileOf(inner) {
-  const path = /^try \{ \[IO\.File\]::Delete\('([^']+)'\) \} catch \{ \}\r\n/.exec(inner)?.[1]
-  assert.ok(path !== undefined, "the window's script deletes its own file first")
+  const path = /^try \{ \$launchSignal = \[Threading\.EventWaitHandle\]::OpenExisting\('[^']+'\); [^\r\n]*\r\ntry \{ \[IO\.File\]::Delete\('([^']+)'\) \} catch \{ \}\r\n/.exec(inner)?.[1]
+  assert.ok(path !== undefined, "the window's script sets its start signal, then deletes its own file")
   return path
 }
 
@@ -297,7 +305,7 @@ function windowLab(change = {}) {
 const labs = new Map()
 const windowLabDirs = input => labs.get(input)
 
-describe("the window's own script, run as the window runs it (hidden, here)", { skip: !isWindows && 'Windows only', concurrency: 2 }, () => {
+describe("the window's own script, run as the window runs it (hidden, here)", { skip: realWindowSkip, concurrency: 2 }, () => {
   test('claude-launch.ps1 from its hashed name, with every config folder: claude --resume <id> in the folder, the launch environment applied', async () => {
     const { dirs, input, inner } = windowLab()
     const ran = await runWindow(inner, dirs)
@@ -388,7 +396,7 @@ describe("the window's own script, run as the window runs it (hidden, here)", { 
   })
 })
 
-describe('S3: the window waits for the old process by its handle, keeps waiting, and records a refusal', { skip: !isWindows && 'Windows only', concurrency: 2 }, () => {
+describe('S3: the window waits for the old process by its handle, keeps waiting, and records a refusal', { skip: realWindowSkip, concurrency: 2 }, () => {
   /** The window's first wait, shortened from 10 minutes to 2 seconds for the test: nothing else changes. */
   /** The window's looks, shortened from 30 s to 1 s, and its 10-minute line to 2 s, for the test: nothing else changes. */
   const shortWait = (inner, waitFor) => {
@@ -535,8 +543,14 @@ function withProgramFiles(script, folder, aside = undefined) {
   return placed
 }
 
-/** The launch of a window that resumes `id` in its folder, run under the stub, its Start-Process recorded: the answer, the input, and what the window was given. */
-async function launchWindow(dirs, id, extra, change = script => script, more = {}) {
+/**
+ * The launch of a window that resumes `id` in its folder, run under the stub, its Start-Process recorded (as
+ * `recorded` says: recordWindow's; by default a window that begins as a real one does): the answer, the input,
+ * what the window was given, and what the watch did (`placed` or `killed`: its looks and the ms since the
+ * first, measured inside the script). Group Policy from the test's own empty hives, unless `change` put
+ * hives of its own in their place: a test not about Group Policy never depends on this machine's.
+ */
+async function launchWindow(dirs, id, extra, change = script => script, more = {}, recorded = {}) {
   const record = join(dirs.root, 'window.json')
   let input
   const ran = await underStub({
@@ -545,24 +559,33 @@ async function launchWindow(dirs, id, extra, change = script => script, more = {
     env: envOf(dirs, extra),
     script: self => {
       input = launchInput(dirs, { id, waitForExit: { pid: self.pid, created: self.created }, now: Date.now(), deadline: Date.now() + 60_000, tool: 'self-restart', ...more })
-      return recordWindow(change(machine.launchScriptText(input)), record)
+      const changed = change(machine.launchScriptText(input))
+      return recordWindow(changed.includes(HIVES) ? withPolicy(changed) : changed, record, recorded)
     },
   })
-  return { ran, input, answer: machine.parseLaunch(ran.stdout), window: existsSync(record) ? JSON.parse(readFileSync(record, 'utf8')) : undefined }
+  const read = path => (existsSync(path) ? JSON.parse(readFileSync(path, 'utf8')) : undefined)
+  return { ran, input, answer: machine.parseLaunch(ran.stdout), window: read(record), placed: read(`${record}.placed`), killed: read(`${record}.killed`), file: machine.windowScriptPath(dirs.state, input.claim.slice('launch:'.length)) }
 }
 
 /**
  * The recorded window's command run here, hidden, as Start-Process would have started it. Its Enter prompts
  * are answered at once; or, with `enterAfter`, only once the output matches it and the window is still
  * running 1.5 s later (`waited`): a window that waits for Enter is still there, one that closed on it isn't.
+ * With `verbatim`, the very command line Windows PowerShell 5.1's Start-Process builds: the program quoted,
+ * then its arguments joined by a space, as they are, nothing quoted again.
  */
-function openRecorded(window, dirs, extra, enterAfter = undefined) {
+function openRecorded(window, dirs, extra, enterAfter = undefined, verbatim = false) {
   const env = envOf(dirs, extra)
   return new Promise(resolve => {
     // Windows PowerShell's Start-Process joins its arguments into one command line as they are, so the quotes
-    // around the script's path are the command line's: spawn quotes for itself.
-    const args = window.args.map(arg => (/^".*"$/.test(arg) ? arg.slice(1, -1) : arg))
-    const child = spawn(window.file, args, { env, cwd: dirs.root, windowsHide: true })
+    // around the script's path are the command line's: by default spawn quotes for itself.
+    const child = verbatim
+      ? spawn(window.file, [window.args.join(' ')], { env, cwd: dirs.root, windowsHide: true, windowsVerbatimArguments: true, argv0: `"${window.file}"` })
+      : spawn(
+          window.file,
+          window.args.map(arg => (/^".*"$/.test(arg) ? arg.slice(1, -1) : arg)),
+          { env, cwd: dirs.root, windowsHide: true },
+        )
     let out = ''
     let waited = false
     let answered = false
@@ -601,11 +624,11 @@ const ticketOf = (resume, by, dir, configDirs, at = '{NOW}') => {
  * conversation on its command line, all along), `enterAfter` (see openRecorded), `probe` (the stub runs
  * the probe under itself at each run), `exit` (each claude run's exit code), `more` (more of the launch's input,
  * given the run's folders: Remote Control and a first prompt, #63), `beforeOpen` (run between the launch and its window),
- * `local` (the LOCALAPPDATA folder's own name, so the state folder and the window's file are under it). Its answer
- * names the window's own file (`windowFile`), its bytes as the launch wrote them (`written`), and whether it is
- * still there once the window ran (`windowFileLeft`).
+ * `local` (the LOCALAPPDATA folder's own name, so the state folder and the window's file are under it), `verbatim`
+ * (see openRecorded). Its answer names the window's own file (`windowFile`), its bytes as the launch wrote them
+ * (`written`), and whether it is still there once the window ran (`windowFileLeft`).
  */
-async function windowRun({ programFiles = 'real', restricted = false, copy = 'ok', plan = (r, input) => ({ 1: ticketOf(r.id, input.claim, r.dirs.folder, [r.dirs.config]) }), holdOther = false, enterAfter = undefined, probe = true, exit = '0', more = () => ({}), beforeOpen = () => {}, local = 'local' } = {}) {
+async function windowRun({ programFiles = 'real', restricted = false, copy = 'ok', plan = (r, input) => ({ 1: ticketOf(r.id, input.claim, r.dirs.folder, [r.dirs.config]) }), holdOther = false, enterAfter = undefined, probe = true, exit = '0', more = () => ({}), beforeOpen = () => {}, local = 'local', verbatim = false } = {}) {
   const dirs = lab({ local })
   const id = randomUUID()
   const other = randomUUID()
@@ -645,7 +668,7 @@ async function windowRun({ programFiles = 'real', restricted = false, copy = 'ok
   beforeOpen(dirs)
   const held = holdOther ? await holder({ stub, work, env: envOf(dirs), args: ['--resume', other], ms: 120_000 }) : undefined
   try {
-    const opened = launched.window === undefined ? undefined : await openRecorded(launched.window, dirs, { ...extra, ...stubExtra }, enterAfter)
+    const opened = launched.window === undefined ? undefined : await openRecorded(launched.window, dirs, { ...extra, ...stubExtra }, enterAfter, verbatim)
     const probeOf = n => {
       const path = join(dirs.root, `probe-${n}.out`)
       return existsSync(path) ? machine.parseProbe(readFileSync(path, 'utf8')) : { error: 'no probe output' }
@@ -665,7 +688,7 @@ const lockFor = (dirs, id, by) => {
 /** Two FILETIMEs within 1 ms, as the plugins compare a pane file's start with its process's. */
 const nearTicks = (a, b) => BigInt(a) - BigInt(b) <= 10_000n && BigInt(b) - BigInt(a) <= 10_000n
 
-describe("a window's launch, end to end: the interpreter it chose, the wrapper's verified copy, and the restart from it in the same window", { skip: !isWindows && 'Windows only', concurrency: 2 }, () => {
+describe("a window's launch, end to end: the interpreter it chose, the wrapper's verified copy, and the restart from it in the same window", { skip: realWindowSkip, concurrency: 2 }, () => {
   test(`PowerShell 7 at its standard path${hasPwsh ? '' : ' (not on this machine: Windows PowerShell)'}: the window runs in it, claude right under it through the wrapper, and its restart comes back in it (pane)`, async () => {
     const r = await windowRun()
     const shell = hasPwsh ? PWSH : WINDOWS_POWERSHELL
@@ -732,10 +755,13 @@ describe("a window's launch, end to end: the interpreter it chose, the wrapper's
     assert.deepEqual(second.args, ['--resume', r.id])
   })
 
-  test("SW-L-5: a LOCALAPPDATA named with a space and past ASCII: the window's own file under it, its path quoted on the command line, found by -File, run, and gone", async () => {
-    const r = await windowRun({ local: 'app data é 中', plan: () => ({}), probe: false })
+  test("SW-L-5, WF-L-6: a LOCALAPPDATA named with a space and past ASCII: the window's own file under it, started by the very command line Windows PowerShell 5.1's Start-Process builds, found by -File, run, and gone", async () => {
+    // Windows PowerShell by its known path (no PowerShell 7 to choose), and the recorded command run verbatim:
+    // "<powershell.exe>" then the arguments joined by a space, the path's own quotes the only ones.
+    const r = await windowRun({ local: 'app data é 中', plan: () => ({}), probe: false, programFiles: 'none', verbatim: true })
     assert.equal(r.launched.answer.launched?.transport, 'window', r.launched.ran.stdout + r.launched.ran.stderr)
     assert.ok(r.windowFile.includes('\\app data é 中\\claude-self-tools\\windows\\'), r.windowFile)
+    assert.equal(r.launched.window.file.toLowerCase(), WINDOWS_POWERSHELL.toLowerCase())
     assert.deepEqual(r.launched.window.args, ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', `"${r.windowFile}"`])
     assert.deepEqual([...(r.written ?? Buffer.alloc(0)).subarray(0, 3)], [0xef, 0xbb, 0xbf])
     const { opened } = r
@@ -979,34 +1005,8 @@ describe("the window's own script file: left ones swept by a later launch", { sk
 // ---------------------------------------------------------------------------------------------
 // A Group Policy execution policy, read as the launch reads it but from hives of the test's own (never the
 // registry, which a test may not write and whose real policy would change the answers), and a window's file
-// the window never read. The window is only recorded, or its Start-Process throws: nothing opens.
-
-/** Where Group Policy sets each PowerShell's execution policy, as the launch reads it. */
-const CORE_KEY = 'Software\\Policies\\Microsoft\\PowerShellCore'
-const WINDOWS_KEY = 'Software\\Policies\\Microsoft\\Windows\\PowerShell'
-/** The one line of a launch script naming the hives it reads Group Policy from. */
-const HIVES = '$policyRoots = @([Microsoft.Win32.Registry]::LocalMachine, [Microsoft.Win32.Registry]::CurrentUser)'
-
-/**
- * A launch script whose Group Policy comes from `machine` (HKLM) and `user` (HKCU) as given, not the registry:
- * each a key's path to its values ({ [WINDOWS_KEY]: { EnableScripts: 1, ExecutionPolicy: 'AllSigned' } }), or a
- * string, a hive whose every read throws it. Each fake answers OpenSubKey, GetValue and Dispose as a
- * RegistryKey does: $null for a key or a value that isn't there.
- */
-function withPolicy(script, { machine = {}, user = {} } = {}) {
-  assert.equal(script.split(HIVES).length, 2, 'the hives are named on one line, once')
-  const ps = value => (typeof value === 'number' ? String(value) : `'${String(value).split("'").join("''")}'`)
-  const hive = keys => (typeof keys === 'string' ? ps(keys) : `@{ ${Object.entries(keys).map(([path, values]) => `${ps(path)} = @{ ${Object.entries(values).map(([name, value]) => `${ps(name)} = ${ps(value)}`).join('; ')} }`).join('; ')} }`)
-  const fake = [
-    'function New-PolicyHive($keys) {',
-    '  $hive = [pscustomobject]@{ Keys = $keys }',
-    '  $hive | Add-Member -MemberType ScriptMethod -Name OpenSubKey -Value { param($path) if ($this.Keys -is [string]) { throw $this.Keys }; if (-not $this.Keys.ContainsKey($path)) { return $null }; $key = [pscustomobject]@{ Values = $this.Keys[$path] }; $key | Add-Member -MemberType ScriptMethod -Name GetValue -Value { param($name) $this.Values[$name] }; $key | Add-Member -MemberType ScriptMethod -Name Dispose -Value { }; return $key }',
-    '  return $hive',
-    '}',
-    `$policyRoots = @((New-PolicyHive ${hive(machine)}), (New-PolicyHive ${hive(user)}))`,
-  ].join('\r\n')
-  return script.split(HIVES).join(fake)
-}
+// the window never read. The window is only recorded, or its Start-Process throws: nothing opens. The hives
+// and the keys: stub.mjs's withPolicy, HIVES, CORE_KEY and WINDOWS_KEY.
 
 /** No PowerShell 7 (the Windows folder, of the standard shape and with none in it), and the hives given. */
 const windowsOnly = hives => script => withPolicy(withProgramFiles(script, SYSTEM_ROOT), hives)
@@ -1148,12 +1148,14 @@ describe("a window's file the window never read: deleted by the launch, and only
         input = launchInput(dirs, { waitForExit: { pid: self.pid, created: self.created }, now: Date.now(), deadline: Date.now() + 60_000 })
         const script = windowsOnly({})(machine.launchScriptText(input))
         assert.ok(!/\\Start-Process|Diagnostics\.Process\]::Start|ProcessStartInfo/.test(script), 'nothing reaches a process start past the function below')
-        // A Start-Process of the test's own, defined first: it opens nothing, and the claim is taken back meanwhile (its
-        // lock deleted), so the launch withdraws the window: its Kill recorded; it has no WaitForExit, which throws.
+        // A Start-Process of the test's own, defined first: it opens nothing; its window begins as a real one does (it
+        // sets the launch's start signal), and the claim is taken back meanwhile (its lock deleted), so the launch
+        // withdraws the window: its Kill recorded; it has no WaitForExit, which throws.
         return [
           'function Start-Process { param([string]$FilePath, [string[]]$ArgumentList, [switch]$PassThru)',
           `  [IO.File]::Delete('${machine.claimPath(dirs.state, input.id)}')`,
-          `  [pscustomobject]@{ Id = 0 } | Add-Member -MemberType ScriptMethod -Name Kill -Value { [IO.File]::WriteAllText('${killed}', 'killed') } -PassThru`,
+          `  $began = [Threading.EventWaitHandle]::OpenExisting('${machine.windowSignalName(input.claim.slice('launch:'.length))}'); try { [void]$began.Set() } finally { $began.Dispose() }`,
+          `  [pscustomobject]@{ Id = 0; Handle = [IntPtr]::new(1) } | Add-Member -MemberType ScriptMethod -Name Kill -Value { [IO.File]::WriteAllText('${killed}', 'killed') } -PassThru`,
           '}',
           script,
         ].join('\r\n')
@@ -1183,48 +1185,74 @@ describe("a window's file the window never read: deleted by the launch, and only
   })
 })
 
-describe('SW-M-2: a launch answers launched only once its window began, or is still starting', { skip: !isWindows && 'Windows only', concurrency: 2 }, () => {
-  /** A window's launch in Windows PowerShell under no Group Policy, its window recorded as `window` says (recordWindow's). */
-  async function launchWith(dirs, window) {
-    const record = join(dirs.root, 'window.json')
-    let input
-    const ran = await underStub({
-      stub,
-      work,
-      env: envOf(dirs),
-      script: self => {
-        input = launchInput(dirs, { waitForExit: { pid: self.pid, created: self.created }, now: Date.now(), deadline: Date.now() + 60_000, tool: 'self-restart' })
-        return recordWindow(windowsOnly({})(machine.launchScriptText(input)), record, window)
-      },
-    })
-    return { ran, input, answer: machine.parseLaunch(ran.stdout), started: existsSync(record), file: machine.windowScriptPath(dirs.state, input.claim.slice('launch:'.length)) }
-  }
+describe("WF-M-1, WF-M-2: a launch answers launched only on its window's start signal; a window that ended without it, or has not given it by the bound, is refused place", { skip: !isWindows && 'Windows only', concurrency: 2 }, () => {
+  /** A window's launch in Windows PowerShell under no Group Policy, its window recorded as `recorded` says (recordWindow's). */
+  const launchWith = (dirs, recorded) => launchWindow(dirs, randomUUID(), {}, windowsOnly({}), {}, recorded)
 
-  test('a window that ended at once with its file still there (it never ran a line): refused place, the claim given back, the file gone', async () => {
+  test('a window that sets its start signal at once: placed, its watch ended at its first look', async () => {
     const dirs = lab()
-    const r = await launchWith(dirs, { ended: 1 })
+    const r = await launchWith(dirs, {})
+    assert.equal(r.answer.launched?.transport, 'window', r.ran.stdout + r.ran.stderr)
+    assert.equal(r.placed?.looks, 1, `one look, measured in the script: ${JSON.stringify(r.placed)}`)
+    assert.equal(r.killed, undefined, 'never ended')
+    assert.ok(existsSync(r.file), 'its file left for the window, which reads it as it starts')
+  })
+
+  test('a window that ended at once without its start signal, its file still there (it never ran a line): refused place, the claim given back, the file gone', async () => {
+    const dirs = lab()
+    const r = await launchWith(dirs, { signals: false, ended: 1 })
     assert.equal(r.answer.refused?.code, 'place', r.ran.stdout + r.ran.stderr)
     assert.match(r.answer.refused.why, /^self-restart: the launch could not be placed: the window ended before its first line ran \(exit code 1; /)
     assert.equal(r.answer.claim, r.input.claim, 'the claim was taken')
     assert.ok(!existsSync(machine.claimPath(dirs.state, r.input.id)), 'and given back, so the session goes on')
-    assert.ok(r.started, 'the window was started')
+    assert.ok(r.window !== undefined, 'the window was started')
     assert.ok(existsSync(join(dirs.state, 'windows')), 'its file was written')
     assert.ok(!existsSync(r.file), 'and is gone')
   })
 
-  test('a window that ran its first line (its file gone), then ended: placed, never refused', async () => {
+  test('WF-M-1: a window that ended without its start signal while its file was already gone (someone else removed it): refused place, never taken as begun, the claim given back', async () => {
     const dirs = lab()
-    const r = await launchWith(dirs, { began: true, ended: 0 })
+    const r = await launchWith(dirs, { signals: false, ended: 1, removesFile: true })
+    assert.equal(r.answer.refused?.code, 'place', r.ran.stdout + r.ran.stderr)
+    assert.match(r.answer.refused.why, /the window ended before its first line ran \(exit code 1; /)
+    assert.equal(r.answer.claim, r.input.claim, 'the claim was taken')
+    assert.ok(!existsSync(machine.claimPath(dirs.state, r.input.id)), 'and given back, so the session goes on')
+    assert.ok(!existsSync(r.file), 'no file left')
+  })
+
+  test('a window that set its start signal, then ended: placed, never refused', async () => {
+    const dirs = lab()
+    const r = await launchWith(dirs, { ended: 0 })
     assert.equal(r.answer.launched?.transport, 'window', r.ran.stdout + r.ran.stderr)
     assert.ok(existsSync(machine.claimPath(dirs.state, r.input.id)), 'the claim kept for the window')
   })
 
-  test('a window still starting (its file there, not ended) once WINDOW_START_MS has passed: placed, as before', async () => {
+  test('WF-M-2, WF-L-1: a window that has not set its start signal by WINDOW_START_MS: watched for the whole bound (measured in the script), ended through its handle, refused place, the claim given back, the file gone', async () => {
     const dirs = lab()
-    const from = Date.now()
-    const r = await launchWith(dirs, {})
-    assert.equal(r.answer.launched?.transport, 'window', r.ran.stdout + r.ran.stderr)
-    assert.ok(Date.now() - from >= machine.WINDOW_START_MS, 'the launch watched the window for its whole bound first')
-    assert.ok(existsSync(r.file), 'its file left for the window, which reads it when it starts')
+    const r = await launchWith(dirs, { signals: false })
+    assert.equal(r.answer.refused?.code, 'place', r.ran.stdout + r.ran.stderr)
+    assert.match(r.answer.refused.why, /^self-restart: the launch could not be placed: the window had not begun [\d.]+ s after it started, so it was ended; the session goes on here, and trying again is reasonable$/)
+    // Measured inside the script, by the recorded window: from the watch's first look to the window's Kill.
+    assert.ok(r.killed !== undefined, 'the window was ended through its handle')
+    assert.ok(r.killed.ms >= machine.WINDOW_START_MS - 100, `the watch waited for its bound before it ended the window: ${JSON.stringify(r.killed)}`)
+    assert.ok(r.killed.looks > 1, `and looked more than once: ${JSON.stringify(r.killed)}`)
+    assert.equal(r.placed, undefined, 'never placed')
+    assert.equal(r.answer.claim, r.input.claim, 'the claim was taken')
+    assert.ok(!existsSync(machine.claimPath(dirs.state, r.input.id)), 'and given back, so the session goes on')
+    assert.ok(!existsSync(r.file), 'its file gone')
+  })
+
+  test("WF-M-1: an event of the start signal's name already there (not this launch's own): refused place before any window starts, the claim given back, the file gone", async () => {
+    const dirs = lab()
+    const claim = `launch:${randomUUID()}`
+    const name = machine.windowSignalName(claim.slice('launch:'.length))
+    // The event made first, in the launch's own process and session, by a line of the test's own before the script.
+    const before = script => [`$planted = [Threading.EventWaitHandle]::new($false, [Threading.EventResetMode]::ManualReset, '${name}')`, windowsOnly({})(script)].join('\r\n')
+    const r = await launchWindow(dirs, randomUUID(), {}, before, { claim })
+    assert.equal(r.answer.refused?.code, 'place', r.ran.stdout + r.ran.stderr)
+    assert.match(r.answer.refused.why, /the start signal Local\\claude-self-tools-window-[0-9a-f-]{36} was there already, and only an event this launch creates is its own/)
+    assert.equal(r.window, undefined, 'no window started')
+    assert.ok(!existsSync(machine.claimPath(dirs.state, r.input.id)), 'the claim given back')
+    assert.ok(!existsSync(r.file), 'its file gone')
   })
 })
