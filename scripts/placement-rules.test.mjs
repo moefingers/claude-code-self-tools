@@ -753,11 +753,13 @@ const CHECKS = {
     const signal = lines.indexOf('if ($windowSignal.WaitOne(0)) { break }')
     const thrown = lines.findIndex(line => line.startsWith('if ($windowEnded) {') && line.includes('throw ("the window ended before its first line ran'))
     const bound = lines.indexOf('if ($windowWatch.ElapsedMilliseconds -ge $windowLimit) {')
-    const kill = lines.findIndex(line => line.startsWith('if ($windowHeld) { try { $window.Kill() } catch { }; try { [void]$window.WaitForExit(2000) } catch { }; throw ("the window had not begun '))
+    const kill = lines.indexOf('if ($windowHeld) { try { $window.Kill() } catch { }; try { [void]$window.WaitForExit(2000) } catch { }; try { $windowGone = $true -eq $window.HasExited } catch { $windowGone = $false } }')
     const wait = lines.indexOf('[void]$windowSignal.WaitOne(100)')
     const placed = lines.indexOf('$placed = "window - " + $window.Id')
-    assert.ok(start > 0 && held === start + 2 && limit > held && capped === limit + 1 && ended > capped && signal === ended + 1 && thrown === signal + 1 && bound === thrown + 1 && kill === bound + 2 && wait > kill && placed > wait, 'the handle at once; the bound, capped at the deadline; at each look its end, then the signal, then the throw, then the bound; a wait on the signal; placed after')
-    assert.ok(lines[kill + 1].startsWith('throw ("the window had not begun '), 'with no handle held: not ended, and refused all the same')
+    assert.ok(start > 0 && held === start + 2 && limit > held && capped === limit + 1 && ended > capped && signal === ended + 1 && thrown === signal + 1 && bound === thrown + 1 && lines[bound + 2] === '$windowGone = $false' && kill === bound + 3 && wait > kill && placed > wait, 'the handle at once; the bound, capped at the deadline; at each look its end, then the signal, then the throw, then the bound; at the bound the Kill, then whether it has gone; a wait on the signal; placed after')
+    // R2-I-2: "ended" only once it has gone; else (no handle, a Kill that failed, not gone after the wait) refused all the same, saying it could not be ended.
+    assert.ok(lines[kill + 1].startsWith('if ($windowGone) { throw ("the window had not begun ') && lines[kill + 1].includes('so it was ended;'), 'said ended only once gone')
+    assert.ok(lines[kill + 2].startsWith('throw ("the window had not begun ') && lines[kill + 2].includes('and could not be ended; its claim is given back, so it resumes nothing;'), 'else refused all the same, saying it could not be ended')
     assert.ok(!late.includes('Start-Sleep -Milliseconds 100'), 'between looks it waits on the signal, not a sleep')
     assert.ok(!m.launchScriptText(launchInput({ claim: `launch:${FRESH}` })).includes('[math]::Min($windowLimit'), 'no deadline: the bound alone')
     assert.ok(m.WINDOW_START_MS >= 1000 && m.WINDOW_START_MS * 2 <= m.LAUNCH_DEADLINE_MS, 'seconds, well inside the deadline')
@@ -904,6 +906,8 @@ const FAULTS = [
   ['WF-M-1: the signal read before the end (a window that began, then ended at once, refused)', 'windowStart', "    '  try { $windowEnded = $true -eq $window.HasExited } catch { $windowEnded = $false }',\n    '  if ($windowSignal.WaitOne(0)) { break }',\n", "    '  if ($windowSignal.WaitOne(0)) { break }',\n    '  try { $windowEnded = $true -eq $window.HasExited } catch { $windowEnded = $false }',\n"],
   ['WF-M-1: the file going taken as the window begun again', 'windowStart', "    '  if ($windowSignal.WaitOne(0)) { break }',\n", "    '  if (-not [IO.File]::Exists($windowFile)) { break }',\n"],
   ['WF-M-2: a window not begun by the bound placed anyway', 'windowStart', 'throw ("the window had not begun " + $windowSecs + " s after it started, so it was ended', 'break; ("the window had not begun " + $windowSecs + " s after it started, so it was ended'],
+  ['R2-I-2: "ended" said without reading that the window has gone', 'windowStart', 'try { $windowGone = $true -eq $window.HasExited } catch { $windowGone = $false }', '$windowGone = $true'],
+  ['R2-I-2: a window that could not be ended placed anyway', 'windowStart', `'    throw ("the window had not begun " + $windowSecs + " s after it started, and could not be ended;`, `'    break; ("the window had not begun " + $windowSecs + " s after it started, and could not be ended;`],
   ['WF-M-2: a watch with no bound', 'windowStart', "    '  if ($windowWatch.ElapsedMilliseconds -ge $windowLimit) {',\n", ''],
   ['WF-M-2: the watch not ended at the deadline (a run that could outlast LAUNCH_RUN_MS)', 'windowStart', '[math]::Min($windowLimit, [math]::Max(0, ${deadline} - [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()))', '$windowLimit'],
   ["WF-M-2: the window's handle not taken at once (its end and exit code may be another process's)", 'windowStart', "    'try { $windowHeld = $null -ne $window.Handle } catch { $windowHeld = $false }',\n", ''],

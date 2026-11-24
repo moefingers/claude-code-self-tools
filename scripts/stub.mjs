@@ -96,7 +96,8 @@ export function noWindow(script) {
  * By default the window it answers with begins as a real one does: it sets the launch's start signal
  * (the event named by the script file's own uuid, machine.WINDOW_SIGNAL_PREFIX), and leaves the file for the
  * test, which may run it. `window` says otherwise: `signals: false`, one that never sets it; `ended` (an exit
- * code), one that has already ended; `removesFile`, the script file removed by someone else first. Its
+ * code), one that has already ended; `removesFile`, the script file removed by someone else first;
+ * `survivesKill`, one still there after the launch's Kill (it reads as gone once killed otherwise). Its
  * Handle is one the launch can hold. It records what the launch's watch did, measured inside the script:
  * each HasExited the watch reads is a look, and the first look's time is kept; `$placed` reading its Id
  * writes `{ looks, ms }` to `<file>.placed`, and its Kill writes the same to `<file>.killed`.
@@ -104,7 +105,7 @@ export function noWindow(script) {
 export function recordWindow(script, file, window = {}) {
   if (/\\Start-Process|Diagnostics\.Process\]::Start|ProcessStartInfo/.test(script)) throw new Error('the script reaches a process start past the recording function')
   if (/['"]/.test(file)) throw new Error('a record file without quotes')
-  const { signals = true, ended, removesFile = false } = window
+  const { signals = true, ended, removesFile = false, survivesKill = false } = window
   if (ended !== undefined && !Number.isInteger(ended)) throw new Error('an exit code is a whole number')
   const path = '$ArgumentList[-1].Trim([char]34)'
   const watched = '(ConvertTo-Json -Compress -InputObject ([ordered]@{ looks = [int]$global:recordedLooks; ms = [long]([DateTime]::UtcNow - $global:recordedFirstLook).TotalMilliseconds }))'
@@ -115,10 +116,11 @@ export function recordWindow(script, file, window = {}) {
     ...(signals ? [`  $recordedSignal = [Threading.EventWaitHandle]::OpenExisting('${machine.WINDOW_SIGNAL_PREFIX}' + [IO.Path]::GetFileNameWithoutExtension(${path})); try { [void]$recordedSignal.Set() } finally { $recordedSignal.Dispose() }`] : []),
     '  $global:recordedLooks = 0',
     '  $global:recordedFirstLook = [DateTime]::UtcNow',
+    '  $global:recordedKilled = $false',
     `  $recorded = [pscustomobject]@{ Handle = [IntPtr]::new(1)${ended === undefined ? '' : `; ExitCode = ${ended}`} }`,
-    `  $recorded | Add-Member -MemberType ScriptProperty -Name HasExited -Value { if ($global:recordedLooks -eq 0) { $global:recordedFirstLook = [DateTime]::UtcNow }; $global:recordedLooks++; ${ended === undefined ? '$false' : '$true'} }`,
+    `  $recorded | Add-Member -MemberType ScriptProperty -Name HasExited -Value { if ($global:recordedLooks -eq 0) { $global:recordedFirstLook = [DateTime]::UtcNow }; $global:recordedLooks++; ${ended === undefined ? '$false' : '$true'} -or ${survivesKill ? '$false' : '$global:recordedKilled'} }`,
     `  $recorded | Add-Member -MemberType ScriptProperty -Name Id -Value { [IO.File]::WriteAllText('${file}.placed', ${watched}); 0 }`,
-    `  $recorded | Add-Member -MemberType ScriptMethod -Name Kill -Value { [IO.File]::WriteAllText('${file}.killed', ${watched}) }`,
+    `  $recorded | Add-Member -MemberType ScriptMethod -Name Kill -Value { [IO.File]::WriteAllText('${file}.killed', ${watched}); $global:recordedKilled = $true }`,
     '  $recorded | Add-Member -MemberType ScriptMethod -Name WaitForExit -Value { param($ms) $true }',
     '  $recorded',
     '}',
@@ -154,21 +156,36 @@ export function withPolicy(script, { machine: hklm = {}, user = {} } = {}) {
   return script.split(HIVES).join(fake)
 }
 
+/** This machine's own Group Policy execution policy for each PowerShell, read once (machinePolicies). */
+let policies
+
 /**
- * Why a test that runs a real window's script by -File can't run on this machine, or false: this machine's
- * own Group Policy, read as the launch reads it (machine.READ_GROUP_POLICY, in Windows PowerShell; only read),
- * sets AllSigned or Restricted for Windows PowerShell or PowerShell 7, which would stop that file before its
- * first line, whatever the test's -ExecutionPolicy. A read that fails counts as none, as the launch counts it.
+ * This machine's own Group Policy execution policy for each PowerShell, `{ windows, core }`, read as the launch
+ * reads it (machine.READ_GROUP_POLICY, in Windows PowerShell; only read) and kept for the run. A read that fails
+ * counts as none, as the launch counts it.
  */
-export function policySkip() {
-  if (process.platform !== 'win32') return false
+function machinePolicies() {
+  if (policies !== undefined) return policies
   const script = [...machine.READ_GROUP_POLICY, `[Console]::Out.WriteLine((Read-GroupPolicy '${WINDOWS_KEY}' $false) + ' ' + (Read-GroupPolicy '${CORE_KEY}' $true))`].join('\r\n')
   const ran = spawnSync(WINDOWS_POWERSHELL, ['-NoProfile', '-NonInteractive', '-EncodedCommand', machine.encodeCommand(script)], { encoding: 'utf8', windowsHide: true, timeout: 60_000 })
   const [windows, core] = `${ran.stdout ?? ''}`.trim().split(/\s+/)
-  const stops = policy => policy === 'AllSigned' || policy === 'Restricted'
-  if (stops(windows)) return `this machine's Group Policy sets Windows PowerShell's execution policy to ${windows}, which stops the window's script file this test runs`
-  if (stops(core)) return `this machine's Group Policy sets PowerShell 7's execution policy to ${core}, which stops the window's script file this test runs`
-  return false
+  policies = { windows: windows ?? 'Undefined', core: core ?? 'Undefined' }
+  return policies
+}
+
+/**
+ * Why a test that runs a real script file by -File in `shell` (WINDOWS_POWERSHELL, or PowerShell 7's pwsh.exe)
+ * can't run on this machine, or false: this machine's own Group Policy sets that PowerShell's execution policy to
+ * AllSigned or Restricted, which stops the file before its first line, whatever the test's -ExecutionPolicy.
+ * Decided by the interpreter the test runs alone: Windows PowerShell's policy for a Windows PowerShell test,
+ * PowerShell 7's for a PowerShell 7 test. A test that starts no real script passes no shell and never skips.
+ */
+export function policySkip(shell) {
+  if (process.platform !== 'win32' || typeof shell !== 'string') return false
+  const core = /\\pwsh\.exe$/i.test(shell)
+  const policy = core ? machinePolicies().core : machinePolicies().windows
+  if (policy !== 'AllSigned' && policy !== 'Restricted') return false
+  return `this machine's Group Policy sets ${core ? "PowerShell 7's" : "Windows PowerShell's"} execution policy to ${policy}, which stops the script file this test runs in it`
 }
 
 /**

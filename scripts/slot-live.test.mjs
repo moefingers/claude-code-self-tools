@@ -868,9 +868,10 @@ describe("the probe's slots mode, and the launch's own run, against a running ru
     }
   })
 
-  // It runs the slot runner for real, by -File: skipped, saying why, where this machine's own Group Policy would
-  // stop that file. Its launches read Group Policy from the test's own empty hives, never this machine's.
-  test('F6: a named window, its own run: the same runner by the same path; with no Windows Terminal there, the plain window', { skip: isWindows && policySkip() }, async () => {
+  // It runs the slot runner for real, by -File in Windows PowerShell: skipped, saying why, where this machine's own
+  // Group Policy for Windows PowerShell would stop that file. Its launches read Group Policy from the test's own
+  // empty hives, never this machine's.
+  test('F6: a named window, its own run: the same runner by the same path; with no Windows Terminal there, the plain window', { skip: policySkip(WINDOWS_POWERSHELL) }, async () => {
     const dirs = lab({ local: 'local app' })
     const id = randomUUID()
     transcript(dirs, id)

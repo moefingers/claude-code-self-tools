@@ -399,7 +399,7 @@ describe('launch(): one powershellCall, the script on standard input', () => {
     }
   })
 
-  test("WF-M-1, WF-M-2: the window's start signal created for this launch alone before Start-Process, and the window watched for it: ended without it, or not begun by the bound (ended through its handle), thrown on (refused place); disposed on every path", () => {
+  test("WF-M-1, WF-M-2, R2-I-2: the window's start signal created for this launch alone before Start-Process, and the window watched for it: ended without it, or not begun by the bound (ended through its handle, said ended only once gone), thrown on (refused place); disposed on every path", () => {
     expect(WINDOW_START_MS).toBe(8000)
     expect(WINDOW_START_MS * 2).toBeLessThanOrEqual(LAUNCH_DEADLINE_MS)
     for (const [script, claim] of [
@@ -409,7 +409,7 @@ describe('launch(): one powershellCall, the script on standard input', () => {
     ] as const) {
       const lines = script.split('\r\n').map(line => line.trim())
       const named = lines.findIndex(line => line.startsWith('$windowSignalName = '))
-      expect(lines.slice(named, named + 24)).toEqual([
+      expect(lines.slice(named, named + 26)).toEqual([
         `$windowSignalName = '${windowSignalName(claim.slice('launch:'.length))}'`,
         '$windowSignalNew = $false',
         '$windowSignal = [Threading.EventWaitHandle]::new($false, [Threading.EventResetMode]::ManualReset, $windowSignalName, [ref]$windowSignalNew)',
@@ -427,8 +427,10 @@ describe('launch(): one powershellCall, the script on standard input', () => {
         'if ($windowEnded) { $windowCode = "unknown"; if ($windowHeld) { try { $windowExit = $window.ExitCode; if ($null -ne $windowExit) { $windowCode = "" + $windowExit } } catch { } }; throw ("the window ended before its first line ran (exit code " + $windowCode + "; an antivirus or an execution policy may have stopped it)") }',
         'if ($windowWatch.ElapsedMilliseconds -ge $windowLimit) {',
         '$windowSecs = [math]::Round($windowWatch.Elapsed.TotalSeconds, 1)',
-        'if ($windowHeld) { try { $window.Kill() } catch { }; try { [void]$window.WaitForExit(2000) } catch { }; throw ("the window had not begun " + $windowSecs + " s after it started, so it was ended; the session goes on here, and trying again is reasonable") }',
-        'throw ("the window had not begun " + $windowSecs + " s after it started; no handle to it was held, so it was not ended, and with its claim given back it resumes nothing; the session goes on here, and trying again is reasonable")',
+        '$windowGone = $false',
+        'if ($windowHeld) { try { $window.Kill() } catch { }; try { [void]$window.WaitForExit(2000) } catch { }; try { $windowGone = $true -eq $window.HasExited } catch { $windowGone = $false } }',
+        'if ($windowGone) { throw ("the window had not begun " + $windowSecs + " s after it started, so it was ended; the session goes on here, and trying again is reasonable") }',
+        'throw ("the window had not begun " + $windowSecs + " s after it started, and could not be ended; its claim is given back, so it resumes nothing; the session goes on here, and trying again is reasonable")',
         '}',
         '[void]$windowSignal.WaitOne(100)',
         '}',
