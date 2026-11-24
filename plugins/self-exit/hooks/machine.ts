@@ -3552,8 +3552,9 @@ export function pickTransport(
 //   there and its Group Policy execution policy runs an unsigned script file, else of Windows PowerShell by
 //   its known path when its own does (else refused `policy`, before anything is written or claimed, and
 //   only where a window would open), with -File and the window's own script, written
-//   whole for this launch alone at windowScriptPath (the uuid of its claim); that script deletes its file
-//   as it starts, waits for the caller's process when asked, then RECHECKs (and the left record's stat), checks
+//   whole for this launch alone at windowScriptPath (the uuid of its claim); that script sets its launch's
+//   start signal (windowSignalName), then deletes its file, as it starts, waits for the caller's process
+//   when asked, then RECHECKs (and the left record's stat), checks
 //   the claim and the folder, checks claude-launch.ps1's SHA-256, and runs it, with every config folder
 //   and the stat, so that its own last look is the same, and with -Wrapper: claude-launch.ps1 is the only
 //   script that starts claude, the only place that holds the launch environment, and it runs claude
@@ -3789,8 +3790,11 @@ export const LAUNCH_DEADLINE_MS = 20_000
  * clock's now: nothing is claimed past the deadline, so the window starts at about the deadline at the latest;
  * the watch ends at this bound or at the deadline, whichever comes first (a window that began after the
  * deadline would be withdrawn as late in any case); ending a window that hadn't begun waits at most 2 s for
- * it to go. So such a run ends by about the deadline + 2 s = 22 s, 8 s inside LAUNCH_RUN_MS. A launch with no
- * deadline watches for this bound alone: at most 8 + 2 = 10 s past its Start-Process.
+ * it to go. So such a run ends by about the deadline + 2 s = 22 s, 8 s inside LAUNCH_RUN_MS. That sum assumes
+ * the work between the deadline's check and Start-Process (the sweep, the file's write and move, the event,
+ * the process's start) is fast: an antivirus scanning the new file or the new process can push it later, and
+ * the run is then still bounded by its caller's timeout, which takes back a run it gave up on. A launch with
+ * no deadline watches for this bound alone: at most 8 + 2 = 10 s past its Start-Process.
  */
 export const WINDOW_START_MS = 8000
 
@@ -4683,12 +4687,14 @@ const WRITE_WINDOW_FILE = [
  * without setting it never ran its first line, whatever the timing, and whether its file is still there or
  * not. Between looks it waits on the signal, 100 ms at a time. The watch ends at WINDOW_START_MS, or at the
  * launch's `deadline` when that comes first. Not begun by then: the window is ended through the handle this
- * run holds (Kill, then up to 2 s for it to go). With no handle held (one that couldn't be read), it is not
- * ended: a kill by process id could end another process that took the id; such a window, if it begins after
- * all, finds no signal and its claim given back, so its own claim check resumes nothing, and says so. Both
- * the ended and the unbegun window throw, saying what happened: the place's catch deletes the file if it is
- * there and refuses `place`, its claim given back, and the caller's session goes on. `$windowHeld` is whether
- * the window's Handle was read, taken at once so its end and exit code are its own, never a later process's.
+ * run holds (Kill, then up to 2 s for it to go), and whether it has gone is read again after that wait. With no
+ * handle held (one that couldn't be read), it is not ended: a kill by process id could end another process
+ * that took the id. A window that couldn't be ended (no handle, a Kill that failed, one not gone after the
+ * wait), if it begins after all, finds no signal and its claim given back, so its own claim check resumes
+ * nothing. Both the ended and the unbegun window throw, the words saying what happened, "ended" only when it
+ * has gone: the place's catch deletes the file if it is there and refuses `place`, its claim given back, and
+ * the caller's session goes on. `$windowHeld` is whether the window's Handle was read, taken at once so its
+ * end and exit code are its own, never a later process's.
  */
 function watchWindowStart(deadline: number | undefined): string[] {
   return [
@@ -4704,8 +4710,10 @@ function watchWindowStart(deadline: number | undefined): string[] {
     '  if ($windowEnded) { $windowCode = "unknown"; if ($windowHeld) { try { $windowExit = $window.ExitCode; if ($null -ne $windowExit) { $windowCode = "" + $windowExit } } catch { } }; throw ("the window ended before its first line ran (exit code " + $windowCode + "; an antivirus or an execution policy may have stopped it)") }',
     '  if ($windowWatch.ElapsedMilliseconds -ge $windowLimit) {',
     '    $windowSecs = [math]::Round($windowWatch.Elapsed.TotalSeconds, 1)',
-    '    if ($windowHeld) { try { $window.Kill() } catch { }; try { [void]$window.WaitForExit(2000) } catch { }; throw ("the window had not begun " + $windowSecs + " s after it started, so it was ended; the session goes on here, and trying again is reasonable") }',
-    '    throw ("the window had not begun " + $windowSecs + " s after it started; no handle to it was held, so it was not ended, and with its claim given back it resumes nothing; the session goes on here, and trying again is reasonable")',
+    '    $windowGone = $false',
+    '    if ($windowHeld) { try { $window.Kill() } catch { }; try { [void]$window.WaitForExit(2000) } catch { }; try { $windowGone = $true -eq $window.HasExited } catch { $windowGone = $false } }',
+    '    if ($windowGone) { throw ("the window had not begun " + $windowSecs + " s after it started, so it was ended; the session goes on here, and trying again is reasonable") }',
+    '    throw ("the window had not begun " + $windowSecs + " s after it started, and could not be ended; its claim is given back, so it resumes nothing; the session goes on here, and trying again is reasonable")',
     '  }',
     '  [void]$windowSignal.WaitOne(100)',
     '}',
