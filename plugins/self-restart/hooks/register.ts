@@ -721,7 +721,7 @@ async function restartNow($: EngineInterface, value: Queued): Promise<void> {
     // The places, in turn: this tab's wrapper; or this pane's slot ('auto' decides it in the script); or
     // placement.json's tab and window, then 'auto'. The next only when one is refused for want of Windows
     // Terminal or the slot runner; past a Group Policy execution policy that stops a window's script, only
-    // a place that opens no window (placeAfter): every window after it would meet the same policy.
+    // this tab's ticket (placeAfter): every other place runs a script file the same policy stops.
     const legs = await restartLegs($, site.state, judged.probe, launch, pane)
     /** The place tried next (placeAfter): the ones before it are passed over. */
     let from = 0

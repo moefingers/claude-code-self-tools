@@ -1586,8 +1586,8 @@ async function switchNow($: EngineInterface, value: Queued): Promise<void> {
     if ('said' in failed) return undo(`this tab's ticket wasn't written (${failed.said})`, record, failed.unclean)
   } else {
     // Each place in turn; only for want of Windows Terminal, the slot runner or a build does the next go; past
-    // a Group Policy execution policy that stops a window's script, only a place that opens no window
-    // (placeAfter): every window after it would meet the same policy.
+    // a Group Policy execution policy that stops a window's script, only this tab's ticket (placeAfter): every
+    // other place runs a script file the same policy stops.
     let placed = false
     /** The place tried next (placeAfter): the ones before it are passed over. */
     let from = 0

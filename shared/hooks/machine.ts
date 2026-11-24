@@ -3726,14 +3726,17 @@ export const paneAfter = (legs: readonly LaunchWhere[], n: number): boolean => l
  * The place a caller tries next, by its index in `legs`, once the `n`th was refused with `code`; undefined:
  * none, the refusal stands. For want of Windows Terminal or the slot runner (`wt`, `slotscript`), or a launch
  * that couldn't be built (`build`): the next place. For a Group Policy execution policy that runs no unsigned
- * script file (`policy`): the next place that is no window, plain or named, which the same policy would stop;
- * a tab's ticket, a slot or a tab opens none, and 'auto' goes to this pane's slot or is refused the same way
- * before anything is written. Any other refusal stands.
+ * script file under Windows PowerShell (`policy`): the next place that is this tab's ticket, alone. The claude
+ * wrapper there runs claude.exe itself (`& $exe --resume`) inside the PowerShell already running, never a
+ * script file. Every other place runs one by its path under Windows PowerShell, which the same policy stops:
+ * a window, plain or named (its own script by -File); a tab (wt runs `powershell.exe -File claude-slot.ps1`);
+ * a slot's record (its runner runs `& $launcherPath`, claude-launch.ps1); and 'auto' (this pane's slot or a
+ * window). Any other refusal stands.
  */
 export function placeAfter(legs: readonly LaunchWhere[], n: number, code: string | undefined): number | undefined {
   if (code === 'wt' || code === 'slotscript' || code === 'build') return n + 1 < legs.length ? n + 1 : undefined
   if (code !== 'policy') return undefined
-  const next = legs.findIndex((leg, at) => at > n && !(typeof leg === 'object' && 'window' in leg))
+  const next = legs.findIndex((leg, at) => at > n && typeof leg === 'object' && 'pane' in leg)
   return next === -1 ? undefined : next
 }
 
