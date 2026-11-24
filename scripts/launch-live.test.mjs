@@ -1310,6 +1310,9 @@ async function holdSignal(dirs, claim) {
   const closed = new Promise(resolve => child.on('close', resolve))
   const end = Date.now() + 30_000
   while (!existsSync(ready) && !existsSync(out) && Date.now() < end) await new Promise(resolve => setTimeout(resolve, 50))
+  // A holder that never got ready is ended here: the test that asked for it has no handle on it yet, and it
+  // would go on to make the signal and wait its 150 s out after the test had failed.
+  if (!existsSync(ready)) child.kill()
   assert.ok(existsSync(ready), `the holder holds the signal (${existsSync(out) ? readFileSync(out, 'utf8') : 'no answer'})`)
   return {
     stop: async () => {
