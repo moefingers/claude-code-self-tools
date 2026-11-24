@@ -4609,6 +4609,58 @@ const READ_GROUP_POLICY = [
 ]
 
 /**
+ * Deletes the window scripts no window ran from `$windowDir` (one killed first, or one that ended before its
+ * first line after the launch stopped watching it): each window deletes its own as it starts, so one older
+ * than a stale claim is no one's. Only names of their shape (LAUNCH_ID's and the ending idPath gives them,
+ * or the temporary's beside it), and never refused on.
+ */
+const SWEEP_WINDOW_FILES = [
+  String.raw`try { if ([IO.Directory]::Exists($windowDir)) { foreach ($staleFile in [IO.Directory]::GetFiles($windowDir)) { if ([IO.Path]::GetFileName($staleFile) -cmatch '${LAUNCH_ID.source.replace(/\$$/, '')}${ID_FILES.window.ending.replace(/\./g, '\\.')}(\.[0-9a-f]{32}\.tmp)?\z' -and ([DateTime]::UtcNow - [IO.File]::GetLastWriteTimeUtc($staleFile)).TotalMilliseconds -gt ${CLAIM_STALE_MS}) { try { [IO.File]::Delete($staleFile) } catch { } } } } } catch { }`,
+]
+
+/**
+ * Writes `$inner` whole to `$windowPath`, then names it `$windowFile`: a temporary file beside it, created for
+ * this run alone (CreateNew, never a file or a link already there), written, flushed and closed as
+ * Install-Launcher writes its own, then moved to its name, never over another (an existing one refuses the
+ * move, and is left as it is). UTF-8 with its byte order mark: Windows PowerShell 5.1 reads a script file
+ * without one in the ANSI code page, which would garble a folder's non-ASCII name. A temporary this run
+ * created goes again on any failure. `$windowFile`, from nothing until then, is what a failed place and a
+ * withdrawn window delete: never a file this run didn't write.
+ */
+const WRITE_WINDOW_FILE = [
+  '$windowTemp = $windowPath + "." + [guid]::NewGuid().ToString("N") + ".tmp"',
+  '[void][IO.Directory]::CreateDirectory($windowDir)',
+  '[byte[]]$windowBytes = [Text.UTF8Encoding]::new($true).GetPreamble() + [Text.UTF8Encoding]::new($true).GetBytes($inner)',
+  '$windowStream = [IO.File]::Open($windowTemp, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)',
+  'try {',
+  '  try { $windowStream.Write($windowBytes, 0, $windowBytes.Length); $windowStream.Flush($true) } finally { $windowStream.Dispose() }',
+  '  [IO.File]::Move($windowTemp, $windowPath)',
+  '} catch { try { [IO.File]::Delete($windowTemp) } catch { }; throw }',
+  '$windowFile = $windowPath',
+]
+
+/**
+ * Watches `$window` until it begins, for WINDOW_START_MS: its first line deletes its file. Whether it has
+ * ended is read before whether its file is there, so an ended window with its file still there never ran a
+ * line, whatever the timing. That throws: the place's catch deletes the file and refuses `place`, its claim
+ * given back, and the caller's session goes on. Still starting at the bound: placed, as before. The handle
+ * is taken at once, so its end and exit code are its own, never a later process's that took its id.
+ */
+const WATCH_WINDOW_START = [
+  '$windowHeld = $false',
+  'try { [void]$window.Handle; $windowHeld = $true } catch { }',
+  '$windowWatch = [Diagnostics.Stopwatch]::StartNew()',
+  'while ($true) {',
+  '  $windowEnded = $false',
+  '  try { $windowEnded = $true -eq $window.HasExited } catch { $windowEnded = $false }',
+  '  if (-not [IO.File]::Exists($windowFile)) { break }',
+  '  if ($windowEnded) { $windowCode = "unknown"; if ($windowHeld) { try { $windowExit = $window.ExitCode; if ($null -ne $windowExit) { $windowCode = "" + $windowExit } } catch { } }; throw ("the window ended before its first line ran (exit code " + $windowCode + "; an antivirus or an execution policy may have stopped it)") }',
+  `  if ($windowWatch.ElapsedMilliseconds -ge ${WINDOW_START_MS}) { break }`,
+  '  Start-Sleep -Milliseconds 100',
+  '}',
+]
+
+/**
  * The launch: `{ argv, stdin }` for `$.process.run` (powershellCall: Windows PowerShell by its known
  * path, the fixed bootstrap, the script on standard input). Throws on any input that isn't what it
  * must be (checkLaunch), so nothing else is spliced into the script. Read the answer with parseLaunch.
@@ -4640,62 +4692,55 @@ export function launchScriptText(input: LaunchInput): string {
    * it doesn't go to this pane's slot. A ticket, a slot's record and a tab open none.
    */
   const opensWindow = transport === 'auto' ? "$transport -eq 'window'" : transport === 'window' && v.wtLine !== undefined ? '$null -ne $slotFallback' : undefined
+  /** Lines that run only where a window opens: as they are for a plain window's launch, else inside the script's own test (opensWindow). */
+  const whereWindowOpens = (body: readonly string[]): string[] => (opensWindow === undefined ? [...body] : [`if (${opensWindow}) {`, ...body.map(line => `  ${line}`), '}'])
   /**
-   * The window's interpreter and the Group Policy execution policy it runs under, read before anything is
-   * written or claimed, and only where a window opens. -File runs under the execution policy, and a Group
-   * Policy one wins over -ExecutionPolicy Bypass: one that runs no unsigned script file (AllSigned,
-   * Restricted) would close the window on PowerShell's error before its own script's first line, with the
-   * old process gone. PowerShell 7 by its standard path when it is there and its own policy lets the file
-   * run (PWSH_RULE); else Windows PowerShell by its known path, when its policy does; else refused
-   * (`policy`), the old process still running. The window script, claude-launch.ps1 and the claude wrapper
-   * run in either; the wrapper's pane file names it. A first prompt's checks read `$pwshOk` as chosen here.
+   * The window's interpreter, chosen before anything is written or claimed, and only where a window opens:
+   * PowerShell 7 by its standard path when it is there (PWSH_RULE) and its own Group Policy execution policy
+   * lets an unsigned script file run; else Windows PowerShell by its known path. -File runs under the
+   * execution policy, and a Group Policy one wins over -ExecutionPolicy Bypass. The window script,
+   * claude-launch.ps1 and the claude wrapper run in either; the wrapper's pane file names it. A first
+   * prompt's checks read `$pwshOk` as chosen here.
    */
   const chooseShell =
     windowed === undefined
       ? []
-      : (() => {
-          const pick = [
+      : [
+          '$windowShell = ' + literal(input.powershell),
+          ...whereWindowOpens([
             ...PWSH_RULE,
             '$pwshPolicy = $null',
             `if ($pwshOk) { $pwshPolicy = Read-GroupPolicy '${PWSH_POLICY_KEY}' $true; if ($pwshPolicy -eq 'AllSigned' -or $pwshPolicy -eq 'Restricted') { $pwshOk = $false } }`,
             'if ($pwshOk) { $windowShell = $pwsh }',
-            `if (-not $pwshOk) { $windowsPolicy = Read-GroupPolicy '${WINDOWS_POLICY_KEY}' $false; if ($windowsPolicy -eq 'AllSigned' -or $windowsPolicy -eq 'Restricted') { $policySaid = 'Windows PowerShell ' + $windowsPolicy; if ($null -ne $pwshPolicy) { $policySaid = 'PowerShell 7 ' + $pwshPolicy + ', ' + $policySaid }; Refuse 'policy' ($tool + ': a Group Policy execution policy runs no unsigned script file (' + $policySaid + '), and a new window runs its own script from one, so none is opened') } }`,
-          ]
-          return ['$windowShell = ' + literal(input.powershell), ...READ_GROUP_POLICY, ...(opensWindow === undefined ? pick : [`if (${opensWindow}) {`, ...pick.map(line => `  ${line}`), '}'])]
-        })()
+          ]),
+        ]
   /**
-   * The window, placed: its script written whole to its own file, then started by Start-Process with -File.
-   * Never a self-unpacking -EncodedCommand (GZip, base64, [scriptblock]::Create), which an antivirus hooked
-   * into AMSI blocks before a line runs; nor the script itself on the command line, which as
-   * -EncodedCommand is past Windows' 32,767 characters.
+   * The refusal `policy`, where a window opens: the window would run in Windows PowerShell, and its Group
+   * Policy execution policy runs no unsigned script file (AllSigned, Restricted), which would close the window
+   * on PowerShell's error before its own script's first line, with the old process gone. Refused before
+   * anything is written or claimed, the old process still running.
+   */
+  const refusePolicy =
+    windowed === undefined
+      ? []
+      : whereWindowOpens([
+          `if (-not $pwshOk) { $windowsPolicy = Read-GroupPolicy '${WINDOWS_POLICY_KEY}' $false; if ($windowsPolicy -eq 'AllSigned' -or $windowsPolicy -eq 'Restricted') { $policySaid = 'Windows PowerShell ' + $windowsPolicy; if ($null -ne $pwshPolicy) { $policySaid = 'PowerShell 7 ' + $pwshPolicy + ', ' + $policySaid }; Refuse 'policy' ($tool + ': a Group Policy execution policy runs no unsigned script file (' + $policySaid + '), and a new window runs its own script from one, so none is opened') } }`,
+        ])
+  /**
+   * The window, placed: its script written whole to its own file, then started by Start-Process with -File,
+   * then watched until it begins. Never a self-unpacking -EncodedCommand (GZip, base64, [scriptblock]::Create),
+   * which an antivirus hooked into AMSI blocks before a line runs; nor the script itself on the command line,
+   * which as -EncodedCommand is past Windows' 32,767 characters.
    */
   const openWindow =
     windowed === undefined
       ? []
       : [
           `$inner = ${literal(windowed.inner)}`,
-          // Window scripts no window ran (one killed first, or one that ended before its first line after the
-          // launch stopped watching it, WINDOW_START_MS): each window deletes its own
-          // as it starts, so one older than a stale claim is no one's. Only names of their shape (LAUNCH_ID's and
-          // the ending idPath gives them, or the temporary's beside it), never refused on.
           `$windowPath = ${literal(windowed.file)}`,
           '$windowDir = [IO.Path]::GetDirectoryName($windowPath)',
-          String.raw`try { if ([IO.Directory]::Exists($windowDir)) { foreach ($staleFile in [IO.Directory]::GetFiles($windowDir)) { if ([IO.Path]::GetFileName($staleFile) -cmatch '${LAUNCH_ID.source.replace(/\$$/, '')}${ID_FILES.window.ending.replace(/\./g, '\\.')}(\.[0-9a-f]{32}\.tmp)?\z' -and ([DateTime]::UtcNow - [IO.File]::GetLastWriteTimeUtc($staleFile)).TotalMilliseconds -gt ${CLAIM_STALE_MS}) { try { [IO.File]::Delete($staleFile) } catch { } } } } } catch { }`,
-          // Written whole: a temporary file beside it, created for this run alone (CreateNew, never a file or a
-          // link already there), written, flushed and closed as Install-Launcher writes its own, then moved to its
-          // name, never over another (an existing one refuses the move, and is left as it is). UTF-8 with its byte
-          // order mark: Windows PowerShell 5.1 reads a script file without one in the ANSI code page, which would
-          // garble a folder's non-ASCII name. A temporary this run created goes again on any failure.
-          '$windowTemp = $windowPath + "." + [guid]::NewGuid().ToString("N") + ".tmp"',
-          '[void][IO.Directory]::CreateDirectory($windowDir)',
-          '[byte[]]$windowBytes = [Text.UTF8Encoding]::new($true).GetPreamble() + [Text.UTF8Encoding]::new($true).GetBytes($inner)',
-          '$windowStream = [IO.File]::Open($windowTemp, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)',
-          'try {',
-          '  try { $windowStream.Write($windowBytes, 0, $windowBytes.Length); $windowStream.Flush($true) } finally { $windowStream.Dispose() }',
-          '  [IO.File]::Move($windowTemp, $windowPath)',
-          '} catch { try { [IO.File]::Delete($windowTemp) } catch { }; throw }',
-          // In place, and this run's own: from here on, the file a failed place and a withdrawn window delete.
-          '$windowFile = $windowPath',
+          ...SWEEP_WINDOW_FILES,
+          ...WRITE_WINDOW_FILE,
           // -ExecutionPolicy Bypass, for this window's scripts alone (claude-launch.ps1 clears it again before
           // claude): the window runs claude-launch.ps1 only with the SHA-256 it pins, checked right before, a
           // stronger check than RemoteSigned's; under RemoteSigned, a downloaded file's mark (Zone.Identifier)
@@ -4704,23 +4749,7 @@ export function launchScriptText(input: LaunchInput): string {
           // Start-Process joins the arguments into one command line as they are: the path goes in quotes (the
           // state folder holds none, and the path ends in .ps1, never a backslash).
           `$window = Start-Process -FilePath $windowShell -ArgumentList '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', ('"' + $windowFile + '"') -PassThru`,
-          // Did the window begin? Its first line deletes its file. Watched for WINDOW_START_MS: whether it has
-          // ended is read before whether its file is there, so an ended window with its file still there never
-          // ran a line, whatever the timing. That throws: the catch below deletes the file and refuses `place`,
-          // its claim given back, and the caller's session goes on. Still starting at the bound: placed, as
-          // before. The handle is taken at once, so its end and exit code are its own, never a later process's
-          // that took its id.
-          '$windowHeld = $false',
-          'try { [void]$window.Handle; $windowHeld = $true } catch { }',
-          '$windowWatch = [Diagnostics.Stopwatch]::StartNew()',
-          'while ($true) {',
-          '  $windowEnded = $false',
-          '  try { $windowEnded = $true -eq $window.HasExited } catch { $windowEnded = $false }',
-          '  if (-not [IO.File]::Exists($windowFile)) { break }',
-          '  if ($windowEnded) { $windowCode = "unknown"; if ($windowHeld) { try { $windowExit = $window.ExitCode; if ($null -ne $windowExit) { $windowCode = "" + $windowExit } } catch { } }; throw ("the window ended before its first line ran (exit code " + $windowCode + "; an antivirus or an execution policy may have stopped it)") }',
-          `  if ($windowWatch.ElapsedMilliseconds -ge ${WINDOW_START_MS}) { break }`,
-          '  Start-Sleep -Milliseconds 100',
-          '}',
+          ...WATCH_WINDOW_START,
           `$placed = "window - " + $window.Id`,
         ]
   /** A tab or a named window: its stamp set first (wt forwards it), the slot script's hash checked right before, then wt.exe with one string. */
@@ -4882,7 +4911,9 @@ export function launchScriptText(input: LaunchInput): string {
       : []),
     // A window's interpreter, and a Group Policy execution policy that would stop its script's file: refused
     // here, before anything is written or claimed, and only where a window opens.
+    ...(windowed === undefined ? [] : READ_GROUP_POLICY),
     ...chooseShell,
+    ...refusePolicy,
     // claude-launch.ps1 in place at its own name, with the shipped hash, before anything is taken or
     // opened: the copy this launch carries is put there when the file is missing or has another hash;
     // refused only when it can't be. A slot or a tab runs that one too, by the hash its record or line
