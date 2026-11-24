@@ -948,7 +948,7 @@ function answerOf(stdout: string): Record<string, unknown> | undefined {
 function ownOf(raw: unknown): OwnWindow | undefined {
   if (!isRecord(raw)) return undefined
   if (isInt(raw.window) && (raw.kind === 'terminal' || raw.kind === 'console')) {
-    return { found: true, window: raw.window, kind: raw.kind, program: visible(text(raw.program), 80), title: text(raw.title) }
+    return { found: true, window: raw.window, kind: raw.kind === 'terminal' ? 'terminal' : 'console', program: visible(text(raw.program), 80), title: text(raw.title) }
   }
   return { found: false, why: visible(text(raw.why) || 'no reason given', 400) }
 }
@@ -973,7 +973,7 @@ export function parseListing(stdout: string): Listing | string {
     const program = visible(text(w.program), 80)
     const terminal = w.terminal === true && program.toLowerCase() === TERMINAL_PROGRAM.toLowerCase()
     const mine = w.window === ownWindow
-    const state: WindowState = w.state === 'minimized' || w.state === 'maximized' ? w.state : 'normal'
+    const state: WindowState = w.state === 'minimized' ? 'minimized' : w.state === 'maximized' ? 'maximized' : 'normal'
     windows.push({
       window: w.window,
       program,
@@ -1028,7 +1028,7 @@ function treeOf(raw: unknown): Tree | undefined {
       offscreen: n.offscreen === true,
       focused: n.focused === true,
       ...(typeof n.selected === 'boolean' ? { selected: n.selected } : {}),
-      ...(n.checked === 'on' || n.checked === 'off' || n.checked === 'mixed' ? { checked: n.checked } : {}),
+      ...(n.checked === 'on' ? { checked: 'on' as const } : n.checked === 'off' ? { checked: 'off' as const } : n.checked === 'mixed' ? { checked: 'mixed' as const } : {}),
       rect: isRect(n.rect) ? n.rect : null,
       ref: /^-?\d{1,11}(?:\.-?\d{1,11}){0,15}$/.test(n.ref) ? n.ref : '',
     })
