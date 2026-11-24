@@ -3599,12 +3599,13 @@ export function pickTransport(
 // claim, the pid, the folders) are in it as checked literals, as they were on the command line. It was a self-unpacking -EncodedCommand (GZip, base64,
 // [scriptblock]::Create) before, which an antivirus hooked into AMSI blocks as malicious content before a
 // line of it runs; the script itself on the command line is past Windows' 32,767 characters. The launch
-// answers `launched` only once the window set its start signal (windowSignalName, its first line), or is
-// still starting after WINDOW_START_MS: a window that ended without setting it is refused `place`, so the
-// caller's session goes on. The
+// answers `launched` only once the window set its start signal (windowSignalName, its first line) within
+// WINDOW_START_MS: a window that ended without setting it, or hadn't set it by then (and was ended), is
+// refused `place`, so the caller's session goes on. The
 // launch deletes the file itself then, when Start-Process fails and when it withdraws a window it placed
-// late; one left behind all the same (a window killed by someone else first) is deleted by a later launch
-// once it is older than a stale claim.
+// late; one left behind all the same (by a window killed by someone else first, or by a launch its caller's
+// timeout killed between its write and its watch's end) is deleted by a later launch once it is older than a
+// stale claim.
 
 /** A launch's answer: `launched <transport> <label> [<pid>]`. */
 export const LAUNCH_ANSWER = /^launched (pane|slot|window|tab) ([A-Za-z0-9_.:-]{1,80})(?: (\d{1,10}))?\s*$/m
@@ -3769,15 +3770,23 @@ export const LAUNCH_DEADLINE_MS = 20_000
 
 /**
  * How long a launch watches a plain window it started, 100 ms at a time, for its start signal, which its
- * script's first line sets (windowSignalName), before it answers `launched` (review SW-M-2). A window that
- * ends without setting it never ran its first line (an antivirus, a Group Policy execution policy, an interpreter that failed to
- * start): the launch is refused `place`, its claim given back, and the caller's session goes on. One still
- * starting when this runs out is taken as placed, as before: a slow cold start, not a failure. 3 s: the
- * deaths this guards against come within about a tenth of a second of the start (the measured AMSI block),
- * or before PowerShell runs a line at all (a policy), and PowerShell 7 or 5.1 reaches a first line well
- * within it; 3 s more still leaves the launch far inside LAUNCH_DEADLINE_MS.
+ * script's first line sets (windowSignalName), before it answers `launched` (reviews SW-M-2, WF-M-1, WF-M-2).
+ * One rule, with no "placed anyway": a window that ended without setting it never ran its first line (an
+ * antivirus, a Group Policy execution policy, an interpreter that failed to start), and one that hasn't set it
+ * by this bound is ended (watchWindowStart); either way the launch is refused `place`, its claim given back,
+ * and the caller's session goes on. Decided on principle, open to the owner's revision: a refusal that leaves
+ * the session running is recoverable, a dead window after the caller exits is not.
+ * 8 s is an estimate, not a measurement: a healthy window sets its signal at its first line, estimated to come
+ * well within 8 s of its start in either PowerShell, so the bound costs it nothing; a machine slower than that
+ * gets the refusal, and trying again is reasonable.
+ * The sums, for a caller's run of LAUNCH_RUN_MS (30 s) with a deadline LAUNCH_DEADLINE_MS (20 s) after its
+ * clock's now: nothing is claimed past the deadline, so the window starts at about the deadline at the latest;
+ * the watch ends at this bound or at the deadline, whichever comes first (a window that began after the
+ * deadline would be withdrawn as late in any case); ending a window that hadn't begun waits at most 2 s for
+ * it to go. So such a run ends by about the deadline + 2 s = 22 s, 8 s inside LAUNCH_RUN_MS. A launch with no
+ * deadline watches for this bound alone: at most 8 + 2 = 10 s past its Start-Process.
  */
-export const WINDOW_START_MS = 3000
+export const WINDOW_START_MS = 8000
 
 /** How long after a launch that failed its caller takes it back once more: a run killed at its timeout may have been writing still. */
 export const LAUNCH_RETRY_MS = 3000
@@ -4629,8 +4638,9 @@ const READ_GROUP_POLICY = [
 ]
 
 /**
- * Deletes the window scripts no window ran from `$windowDir` (one killed first, or one that ended before its
- * first line after the launch stopped watching it): each window deletes its own as it starts, so one older
+ * Deletes the window scripts no window ran from `$windowDir` (one left by a launch whose caller's timeout killed
+ * it between its write and its watch's end, or by a window killed by someone else before its first line): each
+ * window deletes its own as it starts, and its launch deletes it on every refusal, so one older
  * than a stale claim is no one's. Only names of their shape (LAUNCH_ID's and the ending idPath gives them,
  * or the temporary's beside it), and never refused on.
  */
@@ -4660,28 +4670,40 @@ const WRITE_WINDOW_FILE = [
 ]
 
 /**
- * Watches `$window` until it begins, for WINDOW_START_MS: its first line sets `$windowSignal`, the event this
- * launch alone created, which nothing else can set for it (a file someone else removed could look like a
- * begun window; this can't). Each look reads whether the window has ended before whether the signal is set,
- * so a window that ended without setting it never ran its first line, whatever the timing, and whether its
- * file is still there or not. That throws: the place's catch deletes the file if it is there and refuses
- * `place`, its claim given back, and the caller's session goes on. Still starting at the bound: placed, as
- * before. The handle is taken at once, so its end and exit code are its own, never a later process's that
- * took its id. Between looks it waits on the signal, 100 ms at a time.
+ * Watches `$window` until it begins: its first line sets `$windowSignal`, the event this launch alone created,
+ * which nothing else can set for it (a file someone else removed could look like a begun window; this can't).
+ * Each look reads whether the window has ended before whether the signal is set, so a window that ended
+ * without setting it never ran its first line, whatever the timing, and whether its file is still there or
+ * not. Between looks it waits on the signal, 100 ms at a time. The watch ends at WINDOW_START_MS, or at the
+ * launch's `deadline` when that comes first. Not begun by then: the window is ended through the handle this
+ * run holds (Kill, then up to 2 s for it to go). With no handle held (one that couldn't be read), it is not
+ * ended: a kill by process id could end another process that took the id; such a window, if it begins after
+ * all, finds no signal and its claim given back, so its own claim check resumes nothing, and says so. Both
+ * the ended and the unbegun window throw, saying what happened: the place's catch deletes the file if it is
+ * there and refuses `place`, its claim given back, and the caller's session goes on. `$windowHeld` is whether
+ * the window's Handle was read, taken at once so its end and exit code are its own, never a later process's.
  */
-const WATCH_WINDOW_START = [
-  '$windowHeld = $false',
-  'try { [void]$window.Handle; $windowHeld = $true } catch { }',
-  '$windowWatch = [Diagnostics.Stopwatch]::StartNew()',
-  'while ($true) {',
-  '  $windowEnded = $false',
-  '  try { $windowEnded = $true -eq $window.HasExited } catch { $windowEnded = $false }',
-  '  if ($windowSignal.WaitOne(0)) { break }',
-  '  if ($windowEnded) { $windowCode = "unknown"; if ($windowHeld) { try { $windowExit = $window.ExitCode; if ($null -ne $windowExit) { $windowCode = "" + $windowExit } } catch { } }; throw ("the window ended before its first line ran (exit code " + $windowCode + "; an antivirus or an execution policy may have stopped it)") }',
-  `  if ($windowWatch.ElapsedMilliseconds -ge ${WINDOW_START_MS}) { break }`,
-  '  [void]$windowSignal.WaitOne(100)',
-  '}',
-]
+function watchWindowStart(deadline: number | undefined): string[] {
+  return [
+    '$windowHeld = $false',
+    'try { $windowHeld = $null -ne $window.Handle } catch { $windowHeld = $false }',
+    `$windowLimit = ${WINDOW_START_MS}`,
+    ...(deadline === undefined ? [] : [`$windowLimit = [math]::Min($windowLimit, [math]::Max(0, ${deadline} - [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()))`]),
+    '$windowWatch = [Diagnostics.Stopwatch]::StartNew()',
+    'while ($true) {',
+    '  $windowEnded = $false',
+    '  try { $windowEnded = $true -eq $window.HasExited } catch { $windowEnded = $false }',
+    '  if ($windowSignal.WaitOne(0)) { break }',
+    '  if ($windowEnded) { $windowCode = "unknown"; if ($windowHeld) { try { $windowExit = $window.ExitCode; if ($null -ne $windowExit) { $windowCode = "" + $windowExit } } catch { } }; throw ("the window ended before its first line ran (exit code " + $windowCode + "; an antivirus or an execution policy may have stopped it)") }',
+    '  if ($windowWatch.ElapsedMilliseconds -ge $windowLimit) {',
+    '    $windowSecs = [math]::Round($windowWatch.Elapsed.TotalSeconds, 1)',
+    '    if ($windowHeld) { try { $window.Kill() } catch { }; try { [void]$window.WaitForExit(2000) } catch { }; throw ("the window had not begun " + $windowSecs + " s after it started, so it was ended; the session goes on here, and trying again is reasonable") }',
+    '    throw ("the window had not begun " + $windowSecs + " s after it started; no handle to it was held, so it was not ended, and with its claim given back it resumes nothing; the session goes on here, and trying again is reasonable")',
+    '  }',
+    '  [void]$windowSignal.WaitOne(100)',
+    '}',
+  ]
+}
 
 /**
  * The launch: `{ argv, stdin }` for `$.process.run` (powershellCall: Windows PowerShell by its known
@@ -4785,7 +4807,7 @@ export function launchScriptText(input: LaunchInput): string {
           // Start-Process joins the arguments into one command line as they are: the path goes in quotes (the
           // state folder holds none, and the path ends in .ps1, never a backslash).
           `  $window = Start-Process -FilePath $windowShell -ArgumentList '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', ('"' + $windowFile + '"') -PassThru`,
-          ...WATCH_WINDOW_START.map(line => `  ${line}`),
+          ...watchWindowStart(v.deadline).map(line => `  ${line}`),
           '} finally { $windowSignal.Dispose() }',
           `$placed = "window - " + $window.Id`,
         ]
