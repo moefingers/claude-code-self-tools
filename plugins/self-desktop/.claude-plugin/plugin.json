@@ -1,0 +1,26 @@
+{
+  "name": "self-desktop",
+  "version": "0.1.0",
+  "description": "Lets a session read its own machine's desktop on Windows, read only: it lists the windows a person could see (program, rectangle, monitor, state, which is in front; a title only for Windows Terminal windows and the session's own), reads the session's own terminal window (its controls, and the text showing in its own pane, whoever wrote it; never from a console shared by a program that is not the session's own, not its shell above it nor its children below it), and captures a classic console window of the session's own to a local PNG (a picture of a Windows Terminal window isn't built). It never clicks, types, focuses, moves or closes anything. Off until you turn it on.",
+  "author": { "name": "moefingers", "url": "https://github.com/moefingers" },
+  "homepage": "https://github.com/moefingers/claude-code-self-tools/tree/main/plugins/self-desktop#readme",
+  "repository": "https://github.com/moefingers/claude-code-self-tools",
+  "license": "MIT",
+  "keywords": ["desktop", "windows", "ui-automation", "screenshot", "mod"],
+  "userConfig": {
+    "updateCheck": {
+      "type": "string",
+      "title": "Update check",
+      "description": "on: when a tool of this plugin is called and the last check is 30 minutes old, fetch this plugin's published plugin.json from GitHub (a plain GET of a public file) and say when a newer version is out. off: never check.",
+      "default": "on",
+      "options": ["on", "off"]
+    },
+    "enabled": {
+      "type": "string",
+      "title": "Read the desktop",
+      "description": "off (the default): every tool answers that self-desktop is off, and nothing is read. on: desktop_windows lists the windows a person could see (a title only for Windows Terminal windows and this session's own), desktop_read reads this session's own terminal window and the text showing in its own pane, whoever wrote it, and desktop_capture saves a picture of this session's own classic console window to a local file (a picture of a Windows Terminal window isn't built). The model's own calls also go through your permission rules (documented for MCP tools, not seen for these tools); a call another plugin makes through $.tool.call, or a script the REPL tool runs, meets no rules, only the plugin's own refusals. Old pictures are deleted at each call and session start, whatever this says. Windows only. Read only: nothing is clicked, typed, focused, moved or closed.",
+      "default": "off",
+      "options": ["off", "on"]
+    }
+  }
+}
