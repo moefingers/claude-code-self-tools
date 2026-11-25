@@ -143,8 +143,11 @@ const REVIEWED_USINGS = {
   'System.Windows.Automation': 1,
 }
 
-/** A using directive (not a using statement, whose `using` a parenthesis follows), on one line. */
-const USING = /\busing\s+(?!\()([^;{}()\n]*);/g
+/**
+ * A using directive (not a using statement, whose `using` a parenthesis follows), across line breaks too: C# lets a
+ * directive run over several lines, so `using C =` with `System.Console;` on the next line is one directive.
+ */
+const USING = /\busing\s+(?!\()([^;{}()]*);/g
 
 /** A C# extern declaration's start: `static extern` or `extern static`, whatever its attribute is spelled like. */
 const EXTERN = /\b(?:static\s+extern|extern\s+static)\b/g
@@ -323,6 +326,8 @@ test('a new entry point however its attribute is spelled, another use of one rev
     'using Con = System.Console;',
     'using static System.Console;',
     'using   Forms =  System.Windows.Forms ;',
+    // A directive split over two lines: the alias on the next line. It is found on the line it starts on.
+    'using SysCon =\n    System.Console;',
   ]
   for (const plant of plants) {
     const copy = planted(plant)
