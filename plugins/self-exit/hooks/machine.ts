@@ -4494,13 +4494,20 @@ export function clampToMonitors(rect: PixelRect, monitors: readonly MonitorBox[]
 /** SetWindowPos's flags for the place: SWP_NOZORDER (0x0004) | SWP_NOACTIVATE (0x0010) | SWP_NOOWNERZORDER (0x0200) | SWP_ASYNCWINDOWPOS (0x4000). */
 export const PLACE_SWP_FLAGS = 0x4214
 
+/** How many pseudoconsole windows PLACE_CS's Hosted looks at, at most: past it, the count is unknown (-1), and nothing is placed. An estimate, far above the consoles of a machine. */
+export const PLACE_HOSTED_BOUND = 4096
+
 /**
  * The C# the window compiles (Add-Type) to place its own window, one line, of C# 5 (Windows PowerShell 5.1's
  * compiler; PowerShell 7's takes it too). `Place` finds the window from the process's own console: GetConsoleWindow,
  * and that window itself when it is the classic console's (class ConsoleWindowClass), or, when it is a pseudoconsole's
  * (PseudoConsoleWindow), its owner by GetWindow(GW_OWNER = 4), only when that is a Windows Terminal window
- * (CASCADIA_HOSTING_WINDOW_CLASS, #5's table). Anything else, or a window already minimized or maximized (Windows
- * Terminal's launchMode, say): nothing is done, and it says why. Then per-monitor DPI awareness for its thread alone
+ * (CASCADIA_HOSTING_WINDOW_CLASS, #5's table), and only when that window is its own alone: `Hosted` counts the
+ * pseudoconsoles the window owns, and anything but exactly one, its own console, leaves it where it is (a window
+ * with other tabs or panes in it holds other sessions; whether a terminal ever puts a new console there is no page's
+ * to say, so the code does not rest on it). A classic console window holds one console, and is not counted. Anything
+ * else, or a window already minimized or maximized (Windows Terminal's launchMode, say): nothing is done, and it says
+ * why. Then per-monitor DPI awareness for its thread alone
  * (SetThreadDpiAwarenessContext(-4), DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2; Windows PowerShell 5.1 is DPI-unaware,
  * #5), put back as it was before it returns. With a rect: the monitor MonitorFromRect picks (MONITOR_DEFAULTTONEAREST,
  * 2), its work area (GetMonitorInfoW's rcWork), Clamp (clampToWork's arithmetic), then SetWindowPos with
@@ -4508,7 +4515,21 @@ export const PLACE_SWP_FLAGS = 0x4214
  * maximized: ShowWindowAsync(SW_MAXIMIZE = 3), after the rect when both are given, so it maximizes on that rect's
  * monitor and restores to the rect. ShowWindow has no maximize that doesn't activate (its page's table), so a maximized
  * window is activated, as a new window is when it opens. Answers "placed", or why not, as one line of text.
- * It takes no handle, name, title or process id from outside; it never enumerates windows.
+ * It takes no handle, name, title or process id from outside. Its one listing of windows is `Hosted`, a pure read:
+ * the number of pseudoconsole windows `window` owns, or -1 when `console` is not among them or the walk passes
+ * PLACE_HOSTED_BOUND. It lists pseudoconsole windows by class (FindWindowExW from a null parent, the class as its one
+ * literal, no title) to count those its own window owns, reads only their owner (GetWindow(GW_OWNER)), acts on none,
+ * and is there to refuse, never to choose a target. Handles are compared by their low 32 bits (`Same`), the part of a
+ * window handle that is significant (Programming Guide for 64-bit Windows, "Interprocess communication").
+ * FindWindowExW: https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-findwindowexw ("If hwndParent
+ * is NULL, the function uses the desktop window as the parent window"; with both handles NULL it "searches all
+ * top-level and message-only windows"; the class is matched without regard to case). From memory alone: that a
+ * pseudoconsole window is a top-level window (a child of the desktop, not message-only) that this search finds, and
+ * that every pane of Windows Terminal has one, owned by its window (#5 measured the owner relation alone). If the
+ * search finds none, the count is -1 and nothing is placed, so a wrong memory there fails closed; the guarded live run
+ * is what shows the count is 1 in a fresh window. Not measured either: whether the owner is set already when the
+ * window's first lines run (Place reads it after Add-Type's compile; one that is not set yet leaves the window unplaced,
+ * said in its one line, with no wait or retry).
  * Pages: GetConsoleWindow https://learn.microsoft.com/en-us/windows/console/getconsolewindow (in a pseudoconsole, "a
  * window handle for message queue purposes only"); GetWindow https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-getwindow;
  * GetClassNameW https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-getclassnamew; IsIconic
@@ -4539,7 +4560,10 @@ export const PLACE_CS = [
   '[DllImport("user32.dll")] static extern bool GetMonitorInfoW(IntPtr monitor, ref MonitorInfo info);',
   '[DllImport("user32.dll", SetLastError = true)] static extern bool SetWindowPos(IntPtr window, IntPtr after, int x, int y, int width, int height, uint flags);',
   '[DllImport("user32.dll")] static extern bool ShowWindowAsync(IntPtr window, int show);',
+  '[DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern IntPtr FindWindowExW(IntPtr parent, IntPtr after, string className, string title);',
   'static string ClassOf(IntPtr window) { StringBuilder name = new StringBuilder(256); return GetClassNameW(window, name, name.Capacity) > 0 ? name.ToString() : ""; }',
+  'static bool Same(IntPtr a, IntPtr b) { return (a.ToInt64() & 0xffffffffL) == (b.ToInt64() & 0xffffffffL); }',
+  `public static int Hosted(IntPtr window, IntPtr console) { int count = 0; bool seen = false; IntPtr after = IntPtr.Zero; for (int look = 0; look < ${PLACE_HOSTED_BOUND}; look++) { after = FindWindowExW(IntPtr.Zero, after, "PseudoConsoleWindow", null); if (after == IntPtr.Zero) return seen ? count : -1; if (Same(GetWindow(after, 4), window)) { count++; if (Same(after, console)) seen = true; } } return -1; }`,
   'public static int[] Clamp(int x, int y, int width, int height, int left, int top, int right, int bottom) { int w = Math.Min(width, right - left); int h = Math.Min(height, bottom - top); return new int[] { Math.Max(left, Math.Min(x, right - w)), Math.Max(top, Math.Min(y, bottom - h)), w, h }; }',
   'public static string Place(int x, int y, int width, int height, bool hasRect, bool maximized) {',
   'IntPtr console = GetConsoleWindow();',
@@ -4547,7 +4571,7 @@ export const PLACE_CS = [
   'string kind = ClassOf(console);',
   'IntPtr own = IntPtr.Zero;',
   'if (kind == "ConsoleWindowClass") own = console;',
-  'else if (kind == "PseudoConsoleWindow") { own = GetWindow(console, 4); if (own == IntPtr.Zero || ClassOf(own) != "CASCADIA_HOSTING_WINDOW_CLASS") return "its console is a pseudoconsole that no Windows Terminal window owns"; }',
+  'else if (kind == "PseudoConsoleWindow") { own = GetWindow(console, 4); if (own == IntPtr.Zero || ClassOf(own) != "CASCADIA_HOSTING_WINDOW_CLASS") return "its console is a pseudoconsole that no Windows Terminal window owns"; int hosted = Hosted(own, console); if (hosted != 1) return "its Windows Terminal window holds other tabs or panes, or its own console could not be counted among them (" + hosted + "), so it is left where it is"; }',
   'else return "its console window is of class " + kind + ", neither the classic console nor Windows Terminal";',
   'if (IsIconic(own) || IsZoomed(own)) return "it opened minimized or maximized, so it is left as it is";',
   'IntPtr before = SetThreadDpiAwarenessContext(new IntPtr(-4));',

@@ -109,8 +109,11 @@ function outerOf(script) {
 /**
  * The reviewed list (#5): every function the window's own C# (PLACE_CS) imports, as it imports it, and no other.
  * Two of them act on a window, SetWindowPos and ShowWindowAsync, each held below to the one call reviewed; the
- * rest read (and SetThreadDpiAwarenessContext sets the thread's own DPI awareness, put back as it was). An edit
- * that adds, drops or changes one fails here until it is reviewed and this list changed with it.
+ * rest read (and SetThreadDpiAwarenessContext sets the thread's own DPI awareness, put back as it was).
+ * FindWindowExW is the one listing of windows: it lists pseudoconsole windows by class to count those its own window
+ * owns, reads only their owner, acts on none, and is there to refuse, never to choose a target; held below to its one
+ * call (a null parent, the class as that one literal, no title). An edit that adds, drops or changes one fails here
+ * until it is reviewed and this list changed with it.
  */
 const REVIEWED_IMPORTS = [
   '[DllImport("kernel32.dll")] static extern IntPtr GetConsoleWindow();',
@@ -123,10 +126,14 @@ const REVIEWED_IMPORTS = [
   '[DllImport("user32.dll")] static extern bool GetMonitorInfoW(IntPtr monitor, ref MonitorInfo info);',
   '[DllImport("user32.dll", SetLastError = true)] static extern bool SetWindowPos(IntPtr window, IntPtr after, int x, int y, int width, int height, uint flags);',
   '[DllImport("user32.dll")] static extern bool ShowWindowAsync(IntPtr window, int show);',
+  '[DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern IntPtr FindWindowExW(IntPtr parent, IntPtr after, string className, string title);',
 ]
 
-/** What the window's C# never names: nothing that finds, lists, raises, focuses, closes or types into a window, nor reads a value from outside. */
-const FORBIDDEN_IN_PLACE = ['FindWindow', 'EnumWindows', 'EnumChildWindows', 'EnumThreadWindows', 'GetTopWindow', 'GetDesktopWindow', 'WindowFromPoint', 'GetForegroundWindow', 'SetForegroundWindow', 'BringWindowToTop', 'SetActiveWindow', 'SetFocus', 'AttachThreadInput', 'SendMessage', 'PostMessage', 'MoveWindow', 'SetWindowPlacement', 'ShowWindow(', 'DestroyWindow', 'CloseWindow', 'SetWindowLong', 'SetParent', 'SendInput', 'keybd_event', 'mouse_event', 'Environment', 'System.IO', 'Process', 'Registry', 'Console.']
+/**
+ * What the window's C# never names: nothing that finds a window by its title, lists windows any other way than
+ * FindWindowExW's one reviewed call, raises, focuses, closes or types into a window, nor reads a value from outside.
+ */
+const FORBIDDEN_IN_PLACE = ['FindWindow(', 'FindWindowA', 'FindWindowW', 'FindWindowExA', 'EnumWindows', 'EnumChildWindows', 'EnumThreadWindows', 'GetTopWindow', 'GetDesktopWindow', 'WindowFromPoint', 'GetForegroundWindow', 'SetForegroundWindow', 'BringWindowToTop', 'SetActiveWindow', 'SetFocus', 'AttachThreadInput', 'SendMessage', 'PostMessage', 'MoveWindow', 'SetWindowPlacement', 'ShowWindow(', 'DestroyWindow', 'CloseWindow', 'SetWindowLong', 'SetParent', 'SendInput', 'keybd_event', 'mouse_event', 'Environment', 'System.IO', 'Process', 'Registry', 'Console.']
 
 /** Fixed monitors for the clamp: a left-hand one at a negative origin, the primary, and a right-hand one with its taskbar along the top. Made up. */
 const LEFT = { monitor: [-1920, 0, 0, 1080], work: [-1920, 0, 0, 1040] }
@@ -916,7 +923,7 @@ const CHECKS = {
     for (const where of [{ window: { rect: [0, 0, 800, 600], maximized: true } }, { window: true }, 'auto']) {
       const outer = outerOf(m.launchScriptText({ ...plainIn, where }))
       assert.ok(outer.includes('$inner = <the window script>'), 'the window script taken out')
-      assert.ok(!/SetWindowPos|ShowWindow|ClaudeSelfToolsPlace|MoveWindow|SetForegroundWindow|SetWindowPlacement/.test(outer), `${JSON.stringify(where)}: the caller's lines act on no window`)
+      assert.ok(!/SetWindowPos|ShowWindow|ClaudeSelfToolsPlace|MoveWindow|SetForegroundWindow|SetWindowPlacement|FindWindow|EnumWindows/.test(outer), `${JSON.stringify(where)}: the caller's lines act on no window, and list none`)
     }
   },
   actingCalls(m) {
@@ -936,6 +943,18 @@ const CHECKS = {
     const aware = cs.indexOf('IntPtr before = SetThreadDpiAwarenessContext(new IntPtr(-4)); if (before == IntPtr.Zero) return ')
     assert.ok(aware > 0 && aware < cs.indexOf('MonitorFromRect(ref asked'), 'per-monitor DPI awareness before any coordinate is read, and nothing placed without it')
     assert.ok(cs.includes('} finally { SetThreadDpiAwarenessContext(before); }'), "the thread's awareness put back")
+    // Its own window only when that window is its own alone (round 2, Fix A): under a pseudoconsole, the consoles its
+    // window owns are counted, and anything but exactly one, its own, leaves it where it is, before any acting call.
+    assert.deepEqual(cs.match(/\bFindWindowExW\([^)]*\)/g), ['FindWindowExW(IntPtr parent, IntPtr after, string className, string title)', 'FindWindowExW(IntPtr.Zero, after, "PseudoConsoleWindow", null)'], 'one call: a null parent, the class as that one literal, no title')
+    assert.ok(cs.includes(`public static int Hosted(IntPtr window, IntPtr console) { int count = 0; bool seen = false; IntPtr after = IntPtr.Zero; for (int look = 0; look < ${m.PLACE_HOSTED_BOUND}; look++) { after = FindWindowExW(IntPtr.Zero, after, "PseudoConsoleWindow", null); if (after == IntPtr.Zero) return seen ? count : -1; if (Same(GetWindow(after, 4), window)) { count++; if (Same(after, console)) seen = true; } } return -1; }`), 'Hosted: a bounded walk that reads each one\'s owner alone, counts those its window owns, and is -1 unless its own console is among them')
+    assert.ok(cs.includes('static bool Same(IntPtr a, IntPtr b) { return (a.ToInt64() & 0xffffffffL) == (b.ToInt64() & 0xffffffffL); }'), 'handles compared by their low 32 bits')
+    assert.ok(m.PLACE_HOSTED_BOUND >= 256 && Number.isInteger(m.PLACE_HOSTED_BOUND), 'a bound, and a large one')
+    assert.equal(cs.split('Hosted(').length - 1, 2, 'Hosted declared once and called once, by Place')
+    assert.equal(cs.split('FindWindowExW(').length - 1, 2, 'FindWindowExW imported once and called once, by Hosted')
+    const guard = cs.indexOf('if (own == IntPtr.Zero || ClassOf(own) != "CASCADIA_HOSTING_WINDOW_CLASS") return "its console is a pseudoconsole that no Windows Terminal window owns"; int hosted = Hosted(own, console); if (hosted != 1) return "its Windows Terminal window holds other tabs or panes, or its own console could not be counted among them (" + hosted + "), so it is left where it is"; }')
+    assert.ok(guard > 0, 'counted right after its owner is found, in the pseudoconsole branch, and refused on anything but 1')
+    for (const acting of ['SetThreadDpiAwarenessContext(new IntPtr(-4))', 'SetWindowPos(own', 'ShowWindowAsync(own']) assert.ok(cs.indexOf(acting) > guard, `the count comes before ${acting}`)
+    assert.ok(cs.includes('if (kind == "ConsoleWindowClass") own = console; else if'), 'a classic console window holds one console, and is not counted')
     assert.equal(m.PLACE_SWP_FLAGS, 0x0004 | 0x0010 | 0x0200 | 0x4000, 'SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_ASYNCWINDOWPOS, and nothing that shows, hides or reframes')
     for (const name of FORBIDDEN_IN_PLACE) assert.ok(!cs.includes(name), name)
     assert.ok(!/['\u2018-\u201b]/.test(cs), 'no single quote: it sits in a single-quoted literal')
@@ -1136,6 +1155,23 @@ const FAULTS = [
   ['#5: a hosted window opening a new plain window each move', 'plainLegs', '.legs.filter(leg => !isPlainWindow(leg))', '.legs'],
   ["#5: a layout window's maximized dropped from its tab", 'plainLegs', ', ...(home?.maximized === undefined ? {} : { maximized: home.maximized })', ''],
   ['#5: the plain window read as a named one', 'plainLegs', "where.window === true || !('name' in where.window)", 'where.window === true'],
+  ['#5 Fix A: the window moved without its consoles counted (the guard removed)', 'actingCalls', ' int hosted = Hosted(own, console); if (hosted != 1) return "its Windows Terminal window holds other tabs or panes, or its own console could not be counted among them (" + hosted + "), so it is left where it is";', ''],
+  ['#5 Fix A: the count compared to another number', 'actingCalls', 'if (hosted != 1) return "its Windows Terminal window', 'if (hosted < 1) return "its Windows Terminal window'],
+  ["#5 Fix A: every pseudoconsole counted, whoever owns it (the owner comparison dropped)", 'actingCalls', 'if (Same(GetWindow(after, 4), window)) {', 'if (true) {'],
+  ['#5 Fix A: its own console not looked for among them', 'actingCalls', 'if (Same(after, console)) seen = true;', 'seen = true;'],
+  ['#5 Fix A: another class walked', 'actingCalls', 'FindWindowExW(IntPtr.Zero, after, "PseudoConsoleWindow", null)', 'FindWindowExW(IntPtr.Zero, after, "ConsoleWindowClass", null)'],
+  ['#5 Fix A: a variable passed as the class', 'actingCalls', 'FindWindowExW(IntPtr.Zero, after, "PseudoConsoleWindow", null)', 'FindWindowExW(IntPtr.Zero, after, kind, null)'],
+  ['#5 Fix A: a window found by its title', 'actingCalls', 'FindWindowExW(IntPtr.Zero, after, "PseudoConsoleWindow", null)', 'FindWindowExW(IntPtr.Zero, after, "PseudoConsoleWindow", "claude")'],
+  ["#5 Fix A: another window's children walked", 'actingCalls', 'FindWindowExW(IntPtr.Zero, after, "PseudoConsoleWindow", null)', 'FindWindowExW(window, after, "PseudoConsoleWindow", null)'],
+  ['#5 Fix A: a walk with no bound', 'actingCalls', 'look < ${PLACE_HOSTED_BOUND}; look++', 'look >= 0; look++'],
+  ['#5 Fix A: handles compared in full, not by their low 32 bits', 'actingCalls', 'return (a.ToInt64() & 0xffffffffL) == (b.ToInt64() & 0xffffffffL);', 'return a == b;'],
+  [
+    '#5 Fix A: the count moved after an acting call',
+    'actingCalls',
+    ' int hosted = Hosted(own, console); if (hosted != 1) return "its Windows Terminal window holds other tabs or panes, or its own console could not be counted among them (" + hosted + "), so it is left where it is";',
+    '',
+    [['return "SetWindowPos failed with error " + Marshal.GetLastWin32Error();', 'return "SetWindowPos failed with error " + Marshal.GetLastWin32Error(); int hosted = Hosted(own, console); if (hosted != 1) return "its Windows Terminal window holds other tabs or panes, or its own console could not be counted among them (" + hosted + "), so it is left where it is";']],
+  ],
 ]
 
 describe("the window script sweep's names follow LAUNCH_ID", () => {
@@ -1156,10 +1192,15 @@ describe("the window script sweep's names follow LAUNCH_ID", () => {
 describe('planted faults in a copy of the machine code, each caught by its check', () => {
   const work = mkdtempSync(join(tmpdir(), 'machine-faults-'))
   after(() => rmSync(work, { recursive: true, force: true }))
-  FAULTS.forEach(([name, check, from, to], at) => {
+  // A fault is one replacement, and at times more, each made after the one before (`more`: [from, to] pairs).
+  FAULTS.forEach(([name, check, from, to, more = []], at) => {
     test(`${name} (caught by: ${check})`, async () => {
-      const faulty = sourceText.split(from).join(to)
+      let faulty = sourceText.split(from).join(to)
       assert.notEqual(faulty, sourceText, `the fault changed nothing: ${from.slice(0, 80)}`)
+      for (const [also, into] of more) {
+        assert.ok(faulty.includes(also), `the fault's next part finds nothing: ${also.slice(0, 80)}`)
+        faulty = faulty.split(also).join(into)
+      }
       const path = join(work, `machine-${at}.ts`)
       writeFileSync(path, faulty)
       const copy = await import(pathToFileURL(path).href)

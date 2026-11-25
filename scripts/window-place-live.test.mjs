@@ -11,7 +11,12 @@
 //    when the test gives a place, reads back where its window is, writes that to a file, and exits. The test then
 //    confirms the window is gone. Never wt.exe, never a named window, never the person's own windows: a window
 //    the script finds that was open before it started (a terminal that put it in a tab of an existing window) is
-//    left alone, nothing placed, and the test says so and skips.
+//    left alone, nothing placed, and the test says so and skips. That guard is the test's own, and a second one:
+//    the shipped code itself places a Windows Terminal window only when it holds this console alone (PLACE_CS's
+//    Hosted, which lists pseudoconsole windows by class to count those its own window owns, reads only their
+//    owner, acts on none, and is there to refuse, never to choose a target). Each window records that count
+//    (1 in a fresh window, which this run is what shows). The test's own listing (TopWindows, EnumWindows) is in
+//    its starter alone, never in the shipped code.
 //    Focus: the window is asked to open without being activated (STARTUPINFO's wShowWindow = SW_SHOWNOACTIVATE,
 //    with STARTF_USESHOWWINDOW). Whether the default terminal honours that is not known; the test records the
 //    window in front before the window starts, as it begins, and after its place, as a reported fact, never a
@@ -46,9 +51,10 @@ const SIZE_TOLERANCE = 24
 /** `text` as a single-quoted PowerShell literal. */
 const psq = text => `'${String(text).split("'").join("''")}'`
 
-/** Runs `script` in a hidden Windows PowerShell (or `shell`) by -EncodedCommand; its standard output. */
+/** Runs `script` in a hidden Windows PowerShell (or `shell`), on standard input under the plugins' own bootstrap (powershellCall: no command-line limit); its standard output. */
 function hidden(script, shell = WINDOWS_POWERSHELL, timeout = 60_000) {
-  const run = spawnSync(shell, ['-NoProfile', '-NonInteractive', '-EncodedCommand', machine.encodeCommand(script)], { encoding: 'utf8', windowsHide: true, timeout })
+  const call = machine.powershellCall(shell, script)
+  const run = spawnSync(call.argv[0], call.argv.slice(1), { input: call.stdin, encoding: 'utf8', windowsHide: true, timeout })
   return { code: run.status, out: `${run.stdout ?? ''}`, err: `${run.stderr ?? ''}` }
 }
 
@@ -67,13 +73,25 @@ const CLAMP_PAIRS = [
 
 describe('the window\'s own C#, compiled, its Clamp held to clampToWork (no window)', { skip: !isWindows && 'Windows only: Add-Type compiles the C# of a Windows window' }, () => {
   for (const [name, shell] of [['Windows PowerShell 5.1', WINDOWS_POWERSHELL], ['PowerShell 7', PWSH]]) {
-    test(`${name}: PLACE_CS compiles, and every row of Clamp is clampToWork's`, t => {
+    test(`${name}: PLACE_CS compiles, every row of Clamp is clampToWork's, and Hosted counts for the console this test runs in`, t => {
       if (!existsSync(shell)) return t.skip(`${name} is not installed here`)
       const calls = CLAMP_PAIRS.map(([[x, y, w, h], [l, tp, r, b]]) => `@([ClaudeSelfToolsPlace]::Clamp([int]${x}, [int]${y}, [int]${w}, [int]${h}, [int]${l}, [int]${tp}, [int]${r}, [int]${b}))`)
-      const script = [`Add-Type -ErrorAction Stop -TypeDefinition ${psq(machine.PLACE_CS)}`, `[Console]::Out.WriteLine((ConvertTo-Json -Compress -Depth 3 -InputObject @(${calls.join(', ')})))`].join('\r\n')
+      const script = [
+        `Add-Type -ErrorAction Stop -TypeDefinition ${psq(machine.PLACE_CS)}`,
+        `Add-Type -ErrorAction Stop -TypeDefinition ${psq(TEST_CS)}`,
+        // Hosted, a pure read, for whatever console this hidden PowerShell has: under a Windows Terminal tab, the consoles its window holds.
+        '$kind = [ClaudeSelfToolsPlaceTest]::OwnKind()',
+        '$owner = [long][ClaudeSelfToolsPlaceTest]::OwnLow()',
+        '$hosted = $null',
+        'if ($owner -ne 0) { $hosted = [ClaudeSelfToolsPlace]::Hosted([IntPtr]::new($owner), [IntPtr]::new([long][ClaudeSelfToolsPlaceTest]::ConsoleLow())) }',
+        `[Console]::Out.WriteLine((ConvertTo-Json -Compress -Depth 4 -InputObject ([ordered]@{ clamp = @(${calls.join(', ')}); kind = $kind; hosted = $hosted })))`,
+      ].join('\r\n')
       const ran = hidden(script, shell)
       assert.equal(ran.code, 0, `${ran.out}${ran.err}`)
-      const got = JSON.parse(ran.out.trim())
+      const answer = JSON.parse(ran.out.trim().split(/\r?\n/).at(-1))
+      t.diagnostic(`the console this test runs in: ${answer.kind}; Hosted for it: ${answer.hosted ?? 'not counted (not a Windows Terminal pseudoconsole)'}`)
+      assert.ok(answer.hosted === null || (Number.isInteger(answer.hosted) && answer.hosted >= -1), `Hosted answers a count or -1: ${answer.hosted}`)
+      const got = answer.clamp
       const wrong = CLAMP_PAIRS.map(([rect, work], i) => [rect, work, got[i], machine.clampToWork(rect, work)]).filter(([, , cs, ts]) => JSON.stringify(cs) !== JSON.stringify(ts))
       assert.deepEqual(wrong.map(([rect, work, cs, ts]) => `${JSON.stringify(rect)} in ${JSON.stringify(work)}: C# ${JSON.stringify(cs)}, TypeScript ${JSON.stringify(ts)}`), [])
     })
@@ -116,6 +134,7 @@ const TEST_CS = [
   'static IntPtr Own() { IntPtr console = GetConsoleWindow(); if (console == IntPtr.Zero) return IntPtr.Zero; string kind = ClassOf(console); if (kind == "ConsoleWindowClass") return console; if (kind == "PseudoConsoleWindow") { IntPtr owner = GetWindow(console, 4); if (owner != IntPtr.Zero && ClassOf(owner) == "CASCADIA_HOSTING_WINDOW_CLASS") return owner; } return IntPtr.Zero; }',
   'public static string OwnKind() { IntPtr console = GetConsoleWindow(); if (console == IntPtr.Zero) return "no console window"; IntPtr owner = GetWindow(console, 4); return ClassOf(console) + (owner == IntPtr.Zero ? "" : " owned by " + ClassOf(owner)); }',
   'public static long OwnLow() { return Low(Own()); }',
+  'public static long ConsoleLow() { return Low(GetConsoleWindow()); }',
   'public static int[] OwnRect() { IntPtr before = SetThreadDpiAwarenessContext(new IntPtr(-4)); try { Box box; if (!GetWindowRect(Own(), out box)) return new int[0]; return new int[] { box.Left, box.Top, box.Right - box.Left, box.Bottom - box.Top }; } finally { if (before != IntPtr.Zero) SetThreadDpiAwarenessContext(before); } }',
   'public static bool OwnZoomed() { return IsZoomed(Own()); }',
   'public static int[] OwnWork() { IntPtr before = SetThreadDpiAwarenessContext(new IntPtr(-4)); try { MonitorInfo info = new MonitorInfo(); info.Size = (uint)Marshal.SizeOf(typeof(MonitorInfo)); if (!GetMonitorInfoW(MonitorFromWindow(Own(), 2), ref info)) return new int[0]; return new int[] { info.Work.Left, info.Work.Top, info.Work.Right, info.Work.Bottom }; } finally { if (before != IntPtr.Zero) SetThreadDpiAwarenessContext(before); } }',
@@ -157,6 +176,7 @@ function openWindow(place) {
     'try {',
     `  Add-Type -ErrorAction Stop -TypeDefinition ${psq(TEST_CS)}`,
     '  $result.own = [ClaudeSelfToolsPlaceTest]::OwnLow()',
+    '  $result.console = [ClaudeSelfToolsPlaceTest]::ConsoleLow()',
     '  $result.kind = [ClaudeSelfToolsPlaceTest]::OwnKind()',
     '  $result.frontAtStart = [ClaudeSelfToolsPlaceTest]::Foreground()',
     // Windows PowerShell 5.1's ConvertFrom-Json hands a JSON array on as one object: @() of the variable, not of the pipeline.
@@ -174,6 +194,9 @@ function openWindow(place) {
           '    for ($look = 0; $look -lt 30; $look++) { if ([ClaudeSelfToolsPlaceTest]::OwnZoomed() -or (@([ClaudeSelfToolsPlaceTest]::OwnRect()) -join ",") -ne ($result.rectBefore -join ",")) { break }; Start-Sleep -Milliseconds 100 }',
           '    Start-Sleep -Milliseconds 300',
         ]),
+    // The consoles its own window holds, by the shipped Hosted (1 in a fresh window), for a pseudoconsole's window alone.
+    `    if (-not ("ClaudeSelfToolsPlace" -as [type])) { Add-Type -ErrorAction Stop -TypeDefinition ${psq(machine.PLACE_CS)} }`,
+    '    if ($result.kind -like "PseudoConsoleWindow*") { $result.hosted = [ClaudeSelfToolsPlace]::Hosted([IntPtr]::new([long]$result.own), [IntPtr]::new([long]$result.console)) }',
     '    $result.rectAfter = [ClaudeSelfToolsPlaceTest]::OwnRect()',
     '    $result.zoomed = [ClaudeSelfToolsPlaceTest]::OwnZoomed()',
     '    $result.work = [ClaudeSelfToolsPlaceTest]::OwnWork()',
@@ -222,6 +245,11 @@ function settled(t, opened) {
   }
   assert.equal(record.gone, true, 'its window is gone (Windows Terminal closes a tab whose process ends with 0 when closeOnExit is automatic; if it stays, close it by hand)')
   sayFront(t, opened)
+  // A pseudoconsole's window: the consoles it holds, counted by the shipped Hosted, as a fact; in a fresh window, 1.
+  if (typeof result.kind === 'string' && result.kind.startsWith('PseudoConsoleWindow')) {
+    t.diagnostic(`the consoles its window holds (Hosted): ${result.hosted}`)
+    assert.equal(result.hosted, 1, 'a fresh window holds its own console alone')
+  }
   // A terminal set to open its windows maximized (Windows Terminal's launchMode): the shipped code leaves such a window as it is.
   if (typeof result.placeSaid === 'string' && result.placeSaid.startsWith('it opened minimized or maximized')) {
     t.skip(`the window opened maximized or minimized, so the shipped code left it as it is: ${result.placeSaid}`)
