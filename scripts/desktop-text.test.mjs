@@ -24,6 +24,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
 import { pathToFileURL } from 'node:url'
+import { isDeepStrictEqual } from 'node:util'
 import { ROOT } from './sync-shared.mjs'
 
 const desktop = await import(pathToFileURL(join(ROOT, 'plugins', 'self-desktop', 'hooks', 'desktop.ts')).href)
@@ -525,13 +526,24 @@ const NULL_STRING = '[System.Management.Automation.Language.NullString]::Value'
   ['handle round trip: printed, then made again, is the sign-extended handle', '[SelfDesktop]::HandleValue([SelfDesktop]::HandleNumber([long]-2147483000))', -2147483000],
 ]
 
+/** What a row that threw gives, in place of its answer: the error's message after this mark. */
+const THREW = 'threw: '
+
 test("the helper's pure rules answer as the privacy rules say, for fixed values: no window read, no console attached", { skip: ON_WINDOWS }, () => {
-  const lines = ['$answers = New-Object System.Collections.ArrayList', ...RULES.map(([, expression]) => `[void]$answers.Add(${expression})`), '[Console]::Out.Write((ConvertTo-Json -InputObject @($answers.ToArray()) -Compress))']
+  // Every row is answered, one that throws included (its message in its place), and the whole table is compared at
+  // once: one run lists every row that differs, with what it gave.
+  const lines = [
+    '$answers = New-Object System.Collections.ArrayList',
+    ...RULES.map(([, expression]) => `try { [void]$answers.Add(${expression}) } catch { [void]$answers.Add(${desktop.literal(THREW)} + $_.Exception.Message) }`),
+    '[Console]::Out.Write((ConvertTo-Json -InputObject @($answers.ToArray()) -Compress))',
+  ]
   const answers = JSON.parse(afterCompile(lines).trim())
-  assert.equal(answers.length, RULES.length)
-  for (const [i, [name, , expected]] of RULES.entries()) {
-    const got = answers[i]
-    if (expected instanceof RegExp) assert.match(String(got), expected, name)
-    else assert.deepEqual(got === undefined ? null : got, expected, name)
-  }
+  const said = value => (value instanceof RegExp ? String(value) : JSON.stringify(value))
+  const differ = RULES.flatMap(([name, expression, expected], i) => {
+    const got = answers[i] ?? null
+    const same = expected instanceof RegExp ? typeof got === 'string' && !got.startsWith(THREW) && expected.test(got) : isDeepStrictEqual(got, expected)
+    return same ? [] : [`${name}: ${expression} gave ${said(got)}, expected ${said(expected)}`]
+  })
+  if (answers.length !== RULES.length) differ.push(`the table has ${RULES.length} rows, the answers ${answers.length}`)
+  assert.deepEqual(differ, [], `${differ.length} of ${RULES.length} rows differ:\n${differ.join('\n')}`)
 })
