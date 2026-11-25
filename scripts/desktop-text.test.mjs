@@ -433,6 +433,14 @@ test("the helper compiles under Windows PowerShell's Add-Type, and nothing of it
 const TABLE = '[uint32[]]@(10, 11, 12, 20, 30, 60, 70), [uint32[]]@(20, 20, 20, 30, 0, 70, 0), [long[]]@(500, 500, 500, 400, 100, 300, 200)'
 const NAMES = "[string[]]@('powershell.exe', 'node.exe', 'claude.exe', 'claude.exe', 'pwsh.exe', 'cmd.exe', 'explorer.exe')"
 const RULES = [
+/**
+ * A null string, as Windows PowerShell hands one to a .NET method. It converts $null to an empty string for a string
+ * parameter, so a row that means "no reason" passes this instead. Microsoft, the NullString class
+ * (learn.microsoft.com/en-us/dotnet/api/system.management.automation.language.nullstring): "This type is introduced to
+ * provide a way to pass null into a .NET method that has a string parameter." An array parameter (uint[], string[])
+ * is no string: $null reaches it as null, so the one row that means "no list" passes $null.
+ */
+const NULL_STRING = '[System.Management.Automation.Language.NullString]::Value'
   // Which names a tree gives.
   ['named: a tab in a terminal window', "[SelfDesktop]::Named($true, 'TabItem', $false, $false)", true],
   ['named: the window itself in a terminal window', "[SelfDesktop]::Named($true, 'Window', $false, $false)", true],
@@ -479,6 +487,7 @@ const RULES = [
   ],
   ['sharing: a process that can\'t be placed', `[SelfDesktop]::SharingWhy(10, 20, [uint32[]]@(10, 20, 99), ${TABLE}, ${NAMES})`, /can't be placed \(process 99\)/],
   ['sharing: no list of the processes', `[SelfDesktop]::SharingWhy(10, 20, $null, ${TABLE}, ${NAMES})`, /couldn't be told apart/],
+  // A uint[] parameter: $null reaches it as null, not as an empty array.
   [
     'sharing: this script itself may carry the image name of the process Claude Code names',
     "[SelfDesktop]::SharingWhy(10, 20, [uint32[]]@(10, 20), [uint32[]]@(10, 20), [uint32[]]@(20, 0), [long[]]@(500, 400), [string[]]@('powershell.exe', 'powershell.exe'))",
@@ -491,14 +500,18 @@ const RULES = [
   ['kept: no rows', '[SelfDesktop]::KeepFrom([int[]]@(), 200, 20000)', 0],
   ['denied: a password manager among a window and its children', "[SelfDesktop]::DeniedOf([string[]]@('WindowsTerminal.exe', 'KeePassXC.exe'), [string[]]@('keepassxc.exe'))", 'KeePassXC.exe'],
   ['denied: none', "[SelfDesktop]::DeniedOf([string[]]@('WindowsTerminal.exe'), [string[]]@('keepassxc.exe'))", null],
-  ['picture: a Windows Terminal window is not built', "[SelfDesktop]::CaptureRefusal('terminal', $null)", 'terminal'],
-  ['picture: a classic console window may be pictured', "[SelfDesktop]::CaptureRefusal('console', $null)", null],
+  ['picture: a Windows Terminal window is not built', `[SelfDesktop]::CaptureRefusal('terminal', ${NULL_STRING})`, 'terminal'],
+  ['picture: a classic console window may be pictured', `[SelfDesktop]::CaptureRefusal('console', ${NULL_STRING})`, null],
   ['picture: refused with the finding when the console is shared', "[SelfDesktop]::CaptureRefusal('console', 'a program that is not this session''s own shares it')", 'why'],
   ['picture: refused when no window was found', "[SelfDesktop]::CaptureRefusal('', 'no window')", 'why'],
-  ['picture: refused for any other kind', "[SelfDesktop]::CaptureRefusal('app', $null)", 'why'],
-  ['after the picture: the same window, nothing found against it, kept', '[SelfDesktop]::AfterPicture(5, 5, $null)', null],
-  ['after the picture: another window shows the console, not kept', '[SelfDesktop]::AfterPicture(5, 6, $null)', /shown by another window now/],
-  ['after the picture: no window found again, not kept', '[SelfDesktop]::AfterPicture(5, 0, $null)', /shown by another window now/],
+  ['picture: refused for any other kind', `[SelfDesktop]::CaptureRefusal('app', ${NULL_STRING})`, 'why'],
+  // An empty reason is a reason: it refuses, failing closed (what $null would have passed before).
+  ['picture: an empty reason refuses too', "[SelfDesktop]::CaptureRefusal('console', '')", 'why'],
+  ['after the picture: the same window, nothing found against it, kept', `[SelfDesktop]::AfterPicture(5, 5, ${NULL_STRING})`, null],
+  ['after the picture: another window shows the console, not kept', `[SelfDesktop]::AfterPicture(5, 6, ${NULL_STRING})`, /shown by another window now/],
+  ['after the picture: no window found again, not kept', `[SelfDesktop]::AfterPicture(5, 0, ${NULL_STRING})`, /shown by another window now/],
+  // An empty reason found again is a reason: the picture is not kept (the reason comes back, not null).
+  ['after the picture: an empty reason found again, not kept', "[SelfDesktop]::AfterPicture(5, 5, '')", ''],
   ['after the picture: what the look again found, not kept', "[SelfDesktop]::AfterPicture(5, 5, 'a program that is not this session''s own shares it')", "a program that is not this session's own shares it"],
   // A window handle as the helper prints it (its lower 32 bits) and makes it again (those 32 bits sign-extended).
   ['handle printed: a small handle as it is', '[SelfDesktop]::HandleNumber(74565)', 74565],

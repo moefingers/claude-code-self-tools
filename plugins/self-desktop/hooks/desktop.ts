@@ -398,13 +398,17 @@ public static class SelfDesktop {
   }
   // Why this session's own window isn't pictured, as a code: "why" (no window of its own was found, or its console is
   // shared: the finding says why), "terminal" (a picture of a Windows Terminal window isn't built). Null when it may be.
+  // Any reason that isn't null refuses, an empty one included: the reasons are this helper's own sentences, never
+  // empty, so an empty one is a fault, and it fails closed. (Windows PowerShell hands a string parameter its null as
+  // an empty string, so a caller from PowerShell that means none passes the NullString value.)
   public static string CaptureRefusal(string kind, string ownWhy) {
     if (ownWhy != null) return "why";
     if (kind == "console") return null;
     return kind == "terminal" ? "terminal" : "why";
   }
   // Whether a picture taken is kept, from this session's window before it and the look again after it: null when the
-  // same window is still this session's own, else why the picture is not kept.
+  // same window is still this session's own, else why the picture is not kept. Any reason found again that isn't
+  // null means not kept, an empty one included, as in CaptureRefusal: it fails closed.
   public static string AfterPicture(long windowBefore, long windowAfter, string whyAfter) {
     if (whyAfter != null) return whyAfter;
     return windowAfter == windowBefore && windowAfter != 0 ? null : "this session's console is shown by another window now";
