@@ -4506,9 +4506,12 @@ export const PLACE_SWP_FLAGS = 0x4214
  * to say, so the code does not rest on it). A classic console window holds one console, and is not counted. Asked only
  * to be maximized, a window maximized already (Windows Terminal's launchMode "maximized", say) is where it is asked:
  * "placed", and nothing is done. Anything else, or a window already minimized, or maximized when a rect is asked too:
- * nothing is done, and it says why. A full-screen window (launchMode "fullscreen", or "maximizedFocus") is not told
- * apart: from memory, full screen does not set WS_MAXIMIZE, so IsZoomed is false and it is moved or maximized, and
- * Windows Terminal's own idea of its state may then disagree with the window's. Then per-monitor DPI awareness for its thread alone
+ * nothing is done, and it says why. launchMode "maximizedFocus" is a maximized window with focus mode (Windows
+ * Terminal's startup page: "a maximized window with focus mode enabled"), so, IsZoomed being true there (from memory),
+ * it is treated as maximized: "placed" for maximized alone, nothing said; left as it is, its one line, for a rect. A
+ * full-screen window (launchMode "fullscreen") is not told apart: from memory, full screen does not set WS_MAXIMIZE, so
+ * IsZoomed is false and it is moved or maximized, and Windows Terminal's own idea of its state may then disagree with
+ * the window's. Then per-monitor DPI awareness for its thread alone
  * (SetThreadDpiAwarenessContext(-4), DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2; Windows PowerShell 5.1 is DPI-unaware,
  * #5), put back as it was before it returns. With a rect: the monitor MonitorFromRect picks (MONITOR_DEFAULTTONEAREST,
  * 2), its work area (GetMonitorInfoW's rcWork), Clamp (clampToWork's arithmetic), then SetWindowPos with
