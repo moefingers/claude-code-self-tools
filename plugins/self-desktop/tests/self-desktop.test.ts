@@ -42,9 +42,13 @@ import {
   visible,
 } from '../hooks/desktop'
 
-const LIST = 'mcp__self-desktop__desktop_windows'
-const READ = 'mcp__self-desktop__desktop_read'
-const CAPTURE = 'mcp__self-desktop__desktop_capture'
+// Each tool's name keeps its literal type (as const), in a list as well, so $.tool.call and $.tool.run take it as an MCP
+// tool's name, as the engine's types require of a call's `tool`.
+const LIST = 'mcp__self-desktop__desktop_windows' as const
+const READ = 'mcp__self-desktop__desktop_read' as const
+const CAPTURE = 'mcp__self-desktop__desktop_capture' as const
+const TOOLS = [LIST, READ, CAPTURE] as const
+type Tool = (typeof TOOLS)[number]
 const ON = { options: { enabled: 'on' } }
 const START = { cwd: '/', surface: 'terminal', isInteractive: true } as const
 /** The process Claude Code names as its own, and the plugin's data folder, as $.process.hookEnv gives them. */
@@ -203,14 +207,14 @@ function engine(on: On, world: World = {}) {
 }
 
 /** A call's answer as text; it must not be refused. */
-async function call($: Engine, tool: string, input: Record<string, unknown> = {}): Promise<string> {
+async function call($: Engine, tool: Tool, input: Record<string, unknown> = {}): Promise<string> {
   const done = await $.tool.call({ tool, ...input })
   expect(done.deny).toBeUndefined()
   return String(done.result)
 }
 
 /** A call that must be refused: its words. */
-async function refused($: Engine, tool: string, input: Record<string, unknown> = {}): Promise<string> {
+async function refused($: Engine, tool: Tool, input: Record<string, unknown> = {}): Promise<string> {
   const done = await $.tool.call({ tool, ...input })
   expect(done.result).toBeUndefined()
   return String(done.deny)
@@ -222,7 +226,7 @@ async function refused($: Engine, tool: string, input: Record<string, unknown> =
 test('off by default: every tool says how to turn it on, in one line, and no script reads anything', async ($, on) => {
   const { scripts } = engine(on)
   await $.session.start(START)
-  for (const tool of [LIST, READ, CAPTURE]) expect(await call($, tool)).toBe(OFF)
+  for (const tool of TOOLS) expect(await call($, tool)).toBe(OFF)
   // Off, even a call that asks for a window gets the same line: it says how to turn the plugin on.
   expect(await call($, READ, { window: 1002 })).toBe(OFF)
   expect(OFF).not.toContain('\n')
@@ -240,7 +244,7 @@ test('a setting other than on is off', { options: { enabled: 'yes' } }, async ($
 test("on, but not on Windows: each tool says so in one line, macOS isn't built, and nothing runs or is asked of the machine", ON, async ($, on) => {
   const { argvs, asked } = engine(on, { platform: 'macos' })
   await $.session.start(START)
-  for (const tool of [LIST, READ, CAPTURE]) {
+  for (const tool of TOOLS) {
     expect(await call($, tool)).toBe("self-desktop reads the desktop on Windows only, and this session runs on macOS, so nothing was read. macOS isn't built.")
   }
   expect(argvs).toEqual([])
@@ -271,7 +275,7 @@ test('on a hosted server: not the machine whose desktop this would be', ON, asyn
 test('a subagent is refused, promised nothing of the main session, and nothing reads', ON, async ($, on) => {
   const { scripts } = engine(on)
   await $.session.start(START)
-  for (const tool of [LIST, READ, CAPTURE]) expect(await refused($, tool, { agentId: 'a1' })).toBe(SUBAGENT)
+  for (const tool of TOOLS) expect(await refused($, tool, { agentId: 'a1' })).toBe(SUBAGENT)
   expect(SUBAGENT).toBe("A subagent can't read the desktop: self-desktop reads it for the main session only. Finish your piece and return its result.")
   expect(scripts).toEqual([])
 })
@@ -302,7 +306,7 @@ test("the engine's own keys are no argument: tool, tool_use_id, consent, agentId
 test("Claude Code's own permission check holds: a call it refuses runs no script, and gets no answer of the tool's", ON, async ($, on) => {
   const { scripts } = engine(on, { permission: 'deny' })
   await $.session.start(START)
-  for (const tool of [LIST, READ, CAPTURE]) {
+  for (const tool of TOOLS) {
     const done = await $.tool.call({ tool })
     expect(String(done.result ?? '')).not.toMatch(/^(Windows a person could see|Read this session|Captured)/)
   }
@@ -312,8 +316,9 @@ test("Claude Code's own permission check holds: a call it refuses runs no script
 test('the serving refuses a subagent again at tool.run, whatever ran before it, and runs nothing', ON, async ($, on) => {
   const { scripts } = engine(on)
   await $.session.start(START)
-  for (const tool of [LIST, READ, CAPTURE]) {
-    const done = await $.tool.run({ tool, agentId: 'a1' })
+  for (const tool of TOOLS) {
+    // tool.run's input is the call's whole envelope, its tool_use_id included (the engine's ToolCallInput).
+    const done = await $.tool.run({ tool, tool_use_id: 't1', agentId: 'a1' })
     expect(done.deny).toBe(SUBAGENT)
   }
   expect(scripts).toEqual([])
@@ -322,8 +327,8 @@ test('the serving refuses a subagent again at tool.run, whatever ran before it, 
 test('the serving refuses again at tool.run while the setting is off, the same way, and runs nothing', async ($, on) => {
   const { scripts } = engine(on)
   await $.session.start(START)
-  for (const tool of [LIST, READ, CAPTURE]) {
-    const done = await $.tool.run({ tool })
+  for (const tool of TOOLS) {
+    const done = await $.tool.run({ tool, tool_use_id: 't1' })
     expect(done.result).toBe(OFF)
   }
   expect(scripts).toEqual([])
