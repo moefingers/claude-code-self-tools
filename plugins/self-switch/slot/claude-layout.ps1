@@ -16,14 +16,15 @@
 # - It checks the file by the rules of readPlacement in the plugins' machine code (one shared list of good
 #   and bad files holds the two equal): window names of letters, digits, _ and -, never 0, last, new, _quake,
 #   -1 or all digits; tab labels; folders absolute, there, with no quote, semicolon or % (Windows Terminal expands
-#   a % in them); positions and sizes in range; unknown keys refused, naming them. Anything wrong, and it
+#   a % in them); positions and sizes in range; maximized true; a rect only for the plain window (a launch's or a
+#   restart's window with no name), never a named one; unknown keys refused, naming them. Anything wrong, and it
 #   says what, and runs nothing.
 # - It needs the slot runner at %LOCALAPPDATA%\claude-self-tools\claude-slot.ps1, with the SHA-256 the
 #   plugins ship, read by .NET; and with -Apply, Windows Terminal of 1.19 or later (it forwards a tab's
 #   environment, which the tab's stamp needs).
 # - For each window in order, for each tab, it sets CLAUDE_SELF_TOOLS_WT_WINDOW and CLAUDE_SELF_TOOLS_WT_TAB
 #   in its own process, then runs wt.exe, by its full path under %LOCALAPPDATA%\Microsoft\WindowsApps, by Start-Process with one quoted string: the window by its name,
-#   its position and size on the first tab only, and the tab running the slot runner with -Idle. So no
+#   -M when it is maximized, its position and size, on the first tab only, and the tab running the slot runner with -Idle. So no
 #   tab starts a Claude Code: Enter does that, or a launch. 2 seconds between calls, since Windows Terminal
 #   creates a window by name asynchronously. A window of that name that is there already simply gains tabs.
 # - It clears NO_COLOR and the variables Claude Code sets in the processes it starts in its own process
@@ -61,6 +62,8 @@ function Get-Sha256($path) {
 $script:Errors = New-Object System.Collections.ArrayList
 function Add-Fault($what) { [void]$script:Errors.Add($what) }
 function Test-Object($value) { return ($value -is [Management.Automation.PSCustomObject]) }
+# Whether the object has the key at all: a key given as null is there, as readPlacement reads it, and checked.
+function Test-Has($value, $name) { return ($null -ne $value.PSObject.Properties[$name]) }
 function Test-Whole($value, $low, $high) { return (($value -is [int] -or $value -is [long]) -and $value -ge $low -and $value -le $high) }
 function Test-WindowName($name) { return ($name -is [string] -and $name -cmatch '^[A-Za-z0-9_-]{1,40}\z' -and $name -notmatch '^-?\d+\z' -and $name -notmatch '^(new|last|_quake)\z') }
 function Test-TabLabel($label) { return ($label -is [string] -and $label -cmatch '^[A-Za-z0-9 ._-]{1,40}\z') }
@@ -78,9 +81,22 @@ function Test-WtFolder($path) { return ((Test-Shape $path) -and $path.IndexOf(';
 function Test-Keys($value, $allowed, $where) {
   foreach ($p in $value.PSObject.Properties) { if ($allowed -cnotcontains $p.Name) { Add-Fault ($where + ' has an unknown key ' + $p.Name) } }
 }
+function Test-Maximized($value, $where) {
+  if ((Test-Has $value 'maximized') -and -not ($value.maximized -is [bool] -and $value.maximized)) { Add-Fault ($where + ' has a maximized that is not true (leave it out for a window that is not maximized)') }
+}
+# A named window's place (a layout window's too): pos, size and maximized; a rect is not built for one.
 function Test-Place($value, $where) {
-  if ($null -ne $value.pos -and -not ($value.pos -is [array] -and $value.pos.Count -eq 2 -and (Test-Whole $value.pos[0] -32768 32768) -and (Test-Whole $value.pos[1] -32768 32768))) { Add-Fault ($where + ' has a pos that is not two whole numbers within 32768') }
-  if ($null -ne $value.size -and -not ($value.size -is [array] -and $value.size.Count -eq 2 -and (Test-Whole $value.size[0] 20 400) -and (Test-Whole $value.size[1] 5 200))) { Add-Fault ($where + ' has a size that is not 20-400 columns and 5-200 rows') }
+  if ((Test-Has $value 'pos') -and -not ($value.pos -is [array] -and $value.pos.Count -eq 2 -and (Test-Whole $value.pos[0] -32768 32768) -and (Test-Whole $value.pos[1] -32768 32768))) { Add-Fault ($where + ' has a pos that is not two whole numbers within 32768') }
+  if ((Test-Has $value 'size') -and -not ($value.size -is [array] -and $value.size.Count -eq 2 -and (Test-Whole $value.size[0] 20 400) -and (Test-Whole $value.size[1] 5 200))) { Add-Fault ($where + ' has a size that is not 20-400 columns and 5-200 rows') }
+  Test-Maximized $value $where
+  if (Test-Has $value 'rect') { Add-Fault ($where + ' has a rect, which a named window does not take (not built): give it pos, in pixels, and size, in columns and rows') }
+}
+# The plain window's place (a window with no name): rect, maximized or both; never pos or size.
+function Test-Plain($value, $where) {
+  if ((Test-Has $value 'pos') -or (Test-Has $value 'size')) { Add-Fault ($where + ' has no name, so it is the plain window, which takes rect and maximized: pos and size are a named window''s') }
+  if ((Test-Has $value 'rect') -and -not ($value.rect -is [array] -and $value.rect.Count -eq 4 -and (Test-Whole $value.rect[0] -32768 32768) -and (Test-Whole $value.rect[1] -32768 32768) -and (Test-Whole $value.rect[2] 320 32768) -and (Test-Whole $value.rect[3] 200 32768))) { Add-Fault ($where + ' has a rect that is not four whole numbers [x, y, width, height]: x and y within 32768, a width of 320 to 32768 and a height of 200 to 32768') }
+  Test-Maximized $value $where
+  if (-not (Test-Has $value 'rect') -and -not (Test-Has $value 'maximized')) { Add-Fault ($where + ' has no name and no rect or maximized: name a window, or give the plain window its place') }
 }
 function Test-Prefer($value, $where) {
   if (-not ($value -is [array] -and $value.Count -ge 1 -and $value.Count -le 3)) { Add-Fault ($where + '.prefer is not a list of slot, tab and window'); return }
@@ -91,9 +107,11 @@ function Test-Prefer($value, $where) {
     else { $seen[$v] = $true }
   }
 }
-function Test-NamedWindow($value, $where) {
+# A section's window: by its name, a named window of Windows Terminal; with none, the plain window's place.
+function Test-Window($value, $where) {
   if (-not (Test-Object $value)) { Add-Fault ($where + '.window is not an object'); return }
-  Test-Keys $value @('name', 'pos', 'size') ($where + '.window')
+  Test-Keys $value @('name', 'pos', 'size', 'rect', 'maximized') ($where + '.window')
+  if (-not (Test-Has $value 'name')) { Test-Plain $value ($where + '.window'); return }
   if (-not (Test-WindowName $value.name)) { Add-Fault ($where + '.window.name is not a name Windows Terminal takes as one') }
   Test-Place $value ($where + '.window')
 }
@@ -109,7 +127,7 @@ function Get-PlacementFaults($doc) {
       $here = 'layout[' + $at + ']'
       $at++
       if (-not (Test-Object $w)) { Add-Fault ($here + ' is not an object'); continue }
-      Test-Keys $w @('window', 'pos', 'size', 'tabs', 'folder') $here
+      Test-Keys $w @('window', 'pos', 'size', 'maximized', 'rect', 'tabs', 'folder') $here
       if (-not (Test-WindowName $w.window)) { Add-Fault ($here + '.window is not a name Windows Terminal takes as one') }
       elseif ($names.ContainsKey($w.window)) { Add-Fault ($here + '.window names a window twice') }
       else { $names[$w.window] = $true }
@@ -127,12 +145,12 @@ function Get-PlacementFaults($doc) {
       elseif (-not (Test-Path -LiteralPath $w.folder -PathType Container)) { Add-Fault ($here + '.folder is not there') }
     }
   }
-  if ($null -ne $doc.launch) {
+  if (Test-Has $doc 'launch') {
     if (-not (Test-Object $doc.launch)) { Add-Fault 'launch is not an object' }
     else {
       Test-Keys $doc.launch @('prefer', 'tab', 'window') 'launch'
       Test-Prefer $doc.launch.prefer 'launch'
-      if ($null -ne $doc.launch.tab) {
+      if (Test-Has $doc.launch 'tab') {
         if (-not (Test-Object $doc.launch.tab)) { Add-Fault 'launch.tab is not an object' }
         else {
           Test-Keys $doc.launch.tab @('window', 'maxTabs') 'launch.tab'
@@ -141,25 +159,25 @@ function Get-PlacementFaults($doc) {
           if (-not (Test-Whole $doc.launch.tab.maxTabs 1 16)) { Add-Fault 'launch.tab.maxTabs is not a whole number from 1 to 16' }
         }
       }
-      if ($null -ne $doc.launch.window) { Test-NamedWindow $doc.launch.window 'launch' }
+      if (Test-Has $doc.launch 'window') { Test-Window $doc.launch.window 'launch' }
     }
   }
-  if ($null -ne $doc.restart) {
+  if (Test-Has $doc 'restart') {
     if (-not (Test-Object $doc.restart)) { Add-Fault 'restart is not an object' }
     else {
       Test-Keys $doc.restart @('prefer', 'tab', 'window') 'restart'
       Test-Prefer $doc.restart.prefer 'restart'
-      if ($null -ne $doc.restart.tab) {
+      if (Test-Has $doc.restart 'tab') {
         if (-not (Test-Object $doc.restart.tab)) { Add-Fault 'restart.tab is not an object' }
         else {
           Test-Keys $doc.restart.tab @('window') 'restart.tab'
           if ($doc.restart.tab.window -cne 'same' -and -not (Test-WindowName $doc.restart.tab.window)) { Add-Fault 'restart.tab.window is neither same nor a name Windows Terminal takes as one' }
         }
       }
-      if ($null -ne $doc.restart.window) { Test-NamedWindow $doc.restart.window 'restart' }
+      if (Test-Has $doc.restart 'window') { Test-Window $doc.restart.window 'restart' }
     }
   }
-  if ($null -ne $doc.workspaces) {
+  if (Test-Has $doc 'workspaces') {
     if (-not (Test-Object $doc.workspaces)) { Add-Fault 'workspaces is not an object' }
     else {
       foreach ($p in $doc.workspaces.PSObject.Properties) {
@@ -168,19 +186,19 @@ function Get-PlacementFaults($doc) {
       }
     }
   }
-  if ($null -ne $doc.limits) {
+  if (Test-Has $doc 'limits') {
     if (-not (Test-Object $doc.limits)) { Add-Fault 'limits is not an object' }
     else {
       Test-Keys $doc.limits @('minFreeGb', 'maxSessions') 'limits'
-      if ($null -ne $doc.limits.minFreeGb -and -not (Test-Whole $doc.limits.minFreeGb 1 64)) { Add-Fault 'limits.minFreeGb is not a whole number from 1 to 64' }
-      if ($null -ne $doc.limits.maxSessions -and -not (Test-Whole $doc.limits.maxSessions 1 40)) { Add-Fault 'limits.maxSessions is not a whole number from 1 to 40' }
+      if ((Test-Has $doc.limits 'minFreeGb') -and -not (Test-Whole $doc.limits.minFreeGb 1 64)) { Add-Fault 'limits.minFreeGb is not a whole number from 1 to 64' }
+      if ((Test-Has $doc.limits 'maxSessions') -and -not (Test-Whole $doc.limits.maxSessions 1 40)) { Add-Fault 'limits.maxSessions is not a whole number from 1 to 40' }
     }
   }
-  if ($null -ne $doc.afterBoot) {
+  if (Test-Has $doc 'afterBoot') {
     if (-not (Test-Object $doc.afterBoot)) { Add-Fault 'afterBoot is not an object' }
     else {
       Test-Keys $doc.afterBoot @('fltFix') 'afterBoot'
-      if ($null -ne $doc.afterBoot.fltFix -and -not ((Test-WtFolder $doc.afterBoot.fltFix) -and $doc.afterBoot.fltFix -match '\.ps1\z' -and (Test-Path -LiteralPath $doc.afterBoot.fltFix -PathType Leaf))) { Add-Fault 'afterBoot.fltFix is not an absolute .ps1 file that is there, with no quote, semicolon or %' }
+      if ((Test-Has $doc.afterBoot 'fltFix') -and -not ((Test-WtFolder $doc.afterBoot.fltFix) -and $doc.afterBoot.fltFix -match '\.ps1\z' -and (Test-Path -LiteralPath $doc.afterBoot.fltFix -PathType Leaf))) { Add-Fault 'afterBoot.fltFix is not an absolute .ps1 file that is there, with no quote, semicolon or %' }
     }
   }
 }
@@ -223,6 +241,7 @@ foreach ($w in $doc.layout) {
     $folder = $w.folder
     if ($folder.Length -gt 3) { $folder = $folder.TrimEnd([char]92) }
     $elements = @('-w', $w.window)
+    if ($first -and $w.maximized -eq $true) { $elements += @('-M') }
     if ($first -and $null -ne $w.pos) { $elements += @('--pos', ('{0},{1}' -f $w.pos[0], $w.pos[1])) }
     if ($first -and $null -ne $w.size) { $elements += @('--size', ('{0},{1}' -f $w.size[0], $w.size[1])) }
     $elements += @('nt', '--title', $tab, '--suppressApplicationTitle', '-d', $folder, '--', $powershell, '-NoExit', '-NoProfile', '-ExecutionPolicy', 'RemoteSigned', '-File', $slotScript, '-Idle')

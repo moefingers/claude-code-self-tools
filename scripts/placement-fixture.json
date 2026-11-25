@@ -11,7 +11,12 @@
     { "name": "a workspace by id", "file": { "v": 1, "layout": [], "workspaces": { "w1": "w_abcdefghijkl" } } },
     { "name": "a restart by a named window", "file": { "v": 1, "layout": [], "restart": { "prefer": ["window"], "window": { "name": "w1" } } } },
     { "name": "afterBoot's script", "file": { "v": 1, "layout": [], "afterBoot": { "fltFix": "{{FILE}}" } } },
-    { "name": "afterBoot with nothing named", "file": { "v": 1, "layout": [], "afterBoot": {} } }
+    { "name": "afterBoot with nothing named", "file": { "v": 1, "layout": [], "afterBoot": {} } },
+    { "name": "the plain window at a rect, for a launch", "file": { "v": 1, "layout": [], "launch": { "prefer": ["slot", "window"], "window": { "rect": [-1920, 0, 1280, 800] } } } },
+    { "name": "the plain window maximized, for a restart", "file": { "v": 1, "layout": [], "restart": { "prefer": ["window"], "window": { "maximized": true } } } },
+    { "name": "the plain window at a rect and maximized", "file": { "v": 1, "layout": [], "launch": { "prefer": ["window"], "window": { "rect": [2100, 300, 900, 600], "maximized": true } } } },
+    { "name": "the edges of a rect", "file": { "v": 1, "layout": [], "launch": { "prefer": ["window"], "window": { "rect": [-32768, 32768, 320, 200] } }, "restart": { "prefer": ["window"], "window": { "rect": [32768, -32768, 32768, 32768] } } } },
+    { "name": "a maximized layout window and a maximized named window", "file": { "v": 1, "layout": [ { "window": "w1", "pos": [2100, 300], "maximized": true, "tabs": ["t"], "folder": "{{FOLDER}}" } ], "launch": { "prefer": ["window"], "window": { "name": "w2", "pos": [0, 0], "size": [120, 30], "maximized": true } } } }
   ],
   "bad": [
     { "name": "a list, not an object", "file": [] },
@@ -62,6 +67,29 @@
     { "name": "an unknown key in limits", "file": { "v": 1, "layout": [], "limits": { "minFreeGb": 5, "rate": 3 } } },
     { "name": "afterBoot's script not a .ps1", "file": { "v": 1, "layout": [], "afterBoot": { "fltFix": "C:\\x\\flt.exe" } } },
     { "name": "afterBoot's script relative", "file": { "v": 1, "layout": [], "afterBoot": { "fltFix": "flt.ps1" } } },
-    { "name": "an unknown key in afterBoot", "file": { "v": 1, "layout": [], "afterBoot": { "fltFix": "{{FILE}}", "more": 1 } } }
+    { "name": "an unknown key in afterBoot", "file": { "v": 1, "layout": [], "afterBoot": { "fltFix": "{{FILE}}", "more": 1 } } },
+    { "name": "a rect on a named window", "file": { "v": 1, "layout": [], "launch": { "prefer": ["window"], "window": { "name": "w1", "rect": [0, 0, 800, 600] } } } },
+    { "name": "a rect on a layout window", "file": { "v": 1, "layout": [ { "window": "a", "rect": [0, 0, 800, 600], "tabs": ["t"], "folder": "{{FOLDER}}" } ] } },
+    { "name": "a pos on the plain window", "file": { "v": 1, "layout": [], "launch": { "prefer": ["window"], "window": { "pos": [0, 0] } } } },
+    { "name": "a size on the plain window", "file": { "v": 1, "layout": [], "restart": { "prefer": ["window"], "window": { "size": [120, 30], "maximized": true } } } },
+    { "name": "the plain window with no place", "file": { "v": 1, "layout": [], "launch": { "prefer": ["window"], "window": {} } } },
+    { "name": "maximized false", "file": { "v": 1, "layout": [], "launch": { "prefer": ["window"], "window": { "maximized": false } } } },
+    { "name": "maximized as text", "file": { "v": 1, "layout": [ { "window": "a", "maximized": "true", "tabs": ["t"], "folder": "{{FOLDER}}" } ] } },
+    { "name": "a named window maximized as a number", "file": { "v": 1, "layout": [], "restart": { "prefer": ["window"], "window": { "name": "w1", "maximized": 1 } } } },
+    { "name": "a rect of three numbers", "file": { "v": 1, "layout": [], "launch": { "prefer": ["window"], "window": { "rect": [0, 0, 800] } } } },
+    { "name": "a rect too narrow", "file": { "v": 1, "layout": [], "launch": { "prefer": ["window"], "window": { "rect": [0, 0, 319, 600] } } } },
+    { "name": "a rect too short", "file": { "v": 1, "layout": [], "launch": { "prefer": ["window"], "window": { "rect": [0, 0, 800, 199] } } } },
+    { "name": "a rect too far", "file": { "v": 1, "layout": [], "launch": { "prefer": ["window"], "window": { "rect": [32769, 0, 800, 600] } } } },
+    { "name": "a rect too wide", "file": { "v": 1, "layout": [], "launch": { "prefer": ["window"], "window": { "rect": [0, 0, 32769, 600] } } } },
+    { "name": "a rect of fractions", "file": { "v": 1, "layout": [], "launch": { "prefer": ["window"], "window": { "rect": [0.5, 0, 800, 600] } } } },
+    { "name": "a rect of text", "file": { "v": 1, "layout": [], "launch": { "prefer": ["window"], "window": { "rect": ["0", "0", "800", "600"] } } } },
+    { "name": "an unknown key in the plain window", "file": { "v": 1, "layout": [], "launch": { "prefer": ["window"], "window": { "rect": [0, 0, 800, 600], "colour": "red" } } } },
+    { "name": "a window name of null", "file": { "v": 1, "layout": [], "launch": { "prefer": ["window"], "window": { "name": null, "maximized": true } } } },
+    { "name": "a rect of null", "file": { "v": 1, "layout": [], "launch": { "prefer": ["window"], "window": { "rect": null } } } },
+    { "name": "a maximized of null", "file": { "v": 1, "layout": [], "launch": { "prefer": ["window"], "window": { "rect": [0, 0, 800, 600], "maximized": null } } } },
+    { "name": "a pos of null", "file": { "v": 1, "layout": [ { "window": "a", "pos": null, "tabs": ["t"], "folder": "{{FOLDER}}" } ] } },
+    { "name": "a launch of null", "file": { "v": 1, "layout": [], "launch": null } },
+    { "name": "a minFreeGb of null", "file": { "v": 1, "layout": [], "limits": { "minFreeGb": null } } },
+    { "name": "an afterBoot of null", "file": { "v": 1, "layout": [], "afterBoot": null } }
   ]
 }

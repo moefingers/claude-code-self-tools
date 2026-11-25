@@ -571,7 +571,7 @@ export const SLOT_SCRIPT_SHA256 = '80ad3f9a4a142b87098883010c6bed8d2291515dc18ef
  * The SHA-256 of plugins/self-switch/slot/claude-layout.ps1, as it is committed: a release pin, tested and
  * printed in the README for the person to compare. Nothing runs that script but the person, by hand.
  */
-export const LAYOUT_SCRIPT_SHA256 = '6582b11a3846175b2eb167673d2dfce47095660acba96c7a15e11b2aca33f543'
+export const LAYOUT_SCRIPT_SHA256 = '26834063574fe8b6b54b4a4d644f91cbecaa7babb59b23976d06f5759990d262'
 
 /** Input idle for this long before any launch of another process (PM2): a null reading is not idle. */
 export const INPUT_IDLE_MS = 60_000
