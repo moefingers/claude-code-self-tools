@@ -78,7 +78,7 @@ function sources() {
 }
 
 test('the folders scanned for are the machine code\'s own, each once', () => {
-  assert.deepEqual([...machine.ID_FOLDERS].sort(), ['claims', 'gate', 'left', 'panes', 'pending', 'poke', 'refused', 'selfcheck', 'slots', 'wake'])
+  assert.deepEqual([...machine.ID_FOLDERS].sort(), ['claims', 'gate', 'left', 'panes', 'pending', 'poke', 'refused', 'selfcheck', 'slots', 'wake', 'windows'])
   for (const folder of machine.ID_FOLDERS) assert.ok(machine.idPathOrNone('C:\\state', 'left', '00000000-0000-4000-a000-000000000001') !== undefined && typeof folder === 'string')
 })
 
@@ -91,7 +91,7 @@ test('no call site joins an id folder with a value of its own: every such path g
 
 test('each path helper of the machine code delegates to idPath', () => {
   const text = readFileSync(join(ROOT, 'shared', 'hooks', 'machine.ts'), 'utf8')
-  const helpers = { claimPath: 'claim', slotRecordPath: 'slotRecord', slotBeaconPath: 'slotBeacon', gatePath: 'gate', panePath: 'pane', paneTicketPath: 'paneTicket', leftPath: 'left', pokePath: 'poke', wakePath: 'wake', pendingPath: 'pending', selfcheckPath: 'selfcheck' }
+  const helpers = { claimPath: 'claim', slotRecordPath: 'slotRecord', slotBeaconPath: 'slotBeacon', gatePath: 'gate', panePath: 'pane', paneTicketPath: 'paneTicket', leftPath: 'left', pokePath: 'poke', wakePath: 'wake', pendingPath: 'pending', selfcheckPath: 'selfcheck', windowScriptPath: 'window' }
   for (const [name, file] of Object.entries(helpers)) {
     const line = text.split(/\r?\n/).find(l => l.startsWith(`export const ${name} = `))
     assert.ok(line !== undefined, `${name} is defined`)

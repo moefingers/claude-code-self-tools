@@ -470,7 +470,7 @@ const CHECKS = {
     assert.ok(inner.includes('      for ($try = 0; $try -lt 3; $try++) {\r\n        if ($try -gt 0) { Start-Sleep -Milliseconds 250 }\r\n        try { [IO.File]::Delete($claimPath); break } catch { }\r\n'), 'D4: tried three times')
     assert.ok(inner.includes('  } catch { } finally { $stream.Dispose() }\r\n'), 'D4: never throws')
     const late = m.launchScriptText(launchInput({ deadline: NOW }))
-    assert.ok(late.includes('if ($transport -eq "window" -and $null -ne $window) { try { $window.Kill() } catch { } }'), 'N6')
+    assert.ok(late.includes('if ($transport -eq "window" -and $null -ne $window) { try { $window.Kill() } catch { };'), 'N6')
   },
   async trampoline(m) {
     assert.equal(m.GO_VIA, 'direct', 'it ships as direct: the flip is one commit after M17a-d')
@@ -674,6 +674,96 @@ const CHECKS = {
     assert.ok(s.includes("if ($held) { $answer = 'held' } else {"))
     assert.equal(m.RELOCKED.exec('held\r\n')?.[1], 'held')
   },
+  windowFile(m) {
+    // The window's own script: a file of its own, named by the launch's claim, written whole with a byte order
+    // mark, run by -File, and deleted by the window first. Never a self-unpacking -EncodedCommand (GZip, base64,
+    // [scriptblock]::Create), which an antivirus hooked into AMSI blocks before a line of it runs.
+    const s = scriptsOf(m).plain
+    const file = m.windowScriptPath(STATE, FRESH)
+    assert.ok(s.includes(`$windowPath = '${file}'`), "the launch's own file")
+    assert.ok(s.includes(`$window = Start-Process -FilePath $windowShell -ArgumentList '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', ('"' + $windowFile + '"') -PassThru`), '-File, the path quoted')
+    assert.ok(!/GZipStream|\$unpack|\$encoded|'-EncodedCommand'|\[scriptblock\]::Create/.test(s), 'no self-unpacking bootstrap')
+    // SW-L-2: its bytes with a byte order mark, a temporary created for this run alone, written and flushed, then
+    // moved to its name; a temporary of its own deleted on a failure; and the file this run's own only once in place.
+    const bom = s.indexOf('[byte[]]$windowBytes = [Text.UTF8Encoding]::new($true).GetPreamble() + [Text.UTF8Encoding]::new($true).GetBytes($inner)')
+    const open = s.indexOf('$windowStream = [IO.File]::Open($windowTemp, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)')
+    const flush = s.indexOf('try { $windowStream.Write($windowBytes, 0, $windowBytes.Length); $windowStream.Flush($true) } finally { $windowStream.Dispose() }')
+    const move = s.indexOf('[IO.File]::Move($windowTemp, $windowPath)')
+    const cleaned = s.indexOf('} catch { try { [IO.File]::Delete($windowTemp) } catch { }; throw }')
+    const own = s.indexOf('$windowFile = $windowPath')
+    const start = s.indexOf('$window = Start-Process -FilePath')
+    assert.ok(bom > 0 && open > bom && flush > open && move > flush && cleaned > move && own > cleaned && start > own, "with a byte order mark, created anew, written and flushed, moved, and only then the run's own, before the window starts")
+    assert.ok(s.includes(` } catch { }\r\ntry { [IO.File]::Delete(''${file}'') } catch { }\r\n$ErrorActionPreference = "Stop"\r\n`), 'the window deletes its own file right after its start signal, before anything else')
+    assert.ok(s.includes(`.TotalMilliseconds -gt ${m.CLAIM_STALE_MS}) { try { [IO.File]::Delete($staleFile) } catch { } }`), 'only a file older than a stale claim is swept')
+    assert.ok(s.includes(`-cmatch '${m.LAUNCH_ID.source.replace(/\$$/, '')}\\.ps1(\\.[0-9a-f]{32}\\.tmp)?\\z'`), "only names of LAUNCH_ID's shape are swept")
+    // A file the window never read: deleted with a place that failed, and with a window withdrawn once it has gone.
+    assert.ok(s.includes("} catch { $placeWhy = $_.Exception.Message; if ($null -ne $windowFile) { try { [IO.File]::Delete($windowFile) } catch { } }; Refuse 'place'"), 'a place that failed deletes the file')
+    const late = m.launchScriptText(launchInput({ claim: `launch:${FRESH}`, deadline: NOW }))
+    assert.ok(late.includes('try { $window.Kill() } catch { }; if ($null -ne $windowFile) { try { [void]$window.WaitForExit(2000) } catch { }; try { [IO.File]::Delete($windowFile) } catch { } } }'), 'a withdrawn window deletes the file')
+  },
+  windowPolicy(m) {
+    // A Group Policy execution policy that runs no unsigned script file: read for whichever PowerShell the window
+    // would run in (PowerShell 7's own key, or Windows PowerShell's where it defers), before anything is written or
+    // claimed, refused as `policy`; and only where a window opens ('auto' going to the window, a named window
+    // falling back to the plain one).
+    const s = scriptsOf(m).plain
+    const pwsh = s.indexOf("if ($pwshOk) { $pwshPolicy = Read-GroupPolicy 'Software\\Policies\\Microsoft\\PowerShellCore' $true; if ($pwshPolicy -eq 'AllSigned' -or $pwshPolicy -eq 'Restricted') { $pwshOk = $false } }")
+    assert.ok(pwsh > 0, "PowerShell 7's own policy read, and it passed over when it runs no unsigned file")
+    const refused = s.indexOf("if (-not $pwshOk) { $windowsPolicy = Read-GroupPolicy 'Software\\Policies\\Microsoft\\Windows\\PowerShell' $false; if ($windowsPolicy -eq 'AllSigned' -or $windowsPolicy -eq 'Restricted') {")
+    assert.ok(refused > pwsh && s.indexOf("Refuse 'policy'", refused) > refused, "Windows PowerShell's policy read when PowerShell 7 isn't the window's, and refused on")
+    assert.ok(s.indexOf("Refuse 'policy'") < s.indexOf('$installWhy = Install-Launcher') && s.indexOf("Refuse 'policy'") < s.indexOf('$taken = New-Claim'), 'refused before anything is written or claimed')
+    assert.ok(s.includes("if ($defer -is [int] -and $defer -eq 1) { $key.Dispose(); $key = $null; $key = $root.OpenSubKey('Software\\Policies\\Microsoft\\Windows\\PowerShell') }"), "PowerShell 7's key defers to Windows PowerShell's")
+    assert.ok(s.includes("} catch { $policy = 'Undefined' } finally {"), 'a read that fails is Undefined, never refused on')
+    const auto = m.launchScriptText(launchInput({ claim: `launch:${FRESH}`, where: 'auto' }))
+    assert.ok(auto.includes("\r\nif ($transport -eq 'window') {\r\n  try { $pwsh = "), "'auto' reads it only when it goes to the window")
+    assert.ok(scriptsOf(m).named.includes('\r\nif ($null -ne $slotFallback) {\r\n  try { $pwsh = '), 'a named window reads it only when it falls back to the plain one')
+    for (const [name, script] of Object.entries(scriptsOf(m)).filter(([name]) => name.startsWith('slot') || name.startsWith('tab'))) assert.ok(!script.includes("Refuse 'policy'"), `${name} opens no window and is never refused for it`)
+  },
+  windowSignal(m) {
+    // WF-M-1: the window's start signal, which nothing but the window can give: an event created for this launch
+    // alone once its file is in place and before Start-Process (one already there refuses the place), disposed on
+    // every path; the window's first line sets it, then it deletes its file.
+    const s = scriptsOf(m).plain
+    const name = m.windowSignalName(FRESH)
+    assert.equal(name, `Local\\claude-self-tools-window-${FRESH}`, 'in this session, by the claim')
+    assert.throws(() => m.windowSignalName(`launch:${FRESH}`), 'a launch id alone')
+    const lines = s.split('\r\n').map(line => line.trim())
+    const own = lines.indexOf('$windowFile = $windowPath')
+    const named = lines.indexOf(`$windowSignalName = '${name}'`)
+    const created = lines.indexOf('$windowSignal = [Threading.EventWaitHandle]::new($false, [Threading.EventResetMode]::ManualReset, $windowSignalName, [ref]$windowSignalNew)')
+    const ours = lines.findIndex(line => line.startsWith('if (-not $windowSignalNew) { throw ('))
+    const start = lines.findIndex(line => line.startsWith('$window = Start-Process -FilePath'))
+    const disposed = lines.indexOf('} finally { $windowSignal.Dispose() }')
+    const placed = lines.indexOf('$placed = "window - " + $window.Id')
+    assert.ok(own > 0 && named > own && created > named && ours === created + 2 && start === ours + 1 && disposed > start && placed === disposed + 1, 'created once the file is in place, refused when not its own, before the window; disposed before placed')
+    assert.ok(s.includes(`$inner = 'try { $launchSignal = [Threading.EventWaitHandle]::OpenExisting(''${name}''); try { [void]$launchSignal.Set() } finally { $launchSignal.Dispose() } } catch { }\r\ntry { [IO.File]::Delete(''${m.windowScriptPath(STATE, FRESH)}'') } catch { }\r\n`), 'the window sets it as its first line, then deletes its file')
+  },
+  windowStart(m) {
+    // WF-M-1, WF-M-2: the window watched until its start signal: its handle taken at once; at each look its end read
+    // before the signal, so one that ended without it never began, and is thrown on; at the bound (WINDOW_START_MS, or
+    // the deadline when that comes first) one not begun is ended through its handle, and thrown on all the same with
+    // none held. The place's catch turns each into `refused place`. Never placed without its signal.
+    const late = m.launchScriptText(launchInput({ claim: `launch:${FRESH}`, deadline: NOW }))
+    const lines = late.split('\r\n').map(line => line.trim())
+    const start = lines.findIndex(line => line.startsWith('$window = Start-Process -FilePath'))
+    const held = lines.indexOf('try { $windowHeld = $null -ne $window.Handle } catch { $windowHeld = $false }')
+    const limit = lines.indexOf(`$windowLimit = ${m.WINDOW_START_MS}`)
+    const capped = lines.indexOf(`$windowLimit = [math]::Min($windowLimit, [math]::Max(0, ${NOW} - [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()))`)
+    const ended = lines.indexOf('try { $windowEnded = $true -eq $window.HasExited } catch { $windowEnded = $false }')
+    const signal = lines.indexOf('if ($windowSignal.WaitOne(0)) { break }')
+    const thrown = lines.findIndex(line => line.startsWith('if ($windowEnded) {') && line.includes('throw ("the window ended before its first line ran'))
+    const bound = lines.indexOf('if ($windowWatch.ElapsedMilliseconds -ge $windowLimit) {')
+    const kill = lines.indexOf('if ($windowHeld) { try { $window.Kill() } catch { }; try { [void]$window.WaitForExit(2000) } catch { }; try { $windowGone = $true -eq $window.HasExited } catch { $windowGone = $false } }')
+    const wait = lines.indexOf('[void]$windowSignal.WaitOne(100)')
+    const placed = lines.indexOf('$placed = "window - " + $window.Id')
+    assert.ok(start > 0 && held === start + 2 && limit > held && capped === limit + 1 && ended > capped && signal === ended + 1 && thrown === signal + 1 && bound === thrown + 1 && lines[bound + 2] === '$windowGone = $false' && kill === bound + 3 && wait > kill && placed > wait, 'the handle at once; the bound, capped at the deadline; at each look its end, then the signal, then the throw, then the bound; at the bound the Kill, then whether it has gone; a wait on the signal; placed after')
+    // R2-I-2: "ended" only once it has gone; else (no handle, a Kill that failed, not gone after the wait) refused all the same, saying it could not be ended.
+    assert.ok(lines[kill + 1].startsWith('if ($windowGone) { throw ("the window had not begun ') && lines[kill + 1].includes('so it was ended;'), 'said ended only once gone')
+    assert.ok(lines[kill + 2].startsWith('throw ("the window had not begun ') && lines[kill + 2].includes('and could not be ended; its claim is given back, so it resumes nothing;'), 'else refused all the same, saying it could not be ended')
+    assert.ok(!late.includes('Start-Sleep -Milliseconds 100'), 'between looks it waits on the signal, not a sleep')
+    assert.ok(!m.launchScriptText(launchInput({ claim: `launch:${FRESH}` })).includes('[math]::Min($windowLimit'), 'no deadline: the bound alone')
+    assert.ok(m.WINDOW_START_MS >= 1000 && m.WINDOW_START_MS * 2 <= m.LAUNCH_DEADLINE_MS, 'seconds, well inside the deadline')
+  },
   leftAtLastLook(m) {
     // D1: every stat a window takes, claude-launch.ps1 takes.
     assert.ok(m.LAUNCH_SCRIPT_TEXT.includes("$Whole = '^\\d{1,16}\\z'"))
@@ -744,7 +834,7 @@ const FAULTS = [
   ['S3: a refusal no one but the window hears of', 'windowRefusal', "    '  Write-Refused $refusal',\n", ''],
   ['S3: an error no one but the window hears of', 'windowRefusal', "    `  Write-Refused (\"claude-launch.ps1 stopped on an error: \" + $_.Exception.Message)`,\n", ''],
   ['a refusing window keeping the claim', 'windowRefusal', "  `  Write-Host (\"Once it is safe, resume it yourself: \" + ${byHand})`,\n    '  Release-Claim',\n".replace('  `  Write', '    `  Write'), "    `  Write-Host (\"Once it is safe, resume it yourself: \" + ${byHand})`,\n"],
-  ['a window withdrawn left waiting', 'windowRefusal', `          '  if ($transport -eq "window" -and $null -ne $window) { try { $window.Kill() } catch { } }',\n`, ''],
+  ['a window withdrawn left waiting', 'windowRefusal', '{ try { $window.Kill() } catch { }; if ($null -ne $windowFile)', '{ if ($null -ne $windowFile)'],
   ['GO_VIA shipped as the trampoline', 'trampoline', "export const GO_VIA: 'trampoline' | 'direct' = 'direct'", "export const GO_VIA: 'trampoline' | 'direct' = 'trampoline'"],
   ["the handler's epoch check removed", 'trampoline', "const fresh = (): string | undefined => (go.epoch !== at.epoch || go.running ? 'a turn came first' : undefined)", 'const fresh = (): string | undefined => undefined'],
   ['the inner command awaited', 'trampoline', '  void queueIt($, at.step)\n', '  await queueIt($, at.step)\n'],
@@ -795,7 +885,52 @@ const FAULTS = [
   ['N2: wt by its bare name', 'wtByItsPath', '$window = Start-Process $wtExe -ArgumentList', '$window = Start-Process wt.exe -ArgumentList'],
   ["N12: a live holder's lock taken", 'relockHolder', "if ($held) { $answer = 'held' } else {", "if ($false) { $answer = 'held' } else {"],
   ['the left stat left off a tab', 'leftAtLastLook', "...(input.left === undefined ? {} : { left: input.left }) }\n  const tabOf", "}\n  const tabOf"],
+  ['the window back on -EncodedCommand', 'windowFile', `'-File', ('"' + $windowFile + '"')`, "'-EncodedCommand', $encoded"],
+  ['the window script written without its byte order mark', 'windowFile', '[Text.UTF8Encoding]::new($true).GetPreamble() + ', ''],
+  ['the window script written in place', 'windowFile', "  '  [IO.File]::Move($windowTemp, $windowPath)',\n", ''],
+  ['SW-L-2: the temporary opened over a file already there (Create, not CreateNew)', 'windowFile', '[IO.File]::Open($windowTemp, [IO.FileMode]::CreateNew,', '[IO.File]::Open($windowTemp, [IO.FileMode]::Create,'],
+  ["the window's file named this run's own before it is in place (a failure would delete one already there)", 'windowFile', '          `$windowPath = ${literal(windowed.file)}`,\n', "          `$windowPath = ${literal(windowed.file)}`,\n          '$windowFile = $windowPath',\n"],
+  ['a window keeping its script file', 'windowFile', '    `try { [IO.File]::Delete(${literal(v.file)}) } catch { }`,\n', ''],
+  ['a fresh window script swept', 'windowFile', '.TotalMilliseconds -gt ${CLAIM_STALE_MS})', '.TotalMilliseconds -gt 0)'],
+  ['a failed place leaving its window script', 'windowFile', "if ($null -ne $windowFile) { try { [IO.File]::Delete($windowFile) } catch { } }; Refuse 'place'", "Refuse 'place'"],
+  ['a withdrawn window leaving its script', 'windowFile', '; try { [IO.File]::Delete($windowFile) } catch { } } }', ' } }'],
+  ["PowerShell 7's policy left unread", 'windowPolicy', "if ($pwshPolicy -eq 'AllSigned' -or $pwshPolicy -eq 'Restricted') { $pwshOk = $false }", 'if ($false) { $pwshOk = $false }'],
+  ["Windows PowerShell's policy let through to the window", 'windowPolicy', "if ($windowsPolicy -eq 'AllSigned' -or $windowsPolicy -eq 'Restricted') {", 'if ($false) {'],
+  ['the policy read after the claim (or not at all)', 'windowPolicy', '    ...chooseShell,\n', ''],
+  ['the policy refusal left out', 'windowPolicy', '    ...refusePolicy,\n', ''],
+  ['PowerShell 7 deferring to no one', 'windowPolicy', 'if ($defer -is [int] -and $defer -eq 1)', 'if ($false)'],
+  ['a policy that could not be read refused on', 'windowPolicy', "} catch { $policy = 'Undefined' } finally {", "} catch { $policy = 'Restricted' } finally {"],
+  ["'auto' refused for the policy when it goes to this pane's slot", 'windowPolicy', `transport === 'auto' ? "$transport -eq 'window'" :`, "transport === 'auto' ? undefined :"],
+  ['a named window refused for the policy when Windows Terminal opens it', 'windowPolicy', "'$null -ne $slotFallback' : undefined", 'undefined : undefined'],
+  ['WF-M-1: a window that ended without its start signal taken as placed', 'windowStart', 'throw ("the window ended before its first line ran', 'break; ("the window ended before its first line ran'],
+  ['WF-M-1: the signal read before the end (a window that began, then ended at once, refused)', 'windowStart', "    '  try { $windowEnded = $true -eq $window.HasExited } catch { $windowEnded = $false }',\n    '  if ($windowSignal.WaitOne(0)) { break }',\n", "    '  if ($windowSignal.WaitOne(0)) { break }',\n    '  try { $windowEnded = $true -eq $window.HasExited } catch { $windowEnded = $false }',\n"],
+  ['WF-M-1: the file going taken as the window begun again', 'windowStart', "    '  if ($windowSignal.WaitOne(0)) { break }',\n", "    '  if (-not [IO.File]::Exists($windowFile)) { break }',\n"],
+  ['WF-M-2: a window not begun by the bound placed anyway', 'windowStart', 'throw ("the window had not begun " + $windowSecs + " s after it started, so it was ended', 'break; ("the window had not begun " + $windowSecs + " s after it started, so it was ended'],
+  ['R2-I-2: "ended" said without reading that the window has gone', 'windowStart', 'try { $windowGone = $true -eq $window.HasExited } catch { $windowGone = $false }', '$windowGone = $true'],
+  ['R2-I-2: a window that could not be ended placed anyway', 'windowStart', `'    throw ("the window had not begun " + $windowSecs + " s after it started, and could not be ended;`, `'    break; ("the window had not begun " + $windowSecs + " s after it started, and could not be ended;`],
+  ['WF-M-2: a watch with no bound', 'windowStart', "    '  if ($windowWatch.ElapsedMilliseconds -ge $windowLimit) {',\n", ''],
+  ['WF-M-2: the watch not ended at the deadline (a run that could outlast LAUNCH_RUN_MS)', 'windowStart', '[math]::Min($windowLimit, [math]::Max(0, ${deadline} - [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()))', '$windowLimit'],
+  ["WF-M-2: the window's handle not taken at once (its end and exit code may be another process's)", 'windowStart', "    'try { $windowHeld = $null -ne $window.Handle } catch { $windowHeld = $false }',\n", ''],
+  ['WF-M-2: a bound past the deadline', 'windowStart', 'export const WINDOW_START_MS = 8000', 'export const WINDOW_START_MS = 30000'],
+  ['WF-M-1: the window not setting its start signal', 'windowSignal', '    `try { $launchSignal = [Threading.EventWaitHandle]::OpenExisting(${literal(v.signal)}); try { [void]$launchSignal.Set() } finally { $launchSignal.Dispose() } } catch { }`,\n', ''],
+  ["WF-M-1: a start signal already there taken as this launch's own", 'windowSignal', "'  if (-not $windowSignalNew) { throw (", "'  if ($false) { throw ("],
+  ['WF-M-1: the start signal never disposed', 'windowSignal', "          '} finally { $windowSignal.Dispose() }',\n", "          '}',\n"],
 ]
+
+describe("the window script sweep's names follow LAUNCH_ID", () => {
+  const work = mkdtempSync(join(tmpdir(), 'machine-launch-id-'))
+  after(() => rmSync(work, { recursive: true, force: true }))
+  test('a copy of the machine code with another LAUNCH_ID sweeps by that shape, never a pattern of its own', async () => {
+    const from = 'export const LAUNCH_ID = SESSION_ID'
+    assert.equal(sourceText.split(from).length, 2, 'LAUNCH_ID is defined once')
+    const path = join(work, 'machine-launch-id.ts')
+    writeFileSync(path, sourceText.split(from).join('export const LAUNCH_ID = /^[0-9a-f-]{36}$/'))
+    const copy = await import(pathToFileURL(path).href)
+    const s = copy.launchScriptText(launchInput({ claim: `launch:${FRESH}` }))
+    assert.ok(s.includes("-cmatch '^[0-9a-f-]{36}\\.ps1(\\.[0-9a-f]{32}\\.tmp)?\\z'"), 'the sweep follows LAUNCH_ID')
+    assert.ok(!s.includes("-cmatch '^[0-9a-f]{8}-"), 'no uuid pattern of its own')
+  })
+})
 
 describe('planted faults in a copy of the machine code, each caught by its check', () => {
   const work = mkdtempSync(join(tmpdir(), 'machine-faults-'))

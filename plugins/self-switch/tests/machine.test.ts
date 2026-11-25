@@ -932,7 +932,7 @@ describe('the scripts, as text', () => {
     expect(psQuote("a'b\u2018c\u2019d\u201ae\u201bf")).toBe("a''b\u2018\u2018c\u2019\u2019d\u201a\u201ae\u201b\u201bf")
     // The window's script goes in whole as one single-quoted literal, its own literals' quotes doubled:
     // nothing is read and spliced in at run time.
-    expect(window).toContain(`$inner = '$ErrorActionPreference = "Stop"`)
+    expect(window).toContain(`$inner = 'try { $launchSignal = [Threading.EventWaitHandle]::OpenExisting(''Local\\claude-self-tools-window-${LAUNCH.slice('launch:'.length)}''); try { [void]$launchSignal.Set() } finally { $launchSignal.Dispose() } } catch { }\r\ntry { [IO.File]::Delete(''${STATE}\\windows\\${LAUNCH.slice('launch:'.length)}.ps1'') } catch { }\r\n$ErrorActionPreference = "Stop"`)
     expect(window).toContain(`$folder = ''${ELSEWHERE}''`)
     expect(window).not.toContain('EscapeSingleQuotedStringContent')
   })
