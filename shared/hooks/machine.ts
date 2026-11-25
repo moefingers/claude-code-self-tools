@@ -3655,6 +3655,9 @@ export type PixelRect = readonly [number, number, number, number]
  * The plain window's place, which its own script sets (windowPlaceLines): `rect`, its window's rectangle, brought
  * onto the work area of the monitor that holds most of it (clampToMonitors); `maximized`, maximized, on the monitor
  * that holds `rect` when both are given. At least one. A window object with no name in placement.json.
+ * Not built: `rect: "same"` (a session reading its own window's rectangle), a `rect` for a named window (its tab
+ * runs the pinned slot runner, which would have to act), a place per call from a tool's input, full screen and
+ * focus mode.
  */
 export type PlainPlace = { readonly rect?: PixelRect; readonly maximized?: true }
 
