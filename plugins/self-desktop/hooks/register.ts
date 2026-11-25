@@ -283,7 +283,8 @@ async function captureOwn($: EngineInterface): Promise<string> {
     const ran = await runScript($, m.powershell, captureScript({ own: m.processId }, { folder, name }), CAPTURE_MS)
     if ('failed' in ran) said = `Captured nothing: ${ran.failed}.`
     else {
-      const captured = parseCaptured(ran.stdout, folder)
+      // A picture is only the file this call asked for; any other path the script names is none.
+      const captured = parseCaptured(ran.stdout, { folder, name })
       if (typeof captured === 'string') said = `Captured nothing: ${captured}.`
       else if (captured.capture.kind === 'file' && captured.own.found) {
         handedBack = true

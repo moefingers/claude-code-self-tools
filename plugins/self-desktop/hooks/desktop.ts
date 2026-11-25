@@ -1282,18 +1282,19 @@ export type Capture =
   | { readonly kind: 'why'; readonly why: string }
 export type Captured = { readonly dpiAware: boolean; readonly own: OwnWindow; readonly capture: Capture }
 
-/** A capture of this session's own window, as the plugin takes it; the file must be in `folder`, under a name it made. */
-export function parseCaptured(stdout: string, folder: string): Captured | string {
+/**
+ * A capture of this session's own window, as the plugin takes it. A picture is only the file this call asked for:
+ * exactly `file.folder` and `file.name`, as the script was given them. Any other path, even one shaped like a capture
+ * in the same folder, is no picture.
+ */
+export function parseCaptured(stdout: string, file: CaptureFile): Captured | string {
   const line = answerOf(stdout)
   const own = line === undefined ? undefined : ownOf(line.own)
   const raw = line?.capture
   if (own === undefined || !isRecord(raw)) return "the capture's answer isn't the one its script writes"
   let capture: Capture
   if (typeof raw.file === 'string') {
-    const at = raw.file.lastIndexOf('\\')
-    if (raw.file.slice(0, at).toLowerCase() !== folder.toLowerCase() || !CAPTURE_NAME.test(raw.file.slice(at + 1)) || !isInt(raw.width) || !isInt(raw.height)) {
-      return "the capture's answer names a file this plugin didn't ask for"
-    }
+    if (raw.file !== `${file.folder}\\${file.name}` || !isInt(raw.width) || !isInt(raw.height)) return "the capture's answer names a file this plugin didn't ask for"
     capture = { kind: 'file', file: raw.file, width: raw.width, height: raw.height }
   } else if (raw.notBuilt === 'terminal') capture = { kind: 'notBuilt' }
   else if (raw.changed === true) capture = { kind: 'changed', why: visible(text(raw.why) || 'no reason given', 400), deleted: raw.deleted === true }

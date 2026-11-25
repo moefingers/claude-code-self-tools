@@ -718,14 +718,25 @@ test('a capture that times out, answers garbled, or fails: the name it chose is 
   expect(deletions).toHaveLength(4)
 })
 
-test("a capture's answer naming a file outside the plugin's folder, or under a name it didn't make, is not passed on", ON, async ($, on) => {
+test("a capture's answer naming any file but the one the call chose is no picture: elsewhere, another name, even another capture's name in the same folder; the chosen name is deleted", ON, async ($, on) => {
   const world: World = {}
-  const { toasts } = engine(on, world)
+  const { toasts, scripts, deletions } = engine(on, world)
   await $.session.start(START)
-  for (const file of ['C:\\path\\to\\elsewhere\\capture-0b6f3a52-1c2d-4e5f-8a9b-0c1d2e3f4a5b.png', `${FOLDER}\\shot.png`]) {
-    world.capture = () => ({ v: 1, dpiAware: true, own: CONSOLE_OWN, capture: { file, width: 10, height: 10 } })
+  const others = [
+    'C:\\path\\to\\elsewhere\\capture-0b6f3a52-1c2d-4e5f-8a9b-0c1d2e3f4a5b.png',
+    `${FOLDER}\\shot.png`,
+    // Shaped like a capture, in the plugin's own folder, but not the name this call chose.
+    `${FOLDER}\\${captureName(11)}`,
+    // The chosen file, spelled in capitals: Windows would open it, but it is not the text the script was given.
+    (chosen: string) => chosen.toUpperCase(),
+  ]
+  for (const other of others) {
+    world.capture = chosen => ({ v: 1, dpiAware: true, own: CONSOLE_OWN, capture: { file: typeof other === 'string' ? other : other(chosen), width: 10, height: 10 } })
     expect(await call($, CAPTURE)).toBe("Captured nothing: the capture's answer names a file this plugin didn't ask for.")
+    const name = /^\$name = '([^']*)'\r?$/m.exec(scripts.at(-1) ?? '')?.[1] ?? ''
+    expect(deletions.at(-1)).toBe(deleteScript(DATA, [name]))
   }
+  expect(deletions).toHaveLength(others.length)
   expect(toasts).toEqual([])
 })
 
