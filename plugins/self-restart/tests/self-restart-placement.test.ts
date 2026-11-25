@@ -161,7 +161,11 @@ test('a hand-started tab has no stamp: past the tab, to the placement\'s window'
   expect(commands).toEqual([{ command: 'exit' }])
 })
 
-test("the plain window's place (#5, a restart window with no name): one launch of the plain window, which places itself; the caller's lines move nothing", async ($, on) => {
+/** The host's platform, when the runtime says it; undefined when it doesn't (the test then runs). */
+const HOST = (globalThis as { process?: { platform?: string } }).process?.platform
+
+test("the plain window's place (#5, a restart window with no name): one launch of the plain window, which places itself; the caller's lines move nothing. Windows only: off Windows placement.json is not read (CHANGELOG, 2026-11-24), so there it returns at once, the engine's tests having no skip", async ($, on) => {
+  if (HOST !== undefined && HOST !== 'win32') return
   const placed = JSON.stringify({ v: 1, layout: [], restart: { prefer: ['window'], window: { rect: [-1600, 120, 1200, 800], maximized: true } } })
   const { scripts, commands, clock } = engine(on, { placement: placed })
   await $.session.start(start)
