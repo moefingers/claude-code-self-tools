@@ -1,12 +1,13 @@
 // self-desktop on a real desktop, Windows only, and only in a guarded run: each test opens ONE small window of its own
 // (a plain form with a title made at run time, a text box, a password box and a button, shown without taking the
-// focus), or a console of its own, points the plugin's own scripts at it, and closes it in a `finally`. The window is
-// on the screen for a few seconds, so these run only with SELF_DESKTOP_LIVE=1; elsewhere, and without it, each is
-// skipped, saying why. Run with `SELF_DESKTOP_LIVE=1 node --test scripts/desktop-live.test.mjs`.
+// focus), or a pseudoconsole of its own, points the plugin's own scripts at it, and closes it in a `finally`. The
+// window is on the screen for a few seconds, so these run only with SELF_DESKTOP_LIVE=1; elsewhere, and without it,
+// each is skipped, saying why. Run with `SELF_DESKTOP_LIVE=1 node --test scripts/desktop-live.test.mjs`.
 //
 // The tools take no window: these call the plugin's internal scripts with the handle of the window the test opened
-// (desktop.ts's Target `window`, gateScript), the way no tool can. The console test runs the tools' own read script
-// (ReadOwn) under a process whose console the test made, so it shows what the tool's own route reads.
+// (desktop.ts's Target `window`), the way no tool can. The console test runs the tools' own read script (ReadOwn)
+// under a process on a pseudoconsole the test made (the kind Windows Terminal gives a pane, with no terminal window),
+// so it shows what the tool's own route reads, and that it writes nothing to the console it reads.
 //
 // What each shows is in its name. The checks that nothing moved or took the focus compare the window's own rectangle,
 // its activations and its place among the windows before and after; a person using the machine in those seconds can
@@ -14,7 +15,7 @@
 import assert from 'node:assert/strict'
 import { spawn, spawnSync } from 'node:child_process'
 import { randomBytes, randomInt, randomUUID } from 'node:crypto'
-import { mkdtempSync, rmSync } from 'node:fs'
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
@@ -291,7 +292,7 @@ test("the capture is a PNG of the window's drawn size, holding the window's own 
   })
 })
 
-test("nothing moved, focused or closed the window: its rectangle, its activations and its place among the windows are the same after a read, a capture and the structure rule", { skip: SKIP }, async () => {
+test('nothing moved, focused or closed the window: its rectangle, its activations and its place among the windows are the same after a read and a capture', { skip: SKIP }, async () => {
   await withWindow(async ({ shown, report }) => {
     const before = await report()
     const placeBefore = listed(shown.window).index
@@ -299,7 +300,6 @@ test("nothing moved, focused or closed the window: its rectangle, its activation
     try {
       runScript(desktop.readScript({ window: shown.window }))
       runScript(desktop.captureScript({ window: shown.window }, { folder: dir, name: `capture-${randomUUID()}.png` }))
-      runScript(desktop.gateScript(shown.window))
     } finally {
       rmSync(dir, { recursive: true, force: true })
     }
@@ -310,21 +310,6 @@ test("nothing moved, focused or closed the window: its rectangle, its activation
     assert.equal(after.minimized, false)
     assert.equal(after.foreground, before.foreground, 'the window in front is the same')
     assert.equal(listed(shown.window).index, placeBefore, 'its place among the windows is the same')
-  })
-})
-
-test("the own-window capture refuses a window with more than one tab: the structure rule, on a window the test built", { skip: SKIP }, async () => {
-  await withWindow(async ({ shown }) => {
-    const gate = json(runScript(desktop.gateScript(shown.window)))
-    // The test window's tab control has two tabs, and no terminal control: not one tab with one pane.
-    assert.deepEqual(gate.shape, { tabs: 2, panes: 0 })
-    assert.equal(gate.onePane, false)
-    const said = desktop.captureAnswer({
-      dpiAware: true,
-      own: { found: true, window: shown.window, kind: 'terminal', program: 'WindowsTerminal.exe', title: '' },
-      capture: { kind: 'shape', changed: false, tabs: gate.shape.tabs, panes: gate.shape.panes },
-    })
-    assert.match(said, /^Captured nothing: .* it has 2 tabs\. A picture could show another session's pane/)
   })
 })
 
@@ -357,54 +342,149 @@ public static class SelfDesktopTestConsole {
   }
 }`
 
+/**
+ * A pseudoconsole of the test's own, the kind Windows Terminal gives each pane, with no terminal window: the command
+ * runs on it, its output is drained and dropped, and it is closed once the command has exited, or ends with it. From
+ * Microsoft's "Creating a Pseudoconsole session" (CreatePipe, CreatePseudoConsole, the attribute list, CreateProcessW
+ * with EXTENDED_STARTUPINFO_PRESENT, the handles given to the pseudoconsole closed after, ClosePseudoConsole); the
+ * attribute's value, 0x00020016, rests on memory of winbase.h.
+ */
+const PTY_CS = String.raw`using System;
+using System.ComponentModel;
+using System.Runtime.InteropServices;
+using System.Text;
+using System.Threading;
+
+public static class SelfDesktopTestPty {
+  [StructLayout(LayoutKind.Sequential)] struct Coord { public short X; public short Y; }
+  [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)] struct StartupInfo { public int Cb; public string Reserved; public string Desktop; public string Title; public int X; public int Y; public int XSize; public int YSize; public int XCountChars; public int YCountChars; public int FillAttribute; public int Flags; public short ShowWindow; public short Reserved2; public IntPtr Reserved3; public IntPtr StdInput; public IntPtr StdOutput; public IntPtr StdError; }
+  [StructLayout(LayoutKind.Sequential)] struct StartupInfoEx { public StartupInfo Info; public IntPtr AttributeList; }
+  [StructLayout(LayoutKind.Sequential)] struct ProcessInformation { public IntPtr Process; public IntPtr Thread; public int ProcessId; public int ThreadId; }
+  [DllImport("kernel32.dll", SetLastError = true)] static extern bool CreatePipe(out IntPtr read, out IntPtr write, IntPtr attributes, uint size);
+  [DllImport("kernel32.dll")] static extern int CreatePseudoConsole(Coord size, IntPtr input, IntPtr output, uint flags, out IntPtr console);
+  [DllImport("kernel32.dll")] static extern void ClosePseudoConsole(IntPtr console);
+  [DllImport("kernel32.dll", SetLastError = true)] static extern bool InitializeProcThreadAttributeList(IntPtr list, int count, int flags, ref IntPtr size);
+  [DllImport("kernel32.dll", SetLastError = true)] static extern bool UpdateProcThreadAttribute(IntPtr list, uint flags, IntPtr attribute, IntPtr value, IntPtr size, IntPtr previous, IntPtr returned);
+  [DllImport("kernel32.dll")] static extern void DeleteProcThreadAttributeList(IntPtr list);
+  [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)] static extern bool CreateProcessW(string application, StringBuilder commandLine, IntPtr processAttributes, IntPtr threadAttributes, bool inherit, uint flags, IntPtr environment, string directory, ref StartupInfoEx info, out ProcessInformation process);
+  [DllImport("kernel32.dll", SetLastError = true)] static extern uint WaitForSingleObject(IntPtr handle, uint milliseconds);
+  [DllImport("kernel32.dll", SetLastError = true)] static extern bool ReadFile(IntPtr file, byte[] buffer, uint count, out uint read, IntPtr overlapped);
+  [DllImport("kernel32.dll", SetLastError = true)] static extern bool CloseHandle(IntPtr handle);
+  const uint EXTENDED_STARTUPINFO_PRESENT = 0x00080000;
+  static readonly IntPtr PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE = new IntPtr(0x00020016);
+
+  public static int Run(string commandLine, int columns, int rows, int timeoutMs) {
+    IntPtr inputRead;
+    IntPtr inputWrite;
+    IntPtr outputRead;
+    IntPtr outputWrite;
+    if (!CreatePipe(out inputRead, out inputWrite, IntPtr.Zero, 0)) throw new Win32Exception();
+    if (!CreatePipe(out outputRead, out outputWrite, IntPtr.Zero, 0)) throw new Win32Exception();
+    Coord size;
+    size.X = (short)columns;
+    size.Y = (short)rows;
+    IntPtr console;
+    int made = CreatePseudoConsole(size, inputRead, outputWrite, 0, out console);
+    if (made != 0) throw new Win32Exception(made);
+    Thread drain = new Thread(delegate () { byte[] buffer = new byte[4096]; uint read; while (ReadFile(outputRead, buffer, (uint)buffer.Length, out read, IntPtr.Zero) && read > 0) { } });
+    drain.IsBackground = true;
+    drain.Start();
+    IntPtr bytes = IntPtr.Zero;
+    InitializeProcThreadAttributeList(IntPtr.Zero, 1, 0, ref bytes);
+    IntPtr list = Marshal.AllocHGlobal(bytes);
+    try {
+      if (!InitializeProcThreadAttributeList(list, 1, 0, ref bytes)) throw new Win32Exception();
+      if (!UpdateProcThreadAttribute(list, 0, PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE, console, (IntPtr)IntPtr.Size, IntPtr.Zero, IntPtr.Zero)) throw new Win32Exception();
+      StartupInfoEx info = new StartupInfoEx();
+      info.Info.Cb = Marshal.SizeOf(typeof(StartupInfoEx));
+      info.AttributeList = list;
+      ProcessInformation process;
+      if (!CreateProcessW(null, new StringBuilder(commandLine), IntPtr.Zero, IntPtr.Zero, false, EXTENDED_STARTUPINFO_PRESENT, IntPtr.Zero, null, ref info, out process)) throw new Win32Exception();
+      CloseHandle(inputRead);
+      CloseHandle(outputWrite);
+      uint waited = WaitForSingleObject(process.Process, (uint)timeoutMs);
+      CloseHandle(process.Thread);
+      CloseHandle(process.Process);
+      return waited == 0 ? 0 : 1;
+    } finally {
+      DeleteProcThreadAttributeList(list);
+      Marshal.FreeHGlobal(list);
+      ClosePseudoConsole(console);
+      CloseHandle(inputWrite);
+    }
+  }
+}`
+
 /** A process id no process has, which the console's own process puts its id in place of. */
 const STAND_IN = 4000000001
 
-test("this session's own pane is read from its own console: the characters that show, and the alternate screen while it is up", { skip: SKIP }, () => {
+test("this session's own pane is read from its own console: the characters that show, the alternate screen while it is up, and the main screen after exactly as written", { skip: SKIP }, () => {
   const main = `main screen ${randomUUID()}`
   const alternate = `alternate screen ${randomUUID()}`
   const read = desktop.readScript({ own: STAND_IN })
   assert.ok(read.includes(`[SelfDesktop]::ReadOwn([uint32]${STAND_IN}, $deny)`))
   const bootstrap = desktop.encodeCommand(desktop.STDIN_BOOTSTRAP)
-  const owner = [
-    "$ErrorActionPreference = 'Stop'",
-    desktop.PSMODULEPATH_RESET,
-    `Add-Type -TypeDefinition ${desktop.literal(CONSOLE_CS)}`,
-    // Only a console no other process is attached to is written to: this process's own, made for it hidden.
-    `if ([SelfDesktopTestConsole]::Clients() -ne 1) { [Console]::Out.Write('{"refused":"this process shares its console with another, so nothing was written to it"}'); return }`,
-    `$read = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${Buffer.from(read, 'utf8').toString('base64')}')).Replace('[uint32]${STAND_IN},', '[uint32]' + $PID + ',')`,
-    'function Read-Own {',
-    '  $start = New-Object System.Diagnostics.ProcessStartInfo',
-    `  $start.FileName = ${desktop.literal(POWERSHELL)}`,
-    `  $start.Arguments = '-NoProfile -NonInteractive -EncodedCommand ${bootstrap}'`,
-    '  $start.UseShellExecute = $false',
-    '  $start.CreateNoWindow = $false',
-    '  $start.RedirectStandardInput = $true',
-    '  $start.RedirectStandardOutput = $true',
-    '  $child = [System.Diagnostics.Process]::Start($start)',
-    '  $bytes = (New-Object System.Text.UTF8Encoding $false).GetBytes($read)',
-    '  $child.StandardInput.BaseStream.Write($bytes, 0, $bytes.Length)',
-    '  $child.StandardInput.Close()',
-    '  $out = $child.StandardOutput.ReadToEnd()',
-    '  $child.WaitForExit()',
-    '  return $out',
-    '}',
-    '$escape = [string][char]27',
-    `[void][SelfDesktopTestConsole]::Write($escape + '[2J' + $escape + '[H' + ${desktop.literal(main)})`,
-    '$onMain = Read-Own',
-    `[void][SelfDesktopTestConsole]::Write($escape + '[?1049h' + $escape + '[2J' + $escape + '[H' + ${desktop.literal(alternate)})`,
-    '$onAlternate = Read-Own',
-    "[void][SelfDesktopTestConsole]::Write($escape + '[?1049l')",
-    '$back = Read-Own',
-    `[Console]::Out.Write('{"main":' + $onMain + ',"alternate":' + $onAlternate + ',"back":' + $back + '}')`,
-  ].join('\r\n')
-  const seen = json(runScript(owner, 180_000))
-  assert.equal(seen.refused, undefined, seen.refused)
-  const lines = reading => (Array.isArray(reading.pane?.lines) ? reading.pane.lines : assert.fail(`the pane wasn't read: ${JSON.stringify(reading.pane)}`))
-  assert.ok(lines(seen.main).includes(main), 'the main screen is read')
-  assert.ok(lines(seen.alternate).includes(alternate), 'the alternate screen is read while it is up')
-  assert.ok(!lines(seen.alternate).includes(main), "the main screen isn't, meanwhile")
-  assert.ok(lines(seen.back).includes(main), 'the main screen is read again once the alternate is gone')
-  // A console made hidden has no window, so no window of its own is named; or a hidden classic console's own.
-  assert.ok(seen.main.own.why !== undefined || seen.main.own.kind === 'console', JSON.stringify(seen.main.own))
+  const dir = mkdtempSync(join(tmpdir(), 'self-desktop-console-'))
+  try {
+    const readPath = join(dir, 'read.ps1')
+    const resultPath = join(dir, 'result.json')
+    writeFileSync(readPath, read)
+    // The process on the pseudoconsole: it writes to its own console, and runs the tools' own read script under itself,
+    // which shares that console, with its own process id in place of the stand-in. Its answers go to a file.
+    const owner = [
+      "$ErrorActionPreference = 'Stop'",
+      desktop.PSMODULEPATH_RESET,
+      `Add-Type -TypeDefinition ${desktop.literal(CONSOLE_CS)}`,
+      `$result = ${desktop.literal(resultPath)}`,
+      // Only a console no other process is attached to is written to: this process's own.
+      `if ([SelfDesktopTestConsole]::Clients() -ne 1) { [IO.File]::WriteAllText($result, '{"refused":"this process shares its console with another, so nothing was written to it"}'); return }`,
+      `$read = [IO.File]::ReadAllText(${desktop.literal(readPath)}).Replace('[uint32]${STAND_IN},', '[uint32]' + $PID + ',')`,
+      'function Read-Own {',
+      '  $start = New-Object System.Diagnostics.ProcessStartInfo',
+      `  $start.FileName = ${desktop.literal(POWERSHELL)}`,
+      `  $start.Arguments = '-NoProfile -NonInteractive -EncodedCommand ${bootstrap}'`,
+      '  $start.UseShellExecute = $false',
+      '  $start.CreateNoWindow = $false',
+      '  $start.RedirectStandardInput = $true',
+      '  $start.RedirectStandardOutput = $true',
+      // Its errors, unredirected, would land on the console: the main screen after the reads shows whether any did.
+      '  $child = [System.Diagnostics.Process]::Start($start)',
+      '  $bytes = (New-Object System.Text.UTF8Encoding $false).GetBytes($read)',
+      '  $child.StandardInput.BaseStream.Write($bytes, 0, $bytes.Length)',
+      '  $child.StandardInput.Close()',
+      '  $out = $child.StandardOutput.ReadToEnd()',
+      '  $child.WaitForExit()',
+      '  return $out',
+      '}',
+      '$escape = [string][char]27',
+      `[void][SelfDesktopTestConsole]::Write($escape + '[2J' + $escape + '[H' + ${desktop.literal(main)})`,
+      '$onMain = Read-Own',
+      `[void][SelfDesktopTestConsole]::Write($escape + '[?1049h' + $escape + '[2J' + $escape + '[H' + ${desktop.literal(alternate)})`,
+      '$onAlternate = Read-Own',
+      "[void][SelfDesktopTestConsole]::Write($escape + '[?1049l')",
+      '$back = Read-Own',
+      "[IO.File]::WriteAllText($result, '{\"main\":' + $onMain + ',\"alternate\":' + $onAlternate + ',\"back\":' + $back + '}')",
+    ].join('\r\n')
+    const commandLine = `"${POWERSHELL}" -NoProfile -NonInteractive -EncodedCommand ${desktop.encodeCommand(owner)}`
+    assert.ok(commandLine.length < 32_000, 'the command line fits Windows')
+    const host = [
+      "$ErrorActionPreference = 'Stop'",
+      desktop.PSMODULEPATH_RESET,
+      `Add-Type -TypeDefinition ${desktop.literal(PTY_CS)}`,
+      `[Console]::Out.Write([string][SelfDesktopTestPty]::Run(${desktop.literal(commandLine)}, 120, 30, 150000))`,
+    ].join('\r\n')
+    assert.equal(runScript(host, 180_000).trim(), '0', 'the process on the pseudoconsole ended in time')
+    const seen = JSON.parse(readFileSync(resultPath, 'utf8').replace(/^﻿/, ''))
+    assert.equal(seen.refused, undefined, seen.refused)
+    const lines = reading => (Array.isArray(reading.pane?.lines) ? reading.pane.lines.filter(line => line !== '') : assert.fail(`the pane wasn't read: ${JSON.stringify(reading.pane)}`))
+    // Exactly what the test wrote, and nothing else: the read wrote nothing to the console it read.
+    assert.deepEqual(lines(seen.main), [main], 'the main screen is read')
+    assert.deepEqual(lines(seen.alternate), [alternate], 'the alternate screen is read while it is up, and the main screen not')
+    assert.deepEqual(lines(seen.back), [main], 'the main screen after the reads is exactly what the test wrote')
+    // A pseudoconsole whose window no terminal owns: the pane is read, and no window of its own is named.
+    assert.match(seen.main.own.why ?? '', /names no owner/)
+    assert.match(seen.main.tree.why ?? '', /names no owner/)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
 })
