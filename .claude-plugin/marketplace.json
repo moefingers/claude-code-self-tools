@@ -1,6 +1,6 @@
 {
   "name": "claude-code-self-tools",
-  "description": "Small Claude Code plugins that let a session act on itself: compact or clear its conversation, reload its plugins, reconnect an MCP server, read its context window, check its own tools, wake itself later, turn on Remote Control under a title, set its prompt bar color, exit or restart, switch to another conversation, run a command with a secret pasted at the machine that it never sees, make sure Chrome runs for Claude in Chrome, and keep the machine's plugins current; and a skill for running several sessions as a hierarchy. Install only the ones you want.",
+  "description": "Small Claude Code plugins that let a session act on itself: compact or clear its conversation, reload its plugins, reconnect an MCP server, read its context window, check its own tools, wake itself later, turn on Remote Control under a title, set its prompt bar color, exit or restart, switch to another conversation, run a command with a secret pasted at the machine that it never sees, make sure Chrome runs for Claude in Chrome, keep the machine's plugins current, and read its own desktop on Windows; and a skill for running several sessions as a hierarchy. Install only the ones you want.",
   "owner": {
     "name": "moefingers",
     "url": "https://github.com/moefingers"
@@ -80,6 +80,11 @@
       "name": "self-update",
       "source": "./plugins/self-update",
       "description": "Keeps the plugins this machine already has from the marketplaces you name current, with Claude Code's own claude plugin commands, one look at a time, and reloads each session behind an update at its next idle moment. Off until you name a marketplace. Windows only."
+    },
+    {
+      "name": "self-desktop",
+      "source": "./plugins/self-desktop",
+      "description": "Reads the session's own machine's desktop on Windows, read only: lists the windows a person could see (a title only for Windows Terminal windows and the session's own), reads the session's own terminal window and the text showing in its own pane, whoever wrote it (never from a console shared by a program that is not the session's own), and captures a classic console window of the session's own to a local PNG; a picture of a Windows Terminal window isn't built. It never clicks, types, focuses, moves or closes anything. Off until you turn it on."
     },
     {
       "name": "self-hierarchy",

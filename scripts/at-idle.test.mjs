@@ -34,6 +34,9 @@ const QUEUES_NOTHING = new Map([
   ['cancel_wake', 'takes the wake-up back at once'],
   ['compact_reminder', "sets or reads this conversation's reminder levels at once"],
   ['update_status', 'answers at once, and only reads'],
+  ['desktop_windows', 'answers at once, and only reads'],
+  ['desktop_read', 'answers at once, and only reads'],
+  ['desktop_capture', 'answers at once with a file it wrote, and acts on no window'],
 ])
 
 /**
@@ -51,6 +54,9 @@ const TOOLS = [
   'compact_after_turn',
   'compact_reminder',
   'context_usage',
+  'desktop_capture',
+  'desktop_read',
+  'desktop_windows',
   'exit_after_turn',
   'reconnect_mcp_after_turn',
   'reload_plugins_after_turn',
