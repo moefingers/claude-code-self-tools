@@ -84,7 +84,7 @@
     {
       "name": "self-desktop",
       "source": "./plugins/self-desktop",
-      "description": "Reads the session's own machine's desktop on Windows, read only: lists the windows a person could see (a title only for Windows Terminal windows and the session's own), reads the session's own terminal window and its own pane's text (never from a console another program shares), and captures a classic console window of the session's own to a local PNG; a picture of a Windows Terminal window isn't built. It never clicks, types, focuses, moves or closes anything. Off until you turn it on."
+      "description": "Reads the session's own machine's desktop on Windows, read only: lists the windows a person could see (a title only for Windows Terminal windows and the session's own), reads the session's own terminal window and the text showing in its own pane, whoever wrote it (never from a console shared by a program that is not the session's own), and captures a classic console window of the session's own to a local PNG; a picture of a Windows Terminal window isn't built. It never clicks, types, focuses, moves or closes anything. Off until you turn it on."
     },
     {
       "name": "self-hierarchy",
