@@ -99,7 +99,7 @@ Nothing in the plugin makes input, focuses, activates, moves, resizes, minimizes
 
 ## Known limits
 
-- **The ancestor check accepts any ancestor.** The process Claude Code names must be one the script runs under, anywhere up its chain, not only its direct parent. Another installed plugin could hook `$.process.hookEnv` and rewrite `CLAUDE_PID` to an ancestor further up, such as another session's process this one was started from. The sharing check then still refuses a console that holds another Claude Code process. What would tighten it: a call through the installed plugin showing that the script is Claude Code's direct child, after which only the direct parent would be accepted. One run did show the check refusing: a script started under a job wrapper whose own parent had exited is no longer linked to the session in Windows' record of parents, and it found no window of the session's own and read nothing.
+- **The ancestor check accepts any ancestor.** The process Claude Code names must be one the script runs under, anywhere up its chain, not only its direct parent. Another installed plugin could hook `$.process.hookEnv` and rewrite `CLAUDE_PID` to an ancestor further up, such as another session's process this one was started from. The sharing check then still refuses a console that holds another Claude Code process. What would tighten it: a call through the installed plugin showing that the script is Claude Code's direct child, after which only the direct parent would be accepted. One run did show the check refusing: a script started under a job runner whose own parent process had exited, so that Windows' record of parents no longer led to the session, found no window of the session's own and read nothing.
 - **A Claude Code of the other install kind passes the image-name rule.** The rule compares image names, so a `node.exe` Claude Code attached beside a `claude.exe` one, or the other way round, as its ancestor or its descendant, is taken for the session's own shell or child.
 - **A process id reused between the console's process list and the snapshot is judged as its new owner.** The two are read one after the other, in the same attach; a process that ends and whose id is given to a new one in between is judged as the new one.
 - **A guard that refuses the listing of the plugin's data folder stops the cleaning without a word.** Claude Code leaves where a path may go to `fs.*` hooks, so an `fs.*` hook (an organization's guard, say) that refuses to list the plugin's captures folder stops the cleaning, and a picture can then outlive the 10 minutes the answers promise. The cleaning can't tell that refusal from a folder that isn't there, which is the common case, so it says nothing of either.
@@ -121,7 +121,9 @@ Nothing in the plugin makes input, focuses, activates, moves, resizes, minimizes
 These rest on the code and on Microsoft's pages, not on a run ([what ran](#what-ran) is below):
 
 - **Any tool called through the installed plugin in a session.** Every run so far went through the tests or straight through the scripts. So these are not shown: that the model's calls, served after the permission check, are asked about as the section above says; that `desktop_capture` in a Windows Terminal pane answers its refusal; that the script is Claude Code's direct child there; and that the cleaning really lists the plugin's data folder, also on a machine with the person's own `fs.*` hooks, where one that refuses the listing stops it without a word ([Known limits](#known-limits)).
-- **A picture of a classic console window.** The live tests take a picture of a plain form of their own, which holds its own colour; that `PrintWindow` with the full-content flag renders a classic console window as it shows is not shown (the flag is in Windows' header from 8.1 and left out of Microsoft's page).
+- **The capture's own route, on a real console.** The live tests take a picture of a plain form of their own, by its handle, which holds its own colour. The route a tool takes has never run for real: the look at who shares the console before the picture, the second look after it, and the deletion of a picture not kept. Nor is it shown that `PrintWindow` with the full-content flag renders a classic console window as it shows (the flag is in Windows' header from 8.1 and left out of Microsoft's page).
+- **A refusal on a real console.** That the sharing check refuses a real console a program not the session's own shares, and that a real console with no window is taken as no pane, rest on the fixed-value rows alone; the one real read showed a pass. (The ancestor check did refuse for real once: [what ran](#what-ran).)
+- **Elevated windows.** What the section above says of them rests on Microsoft's page alone.
 - **A session started any other way than in a Windows Terminal pane**: a classic console, an editor's terminal, an app or an SDK host. Which processes such a session leaves on its console, and whether the sharing check passes there, is not shown.
 - **Which sign marks a terminal control.** The one real read marked 3 terminal controls in a Windows Terminal window and gave none a name; whether the class name `TermControl` or the control's text matched was not recorded.
 - **Mixed DPI.** The live tests found each control's bounds where the form itself said they were, on one machine's monitors; that UI Automation gives a per-monitor-aware thread physical pixels on monitors of different scaling is not shown.
@@ -141,12 +143,12 @@ The plugin runs Windows PowerShell 5.1 by its known path, never PowerShell 7, so
 
 Each run names the commit it was on. `480b4e3` is the last commit that changes code or tests; what follows it changes these words only.
 
-- **Linux (a cloud machine, Node 22, Claude Code 2.1.331), the repository's whole list (`scripts/test-all.mjs`, 37 steps), on `480b4e3`:**
+- **Linux (a cloud machine, Node 22, Claude Code 2.1.332), the repository's whole list (`scripts/test-all.mjs`, 37 steps), on `480b4e3`:**
   - `claude plugin validate plugins/self-desktop --strict` says "Validation passed".
   - `claude plugin test plugins/self-desktop` passes 75 of 75.
-  - The script tests count 346: 296 pass, 49 are skipped (those that need Windows, this plugin's among them), and 1 fails that is not this plugin's (`readPlacement…`, which fails there on `main` too).
-  - Eight of the 37 steps fail there, the same eight as on `main` with the same failing tests, all for want of Windows.
-- **Windows 11 (Windows PowerShell 5.1, Node 26, Claude Code 2.1.332), each run once:**
+  - The script tests count 346: 296 pass, 49 are skipped (nearly all for want of Windows, this plugin's Windows-only tests among them), and 1 fails that is not this plugin's (`readPlacement…`, which fails there on `main` too).
+  - Eight of the 37 steps fail there: the same eight, with the same failing tests, as in a run of `main`'s own files on the same kind of machine (that one on Claude Code 2.1.331).
+- **Windows 11 (Windows PowerShell 5.1, Node 26, Claude Code 2.1.332), each once on the commit named:**
   - `node --test scripts/desktop-text.test.mjs` on `480b4e3`: 10 of 10. Every script parses in Windows PowerShell, the helper compiles under `Add-Type`, and its pure rules answer for every fixed-value row.
   - `claude plugin test plugins/self-desktop` on `01d1a69`: 75 of 75. The four commits after it change the text test's table and two comments in the helper.
   - `SELF_DESKTOP_LIVE=1 node --test scripts/desktop-live.test.mjs` on `480b4e3`: 5 of 5, in 17 seconds.
@@ -156,7 +158,7 @@ Each run names the commit it was on. `480b4e3` is the last commit that changes c
     - What it read stays on that machine.
 - **Two runs that failed first, and why:**
   - The text test's first Windows run, on `01d1a69`, failed 1 of 10. Its table handed the helper `$null` for a string, which Windows PowerShell passes to a .NET method as an empty string. The table was wrong, not the helper; `480b4e3` has it right.
-  - The first try at the real read ran under a job wrapper whose own parent had exited. The helper's ancestor check refused it: no window of the session's own was found and nothing was read.
+  - The first try at the real read ran under a job runner whose own parent process had exited, so Windows' record of parents no longer led from the script to the session. The helper's ancestor check refused it: no window of the session's own was found and nothing was read.
 
 ## Update check
 
