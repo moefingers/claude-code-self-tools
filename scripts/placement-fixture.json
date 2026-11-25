@@ -2,7 +2,8 @@
   "comment": "One list of good and bad placement.json files, read by readPlacement (shared/hooks/machine.ts) and by claude-layout.ps1's validator alike (scripts/placement.test.mjs). {{FOLDER}} and {{FILE}} are an existing folder and .ps1 file, put in by the test. `raw` holds files as text, each read as written, never rewritten through JSON.stringify: how a number is written (100.0, 1e3) only survives there.",
   "raw": [
     { "name": "a rect written with a zero fraction and with exponents", "good": true, "text": "{\"v\": 1, \"layout\": [], \"launch\": {\"prefer\": [\"window\"], \"window\": {\"rect\": [100.0, -1e2, 1.28e3, 8E2]}}}" },
-    { "name": "a pos and a size written 0.0, -0, 1.2e2 and 30.0", "good": true, "text": "{\"v\": 1, \"layout\": [{\"window\": \"a\", \"pos\": [0.0, -0], \"size\": [1.2e2, 30.0], \"tabs\": [\"t\"], \"folder\": \"{{FOLDER}}\"}]}" },
+    { "name": "a pos and a size written 0.0, 1.2e2 and 30.0", "good": true, "text": "{\"v\": 1, \"layout\": [{\"window\": \"a\", \"pos\": [0.0, 0], \"size\": [1.2e2, 30.0], \"tabs\": [\"t\"], \"folder\": \"{{FOLDER}}\"}]}" },
+    { "name": "a pos written -0 (negative zero is zero), on a named window", "good": true, "text": "{\"v\": 1, \"layout\": [], \"launch\": {\"prefer\": [\"window\"], \"window\": {\"name\": \"w1\", \"pos\": [-0, 0]}}}" },
     { "name": "the version and the limits written 1.0, 5.0 and 1.2e1", "good": true, "text": "{\"v\": 1.0, \"layout\": [], \"limits\": {\"minFreeGb\": 5.0, \"maxSessions\": 1.2e1}}" },
     { "name": "maxTabs written 2.0", "good": true, "text": "{\"v\": 1, \"layout\": [], \"launch\": {\"prefer\": [\"tab\"], \"tab\": {\"window\": \"a\", \"maxTabs\": 2.0}}}" },
     { "name": "a rect with a half", "good": false, "text": "{\"v\": 1, \"layout\": [], \"launch\": {\"prefer\": [\"window\"], \"window\": {\"rect\": [100.5, 0, 800, 600]}}}" },
