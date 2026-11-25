@@ -1431,7 +1431,7 @@ export function readAnswer(r: Reading): string {
 
 /** Why a picture of a Windows Terminal window isn't taken in this step. */
 export const TERMINAL_NOT_BUILT =
-  "a picture of a Windows Terminal window isn't built in this step: nothing the window's structure shows proves the picture would hold only this session's pane (a zoomed pane takes the others out of it, and another session's pane could be the one on screen). desktop_read reads this session's own pane as text."
+  "a picture of a Windows Terminal window isn't built in this step: nothing the window's structure shows proves the picture would hold only this session's pane (a zoomed pane takes the others out of it, and another session's pane could be the one on screen). desktop_read reads the text showing in this session's own pane."
 
 /** How long a capture lasts, as the answers and the README say it. */
 export const CAPTURE_LIFETIME = `It stays on this machine, in this plugin's own folder, until the first call of this plugin's tools, or the first session start, ${CAPTURE_MINUTES} minutes or more after it was taken, which deletes it. The plugin sends it nowhere.`

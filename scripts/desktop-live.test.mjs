@@ -419,7 +419,7 @@ public static class SelfDesktopTestPty {
 /** A process id no process has, which the console's own process puts its id in place of. */
 const STAND_IN = 4000000001
 
-test("this session's own pane is read from its own console: the characters that show, the alternate screen while it is up, and the main screen after exactly as written", { skip: SKIP }, () => {
+test("the text showing in this session's own pane is read from its own console: the characters that show, the alternate screen while it is up, and the main screen after exactly as written", { skip: SKIP }, () => {
   const main = `main screen ${randomUUID()}`
   const alternate = `alternate screen ${randomUUID()}`
   const read = desktop.readScript({ own: STAND_IN })
