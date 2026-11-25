@@ -6,5 +6,10 @@ import type { On } from 'claude-code'
 export const PLUGIN = 'self-desktop'
 export const CALL = { tool: 'mcp__self-desktop__desktop_windows' } as const
 
-/** The plugin is off by default: the call answers that it is off, the same each time, and reads and runs nothing. */
-export function world(_on: On): void {}
+/**
+ * The plugin is off by default, and the session runs on Linux: the call answers that it is off, the same each time,
+ * and the cleaning of old captures, which asks where the session runs, finds nothing to clean there.
+ */
+export function world(on: On): void {
+  on('session.info', () => ({ value: { transcriptPath: '', platform: 'linux' as const, isHosted: false } }))
+}
