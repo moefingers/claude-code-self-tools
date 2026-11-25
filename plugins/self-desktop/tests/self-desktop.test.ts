@@ -173,7 +173,12 @@ function engine(on: On, world: World = {}) {
   const answer = (value: unknown) => ({ value: { exitCode: 0, stdout: `${JSON.stringify(value)}\r\n`, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } })
   on('fs.list', (_, e) => {
     asked.list += 1
-    if (world.captures === undefined || e.path !== FOLDER) return { deny: `ENOENT: ${e.path ?? ''}` }
+    // The engine puts a relative path under the session's working directory before a hook hears it. The captures
+    // folder is a Windows drive path: absolute on Windows, so heard as given there, and relative on Linux or macOS, so
+    // heard after a POSIX working directory there. Either way it is the plugin's own folder and no other.
+    const path = e.path ?? ''
+    const isOwn = path === FOLDER || path.endsWith(`/${FOLDER}`)
+    if (world.captures === undefined || !isOwn) return { deny: `ENOENT: ${path}` }
     return { value: world.captures }
   })
   on('process.run', (_, e) => {
