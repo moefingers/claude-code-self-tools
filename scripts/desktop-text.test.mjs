@@ -433,7 +433,6 @@ test("the helper compiles under Windows PowerShell's Add-Type, and nothing of it
  */
 const TABLE = '[uint32[]]@(10, 11, 12, 20, 30, 60, 70), [uint32[]]@(20, 20, 20, 30, 0, 70, 0), [long[]]@(500, 500, 500, 400, 100, 300, 200)'
 const NAMES = "[string[]]@('powershell.exe', 'node.exe', 'claude.exe', 'claude.exe', 'pwsh.exe', 'cmd.exe', 'explorer.exe')"
-const RULES = [
 /**
  * A null string, as Windows PowerShell hands one to a .NET method. It converts $null to an empty string for a string
  * parameter, so a row that means "no reason" passes this instead. Microsoft, the NullString class
@@ -442,6 +441,7 @@ const RULES = [
  * is no string: $null reaches it as null, so the one row that means "no list" passes $null.
  */
 const NULL_STRING = '[System.Management.Automation.Language.NullString]::Value'
+const RULES = [
   // Which names a tree gives.
   ['named: a tab in a terminal window', "[SelfDesktop]::Named($true, 'TabItem', $false, $false)", true],
   ['named: the window itself in a terminal window', "[SelfDesktop]::Named($true, 'Window', $false, $false)", true],
@@ -487,8 +487,8 @@ const NULL_STRING = '[System.Management.Automation.Language.NullString]::Value'
     /^another Claude Code process \(CLAUDE\.EXE, process 30\)/,
   ],
   ['sharing: a process that can\'t be placed', `[SelfDesktop]::SharingWhy(10, 20, [uint32[]]@(10, 20, 99), ${TABLE}, ${NAMES})`, /can't be placed \(process 99\)/],
-  ['sharing: no list of the processes', `[SelfDesktop]::SharingWhy(10, 20, $null, ${TABLE}, ${NAMES})`, /couldn't be told apart/],
   // A uint[] parameter: $null reaches it as null, not as an empty array.
+  ['sharing: no list of the processes', `[SelfDesktop]::SharingWhy(10, 20, $null, ${TABLE}, ${NAMES})`, /couldn't be told apart/],
   [
     'sharing: this script itself may carry the image name of the process Claude Code names',
     "[SelfDesktop]::SharingWhy(10, 20, [uint32[]]@(10, 20), [uint32[]]@(10, 20), [uint32[]]@(20, 0), [long[]]@(500, 400), [string[]]@('powershell.exe', 'powershell.exe'))",
