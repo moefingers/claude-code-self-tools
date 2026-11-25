@@ -4472,7 +4472,8 @@ export function clampToWork(rect: PixelRect, work: ScreenBox): PixelRect {
 }
 
 /**
- * Where the plain window's script puts `rect` among `monitors`: on the work area of the monitor MonitorFromRect
+ * A model, for the tests, of where the plain window's script puts `rect` among `monitors` (in the script, Windows'
+ * MonitorFromRect picks the monitor, and only the clamp is this code's): on the work area of the monitor MonitorFromRect
  * picks with MONITOR_DEFAULTTONEAREST, clamped (clampToWork), so a rectangle wholly off every monitor still lands
  * on one. The pick as Microsoft's page states it (https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-monitorfromrect):
  * the monitor with the largest area of intersection with the rectangle. For a rectangle that meets none, the page
@@ -4502,16 +4503,21 @@ export const PLACE_SWP_FLAGS = 0x4214
  * (CASCADIA_HOSTING_WINDOW_CLASS, #5's table), and only when that window is its own alone: `Hosted` counts the
  * pseudoconsoles the window owns, and anything but exactly one, its own console, leaves it where it is (a window
  * with other tabs or panes in it holds other sessions; whether a terminal ever puts a new console there is no page's
- * to say, so the code does not rest on it). A classic console window holds one console, and is not counted. Anything
- * else, or a window already minimized or maximized (Windows Terminal's launchMode, say): nothing is done, and it says
- * why. Then per-monitor DPI awareness for its thread alone
+ * to say, so the code does not rest on it). A classic console window holds one console, and is not counted. Asked only
+ * to be maximized, a window maximized already (Windows Terminal's launchMode "maximized", say) is where it is asked:
+ * "placed", and nothing is done. Anything else, or a window already minimized, or maximized when a rect is asked too:
+ * nothing is done, and it says why. A full-screen window (launchMode "fullscreen", or "maximizedFocus") is not told
+ * apart: from memory, full screen does not set WS_MAXIMIZE, so IsZoomed is false and it is moved or maximized, and
+ * Windows Terminal's own idea of its state may then disagree with the window's. Then per-monitor DPI awareness for its thread alone
  * (SetThreadDpiAwarenessContext(-4), DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2; Windows PowerShell 5.1 is DPI-unaware,
  * #5), put back as it was before it returns. With a rect: the monitor MonitorFromRect picks (MONITOR_DEFAULTTONEAREST,
  * 2), its work area (GetMonitorInfoW's rcWork), Clamp (clampToWork's arithmetic), then SetWindowPos with
  * PLACE_SWP_FLAGS: no Z-order change, no activation, posted to the window's own thread rather than waited on. With
  * maximized: ShowWindowAsync(SW_MAXIMIZE = 3), after the rect when both are given, so it maximizes on that rect's
- * monitor and restores to the rect. ShowWindow has no maximize that doesn't activate (its page's table), so a maximized
- * window is activated, as a new window is when it opens. Answers "placed", or why not, as one line of text.
+ * monitor and restores to the rect: so intended, and not seen until the guarded live run shows it. ShowWindow has no
+ * maximize that doesn't activate (its page's table), so a maximized window is activated, and only after the compile,
+ * 1 to 2 s after it opened (an estimate): when the person has moved on, that is a second activation, which from memory
+ * the foreground lock likely refuses. Answers "placed", or why not, as one line of text.
  * It takes no handle, name, title or process id from outside. Its one listing of windows is `Hosted`, a pure read:
  * the number of pseudoconsole windows `window` owns, or -1 when `console` is not among them or the listing fails. It
  * lists the top-level windows once (EnumWindows, its callback held alive across the call), reads each one's class
@@ -4573,6 +4579,7 @@ export const PLACE_CS = [
   'if (kind == "ConsoleWindowClass") own = console;',
   'else if (kind == "PseudoConsoleWindow") { own = GetWindow(console, 4); if (own == IntPtr.Zero || ClassOf(own) != "CASCADIA_HOSTING_WINDOW_CLASS") return "its console is a pseudoconsole that no Windows Terminal window owns"; int hosted = Hosted(own, console); if (hosted != 1) return "its Windows Terminal window holds other tabs or panes, or its own console could not be counted among them (" + hosted + "), so it is left where it is"; }',
   'else return "its console window is of class " + kind + ", neither the classic console nor Windows Terminal";',
+  'if (!hasRect && maximized && IsZoomed(own) && !IsIconic(own)) return "placed";',
   'if (IsIconic(own) || IsZoomed(own)) return "it opened minimized or maximized, so it is left as it is";',
   'IntPtr before = SetThreadDpiAwarenessContext(new IntPtr(-4));',
   'if (before == IntPtr.Zero) return "per-monitor DPI awareness could not be set for its thread";',

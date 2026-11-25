@@ -134,7 +134,7 @@ const REVIEWED_IMPORTS = [
  * than EnumWindows's one reviewed call, raises, focuses, closes or types into a window, reads a window's title, nor
  * reads a value from outside. A GetWindow loop is held off below: every GetWindow is GW_OWNER.
  */
-const FORBIDDEN_IN_PLACE = ['FindWindow', 'EnumChildWindows', 'EnumDesktopWindows', 'GetWindowText', 'InternalGetWindowText', 'EnumThreadWindows', 'GetTopWindow', 'GetDesktopWindow', 'WindowFromPoint', 'GetForegroundWindow', 'SetForegroundWindow', 'BringWindowToTop', 'SetActiveWindow', 'SetFocus', 'AttachThreadInput', 'SendMessage', 'PostMessage', 'MoveWindow', 'SetWindowPlacement', 'ShowWindow(', 'DestroyWindow', 'CloseWindow', 'SetWindowLong', 'SetParent', 'SendInput', 'keybd_event', 'mouse_event', 'Environment', 'System.IO', 'Process', 'Registry', 'Console.']
+const FORBIDDEN_IN_PLACE = ['FindWindow', 'EnumChildWindows', 'EnumDesktopWindows', 'GetWindowText', 'InternalGetWindowText', 'SwitchToThisWindow', 'AnimateWindow', 'DeferWindowPos', 'EndDeferWindowPos', 'SendNotifyMessage', 'PostThreadMessage', 'SetWindowRgn', 'FlashWindowEx', 'OpenIcon', 'System.Windows', 'VisualBasic', 'Automation', 'LoadLibrary', 'GetProcAddress', 'GetDelegateForFunctionPointer', 'unsafe', 'DllImportAttribute', 'EnumThreadWindows', 'GetTopWindow', 'GetDesktopWindow', 'WindowFromPoint', 'GetForegroundWindow', 'SetForegroundWindow', 'BringWindowToTop', 'SetActiveWindow', 'SetFocus', 'AttachThreadInput', 'SendMessage', 'PostMessage', 'MoveWindow', 'SetWindowPlacement', 'ShowWindow(', 'DestroyWindow', 'CloseWindow', 'SetWindowLong', 'SetParent', 'SendInput', 'keybd_event', 'mouse_event', 'Environment', 'System.IO', 'Process', 'Registry', 'Console.']
 
 /** Fixed monitors for the clamp: a left-hand one at a negative origin, the primary, and a right-hand one with its taskbar along the top. Made up. */
 const LEFT = { monitor: [-1920, 0, 0, 1080], work: [-1920, 0, 0, 1040] }
@@ -933,12 +933,19 @@ const CHECKS = {
     const cs = m.PLACE_CS
     assert.deepEqual(cs.match(/\[DllImport\([^\]]*\)\] static extern [^;]+;/g), REVIEWED_IMPORTS)
     assert.equal(cs.split('[DllImport(').length - 1, REVIEWED_IMPORTS.length, 'no import of another shape')
+    // However it is spelled (System.Runtime.InteropServices.DllImport, DllImportAttribute): every import is one of the reviewed list.
+    assert.equal((cs.match(/\bextern\b/g) ?? []).length, REVIEWED_IMPORTS.length, 'every extern is a reviewed import')
+    assert.equal((cs.match(/DllImport/g) ?? []).length, REVIEWED_IMPORTS.length, 'every DllImport is a reviewed import')
     assert.deepEqual(cs.match(/\bSetWindowPos\([^)]*\)/g), ['SetWindowPos(IntPtr window, IntPtr after, int x, int y, int width, int height, uint flags)', 'SetWindowPos(own, IntPtr.Zero, at[0], at[1], at[2], at[3], 0x4214)'])
     assert.deepEqual(cs.match(/\bShowWindowAsync\([^)]*\)/g), ['ShowWindowAsync(IntPtr window, int show)', 'ShowWindowAsync(own, 3)'], 'SW_MAXIMIZE alone')
     assert.deepEqual(cs.match(/\bown = [^;]+;/g), ['own = IntPtr.Zero;', 'own = console;', 'own = GetWindow(console, 4);'], 'its own window: its console window, or that window\'s owner (GW_OWNER)')
     assert.deepEqual(cs.match(/\bconsole = [^;]+;/g), ['console = GetConsoleWindow();'])
     assert.deepEqual(cs.match(/\bat = [^;]+;/g), ['at = Clamp(x, y, width, height, info.Work.Left, info.Work.Top, info.Work.Right, info.Work.Bottom);'])
     assert.ok(cs.includes('if (kind == "ConsoleWindowClass") own = console; else if (kind == "PseudoConsoleWindow") { own = GetWindow(console, 4); if (own == IntPtr.Zero || ClassOf(own) != "CASCADIA_HOSTING_WINDOW_CLASS") return '), 'the classic console\'s window, or the Windows Terminal window that owns the pseudoconsole; else nothing')
+    // Asked only to be maximized, a window maximized already is where it is asked: "placed", nothing done, nothing said;
+    // with a rect too, it is left as it is (the rect was not applied), as before.
+    const already = cs.indexOf('if (!hasRect && maximized && IsZoomed(own) && !IsIconic(own)) return "placed"; if (IsIconic(own) || IsZoomed(own)) return "it opened minimized or maximized, so it is left as it is";')
+    assert.ok(already > cs.indexOf('int hosted = Hosted(own, console);') && already < cs.indexOf('SetThreadDpiAwarenessContext(new IntPtr(-4))'), 'after the count, before anything acts: a maximized-only ask of a maximized window is placed, and nothing else short of the rule below')
     const iconic = cs.indexOf('if (IsIconic(own) || IsZoomed(own)) return ')
     assert.ok(iconic > 0 && iconic < cs.indexOf('SetWindowPos(own'), 'a window minimized or maximized as it opened is left as it is')
     const aware = cs.indexOf('IntPtr before = SetThreadDpiAwarenessContext(new IntPtr(-4)); if (before == IntPtr.Zero) return ')
@@ -1178,6 +1185,20 @@ const FAULTS = [
     [['bool listed = EnumWindows(each, IntPtr.Zero);', 'IntPtr after = IntPtr.Zero; while ((after = FindWindowExW(IntPtr.Zero, after, "PseudoConsoleWindow", null)) != IntPtr.Zero) each(after, IntPtr.Zero); bool listed = true;']],
   ],
   ['#5 Fix A: a GetWindow loop put back', 'actingCalls', 'bool listed = EnumWindows(each, IntPtr.Zero);', 'for (IntPtr next = GetWindow(console, 0); next != IntPtr.Zero; next = GetWindow(next, 2)) each(next, IntPtr.Zero); bool listed = true;'],
+  [
+    '#5 review WP-L-3: an import by the namespace-qualified attribute',
+    'actingCalls',
+    "  '[DllImport(\"user32.dll\")] static extern bool EnumWindows(EachWindow each, IntPtr data);',\n",
+    "  '[DllImport(\"user32.dll\")] static extern bool EnumWindows(EachWindow each, IntPtr data);',\n  '[System.Runtime.InteropServices.DllImport(\"user32.dll\")] static extern bool SwitchToThisWindow(IntPtr w, bool b);',\n",
+  ],
+  [
+    '#5 review WP-L-3: an import by DllImportAttribute',
+    'actingCalls',
+    "  '[DllImport(\"user32.dll\")] static extern bool EnumWindows(EachWindow each, IntPtr data);',\n",
+    "  '[DllImport(\"user32.dll\")] static extern bool EnumWindows(EachWindow each, IntPtr data);',\n  '[DllImportAttribute(\"user32.dll\")] static extern bool OpenIcon(IntPtr w);',\n",
+  ],
+  ['#5 review WP-L-4: a maximized-only ask of a maximized window said as not placed again', 'actingCalls', "  'if (!hasRect && maximized && IsZoomed(own) && !IsIconic(own)) return \"placed\";',\n", ''],
+  ['#5 review WP-L-4: a maximized window taken as placed when a rect is asked too', 'actingCalls', 'if (!hasRect && maximized && IsZoomed(own)', 'if (maximized && IsZoomed(own)'],
   [
     '#5 Fix A: the count moved after an acting call',
     'actingCalls',
