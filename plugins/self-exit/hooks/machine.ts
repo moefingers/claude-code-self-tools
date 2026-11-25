@@ -4861,6 +4861,19 @@ export const READ_GROUP_POLICY = [
 ]
 
 /**
+ * The window's interpreter rule, the lines a launch runs where a window opens: `$windowShell` (Windows PowerShell by
+ * its known path, set first) becomes PowerShell 7 when PWSH_RULE finds it and its own Group Policy execution policy
+ * runs an unsigned script file. Needs READ_GROUP_POLICY's Read-GroupPolicy. Exported for the live tests, which run
+ * their windows in the shell a launch would give them by these very lines.
+ */
+export const WINDOW_SHELL_RULE = [
+  ...PWSH_RULE,
+  '$pwshPolicy = $null',
+  `if ($pwshOk) { $pwshPolicy = Read-GroupPolicy '${PWSH_POLICY_KEY}' $true; if ($pwshPolicy -eq 'AllSigned' -or $pwshPolicy -eq 'Restricted') { $pwshOk = $false } }`,
+  'if ($pwshOk) { $windowShell = $pwsh }',
+]
+
+/**
  * Deletes the window scripts no window ran from `$windowDir` (one left by a launch whose caller's timeout killed
  * it between its write and its watch's end, or by a window killed by someone else before its first line): each
  * window deletes its own as it starts, and its launch deletes it on every refusal, so one older
@@ -4982,12 +4995,7 @@ export function launchScriptText(input: LaunchInput): string {
       ? []
       : [
           '$windowShell = ' + literal(input.powershell),
-          ...whereWindowOpens([
-            ...PWSH_RULE,
-            '$pwshPolicy = $null',
-            `if ($pwshOk) { $pwshPolicy = Read-GroupPolicy '${PWSH_POLICY_KEY}' $true; if ($pwshPolicy -eq 'AllSigned' -or $pwshPolicy -eq 'Restricted') { $pwshOk = $false } }`,
-            'if ($pwshOk) { $windowShell = $pwsh }',
-          ]),
+          ...whereWindowOpens(WINDOW_SHELL_RULE),
         ]
   /**
    * The refusal `policy`, where a window opens: the window would run in Windows PowerShell, and its Group
