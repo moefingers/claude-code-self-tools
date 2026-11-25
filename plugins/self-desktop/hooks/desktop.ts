@@ -1207,6 +1207,7 @@ export type Reading = { readonly dpiAware: boolean; readonly own: OwnWindow; rea
 /**
  * The tree as the plugin takes it. The name rules are applied again here, whatever the script said: a password field
  * and a terminal control carry no name, and in a terminal window (`inTerminal`) only the roles of NAMED_IN_TERMINAL do.
+ * `inTerminal` is the plugin's to say, never the script's: the tools pass true for every tree they read.
  */
 function treeOf(raw: unknown, inTerminal: boolean): Tree | undefined {
   if (!isRecord(raw)) return undefined
@@ -1260,12 +1261,25 @@ function paneOf(raw: unknown): Pane | undefined {
   }
 }
 
-/** A read of this session's own window and pane, as the plugin takes it. */
+/**
+ * A read of this session's own window and pane, as the plugin takes it. The plugin decides which rules hold, not the
+ * script's answer: the tools only ever read this session's own terminal or console window, so the terminal naming rule
+ * holds for every tree; and when the window wasn't found, no tree is passed on, whatever the script sent, and the
+ * controls say why, as the helper itself says it.
+ */
 export function parseReading(stdout: string): Reading | string {
   const line = answerOf(stdout)
   const own = line === undefined ? undefined : ownOf(line.own)
   const pane = line === undefined ? undefined : paneOf(line.pane)
-  const tree = line === undefined || own === undefined ? undefined : treeOf(line.tree, own.found)
+  const tree: Tree | undefined =
+    line === undefined || own === undefined
+      ? undefined
+      : !own.found
+        ? { kind: 'why', why: own.why }
+        : // The deny list again, on the window's own program: a tree of a program on it is never passed on.
+          isDenied(own.program)
+          ? { kind: 'denied', program: own.program }
+          : treeOf(line.tree, true)
   if (own === undefined || pane === undefined || tree === undefined) return "the read's answer isn't the one its script writes"
   return { dpiAware: line?.dpiAware === true, own, pane, tree }
 }

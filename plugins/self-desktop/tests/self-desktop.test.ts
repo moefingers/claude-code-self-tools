@@ -588,6 +588,31 @@ test("the read where the session's window isn't found: the text showing in this 
   expect(toasts).toEqual(["self-desktop read the text showing in this session's own pane"])
 })
 
+test("the plugin decides the read's rules, not the script's answer: a window not found passes no tree it was sent; the naming rule holds in a console window; a program on the deny list passes no tree", ON, async ($, on) => {
+  const world: World = {}
+  engine(on, world)
+  await $.session.start(START)
+  const history = 'a history entry'
+  const tree = { nodes: [{ depth: 0, role: 'Window', name: 'claude', rect: [0, 0, 10, 10], ref: '42.1' }, { depth: 1, role: 'ListItem', name: history, rect: [0, 0, 1, 1], ref: '42.2' }], cut: false }
+  // The script says the window wasn't found, yet sends a tree with a named ListItem: none of it is passed on.
+  const why = 'no window of its own was found'
+  world.read = { ...READ_ANSWER, own: { why, console: 'PseudoConsoleWindow' }, tree }
+  let said = await call($, READ)
+  expect(said).toContain(`Controls: not read: ${why}.`)
+  expect(said).not.toContain(history)
+  expect(said).not.toContain('ListItem')
+  // A classic console window, found: the naming rule holds there too, so the ListItem has no name.
+  world.read = { ...READ_ANSWER, own: CONSOLE_OWN, tree }
+  said = await call($, READ)
+  expect(said).toContain('- ListItem')
+  expect(said).not.toContain(history)
+  // The window's own program is on the deny list, though the script sent its tree: no tree is passed on.
+  world.read = { ...READ_ANSWER, own: { ...CONSOLE_OWN, program: '1Password.exe' }, tree }
+  said = await call($, READ)
+  expect(said).toContain(`Controls: not read: ${deniedSaid('1Password.exe')}`)
+  expect(said).not.toContain(history)
+})
+
 test("the read reads nothing, says so in one line, and toasts nothing: no console, a console with no window, or a console shared by a program that is not this session's own or by another Claude Code", ON, async ($, on) => {
   const world: World = {}
   const { toasts } = engine(on, world)
