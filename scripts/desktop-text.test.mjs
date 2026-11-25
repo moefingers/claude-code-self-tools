@@ -2,17 +2,19 @@
 // `node --test "scripts/*.test.mjs"`.
 // - Nothing acts: no file of the plugin's hooks names a call that makes input, reads keys or the clipboard, brings a
 //   window forward, moves, sizes, shows, hides or closes one, reads the screen rather than one window, writes to a
-//   console or sets its state, changes a control, changes the system, or starts or ends a process. Each kind of fault,
-//   planted on a line of its own in a copy of the helper, is found on that line, and the unplanted text has none.
-//   Comments count: a shipped file doesn't name one even to say it isn't used.
-// - The helper's imported entry points, the .NET calls it makes and the types it builds are held equal to a reviewed
-//   list: a new one fails here until someone reviews it and adds it.
+//   console or sets its state (in PowerShell or in C#), changes a control, changes the system, or starts or ends a
+//   process. Each kind of fault, planted on a line of its own in a copy of the helper, is found on that line, and the
+//   unplanted text has none. Comments count: a shipped file doesn't name one even to say it isn't used.
+// - The helper's every use is held to a reviewed count: each static extern declaration (however its attribute is
+//   written, and its call sites), each qualified .NET call, each type it builds. A new one, or another use of one
+//   listed, fails here until it is reviewed. Every CreateFileW call passes GENERIC_READ, by name, as its access.
+// - The serving at tool.run refuses a subagent and the setting off again, in each of the three handlers.
 // - Its few lines of PowerShell plumbing are the shared machine code's, so a fix there is seen here.
 // - On Windows: every script it builds parses in Windows PowerShell with no error; the helper compiles under Add-Type;
 //   and its pure rules (the ancestor check, who may share the console, whether a console is a pane, which window is the
-//   session's own, which names a tree gives, how much of a pane is kept, the deny list, whether a picture is taken)
-//   give the answers below for fixed values. That runs PowerShell and the C# compiler and calls only those pure rules:
-//   no window is read and no console is attached to.
+//   session's own, which names a tree gives, how much of a pane is kept, the deny list, whether a picture is taken,
+//   whether a picture taken is kept) give the answers below for fixed values. That runs PowerShell and the C# compiler
+//   and calls only those pure rules: no window is read and no console is attached to.
 import assert from 'node:assert/strict'
 import { spawnSync } from 'node:child_process'
 import { mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
@@ -41,8 +43,11 @@ const ACTS = [
   ['the screen read rather than one window', /\b(?:CopyFromScreen|BitBlt|StretchBlt|GetDCEx|GetWindowDC|CreateDC|DwmRegisterThumbnail|GraphicsCaptureItem|IDXGIOutputDuplication|DuplicateOutput)|\bGetDC\(/],
   ['a write to a console, or a change of its state', /\b(?:WriteConsole|WriteFile|FillConsoleOutput|SetConsole|ScrollConsoleScreenBuffer|GenerateConsoleCtrlEvent|AllocConsole|SetStdHandle|SetCurrentConsoleFont)/],
   ["a read of a console's input, which takes keys from the person", /\b(?:ReadConsoleInput|PeekConsoleInput|FlushConsoleInputBuffer|ReadConsoleW?\b)|CONIN\$/],
-  ['a console handle opened for writing', /GENERIC_WRITE|0x40000000|0xC0000000|3221225472/i],
-  ['a console setting from PowerShell', /\[Console\]::(?:OutputEncoding|InputEncoding|Title|CursorLeft|CursorTop|CursorVisible|BackgroundColor|ForegroundColor|WindowWidth|WindowHeight|BufferWidth|BufferHeight|TreatControlCAsInput)\s*=|RawUI|Write-Host|Clear-Host/],
+  ['a console handle opened for writing', /GENERIC_WRITE|GENERIC_ALL|0x40000000|0xC0000000|0x10000000|3221225472|1073741824|268435456/i],
+  [
+    'a console setting, from PowerShell or from C#',
+    /\[Console\]::(?:OutputEncoding|InputEncoding|Title|CursorLeft|CursorTop|CursorVisible|BackgroundColor|ForegroundColor|WindowWidth|WindowHeight|BufferWidth|BufferHeight|TreatControlCAsInput)\s*=|RawUI|Write-Host|Clear-Host|\bConsole\s*\.\s*\w+\s*=(?!=)/,
+  ],
   [
     'a UI Automation pattern object, or a method that acts',
     /\b(?:GetCurrentPattern|TryGetCurrentPattern|GetCachedPattern|TryGetCachedPattern|InvokePattern|ValuePattern|WindowPattern|TransformPattern|ScrollItemPattern|ScrollPattern|ExpandCollapsePattern|LegacyIAccessiblePattern|TextPattern\b|TogglePattern\b|SelectionItemPattern\b|DoDefaultAction|ScrollIntoView|SetWindowVisualState|AddToSelection|RemoveFromSelection)|\.(?:Invoke|Toggle|Select|Expand|Collapse|Realize|SetValue|Move|Resize|Rotate|SetView|Close|Kill|SetFocus)\(/,
@@ -51,75 +56,135 @@ const ACTS = [
   ['a process started or ended', /Stop-Process|taskkill|Start-Process|ShellExecute|CreateProcess|WinExec|TerminateProcess|Invoke-Expression|\biex\b|Process\]::Start\(|Process\.Start\(|\bwt\.exe|Invoke-Item|\bcmd\.exe|\.Kill\(|CloseMainWindow/i],
 ]
 
-/**
- * The helper's imports, as dll!entry, reviewed: each a read, or an act on this script's own process, thread or bitmap
- * (FreeConsole and AttachConsole move this process alone; SetThreadDpiAwarenessContext sets this thread's alone;
- * PrintWindow has a window render itself into this process's bitmap).
- */
-const REVIEWED_IMPORTS = [
-  'dwmapi.dll!DwmGetWindowAttribute',
-  'dwmapi.dll!DwmGetWindowAttribute',
-  'kernel32.dll!AttachConsole',
-  'kernel32.dll!CloseHandle',
-  'kernel32.dll!CreateFileW',
-  'kernel32.dll!CreateToolhelp32Snapshot',
-  'kernel32.dll!FreeConsole',
-  'kernel32.dll!GetConsoleProcessList',
-  'kernel32.dll!GetConsoleScreenBufferInfo',
-  'kernel32.dll!GetConsoleWindow',
-  'kernel32.dll!Process32FirstW',
-  'kernel32.dll!Process32NextW',
-  'kernel32.dll!ReadConsoleOutputCharacterW',
-  'shcore.dll!GetDpiForMonitor',
-  'user32.dll!EnumChildWindows',
-  'user32.dll!EnumDisplayMonitors',
-  'user32.dll!EnumWindows',
-  'user32.dll!GetClassNameW',
-  'user32.dll!GetForegroundWindow',
-  'user32.dll!GetMonitorInfoW',
-  'user32.dll!GetWindow',
-  'user32.dll!GetWindowRect',
-  'user32.dll!GetWindowTextW',
-  'user32.dll!GetWindowThreadProcessId',
-  'user32.dll!IsIconic',
-  'user32.dll!IsWindow',
-  'user32.dll!IsWindowVisible',
-  'user32.dll!IsZoomed',
-  'user32.dll!MonitorFromWindow',
-  'user32.dll!PrintWindow',
-  'user32.dll!SetThreadDpiAwarenessContext',
-]
+// The reviewed counts. Each entry is a use the helper makes, reviewed as a read, or as an act on this script's own
+// process, thread, bitmap or capture file alone (FreeConsole and AttachConsole move this process; SetThreadDpiAwareness-
+// Context sets this thread; PrintWindow has a window render itself into this process's bitmap; Directory.CreateDirectory,
+// part.Save, File.Delete and File.Exists touch only the plugin's own capture). When a count moves, or a new entry shows,
+// the test fails. A reviewer then reads each new use in the diff, checks it reads, or acts only on the script's own
+// process, thread, bitmap or capture file, and only then sets the count here, in the same commit, saying so in its
+// message. A use that acts on anything else is refused, not counted.
+
+/** Each static extern declaration (dll!entry, `as` the name it is called by when that differs), by its call sites. */
+const REVIEWED_IMPORTS = {
+  'dwmapi.dll!DwmGetWindowAttribute': 1,
+  'dwmapi.dll!DwmGetWindowAttribute as DwmGetWindowAttributeInt': 1,
+  'kernel32.dll!AttachConsole': 1,
+  'kernel32.dll!CloseHandle': 2,
+  'kernel32.dll!CreateFileW': 1,
+  'kernel32.dll!CreateToolhelp32Snapshot': 1,
+  'kernel32.dll!FreeConsole': 2,
+  'kernel32.dll!GetConsoleProcessList': 2,
+  'kernel32.dll!GetConsoleScreenBufferInfo': 1,
+  'kernel32.dll!GetConsoleWindow': 1,
+  'kernel32.dll!Process32FirstW': 1,
+  'kernel32.dll!Process32NextW': 1,
+  'kernel32.dll!ReadConsoleOutputCharacterW': 1,
+  'shcore.dll!GetDpiForMonitor': 1,
+  'user32.dll!EnumChildWindows': 1,
+  'user32.dll!EnumDisplayMonitors': 1,
+  'user32.dll!EnumWindows': 1,
+  'user32.dll!GetClassNameW': 1,
+  'user32.dll!GetForegroundWindow': 1,
+  'user32.dll!GetMonitorInfoW': 1,
+  'user32.dll!GetWindow': 1,
+  'user32.dll!GetWindowRect': 2,
+  'user32.dll!GetWindowTextW': 1,
+  'user32.dll!GetWindowThreadProcessId': 1,
+  'user32.dll!IsIconic': 2,
+  'user32.dll!IsWindow': 2,
+  'user32.dll!IsWindowVisible': 3,
+  'user32.dll!IsZoomed': 1,
+  'user32.dll!MonitorFromWindow': 1,
+  'user32.dll!PrintWindow': 1,
+  'user32.dll!SetThreadDpiAwarenessContext': 10,
+}
+
+/** Each qualified .NET call, by its uses. */
+const REVIEWED_CALLS = {
+  'Array.Copy': 1, 'Array.IndexOf': 1, 'AutomationElement.FromHandle': 1, 'CAPTURE_NAME.IsMatch': 1, 'Columns.ToString': 1, 'CutChars.ToString': 1,
+  'CutRows.ToString': 1, 'Directory.CreateDirectory': 1, 'Dpi.ToString': 1, 'File.Delete': 1, 'File.Exists': 1, 'GC.KeepAlive': 3,
+  'Graphics.FromImage': 1, 'Height.ToString': 1, 'Marshal.GetLastWin32Error': 4, 'Marshal.SizeOf': 4, 'Math.Min': 3, 'Math.Round': 4,
+  'Path.Combine': 1, 'Path.IsPathRooted': 1, 'Process.GetCurrentProcess': 1, 'Process.GetProcessById': 1, 'ProgrammaticName.Replace': 1,
+  'Rectangle.Intersect': 1, 'Rows.ToString': 1, 'StartTime.ToUniversalTime': 1, 'Width.ToString': 1, 'Window.ToInt64': 3, 'all.TryGetValue': 2,
+  'b.Append': 4, 'depth.ToString': 1, 'double.IsInfinity': 2, 'double.IsNaN': 1, 'element.GetCurrentPropertyValue': 1, 'element.GetRuntimeId': 1,
+  'fields.Add': 22, 'fields.ToArray': 1, 'found.Add': 1, 'front.ToInt64': 1, 'graphics.GetHdc': 1, 'graphics.ReleaseHdc': 1, 'handle.ToString': 1,
+  'ids.Add': 1, 'ids.Contains': 1, 'ids.ToArray': 1, 'lines.Add': 1, 'lines.ToArray': 1, 'listed.Add': 1, 'listed.ToArray': 1, 'monitors.Add': 1,
+  'monitors.ToArray': 1, 'name.ToString': 1, 'nodes.Add': 1, 'nodes.ToArray': 1, 'part.Save': 1, 'part.ToString': 1, 'parts.Add': 1,
+  'parts.ToArray': 1, 'programs.Add': 2, 'programs.ToArray': 1, 'roots.Add': 2, 'roots.AddRange': 1, 'roots.ToArray': 1, 'rows.Add': 1,
+  'rows.GetRange': 1, 'string.Equals': 4, 'string.Join': 7, 'text.Substring': 1, 'text.ToString': 1, 'walker.GetFirstChild': 1,
+  'walker.GetNextSibling': 1, 'whole.Clone': 1, 'window.ToInt64': 1, 'windows.Add': 1,
+}
+
+/** Each type the helper builds, by its uses: its own records, collections, strings, a bitmap of its own, rectangles. */
+const REVIEWED_BUILT = {
+  Bitmap: 1, Box: 1, Dictionary: 1, IntPtr: 4, List: 13, MonitorInfo: 1, Own: 1, Pane: 1, ProcessEntry: 1, Rectangle: 2, Regex: 1, Screen: 1,
+  Shot: 1, StringBuilder: 3, Table: 1, char: 1, int: 1, long: 1, string: 2, uint: 5,
+}
+
+/** A C# extern declaration's start: `static extern` or `extern static`, whatever its attribute is spelled like. */
+const EXTERN = /\b(?:static\s+extern|extern\s+static)\b/g
 
 /**
- * The helper's qualified .NET calls, reviewed: reads, its own collections and strings, and the writes it makes to its
- * own capture alone (Directory.CreateDirectory and part.Save in the plugin's folder; File.Delete of the picture it took).
+ * Every use the helper's text makes, each with its line: the static extern declarations (dll!entry, `as` the name it is
+ * called by) with their call sites; the qualified calls; the types built. And how many times `extern` appears at all,
+ * so a declaration this can't read can't pass unseen.
  */
-const REVIEWED_CALLS = [
-  'Array.Copy', 'Array.IndexOf', 'AutomationElement.FromHandle', 'CAPTURE_NAME.IsMatch', 'Columns.ToString', 'CutChars.ToString', 'CutRows.ToString',
-  'Directory.CreateDirectory', 'Dpi.ToString', 'File.Delete', 'GC.KeepAlive', 'Graphics.FromImage', 'Height.ToString', 'Marshal.GetLastWin32Error',
-  'Marshal.SizeOf', 'Math.Min', 'Math.Round', 'Path.Combine', 'Path.IsPathRooted', 'Process.GetCurrentProcess', 'Process.GetProcessById',
-  'ProgrammaticName.Replace', 'Rectangle.Intersect', 'Rows.ToString', 'StartTime.ToUniversalTime', 'Width.ToString', 'Window.ToInt64', 'all.TryGetValue',
-  'b.Append', 'depth.ToString', 'double.IsInfinity', 'double.IsNaN', 'element.GetCurrentPropertyValue', 'element.GetRuntimeId', 'fields.Add',
-  'fields.ToArray', 'found.Add', 'front.ToInt64', 'graphics.GetHdc', 'graphics.ReleaseHdc', 'handle.ToString', 'ids.Add', 'ids.Contains', 'ids.ToArray',
-  'lines.Add', 'lines.ToArray', 'listed.Add', 'listed.ToArray', 'monitors.Add', 'monitors.ToArray', 'name.ToString', 'nodes.Add', 'nodes.ToArray',
-  'part.Save', 'part.ToString', 'parts.Add', 'parts.ToArray', 'programs.Add', 'programs.ToArray', 'roots.Add', 'roots.AddRange', 'roots.ToArray',
-  'rows.Add', 'rows.GetRange', 'string.Equals', 'string.Join', 'text.Substring', 'text.ToString', 'walker.GetFirstChild', 'walker.GetNextSibling',
-  'whole.Clone', 'window.ToInt64', 'windows.Add',
-]
-
-/** The types the helper builds, reviewed: its own records, collections, strings, a bitmap of its own and a rectangle. */
-const REVIEWED_BUILT = ['Bitmap', 'Box', 'Dictionary', 'IntPtr', 'List', 'MonitorInfo', 'Own', 'Pane', 'ProcessEntry', 'Rectangle', 'Regex', 'Screen', 'Shot', 'StringBuilder', 'Table', 'char', 'int', 'long', 'string', 'uint']
-
-/** What the helper's text imports, calls and builds, as the reviewed lists name them. */
 function helperUses(cs) {
-  const imports = cs
-    .split('\n')
-    .filter(line => line.includes('[DllImport('))
-    .map(line => `${/DllImport\("([^"]+)"/.exec(line)?.[1]}!${/EntryPoint = "([^"]+)"/.exec(line)?.[1] ?? /static extern \S+ (\w+)\(/.exec(line)?.[1]}`)
-    .sort()
-  const calls = [...new Set([...cs.matchAll(/\b([A-Za-z_][A-Za-z0-9_]*)\.([A-Z][A-Za-z0-9]*)\s*\(/g)].map(m => `${m[1]}.${m[2]}`))].sort()
-  const built = [...new Set([...cs.matchAll(/\bnew\s+([A-Za-z_][A-Za-z0-9_.]*)/g)].map(m => m[1]))].sort()
-  return { imports, calls, built }
+  const lineOf = at => cs.slice(0, at).split('\n').length
+  const imports = []
+  for (const m of cs.matchAll(EXTERN)) {
+    const start = Math.max(cs.lastIndexOf(';', m.index), cs.lastIndexOf('{', m.index), cs.lastIndexOf('}', m.index)) + 1
+    const end = cs.indexOf(';', m.index) + 1
+    const declaration = cs.slice(start, end)
+    const dll = /"([^"]+?\.dll)"/i.exec(declaration)?.[1] ?? '?'
+    const name = /\b(?:static\s+extern|extern\s+static)\s+[\w.<>[\], ]+?\s+(\w+)\s*\(/.exec(declaration)?.[1] ?? '?'
+    const entry = /EntryPoint\s*=\s*"([^"]+)"/.exec(declaration)?.[1] ?? name
+    const sites = [...cs.matchAll(new RegExp(`\\b${name}\\s*\\(`, 'g'))].filter(c => c.index < start || c.index >= end).map(c => lineOf(c.index))
+    imports.push({ key: `${dll}!${entry}${entry === name ? '' : ` as ${name}`}`, declared: lineOf(m.index), lines: sites })
+  }
+  const calls = [...cs.matchAll(/\b([A-Za-z_][A-Za-z0-9_]*)\s*\.\s*([A-Z][A-Za-z0-9]*)\s*\(/g)].map(m => ({ key: `${m[1]}.${m[2]}`, line: lineOf(m.index) }))
+  const built = [...cs.matchAll(/\bnew\s+([A-Za-z_][A-Za-z0-9_.]*)/g)].map(m => ({ key: m[1], line: lineOf(m.index) }))
+  return { imports, calls, built, externs: [...cs.matchAll(/\bextern\b/g)].length }
+}
+
+/** The helper's uses, counted as the reviewed lists count them. */
+function counted(cs) {
+  const uses = helperUses(cs)
+  const tally = list => {
+    const out = {}
+    for (const u of list) out[u.key] = (out[u.key] ?? 0) + 1
+    return out
+  }
+  return { imports: Object.fromEntries(uses.imports.map(i => [i.key, i.lines.length])), calls: tally(uses.calls), built: tally(uses.built), externs: uses.externs, declared: uses.imports.length }
+}
+
+/** What in `cs` differs from the reviewed counts, with the lines each differing entry is used on. */
+function unreviewed(cs) {
+  const uses = helperUses(cs)
+  const counts = counted(cs)
+  const found = []
+  for (const [list, reviewed, entries] of [
+    [counts.imports, REVIEWED_IMPORTS, uses.imports.map(i => ({ key: i.key, lines: [i.declared, ...i.lines] }))],
+    [counts.calls, REVIEWED_CALLS, uses.calls.map(c => ({ key: c.key, lines: [c.line] }))],
+    [counts.built, REVIEWED_BUILT, uses.built.map(b => ({ key: b.key, lines: [b.line] }))],
+  ]) {
+    for (const key of new Set([...Object.keys(list), ...Object.keys(reviewed)])) {
+      if (list[key] !== reviewed[key]) found.push({ key, lines: entries.filter(e => e.key === key).flatMap(e => e.lines) })
+    }
+  }
+  if (counts.externs !== counts.declared) found.push({ key: 'an extern this test cannot read', lines: [] })
+  return found
+}
+
+/** The access argument of each CreateFileW call in `cs` (not its declaration), with its line. */
+function createFileAccess(cs) {
+  const lineOf = at => cs.slice(0, at).split('\n').length
+  return [...cs.matchAll(/\bCreateFileW\s*\(/g)]
+    .filter(m => !/\bextern\b/.test(cs.slice(cs.lastIndexOf('\n', m.index), m.index)))
+    .map(m => {
+      const args = cs.slice(m.index + m[0].length, cs.indexOf(')', m.index)).split(',')
+      return { access: (args[1] ?? '').trim(), line: lineOf(m.index) }
+    })
 }
 
 /** The shipped files of the plugin's hooks, every one: the module, its helper's text, the shared copies, hooks.json. */
@@ -134,6 +199,14 @@ function acting(text) {
   return found
 }
 
+/** The helper with `plant` on a line of its own after its class's opening line, and that line's number. */
+function planted(plant) {
+  const lines = desktop.HELPER_CS.split('\n')
+  const at = lines.indexOf('public static class SelfDesktop {')
+  assert.ok(at >= 0, 'the place to plant is found')
+  return { text: [...lines.slice(0, at + 1), `  ${plant}`, ...lines.slice(at + 1)].join('\n'), line: at + 2 }
+}
+
 test("nothing in the plugin's shipped hooks acts: no input, no keys or clipboard read, no window brought forward, moved, sized, shown, hidden or closed, no screen read, no console written to or set, no control changed, no system change, no process started or ended", () => {
   const files = hookFiles(HOOKS)
   assert.ok(files.some(f => f.endsWith('desktop.ts')) && files.some(f => f.endsWith('register.ts')), 'the hooks were found')
@@ -143,11 +216,6 @@ test("nothing in the plugin's shipped hooks acts: no input, no keys or clipboard
 
 test('each kind of acting call, planted on a line of its own in a copy of the helper, is found on that line, and the unplanted helper has none', () => {
   assert.deepEqual(acting(desktop.HELPER_CS), [], 'the helper as shipped names nothing that acts')
-  const anchor = 'public static class SelfDesktop {'
-  const lines = desktop.HELPER_CS.split('\n')
-  const at = lines.indexOf(anchor)
-  assert.ok(at >= 0, 'the place to plant is found')
-  const planted = at + 2
   const plants = [
     'SetForegroundWindow(window);',
     'ShowWindow(window, 9);',
@@ -169,7 +237,12 @@ test('each kind of acting call, planted on a line of its own in a copy of the he
     'SetConsoleOutputCP(65001);',
     'ReadConsoleInputW(input, records, 1, out read);',
     'CreateFileW("CONOUT$", 0x40000000, 3, IntPtr.Zero, 3, 0, IntPtr.Zero);',
+    'CreateFileW("CONOUT$", 1073741824, 3, IntPtr.Zero, 3, 0, IntPtr.Zero);',
+    'CreateFileW("CONOUT$", 0x10000000, 3, IntPtr.Zero, 3, 0, IntPtr.Zero);',
     '[Console]::OutputEncoding = [Text.Encoding]::UTF8',
+    'Console.Title = "x";',
+    'Console.OutputEncoding = Encoding.UTF8;',
+    'System.Console . CursorVisible = false;',
     'object pattern = element.GetCurrentPattern(InvokePattern.Pattern);',
     'element.SetFocus();',
     '((InvokePattern)pattern).Invoke();',
@@ -183,21 +256,58 @@ test('each kind of acting call, planted on a line of its own in a copy of the he
     'Start-Process wt.exe',
   ]
   for (const plant of plants) {
-    const text = [...lines.slice(0, at + 1), `  ${plant}`, ...lines.slice(at + 1)].join('\n')
-    const found = acting(text)
+    const copy = planted(plant)
+    const found = acting(copy.text)
     assert.ok(found.length > 0, `the scan finds: ${plant}`)
-    assert.deepEqual([...new Set(found.map(f => f.line))], [planted], `the scan finds ${plant} on its own line, and nowhere else`)
+    assert.deepEqual([...new Set(found.map(f => f.line))], [copy.line], `the scan finds ${plant} on its own line, and nowhere else`)
   }
 })
 
-test("the helper imports, calls and builds only what was reviewed: a new entry point, call or type fails here until it is reviewed and added", () => {
-  const uses = helperUses(desktop.HELPER_CS)
-  assert.deepEqual(uses.imports, [...REVIEWED_IMPORTS].sort())
-  assert.deepEqual(uses.calls, [...REVIEWED_CALLS].sort())
-  assert.deepEqual(uses.built, [...REVIEWED_BUILT].sort())
-  // A screen read planted in a copy is a new call, and fails the list.
-  const planted = desktop.HELPER_CS.replace('using (Graphics graphics = Graphics.FromImage(whole)) {', 'using (Graphics graphics = Graphics.FromImage(whole)) { graphics.CopyFromScreen(0, 0, 0, 0, whole.Size);')
-  assert.notDeepEqual(helperUses(planted).calls, [...REVIEWED_CALLS].sort())
+test('the helper makes exactly the uses reviewed, by count: each extern declaration and its call sites, each qualified call, each type built', () => {
+  assert.deepEqual(unreviewed(desktop.HELPER_CS), [])
+  const counts = counted(desktop.HELPER_CS)
+  assert.equal(counts.externs, counts.declared, 'every extern is a declaration this test reads')
+})
+
+test('a new entry point however its attribute is spelled, or another use of one reviewed, fails the counts on its own line', () => {
+  const plants = [
+    // A new import, with a space before its attribute's parenthesis, and with its modifiers the other way round.
+    '[DllImport ("user32.dll")] static extern bool ShowOwnedPopups(IntPtr window, bool show);',
+    '[System.Runtime.InteropServices.DllImport("user32.dll")] extern static bool ShowOwnedPopups(IntPtr window, bool show);',
+    // Another call of an import reviewed, and another use of a .NET call and of a type reviewed.
+    'IntPtr other = CreateFileW("CONOUT$", GENERIC_READ, 3, IntPtr.Zero, 3, 0, IntPtr.Zero);',
+    'static void Again(string path) { File.Delete(path); }',
+    'static void Folder(string path) { Directory.CreateDirectory(path); }',
+    'static Bitmap Another() { return new Bitmap(1, 1); }',
+    // A screen read through a call not reviewed.
+    'static void Screen2(Graphics graphics) { graphics.CopyFromScreen(0, 0, 0, 0, new Size(1, 1)); }',
+  ]
+  for (const plant of plants) {
+    const copy = planted(plant)
+    const found = unreviewed(copy.text)
+    assert.ok(found.length > 0, `the counts catch: ${plant}`)
+    assert.ok(found.every(f => f.lines.includes(copy.line)), `each entry it moves is used on the planted line: ${plant} (${JSON.stringify(found)})`)
+  }
+})
+
+test('every CreateFileW call in the helper opens for reading only: GENERIC_READ by name, defined once as 0x80000000; a number in its place fails', () => {
+  const calls = createFileAccess(desktop.HELPER_CS)
+  assert.ok(calls.length > 0, 'the calls were found')
+  assert.deepEqual([...new Set(calls.map(c => c.access))], ['GENERIC_READ'])
+  assert.equal((desktop.HELPER_CS.match(/\bGENERIC_READ\s*=(?!=)/g) ?? []).length, 1, 'GENERIC_READ is defined once')
+  assert.ok(desktop.HELPER_CS.includes('const uint GENERIC_READ = 0x80000000;'))
+  for (const access of ['1073741824', '0x10000000', '0x80000000', 'GENERIC_READ | 0x40000000', '(uint)-1']) {
+    const copy = planted(`IntPtr other = CreateFileW("CONOUT$", ${access}, 3, IntPtr.Zero, 3, 0, IntPtr.Zero);`)
+    const bad = createFileAccess(copy.text).filter(c => c.access !== 'GENERIC_READ')
+    assert.deepEqual(bad.map(c => c.line), [copy.line], `CreateFileW with ${access} is found on its own line`)
+  }
+})
+
+test('each of the three servings at tool.run refuses a subagent and the setting off again before anything runs', () => {
+  const register = readFileSync(join(HOOKS, 'register.ts'), 'utf8')
+  const servings = [...register.matchAll(/on\('tool\.run', \{ tool: (\w+) \}, async \(\$, e\) => \{\s*const refused = servingRefusal\(e\.agentId, enabled\)\s*return withUpdateNotice\(\$, e, refused \?\? \{ result: await \w+\(\$\) \}\)/g)].map(m => m[1])
+  assert.deepEqual(servings, ['LIST_TOOL', 'READ_TOOL', 'CAPTURE_TOOL'])
+  assert.equal([...register.matchAll(/on\('tool\.run'/g)].length, 3, 'no other serving')
 })
 
 test("the plugin's PowerShell plumbing is the shared machine code's: the bootstrap, the call, the module path, the Windows folder, the folder check", () => {
@@ -223,7 +333,7 @@ function scripts() {
     'read, a test window': desktop.readScript({ window: 777 }),
     'capture, own window': desktop.captureScript({ own: 4242 }, file),
     'capture, a test window': desktop.captureScript({ window: 777 }, file),
-    'deletion of old captures': desktop.deleteScript([`${file.folder}\\${file.name}`]),
+    'deletion of captures': desktop.deleteScript(file.folder, [file.name]),
   }
 }
 
@@ -293,7 +403,7 @@ const RULES = [
   ['pane: a console with no window', "[SelfDesktop]::HasPane('', $false)", false],
   ['pane: a window of another class', "[SelfDesktop]::HasPane('Other', $true)", false],
   ['window: owned by Windows Terminal', "[SelfDesktop]::WindowKind('PseudoConsoleWindow', $true, 'CASCADIA_HOSTING_WINDOW_CLASS', 'WindowsTerminal.exe')", 'terminal'],
-  ['window: that class, another program', "[SelfDesktop]::WindowKind('PseudoConsoleWindow', $true, 'CASCADIA_HOSTING_WINDOW_CLASS', 'other.exe')", ''],
+  ['window: that class, of a program that is not Windows Terminal',"[SelfDesktop]::WindowKind('PseudoConsoleWindow', $true, 'CASCADIA_HOSTING_WINDOW_CLASS', 'other.exe')", ''],
   ['window: a pseudoconsole with no owner', "[SelfDesktop]::WindowKind('PseudoConsoleWindow', $true, '', '')", ''],
   ['window: a classic console that shows', "[SelfDesktop]::WindowKind('ConsoleWindowClass', $true, '', '')", 'console'],
   ['window: a hidden classic console', "[SelfDesktop]::WindowKind('ConsoleWindowClass', $false, '', '')", ''],
@@ -308,7 +418,11 @@ const RULES = [
   // Who may share the console.
   ['sharing: this script, claude and its shell', `[SelfDesktop]::SharingWhy(10, 20, [uint32[]]@(10, 20, 30), ${TABLE}, ${NAMES})`, null],
   ['sharing: a descendant of claude of another name', `[SelfDesktop]::SharingWhy(10, 20, [uint32[]]@(10, 20, 11), ${TABLE}, ${NAMES})`, null],
-  ['sharing: an unrelated program', `[SelfDesktop]::SharingWhy(10, 20, [uint32[]]@(10, 20, 60), ${TABLE}, ${NAMES})`, /^another program \(cmd\.exe, process 60\) shares this session's console/],
+  [
+    'sharing: a program that is not this session\'s own',
+    `[SelfDesktop]::SharingWhy(10, 20, [uint32[]]@(10, 20, 60), ${TABLE}, ${NAMES})`,
+    /^a program that is not this session's own, not its shell above it nor its children below it \(cmd\.exe, process 60\), shares this session's console/,
+  ],
   ['sharing: another Claude Code under claude', `[SelfDesktop]::SharingWhy(10, 20, [uint32[]]@(10, 20, 12), ${TABLE}, ${NAMES})`, /^another Claude Code process \(claude\.exe, process 12\)/],
   [
     'sharing: another Claude Code above claude',
@@ -322,18 +436,22 @@ const RULES = [
     "[SelfDesktop]::SharingWhy(10, 20, [uint32[]]@(10, 20), [uint32[]]@(10, 20), [uint32[]]@(20, 0), [long[]]@(500, 400), [string[]]@('powershell.exe', 'powershell.exe'))",
     null,
   ],
-  // How much of a pane is kept, the deny list, whether a picture is taken.
+  // How much of a pane is kept, the deny list, whether a picture is taken, whether a picture taken is kept.
   ['kept: the bottom 2 of 3 rows', '[SelfDesktop]::KeepFrom([int[]]@(5, 5, 5), 2, 100)', 1],
   ['kept: the bottom rows within 9 characters', '[SelfDesktop]::KeepFrom([int[]]@(5, 5, 5), 10, 9)', 2],
   ['kept: 30 rows of 1,000 within 20,000 characters', `[SelfDesktop]::KeepFrom([int[]]@(${Array.from({ length: 30 }, () => 1000).join(', ')}), 200, 20000)`, 10],
   ['kept: no rows', '[SelfDesktop]::KeepFrom([int[]]@(), 200, 20000)', 0],
   ['denied: a password manager among a window and its children', "[SelfDesktop]::DeniedOf([string[]]@('WindowsTerminal.exe', 'KeePassXC.exe'), [string[]]@('keepassxc.exe'))", 'KeePassXC.exe'],
   ['denied: none', "[SelfDesktop]::DeniedOf([string[]]@('WindowsTerminal.exe'), [string[]]@('keepassxc.exe'))", null],
-  ['picture: a Windows Terminal window is not built', '[SelfDesktop]::CaptureRefusal(\'terminal\', $null)', 'terminal'],
-  ['picture: a classic console window may be pictured', '[SelfDesktop]::CaptureRefusal(\'console\', $null)', null],
-  ['picture: refused with the finding when the console is shared', "[SelfDesktop]::CaptureRefusal('console', 'another program shares it')", 'why'],
+  ['picture: a Windows Terminal window is not built', "[SelfDesktop]::CaptureRefusal('terminal', $null)", 'terminal'],
+  ['picture: a classic console window may be pictured', "[SelfDesktop]::CaptureRefusal('console', $null)", null],
+  ['picture: refused with the finding when the console is shared', "[SelfDesktop]::CaptureRefusal('console', 'a program that is not this session''s own shares it')", 'why'],
   ['picture: refused when no window was found', "[SelfDesktop]::CaptureRefusal('', 'no window')", 'why'],
-  ['picture: refused for any other kind', '[SelfDesktop]::CaptureRefusal(\'app\', $null)', 'why'],
+  ['picture: refused for any other kind', "[SelfDesktop]::CaptureRefusal('app', $null)", 'why'],
+  ['after the picture: the same window, nothing found against it, kept', '[SelfDesktop]::AfterPicture(5, 5, $null)', null],
+  ['after the picture: another window shows the console, not kept', '[SelfDesktop]::AfterPicture(5, 6, $null)', /shown by another window now/],
+  ['after the picture: no window found again, not kept', '[SelfDesktop]::AfterPicture(5, 0, $null)', /shown by another window now/],
+  ['after the picture: what the look again found, not kept', "[SelfDesktop]::AfterPicture(5, 5, 'a program that is not this session''s own shares it')", "a program that is not this session's own shares it"],
 ]
 
 test("the helper's pure rules answer as the privacy rules say, for fixed values: no window read, no console attached", { skip: ON_WINDOWS }, () => {

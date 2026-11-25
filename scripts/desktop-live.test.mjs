@@ -474,7 +474,7 @@ test("this session's own pane is read from its own console: the characters that 
       `[Console]::Out.Write([string][SelfDesktopTestPty]::Run(${desktop.literal(commandLine)}, 120, 30, 150000))`,
     ].join('\r\n')
     assert.equal(runScript(host, 180_000).trim(), '0', 'the process on the pseudoconsole ended in time')
-    const seen = JSON.parse(readFileSync(resultPath, 'utf8').replace(/^﻿/, ''))
+    const seen = JSON.parse(readFileSync(resultPath, 'utf8').replace(/^\uFEFF/, ''))
     assert.equal(seen.refused, undefined, seen.refused)
     const lines = reading => (Array.isArray(reading.pane?.lines) ? reading.pane.lines.filter(line => line !== '') : assert.fail(`the pane wasn't read: ${JSON.stringify(reading.pane)}`))
     // Exactly what the test wrote, and nothing else: the read wrote nothing to the console it read.
