@@ -4297,7 +4297,7 @@ function checkLaunch(input: LaunchInput) {
     if (fault !== undefined) throw new Error(`the prompt file ${JSON.stringify(promptFile)} ${fault}, so a launch never takes it: it takes an absolute path with no quote, control character, semicolon, < > | ? * or /, and no '.' or '..' part`)
   }
   // Only a plain window runs claude-launch.ps1 itself: the wrapper's ticket, a slot's record and a tab's line carry neither.
-  if ((remoteControl !== undefined || promptFile !== undefined) && !isPlainWindow(where)) throw new Error("Remote Control and a first prompt at launch go to a plain window ({ window: true }, placed or not) alone: the claude wrapper's ticket, a slot's record and a tab's line carry neither")
+  if ((remoteControl !== undefined || promptFile !== undefined) && !isPlainWindow(where)) throw new Error("Remote Control and a first prompt at launch go to a plain window ({ window: true }) alone, placed or not: the claude wrapper's ticket, a slot's record and a tab's line carry neither")
   return { id, folder, state, configDirs, tool, checks, where, waitFor, label, ticket, wtLine, stamp, maxSessions, heavyRoot, deadline: input.deadline, remoteControl, promptFile, place }
 }
 
