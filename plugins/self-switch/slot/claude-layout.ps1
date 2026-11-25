@@ -64,7 +64,15 @@ function Add-Fault($what) { [void]$script:Errors.Add($what) }
 function Test-Object($value) { return ($value -is [Management.Automation.PSCustomObject]) }
 # Whether the object has the key at all: a key given as null is there, as readPlacement reads it, and checked.
 function Test-Has($value, $name) { return ($null -ne $value.PSObject.Properties[$name]) }
-function Test-Whole($value, $low, $high) { return (($value -is [int] -or $value -is [long]) -and $value -ge $low -and $value -le $high) }
+# A whole number however the JSON writes it (100, 100.0, 1e2), as readPlacement reads one: ConvertFrom-Json gives
+# Int32, Int64, Decimal or Double in Windows PowerShell 5.1 and Int64, Double or BigInteger in PowerShell 7, and
+# each is read as the double JSON.parse reads it, then held to whole, finite and the bounds. A string or a
+# boolean is no number.
+function Test-Whole($value, $low, $high) {
+  if ($null -eq $value -or @('System.Int32', 'System.Int64', 'System.Decimal', 'System.Double', 'System.Numerics.BigInteger') -cnotcontains $value.GetType().FullName) { return $false }
+  $number = [double]$value
+  return (-not [double]::IsNaN($number) -and -not [double]::IsInfinity($number) -and [math]::Floor($number) -eq $number -and $number -ge $low -and $number -le $high)
+}
 function Test-WindowName($name) { return ($name -is [string] -and $name -cmatch '^[A-Za-z0-9_-]{1,40}\z' -and $name -notmatch '^-?\d+\z' -and $name -notmatch '^(new|last|_quake)\z') }
 function Test-TabLabel($label) { return ($label -is [string] -and $label -cmatch '^[A-Za-z0-9 ._-]{1,40}\z') }
 function Test-Shape($path) {
@@ -242,8 +250,9 @@ foreach ($w in $doc.layout) {
     if ($folder.Length -gt 3) { $folder = $folder.TrimEnd([char]92) }
     $elements = @('-w', $w.window)
     if ($first -and $w.maximized -eq $true) { $elements += @('-M') }
-    if ($first -and $null -ne $w.pos) { $elements += @('--pos', ('{0},{1}' -f $w.pos[0], $w.pos[1])) }
-    if ($first -and $null -ne $w.size) { $elements += @('--size', ('{0},{1}' -f $w.size[0], $w.size[1])) }
+    # Checked whole above, however the JSON wrote them (100.0, 1e2): written to wt as whole numbers, as wtTabLine writes them.
+    if ($first -and $null -ne $w.pos) { $elements += @('--pos', ('{0},{1}' -f [long][double]$w.pos[0], [long][double]$w.pos[1])) }
+    if ($first -and $null -ne $w.size) { $elements += @('--size', ('{0},{1}' -f [long][double]$w.size[0], [long][double]$w.size[1])) }
     $elements += @('nt', '--title', $tab, '--suppressApplicationTitle', '-d', $folder, '--', $powershell, '-NoExit', '-NoProfile', '-ExecutionPolicy', 'RemoteSigned', '-File', $slotScript, '-Idle')
     $line = (@($elements | ForEach-Object { ConvertTo-WtArgument $_ }) -join ' ')
     [void]$commands.Add([ordered]@{ window = $w.window; tab = $tab; line = $line })

@@ -288,7 +288,7 @@ Copy the slot runner to `%LOCALAPPDATA%\claude-self-tools\claude-slot.ps1`; a pa
   4. Give a Windows Terminal profile the line under [Slots v2](#slots-v2), if you want new tabs to be slots too.
   5. Your choice: `firstWindowPreference: "persistedWindowLayout"` keeps the names, places and tabs across a restart of Windows Terminal; without it, run the script again.
 
-  Compare what you copied: LAYOUT_SCRIPT_SHA256: `26834063574fe8b6b54b4a4d644f91cbecaa7babb59b23976d06f5759990d262`. Nothing checks that at run time.
+  Compare what you copied: LAYOUT_SCRIPT_SHA256: `68badd536a0ddb56172e740e60c40beffeb6a9aa939b3a208bd0f592de8f9aa6`. Nothing checks that at run time.
 
 #### A window's place
 

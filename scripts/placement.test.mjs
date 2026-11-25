@@ -40,6 +40,14 @@ const textOf = file =>
     .split('{{FILE}}')
     .join(JSON.stringify(join(work, 'flt.ps1')).slice(1, -1))
 
+/** A raw fixture file's text as written, its placeholders the test's own folder and script: never rewritten through JSON.stringify. */
+const rawOf = text =>
+  text
+    .split('{{FOLDER}}')
+    .join(JSON.stringify(join(work, 'a folder')).slice(1, -1))
+    .split('{{FILE}}')
+    .join(JSON.stringify(join(work, 'flt.ps1')).slice(1, -1))
+
 /** The layout script, -WhatIf or as given: hidden, in the temporary folder. Never -Apply. */
 function runLayout(args, script = LAYOUT) {
   assert.ok(!args.includes('-Apply'), 'no test runs the layout script with -Apply')
@@ -56,6 +64,13 @@ function runLayout(args, script = LAYOUT) {
 function psTakes(file, script = LAYOUT, tag = 'case') {
   const path = join(work, `${tag}-${createHash('sha256').update(textOf(file)).digest('hex').slice(0, 16)}.json`)
   writeFileSync(path, textOf(file))
+  return runLayout(['-WhatIf', '-Placement', path], script)
+}
+
+/** The PowerShell validator's verdict on a raw fixture file's text, written as it is. */
+function psTakesRaw(text, script = LAYOUT, tag = 'raw') {
+  const path = join(work, `${tag}-${createHash('sha256').update(rawOf(text)).digest('hex').slice(0, 16)}.json`)
+  writeFileSync(path, rawOf(text))
   return runLayout(['-WhatIf', '-Placement', path], script)
 }
 
@@ -77,6 +92,12 @@ test('readPlacement takes each good file and refuses each bad one', () => {
     const read = machine.readPlacement(textOf(file))
     assert.ok('errors' in read && read.errors.length > 0, `${name} was taken`)
   }
+})
+
+test('readPlacement takes and refuses each raw file as JSON writes it: 100.0 and 1e3 are whole numbers, 100.5, 1e400 and "100" are not', () => {
+  assert.ok(fixture.raw.length >= 10 && fixture.raw.some(c => c.good) && fixture.raw.some(c => !c.good))
+  const wrong = fixture.raw.filter(({ good, text }) => ('placement' in machine.readPlacement(rawOf(text))) !== good).map(({ name, good }) => `${name}: ${good ? 'refused' : 'taken'}`)
+  assert.deepEqual(wrong, [], 'every row, in one run')
 })
 
 test('an unknown key is refused by its name; a BOM is read past; not JSON says so', () => {
@@ -112,6 +133,22 @@ describe('the validator in PowerShell', { skip: !isWindows && 'Windows only', co
       assert.ok(!ran.out.includes('wt.exe'), 'prints no command for a bad file')
     })
   }
+  // The same raw text readPlacement reads: how ConvertFrom-Json types a number (5.1 and 7 differ) changes nothing.
+  for (const { name, good, text } of [...(fixture.raw ?? [])]) {
+    test(`${good ? 'takes' : 'refuses'}, as written: ${name}`, () => {
+      const ran = psTakesRaw(text)
+      assert.equal(ran.code, good ? 0 : 2, ran.out)
+      if (!good) assert.ok(!ran.out.includes('wt.exe'), 'prints no command for a bad file')
+    })
+  }
+  test('a pos and a size written 0.0 and 1.2e2 reach wt as 0 and 120, as wtTabLine writes them', () => {
+    const { text } = fixture.raw.find(c => c.name === 'a pos and a size written 0.0, -0, 1.2e2 and 30.0')
+    const ran = psTakesRaw(text, LAYOUT, 'written')
+    assert.equal(ran.code, 0, ran.out)
+    const line = machine.wtTabLine({ powershell: WINDOWS_POWERSHELL, stateDir: join(work, 'local', 'claude-self-tools'), window: 'a', title: 't', pos: [0, 0], size: [120, 30], folder: join(work, 'a folder'), run: { idle: true } })
+    assert.ok(line.includes(' --pos 0,0 --size 120,30 nt '), line)
+    assert.ok(ran.out.includes(`[a / t] wt.exe ${line}`), `${line}\nin:\n${ran.out}`)
+  })
 })
 
 describe('-WhatIf, the default, for the design\'s example', { skip: !isWindows && 'Windows only' }, () => {
@@ -251,6 +288,28 @@ describe('planted faults in the layout script and the validators, each caught', 
     const nullCase = fixture.bad.find(c => c.name === 'a pos of null')
     assert.equal(psTakes(nullCase.file, path, 'fault').code, 0, 'the copy takes it')
     assert.ok('errors' in machine.readPlacement(textOf(nullCase.file)), 'readPlacement still refuses it')
+  })
+
+  test('#5: a whole number read by its type again (Int32 and Int64 alone): 100.0 and 1e3 refused by the copy, taken by readPlacement', () => {
+    const { path } = copyWith('whole', "@('System.Int32', 'System.Int64', 'System.Decimal', 'System.Double', 'System.Numerics.BigInteger') -cnotcontains", "@('System.Int32', 'System.Int64') -cnotcontains")
+    const { text } = fixture.raw.find(c => c.name === 'a rect written with a zero fraction and with exponents')
+    assert.equal(psTakesRaw(text, path, 'fault').code, 2, 'the copy refuses it')
+    assert.ok('placement' in machine.readPlacement(rawOf(text)), 'readPlacement takes it')
+  })
+
+  test('#5: a whole number read as a fraction (no floor): 100.5 taken by the copy, refused by readPlacement', () => {
+    const { path } = copyWith('floor', ' -and [math]::Floor($number) -eq $number', '')
+    const { text } = fixture.raw.find(c => c.name === 'a rect with a half')
+    assert.equal(psTakesRaw(text, path, 'fault').code, 0, 'the copy takes it')
+    assert.ok('errors' in machine.readPlacement(rawOf(text)), 'readPlacement refuses it')
+  })
+
+  test('#5: a pos written 0.0 handed to wt as written: its line no longer the machine code\'s', () => {
+    const { path } = copyWith('format', "('{0},{1}' -f [long][double]$w.pos[0], [long][double]$w.pos[1])", "('{0},{1}' -f $w.pos[0], $w.pos[1])")
+    const { text } = fixture.raw.find(c => c.name === 'a pos and a size written 0.0, -0, 1.2e2 and 30.0')
+    const ran = psTakesRaw(text, path, 'fault')
+    assert.equal(ran.code, 0, ran.out)
+    assert.ok(!ran.out.includes(' --pos 0,0 '), `the copy writes the number as JSON gave it:\n${ran.out}`)
   })
 
   test("#5: -M left off a maximized window's first tab: its line no longer the machine code's", () => {
