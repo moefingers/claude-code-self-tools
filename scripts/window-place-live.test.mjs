@@ -57,11 +57,21 @@ const machine = await import(pathToFileURL(join(ROOT, 'shared', 'hooks', 'machin
 const isWindows = process.platform === 'win32'
 const PWSH = join(process.env.ProgramFiles ?? 'C:\\Program Files', 'PowerShell', '7', 'pwsh.exe')
 
-/** How many windows part 2 opens, and how long each may take at most (an estimate: the DLL's load, the place's compile, the wait, the close). */
+/** How many windows part 2 opens. */
 const LIVE_WINDOWS = 4
-const LIVE_EACH_MS = 25_000
-/** The window is ended by the test's starter if it hasn't ended by itself by then (it ends itself within about 12 s). */
+/** How long one window is expected to take, its shell's start to its end: an estimate, not a measurement (the DLL's load, the place's compile, the wait for its state, the close). */
+const WINDOW_EXPECTED_MS = 12_000
+/** The window is ended by the test's starter if it hasn't ended by itself by then. */
 const WINDOW_LIMIT_MS = 20_000
+/** How long the starter waits for the window's process to go once it has ended it. */
+const KILL_WAIT_MS = 5000
+/** How long the starter looks for the window to be gone once its process has ended, looking every GONE_POLL_MS. */
+const GONE_LIMIT_MS = 5000
+const GONE_POLL_MS = 100
+/** The starter's own cap, at which it is ended: the window's limit, the wait after a kill, the look for the window gone, and 5 s for its shell's start and the DLL's load (an estimate). */
+const STARTER_LIMIT_MS = WINDOW_LIMIT_MS + KILL_WAIT_MS + GONE_LIMIT_MS + 5000
+/** The cap on every other hidden run: the shipped shell rule's read, a compile, the monitors' read. */
+const HIDDEN_LIMIT_MS = 60_000
 /** How long a placed window waits for the state its test asks for, looking every POLL_MS. */
 const SETTLE_LIMIT_MS = 5000
 const POLL_MS = 50
@@ -74,7 +84,7 @@ const SIZE_TOLERANCE = 24
 const psq = text => `'${String(text).split("'").join("''")}'`
 
 /** Runs `script` in a hidden Windows PowerShell (or `shell`), on standard input under the plugins' own bootstrap (powershellCall: no command-line limit); its standard output. */
-function hidden(script, shell = WINDOWS_POWERSHELL, timeout = 60_000) {
+function hidden(script, shell = WINDOWS_POWERSHELL, timeout = HIDDEN_LIMIT_MS) {
   const call = machine.powershellCall(shell, script)
   const run = spawnSync(call.argv[0], call.argv.slice(1), { input: call.stdin, encoding: 'utf8', windowsHide: true, timeout })
   return { code: run.status, out: `${run.stdout ?? ''}`, err: `${run.stderr ?? ''}` }
@@ -151,7 +161,7 @@ const TEST_CS = [
   '[DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)] static extern bool CreateProcessW(string app, StringBuilder line, IntPtr processAttributes, IntPtr threadAttributes, bool inherit, uint flags, IntPtr environment, string folder, ref StartupInfo startup, out ProcessInfo process);',
   '[DllImport("kernel32.dll")] static extern uint WaitForSingleObject(IntPtr handle, uint ms);',
   '[DllImport("kernel32.dll")] static extern bool GetExitCodeProcess(IntPtr process, out uint code);',
-  '[DllImport("kernel32.dll")] static extern bool TerminateProcess(IntPtr process, uint code);',
+  '[DllImport("kernel32.dll", SetLastError = true)] static extern bool TerminateProcess(IntPtr process, uint code);',
   '[DllImport("kernel32.dll")] static extern bool CloseHandle(IntPtr handle);',
   'static long Low(IntPtr window) { return window.ToInt64() & 0xffffffffL; }',
   'static string ClassOf(IntPtr window) { StringBuilder name = new StringBuilder(256); return GetClassNameW(window, name, name.Capacity) > 0 ? name.ToString() : ""; }',
@@ -168,7 +178,11 @@ const TEST_CS = [
   'public static bool Alive(long low) { return IsWindow(new IntPtr(low)); }',
   'public static long[] TopWindows() { List<long> all = new List<long>(); EachWindow each = delegate(IntPtr window, IntPtr data) { all.Add(Low(window)); return true; }; EnumWindows(each, IntPtr.Zero); GC.KeepAlive(each); return all.ToArray(); }',
   'public static string Monitors() { IntPtr before = SetThreadDpiAwarenessContext(new IntPtr(-4)); try { List<string> all = new List<string>(); EachMonitor each = delegate(IntPtr monitor, IntPtr dc, ref Box box, IntPtr data) { MonitorInfo info = new MonitorInfo(); info.Size = (uint)Marshal.SizeOf(typeof(MonitorInfo)); if (GetMonitorInfoW(monitor, ref info)) all.Add(info.Whole.Left + "," + info.Whole.Top + "," + info.Whole.Right + "," + info.Whole.Bottom + "," + info.Work.Left + "," + info.Work.Top + "," + info.Work.Right + "," + info.Work.Bottom + "," + (info.Flags & 1)); return true; }; EnumDisplayMonitors(IntPtr.Zero, IntPtr.Zero, each, IntPtr.Zero); GC.KeepAlive(each); return string.Join(";", all.ToArray()); } finally { if (before != IntPtr.Zero) SetThreadDpiAwarenessContext(before); } }',
-  'public static string Start(string app, string line, uint limitMs) { StartupInfo startup = new StartupInfo(); startup.cb = Marshal.SizeOf(typeof(StartupInfo)); startup.dwFlags = 1; startup.wShowWindow = 4; ProcessInfo process; if (!CreateProcessW(app, new StringBuilder(line), IntPtr.Zero, IntPtr.Zero, false, 0x10, IntPtr.Zero, null, ref startup, out process)) return "not started, error " + Marshal.GetLastWin32Error(); try { bool ended = WaitForSingleObject(process.hProcess, limitMs) == 0; if (!ended) { TerminateProcess(process.hProcess, 1); WaitForSingleObject(process.hProcess, 5000); } uint code; GetExitCodeProcess(process.hProcess, out code); return (ended ? "ended " : "ended by the test ") + code; } finally { CloseHandle(process.hThread); CloseHandle(process.hProcess); } }',
+  'static string ExitOf(IntPtr process) { uint code; return GetExitCodeProcess(process, out code) ? "" + code : "unknown"; }',
+  // Its answer: "ended <exit code>" for a window that ended by itself within limitMs; "ended by the test <exit code>"
+  // only when the kill was made and the wait after it saw the process end; "still running" when that wait timed out
+  // (WAIT_TIMEOUT, 258), with the kill's error when it failed.
+  'public static string Start(string app, string line, uint limitMs, uint killWaitMs) { StartupInfo startup = new StartupInfo(); startup.cb = Marshal.SizeOf(typeof(StartupInfo)); startup.dwFlags = 1; startup.wShowWindow = 4; ProcessInfo process; if (!CreateProcessW(app, new StringBuilder(line), IntPtr.Zero, IntPtr.Zero, false, 0x10, IntPtr.Zero, null, ref startup, out process)) return "not started, error " + Marshal.GetLastWin32Error(); try { if (WaitForSingleObject(process.hProcess, limitMs) == 0) return "ended " + ExitOf(process.hProcess); bool killed = TerminateProcess(process.hProcess, 1); string failed = killed ? "" : ", which failed (error " + Marshal.GetLastWin32Error() + ")"; uint after = WaitForSingleObject(process.hProcess, killWaitMs); if (after == 0) return killed ? "ended by the test " + ExitOf(process.hProcess) : "not ended in time, then gone after the test\'s kill" + failed + ", exit code " + ExitOf(process.hProcess); return (after == 258 ? "still running " + killWaitMs + " ms after the test\'s kill" : "not seen to end after the test\'s kill (its wait failed)") + failed; } finally { CloseHandle(process.hThread); CloseHandle(process.hProcess); } }',
   '}',
 ].join(' ')
 
@@ -218,7 +232,7 @@ function openWindow(plan) {
     `$opened = (@(${T}::OwnWork()) -join ",")`,
     '$chosen = $null',
     ...variants.flatMap(({ work: w, place }) => [
-      `if ($null -eq $chosen -and $opened -ne '${w.join(',')}') {`,
+      `if ($null -eq $chosen -and $opened -ne '' -and $opened -ne '${w.join(',')}') {`,
       `$chosen = '${w.join(',')}'`,
       '$result.monitorChoice = "shown: another monitor than the one it opened on"',
       // The shipped lines, byte for byte, unindented.
@@ -228,6 +242,8 @@ function openWindow(plan) {
     'if ($null -eq $chosen) {',
     `$chosen = '${variants[0].work.join(',')}'`,
     '$result.monitorChoice = "not shown: it opened on the one monitor there is"',
+    // The monitor it opened on could not be read (OwnWork answered nothing): which one it opened on is not known.
+    `if ($opened -eq '') { $result.monitorChoice = "unknown: the monitor it opened on could not be read" }`,
     ...machine.windowPlaceLines(variants[0].place),
     '}',
     '$result.chosenWork = $chosen',
@@ -296,12 +312,12 @@ function openWindow(plan) {
     `Add-Type -ErrorAction Stop -Path ${psq(dll)}`,
     `[IO.File]::WriteAllText(${psq(files.existing)}, (ConvertTo-Json -Compress -InputObject @(${T}::TopWindows())))`,
     `$frontBefore = ${T}::Foreground()`,
-    `$started = ${T}::Start(${psq(LIVE.shell)}, ${psq(line)}, [uint32]${WINDOW_LIMIT_MS})`,
+    `$started = ${T}::Start(${psq(LIVE.shell)}, ${psq(line)}, [uint32]${WINDOW_LIMIT_MS}, [uint32]${KILL_WAIT_MS})`,
     '$gone = $null',
-    `if (Test-Path -LiteralPath ${psq(files.result)}) { $own = [long](([IO.File]::ReadAllText(${psq(files.result)}) | ConvertFrom-Json).own); if ($own -ne 0) { $gone = $false; for ($look = 0; $look -lt 50; $look++) { if (-not ${T}::Alive($own)) { $gone = $true; break }; Start-Sleep -Milliseconds 100 } } }`,
+    `if (Test-Path -LiteralPath ${psq(files.result)}) { $own = [long](([IO.File]::ReadAllText(${psq(files.result)}) | ConvertFrom-Json).own); if ($own -ne 0) { $gone = $false; for ($look = 0; $look -lt ${GONE_LIMIT_MS / GONE_POLL_MS}; $look++) { if (-not ${T}::Alive($own)) { $gone = $true; break }; Start-Sleep -Milliseconds ${GONE_POLL_MS} } } }`,
     '[Console]::Out.WriteLine((ConvertTo-Json -Compress -InputObject ([ordered]@{ frontBefore = $frontBefore; started = $started; gone = $gone })))',
   ].join('\r\n')
-  const ran = hidden(starter, LIVE.shell, LIVE_EACH_MS + 10_000)
+  const ran = hidden(starter, LIVE.shell, STARTER_LIMIT_MS)
   assert.equal(ran.code, 0, `${ran.out}${ran.err}`)
   const record = JSON.parse(ran.out.trim().split(/\r?\n/).at(-1))
   assert.ok(existsSync(files.result), `the window wrote nothing (${record.started})`)
@@ -323,8 +339,8 @@ function sayFacts(t, { result, record }) {
 function settled(t, opened) {
   const { result, record } = opened
   assert.equal(result.error, undefined, seen(opened))
-  assert.match(record.started, /^ended /, `the window ended: ${seen(opened)}`)
-  assert.ok(!record.started.startsWith('ended by the test'), `the window did not end by itself within ${WINDOW_LIMIT_MS / 1000} s, so the test ended it: ${seen(opened)}`)
+  // Start's answer is "ended <exit code>" only for a window that ended by itself; "ended by the test", "still running" and the rest say otherwise.
+  assert.match(record.started, /^ended (\d+|unknown)$/, `the window ended by itself within ${WINDOW_LIMIT_MS / 1000} s (one the test ended says so, and one still running after the test's kill is left open, to close by hand): ${seen(opened)}`)
   // A window that was open before (not this test's) is never asked to be gone, and never placed.
   if (result.skipped !== undefined) {
     if (result.existingWindow === true && typeof result.kind === 'string' && result.kind.startsWith('PseudoConsoleWindow')) {
@@ -349,7 +365,7 @@ describe('the plain window places itself, live (#5)', { skip: liveSkip, concurre
   let screens
   before(() => {
     assert.ok(LIVE?.shell !== undefined, LIVE?.why ?? 'the shipped shell rule was not read')
-    process.stdout.write(`window-place-live: opens ${LIVE_WINDOWS} windows, one at a time, each in ${LIVE.shell} (the shell a launch's window would get here), each running only this test's script, which ends by itself (the test ends it at ${WINDOW_LIMIT_MS / 1000} s); about ${LIVE_EACH_MS / 1000} s each at most, ${(LIVE_WINDOWS * LIVE_EACH_MS) / 1000} s in all.\n`)
+    process.stdout.write(`window-place-live: opens ${LIVE_WINDOWS} windows, one at a time, each in ${LIVE.shell} (the shell a launch's window would get here), each running only this test's script, which ends by itself (the test ends it at ${WINDOW_LIMIT_MS / 1000} s). Each is expected to take about ${WINDOW_EXPECTED_MS / 1000} s (an estimate); the most one can take is ${STARTER_LIMIT_MS / 1000} s, when its starter is ended, so ${(LIVE_WINDOWS * STARTER_LIMIT_MS) / 1000} s for the ${LIVE_WINDOWS}. Before them, the test's C# is compiled and the monitors are read, at most ${HIDDEN_LIMIT_MS / 1000} s each.\n`)
     work = mkdtempSync(join(tmpdir(), 'window-place-'))
     dll = join(work, 'place-test.dll')
     const compiled = hidden(`Add-Type -ErrorAction Stop -TypeDefinition ${psq(TEST_CS)} -OutputAssembly ${psq(dll)}`, LIVE.shell)
@@ -395,7 +411,10 @@ describe('the plain window places itself, live (#5)', { skip: liveSkip, concurre
     assert.notEqual(result.settledMs, null, `maximized on that monitor within ${SETTLE_LIMIT_MS} ms: ${seen(opened)}`)
     assert.equal(result.zoomed, true, `maximized: ${seen(opened)}`)
     assert.deepEqual(result.work, chosen, `on the monitor that holds the rectangle: ${seen(opened)}`)
-    if (screens.length > 1) assert.notDeepEqual(chosen, result.workBefore, `another monitor than the one it opened on: ${seen(opened)}`)
+    if (screens.length > 1) {
+      assert.match(String(result.monitorChoice), /^shown: /, `the monitor it opened on was read, so the choice of another is shown: ${seen(opened)}`)
+      assert.notDeepEqual(chosen, result.workBefore, `another monitor than the one it opened on: ${seen(opened)}`)
+    }
     assert.ok(covers(result.rectAfter, chosen), `its frame covers that monitor's work area: ${seen(opened)}`)
   })
 
