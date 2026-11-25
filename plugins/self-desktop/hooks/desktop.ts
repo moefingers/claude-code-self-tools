@@ -914,8 +914,11 @@ export type Target = { readonly own: number } | { readonly window: number }
 /** A process id Windows hands out: a whole number from 1 to 2^32 - 1. */
 export const isProcessId = (value: unknown): value is number => typeof value === 'number' && Number.isInteger(value) && value >= 1 && value <= 0xffffffff
 
-/** A window handle as a script takes it: a whole number from 1 up. */
-const isHandle = (value: unknown): value is number => typeof value === 'number' && Number.isSafeInteger(value) && value >= 1
+/**
+ * A window handle as a script takes it: a whole number from 1 to 2^32 - 1. 64-bit Windows uses 32-bit handles, only
+ * their lower 32 bits significant, so a larger number is no handle Windows hands out, and builds no script.
+ */
+const isHandle = (value: unknown): value is number => typeof value === 'number' && Number.isInteger(value) && value >= 1 && value <= 0xffffffff
 
 /** A capture's file name: one this plugin makes, from a fresh UUID. */
 export const CAPTURE_NAME = /^capture-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.png$/
