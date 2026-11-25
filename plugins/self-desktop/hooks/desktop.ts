@@ -1147,12 +1147,14 @@ function ownOf(raw: unknown): OwnWindow | undefined {
 
 /**
  * The list as the plugin takes it. The title rule is applied again here: a title stays only on a Windows Terminal
- * window and on this session's own, whatever the script said.
+ * window and on this session's own, whatever the script said. `lookedFor` says whether the plugin gave the script a
+ * process to find this session's own window by: when it gave none, no window is this session's own, whatever the
+ * script said, so none gets a title for being one.
  */
-export function parseListing(stdout: string): Listing | string {
+export function parseListing(stdout: string, lookedFor: boolean): Listing | string {
   const line = answerOf(stdout)
   if (line === undefined || !Array.isArray(line.monitors) || !Array.isArray(line.windows)) return "the list's answer isn't the one its script writes"
-  const own = line.own === null ? undefined : ownOf(line.own)
+  const own = !lookedFor || line.own === null ? undefined : ownOf(line.own)
   const ownWindow = own?.found === true ? own.window : undefined
   const monitors: Monitor[] = []
   for (const m of line.monitors) {

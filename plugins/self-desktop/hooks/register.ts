@@ -236,7 +236,8 @@ async function listWindows($: EngineInterface): Promise<string> {
   if (typeof m === 'string') return `Windows: not listed: ${m}.`
   const ran = await runScript($, m.powershell, listScript(m.processId), LIST_MS)
   if ('failed' in ran) return `Windows: not listed: ${ran.failed}.`
-  const listing = parseListing(ran.stdout)
+  // With no process named, the script looked for no window of this session's own, and none is taken as one.
+  const listing = parseListing(ran.stdout, m.processId !== undefined)
   return typeof listing === 'string' ? `Windows: not listed: ${listing}.` : listAnswer(listing)
 }
 

@@ -390,7 +390,11 @@ test('a process named in another shape than a whole number: read and capture run
   expect(scripts).toEqual([listScript(undefined)])
   expect(scripts[0]).toContain('[SelfDesktop]::List([uint32]0)')
   expect(scripts[0]).not.toContain('Remove-Item C:')
+  // The fixture's answer still names an own window, as a script that broke the rule would: the plugin, which named no
+  // process, takes no window as this session's own, so none gets a title for being one.
   expect(listed).toContain("This session's own window: not looked for: Claude Code didn't name its own process (CLAUDE_PID, given from Claude Code 2.1.214 on).")
+  expect(listed).not.toContain('"own":true')
+  expect(listed).not.toContain(PRIVATE_TITLE)
 })
 
 test('no process named by Claude Code (a version before 2.1.214), or one of any other shape: zero, negative, too large, padded, hex, empty', ON, async ($, on) => {

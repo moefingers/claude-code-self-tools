@@ -234,7 +234,8 @@ test('the list finds the test window with its rectangle and its monitor, and giv
     assert.ok(row.frame[0] >= row.rect[0] && row.frame[1] >= row.rect[1] && row.frame[2] <= row.rect[2] && row.frame[3] <= row.rect[3])
     // No title: it is neither a Windows Terminal window nor this session's own; and nothing of its content.
     assert.equal('title' in row, false)
-    const answer = desktop.listAnswer(desktop.parseListing(JSON.stringify(listing)))
+    // The list ran with no process named (listScript(undefined)), as the plugin tells parseListing.
+    const answer = desktop.listAnswer(desktop.parseListing(JSON.stringify(listing), false))
     for (const shownText of [look.title, look.textName, look.textValue, look.buttonName]) assert.ok(!answer.includes(shownText), `the list doesn't hold ${shownText}`)
   })
 })
