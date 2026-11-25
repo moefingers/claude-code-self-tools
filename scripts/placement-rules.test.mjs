@@ -110,10 +110,10 @@ function outerOf(script) {
  * The reviewed list (#5): every function the window's own C# (PLACE_CS) imports, as it imports it, and no other.
  * Two of them act on a window, SetWindowPos and ShowWindowAsync, each held below to the one call reviewed; the
  * rest read (and SetThreadDpiAwarenessContext sets the thread's own DPI awareness, put back as it was).
- * FindWindowExW is the one listing of windows: it lists pseudoconsole windows by class to count those its own window
- * owns, reads only their owner, acts on none, and is there to refuse, never to choose a target; held below to its one
- * call (a null parent, the class as that one literal, no title). An edit that adds, drops or changes one fails here
- * until it is reviewed and this list changed with it.
+ * EnumWindows is the one listing of windows: it lists the top-level windows once, reads each one's class name, reads
+ * the owner of those that are pseudoconsole windows, acts on none, and is there to refuse, never to choose a target
+ * (no title is read); held below to its one declaration, its one call and its callback's exact text. An edit that
+ * adds, drops or changes one fails here until it is reviewed and this list changed with it.
  */
 const REVIEWED_IMPORTS = [
   '[DllImport("kernel32.dll")] static extern IntPtr GetConsoleWindow();',
@@ -126,14 +126,15 @@ const REVIEWED_IMPORTS = [
   '[DllImport("user32.dll")] static extern bool GetMonitorInfoW(IntPtr monitor, ref MonitorInfo info);',
   '[DllImport("user32.dll", SetLastError = true)] static extern bool SetWindowPos(IntPtr window, IntPtr after, int x, int y, int width, int height, uint flags);',
   '[DllImport("user32.dll")] static extern bool ShowWindowAsync(IntPtr window, int show);',
-  '[DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern IntPtr FindWindowExW(IntPtr parent, IntPtr after, string className, string title);',
+  '[DllImport("user32.dll")] static extern bool EnumWindows(EachWindow each, IntPtr data);',
 ]
 
 /**
- * What the window's C# never names: nothing that finds a window by its title, lists windows any other way than
- * FindWindowExW's one reviewed call, raises, focuses, closes or types into a window, nor reads a value from outside.
+ * What the window's C# never names: nothing that finds a window (any FindWindow name), lists windows any other way
+ * than EnumWindows's one reviewed call, raises, focuses, closes or types into a window, reads a window's title, nor
+ * reads a value from outside. A GetWindow loop is held off below: every GetWindow is GW_OWNER.
  */
-const FORBIDDEN_IN_PLACE = ['FindWindow(', 'FindWindowA', 'FindWindowW', 'FindWindowExA', 'EnumWindows', 'EnumChildWindows', 'EnumThreadWindows', 'GetTopWindow', 'GetDesktopWindow', 'WindowFromPoint', 'GetForegroundWindow', 'SetForegroundWindow', 'BringWindowToTop', 'SetActiveWindow', 'SetFocus', 'AttachThreadInput', 'SendMessage', 'PostMessage', 'MoveWindow', 'SetWindowPlacement', 'ShowWindow(', 'DestroyWindow', 'CloseWindow', 'SetWindowLong', 'SetParent', 'SendInput', 'keybd_event', 'mouse_event', 'Environment', 'System.IO', 'Process', 'Registry', 'Console.']
+const FORBIDDEN_IN_PLACE = ['FindWindow', 'EnumChildWindows', 'EnumDesktopWindows', 'GetWindowText', 'InternalGetWindowText', 'EnumThreadWindows', 'GetTopWindow', 'GetDesktopWindow', 'WindowFromPoint', 'GetForegroundWindow', 'SetForegroundWindow', 'BringWindowToTop', 'SetActiveWindow', 'SetFocus', 'AttachThreadInput', 'SendMessage', 'PostMessage', 'MoveWindow', 'SetWindowPlacement', 'ShowWindow(', 'DestroyWindow', 'CloseWindow', 'SetWindowLong', 'SetParent', 'SendInput', 'keybd_event', 'mouse_event', 'Environment', 'System.IO', 'Process', 'Registry', 'Console.']
 
 /** Fixed monitors for the clamp: a left-hand one at a negative origin, the primary, and a right-hand one with its taskbar along the top. Made up. */
 const LEFT = { monitor: [-1920, 0, 0, 1080], work: [-1920, 0, 0, 1040] }
@@ -943,14 +944,17 @@ const CHECKS = {
     const aware = cs.indexOf('IntPtr before = SetThreadDpiAwarenessContext(new IntPtr(-4)); if (before == IntPtr.Zero) return ')
     assert.ok(aware > 0 && aware < cs.indexOf('MonitorFromRect(ref asked'), 'per-monitor DPI awareness before any coordinate is read, and nothing placed without it')
     assert.ok(cs.includes('} finally { SetThreadDpiAwarenessContext(before); }'), "the thread's awareness put back")
-    // Its own window only when that window is its own alone (round 2, Fix A): under a pseudoconsole, the consoles its
-    // window owns are counted, and anything but exactly one, its own, leaves it where it is, before any acting call.
-    assert.deepEqual(cs.match(/\bFindWindowExW\([^)]*\)/g), ['FindWindowExW(IntPtr parent, IntPtr after, string className, string title)', 'FindWindowExW(IntPtr.Zero, after, "PseudoConsoleWindow", null)'], 'one call: a null parent, the class as that one literal, no title')
-    assert.ok(cs.includes(`public static int Hosted(IntPtr window, IntPtr console) { int count = 0; bool seen = false; IntPtr after = IntPtr.Zero; for (int look = 0; look < ${m.PLACE_HOSTED_BOUND}; look++) { after = FindWindowExW(IntPtr.Zero, after, "PseudoConsoleWindow", null); if (after == IntPtr.Zero) return seen ? count : -1; if (Same(GetWindow(after, 4), window)) { count++; if (Same(after, console)) seen = true; } } return -1; }`), 'Hosted: a bounded walk that reads each one\'s owner alone, counts those its window owns, and is -1 unless its own console is among them')
+    // Its own window only when that window is its own alone (round 2, Fix A; round 3, by EnumWindows): under a
+    // pseudoconsole, the consoles its window owns are counted, and anything but exactly one, its own, leaves it where
+    // it is, before any acting call. The listing is EnumWindows, once: its page calls it "more reliable than calling the
+    // GetWindow function in a loop".
+    assert.ok(cs.includes('public delegate bool EachWindow(IntPtr found, IntPtr data);'), "the callback's delegate type")
+    assert.ok(cs.includes('public static int Hosted(IntPtr window, IntPtr console) { int count = 0; bool seen = false; EachWindow each = delegate(IntPtr found, IntPtr data) { if (ClassOf(found) == "PseudoConsoleWindow" && Same(GetWindow(found, 4), window)) { count++; if (Same(found, console)) seen = true; } return true; }; bool listed = EnumWindows(each, IntPtr.Zero); GC.KeepAlive(each); if (!listed) return -1; return seen ? count : -1; }'), "Hosted and its callback, as reviewed: each top-level window's class read, the owner read only of a pseudoconsole window, counted when it is this window, -1 unless its own console is among them or when the listing fails; the delegate held alive across the call")
     assert.ok(cs.includes('static bool Same(IntPtr a, IntPtr b) { return (a.ToInt64() & 0xffffffffL) == (b.ToInt64() & 0xffffffffL); }'), 'handles compared by their low 32 bits')
-    assert.ok(m.PLACE_HOSTED_BOUND >= 256 && Number.isInteger(m.PLACE_HOSTED_BOUND), 'a bound, and a large one')
+    assert.deepEqual(cs.match(/\bEnumWindows\([^)]*\)/g), ['EnumWindows(EachWindow each, IntPtr data)', 'EnumWindows(each, IntPtr.Zero)'], 'EnumWindows declared once and called once, by Hosted')
+    assert.deepEqual(cs.match(/\bGetWindow\([^)]*\)/g), ['GetWindow(IntPtr window, uint relation)', 'GetWindow(found, 4)', 'GetWindow(console, 4)'], 'every GetWindow is GW_OWNER: no GetWindow walk')
     assert.equal(cs.split('Hosted(').length - 1, 2, 'Hosted declared once and called once, by Place')
-    assert.equal(cs.split('FindWindowExW(').length - 1, 2, 'FindWindowExW imported once and called once, by Hosted')
+    assert.equal(cs.split('delegate(').length - 1, 1, 'one callback')
     const guard = cs.indexOf('if (own == IntPtr.Zero || ClassOf(own) != "CASCADIA_HOSTING_WINDOW_CLASS") return "its console is a pseudoconsole that no Windows Terminal window owns"; int hosted = Hosted(own, console); if (hosted != 1) return "its Windows Terminal window holds other tabs or panes, or its own console could not be counted among them (" + hosted + "), so it is left where it is"; }')
     assert.ok(guard > 0, 'counted right after its owner is found, in the pseudoconsole branch, and refused on anything but 1')
     for (const acting of ['SetThreadDpiAwarenessContext(new IntPtr(-4))', 'SetWindowPos(own', 'ShowWindowAsync(own']) assert.ok(cs.indexOf(acting) > guard, `the count comes before ${acting}`)
@@ -1157,14 +1161,23 @@ const FAULTS = [
   ['#5: the plain window read as a named one', 'plainLegs', "where.window === true || !('name' in where.window)", 'where.window === true'],
   ['#5 Fix A: the window moved without its consoles counted (the guard removed)', 'actingCalls', ' int hosted = Hosted(own, console); if (hosted != 1) return "its Windows Terminal window holds other tabs or panes, or its own console could not be counted among them (" + hosted + "), so it is left where it is";', ''],
   ['#5 Fix A: the count compared to another number', 'actingCalls', 'if (hosted != 1) return "its Windows Terminal window', 'if (hosted < 1) return "its Windows Terminal window'],
-  ["#5 Fix A: every pseudoconsole counted, whoever owns it (the owner comparison dropped)", 'actingCalls', 'if (Same(GetWindow(after, 4), window)) {', 'if (true) {'],
-  ['#5 Fix A: its own console not looked for among them', 'actingCalls', 'if (Same(after, console)) seen = true;', 'seen = true;'],
-  ['#5 Fix A: another class walked', 'actingCalls', 'FindWindowExW(IntPtr.Zero, after, "PseudoConsoleWindow", null)', 'FindWindowExW(IntPtr.Zero, after, "ConsoleWindowClass", null)'],
-  ['#5 Fix A: a variable passed as the class', 'actingCalls', 'FindWindowExW(IntPtr.Zero, after, "PseudoConsoleWindow", null)', 'FindWindowExW(IntPtr.Zero, after, kind, null)'],
-  ['#5 Fix A: a window found by its title', 'actingCalls', 'FindWindowExW(IntPtr.Zero, after, "PseudoConsoleWindow", null)', 'FindWindowExW(IntPtr.Zero, after, "PseudoConsoleWindow", "claude")'],
-  ["#5 Fix A: another window's children walked", 'actingCalls', 'FindWindowExW(IntPtr.Zero, after, "PseudoConsoleWindow", null)', 'FindWindowExW(window, after, "PseudoConsoleWindow", null)'],
-  ['#5 Fix A: a walk with no bound', 'actingCalls', 'look < ${PLACE_HOSTED_BOUND}; look++', 'look >= 0; look++'],
+  ['#5 Fix A: every top-level window counted (the class comparison dropped)', 'actingCalls', 'if (ClassOf(found) == "PseudoConsoleWindow" && Same(GetWindow(found, 4), window)) {', 'if (Same(GetWindow(found, 4), window)) {'],
+  ['#5 Fix A: another class counted', 'actingCalls', 'ClassOf(found) == "PseudoConsoleWindow" &&', 'ClassOf(found) == "ConsoleWindowClass" &&'],
+  ['#5 Fix A: a variable taken as the class', 'actingCalls', 'ClassOf(found) == "PseudoConsoleWindow" &&', 'ClassOf(found) == kind &&'],
+  ['#5 Fix A: every pseudoconsole counted, whoever owns it (the owner comparison dropped)', 'actingCalls', ' && Same(GetWindow(found, 4), window)) {', ') {'],
+  ['#5 Fix A: its own console not looked for among them', 'actingCalls', 'if (Same(found, console)) seen = true;', 'seen = true;'],
+  ['#5 Fix A: a failed listing taken as a count', 'actingCalls', ' if (!listed) return -1;', ''],
+  ['#5 Fix A: the listing stopped at the first window (the callback answering false)', 'actingCalls', ' seen = true; } return true; };', ' seen = true; } return false; };'],
+  ['#5 Fix A: the delegate let go before the listing ends', 'actingCalls', ' GC.KeepAlive(each);', ''],
   ['#5 Fix A: handles compared in full, not by their low 32 bits', 'actingCalls', 'return (a.ToInt64() & 0xffffffffL) == (b.ToInt64() & 0xffffffffL);', 'return a == b;'],
+  [
+    '#5 Fix A: a FindWindow walk put back',
+    'actingCalls',
+    "  '[DllImport(\"user32.dll\")] static extern bool EnumWindows(EachWindow each, IntPtr data);',\n",
+    "  '[DllImport(\"user32.dll\")] static extern bool EnumWindows(EachWindow each, IntPtr data);',\n  '[DllImport(\"user32.dll\", CharSet = CharSet.Unicode)] static extern IntPtr FindWindowExW(IntPtr parent, IntPtr after, string className, string title);',\n",
+    [['bool listed = EnumWindows(each, IntPtr.Zero);', 'IntPtr after = IntPtr.Zero; while ((after = FindWindowExW(IntPtr.Zero, after, "PseudoConsoleWindow", null)) != IntPtr.Zero) each(after, IntPtr.Zero); bool listed = true;']],
+  ],
+  ['#5 Fix A: a GetWindow loop put back', 'actingCalls', 'bool listed = EnumWindows(each, IntPtr.Zero);', 'for (IntPtr next = GetWindow(console, 0); next != IntPtr.Zero; next = GetWindow(next, 2)) each(next, IntPtr.Zero); bool listed = true;'],
   [
     '#5 Fix A: the count moved after an acting call',
     'actingCalls',

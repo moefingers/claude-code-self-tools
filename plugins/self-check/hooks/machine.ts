@@ -4494,9 +4494,6 @@ export function clampToMonitors(rect: PixelRect, monitors: readonly MonitorBox[]
 /** SetWindowPos's flags for the place: SWP_NOZORDER (0x0004) | SWP_NOACTIVATE (0x0010) | SWP_NOOWNERZORDER (0x0200) | SWP_ASYNCWINDOWPOS (0x4000). */
 export const PLACE_SWP_FLAGS = 0x4214
 
-/** How many pseudoconsole windows PLACE_CS's Hosted looks at, at most: past it, the count is unknown (-1), and nothing is placed. An estimate, far above the consoles of a machine. */
-export const PLACE_HOSTED_BOUND = 4096
-
 /**
  * The C# the window compiles (Add-Type) to place its own window, one line, of C# 5 (Windows PowerShell 5.1's
  * compiler; PowerShell 7's takes it too). `Place` finds the window from the process's own console: GetConsoleWindow,
@@ -4516,18 +4513,20 @@ export const PLACE_HOSTED_BOUND = 4096
  * monitor and restores to the rect. ShowWindow has no maximize that doesn't activate (its page's table), so a maximized
  * window is activated, as a new window is when it opens. Answers "placed", or why not, as one line of text.
  * It takes no handle, name, title or process id from outside. Its one listing of windows is `Hosted`, a pure read:
- * the number of pseudoconsole windows `window` owns, or -1 when `console` is not among them or the walk passes
- * PLACE_HOSTED_BOUND. It lists pseudoconsole windows by class (FindWindowExW from a null parent, the class as its one
- * literal, no title) to count those its own window owns, reads only their owner (GetWindow(GW_OWNER)), acts on none,
- * and is there to refuse, never to choose a target. Handles are compared by their low 32 bits (`Same`), the part of a
- * window handle that is significant (Programming Guide for 64-bit Windows, "Interprocess communication").
- * FindWindowExW: https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-findwindowexw ("If hwndParent
- * is NULL, the function uses the desktop window as the parent window"; with both handles NULL it "searches all
- * top-level and message-only windows"; the class is matched without regard to case). From memory alone: that a
- * pseudoconsole window is a top-level window (a child of the desktop, not message-only) that this search finds, and
- * that every pane of Windows Terminal has one, owned by its window (#5 measured the owner relation alone). If the
- * search finds none, the count is -1 and nothing is placed, so a wrong memory there fails closed; the guarded live run
- * is what shows the count is 1 in a fresh window. Not measured either: whether the owner is set already when the
+ * the number of pseudoconsole windows `window` owns, or -1 when `console` is not among them or the listing fails. It
+ * lists the top-level windows once (EnumWindows, its callback held alive across the call), reads each one's class
+ * name (GetClassNameW), reads the owner (GetWindow(GW_OWNER)) of those that are pseudoconsole windows, acts on none,
+ * and is there to refuse, never to choose a target. No title is read. Handles are compared by their low 32 bits
+ * (`Same`), the part of a window handle that is significant (Programming Guide for 64-bit Windows, "Interprocess
+ * communication"). EnumWindows: https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-enumwindows,
+ * which says: "This function is more reliable than calling the GetWindow function in a loop. An application that
+ * calls GetWindow to perform this task risks being caught in an infinite loop or referencing a handle to a window
+ * that has been destroyed." It also says that it "does not enumerate child windows", and that "For Windows 8 and later,
+ * EnumWindows enumerates only top-level windows of desktop apps". From memory alone: the class name PseudoConsoleWindow;
+ * that a pseudoconsole window is a top-level window of a desktop app (the console host), and so listed; and that every
+ * pane of Windows Terminal has one, owned by its window (#5 measured the owner relation alone). A wrong memory there
+ * lists none of them: the count is -1, and nothing is placed. The guarded live run is what shows the count is 1 in a
+ * fresh window. Not measured either: whether the owner is set already when the
  * window's first lines run (Place reads it after Add-Type's compile; one that is not set yet leaves the window unplaced,
  * said in its one line, with no wait or retry).
  * Pages: GetConsoleWindow https://learn.microsoft.com/en-us/windows/console/getconsolewindow (in a pseudoconsole, "a
@@ -4560,10 +4559,11 @@ export const PLACE_CS = [
   '[DllImport("user32.dll")] static extern bool GetMonitorInfoW(IntPtr monitor, ref MonitorInfo info);',
   '[DllImport("user32.dll", SetLastError = true)] static extern bool SetWindowPos(IntPtr window, IntPtr after, int x, int y, int width, int height, uint flags);',
   '[DllImport("user32.dll")] static extern bool ShowWindowAsync(IntPtr window, int show);',
-  '[DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern IntPtr FindWindowExW(IntPtr parent, IntPtr after, string className, string title);',
+  'public delegate bool EachWindow(IntPtr found, IntPtr data);',
+  '[DllImport("user32.dll")] static extern bool EnumWindows(EachWindow each, IntPtr data);',
   'static string ClassOf(IntPtr window) { StringBuilder name = new StringBuilder(256); return GetClassNameW(window, name, name.Capacity) > 0 ? name.ToString() : ""; }',
   'static bool Same(IntPtr a, IntPtr b) { return (a.ToInt64() & 0xffffffffL) == (b.ToInt64() & 0xffffffffL); }',
-  `public static int Hosted(IntPtr window, IntPtr console) { int count = 0; bool seen = false; IntPtr after = IntPtr.Zero; for (int look = 0; look < ${PLACE_HOSTED_BOUND}; look++) { after = FindWindowExW(IntPtr.Zero, after, "PseudoConsoleWindow", null); if (after == IntPtr.Zero) return seen ? count : -1; if (Same(GetWindow(after, 4), window)) { count++; if (Same(after, console)) seen = true; } } return -1; }`,
+  'public static int Hosted(IntPtr window, IntPtr console) { int count = 0; bool seen = false; EachWindow each = delegate(IntPtr found, IntPtr data) { if (ClassOf(found) == "PseudoConsoleWindow" && Same(GetWindow(found, 4), window)) { count++; if (Same(found, console)) seen = true; } return true; }; bool listed = EnumWindows(each, IntPtr.Zero); GC.KeepAlive(each); if (!listed) return -1; return seen ? count : -1; }',
   'public static int[] Clamp(int x, int y, int width, int height, int left, int top, int right, int bottom) { int w = Math.Min(width, right - left); int h = Math.Min(height, bottom - top); return new int[] { Math.Max(left, Math.Min(x, right - w)), Math.Max(top, Math.Min(y, bottom - h)), w, h }; }',
   'public static string Place(int x, int y, int width, int height, bool hasRect, bool maximized) {',
   'IntPtr console = GetConsoleWindow();',

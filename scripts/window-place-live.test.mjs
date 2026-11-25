@@ -13,10 +13,10 @@
 //    the script finds that was open before it started (a terminal that put it in a tab of an existing window) is
 //    left alone, nothing placed, and the test says so and skips. That guard is the test's own, and a second one:
 //    the shipped code itself places a Windows Terminal window only when it holds this console alone (PLACE_CS's
-//    Hosted, which lists pseudoconsole windows by class to count those its own window owns, reads only their
-//    owner, acts on none, and is there to refuse, never to choose a target). Each window records that count
-//    (1 in a fresh window, which this run is what shows). The test's own listing (TopWindows, EnumWindows) is in
-//    its starter alone, never in the shipped code.
+//    Hosted, which lists the top-level windows once, reads each one's class name, reads the owner of those that
+//    are pseudoconsole windows, acts on none, and is there to refuse, never to choose a target; no title is read).
+//    Each window records that count (1 in a fresh window, which this run is what shows). The test's own listing
+//    (TopWindows, to know which windows were open before) is in its starter, and serves the test alone.
 //    Focus: the window is asked to open without being activated (STARTUPINFO's wShowWindow = SW_SHOWNOACTIVATE,
 //    with STARTF_USESHOWWINDOW). Whether the default terminal honours that is not known; the test records the
 //    window in front before the window starts, as it begins, and after its place, as a reported fact, never a
