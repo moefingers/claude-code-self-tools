@@ -2,12 +2,14 @@
 // `node --test "scripts/*.test.mjs"`.
 // - Nothing acts: no file of the plugin's hooks names a call that makes input, reads keys or the clipboard, brings a
 //   window forward, moves, sizes, shows, hides or closes one, reads the screen rather than one window, writes to a
-//   console or sets its state (in PowerShell or in C#), changes a control, changes the system, or starts or ends a
-//   process. Each kind of fault, planted on a line of its own in a copy of the helper, is found on that line, and the
-//   unplanted text has none. Comments count: a shipped file doesn't name one even to say it isn't used.
+//   console or sets its state (in PowerShell or in C#, by a plain or a compound assignment), changes a control, changes
+//   the system, or starts or ends a process. Each kind of fault, planted on a line of its own in a copy of the helper,
+//   is found on that line, and the unplanted text has none. Comments count: a shipped file doesn't name one even to say
+//   it isn't used.
 // - The helper's every use is held to a reviewed count: each static extern declaration (however its attribute is
-//   written, and its call sites), each qualified .NET call, each type it builds. A new one, or another use of one
-//   listed, fails here until it is reviewed. Every CreateFileW call passes GENERIC_READ, by name, as its access.
+//   written, and its call sites), each qualified .NET call, each type it builds, each using directive (so a type under
+//   another name fails). A new one, or another use of one listed, fails here until it is reviewed. Every CreateFileW
+//   call passes GENERIC_READ, by name, as its access.
 // - The serving at tool.run refuses a subagent and the setting off again, in each of the three handlers.
 // - Its few lines of PowerShell plumbing are the shared machine code's, so a fix there is seen here.
 // - On Windows: every script it builds parses in Windows PowerShell with no error; the helper compiles under Add-Type;
@@ -46,7 +48,9 @@ const ACTS = [
   ['a console handle opened for writing', /GENERIC_WRITE|GENERIC_ALL|0x40000000|0xC0000000|0x10000000|3221225472|1073741824|268435456/i],
   [
     'a console setting, from PowerShell or from C#',
-    /\[Console\]::(?:OutputEncoding|InputEncoding|Title|CursorLeft|CursorTop|CursorVisible|BackgroundColor|ForegroundColor|WindowWidth|WindowHeight|BufferWidth|BufferHeight|TreatControlCAsInput)\s*=|RawUI|Write-Host|Clear-Host|\bConsole\s*\.\s*\w+\s*=(?!=)/,
+    // An assignment, plain or compound (+=, -=, ??=, <<= and the rest), to a Console property: PowerShell's [Console]::X,
+    // and C#'s Console.X however it is spaced.
+    /\[Console\]::(?:OutputEncoding|InputEncoding|Title|CursorLeft|CursorTop|CursorVisible|BackgroundColor|ForegroundColor|WindowWidth|WindowHeight|BufferWidth|BufferHeight|TreatControlCAsInput)\s*(?:\?\?|[-+*/%])?=|RawUI|Write-Host|Clear-Host|\bConsole\s*\.\s*\w+\s*(?:<<|>>|\?\?|[-+*/%&|^])?=(?!=)/,
   ],
   [
     'a UI Automation pattern object, or a method that acts',
@@ -121,6 +125,27 @@ const REVIEWED_BUILT = {
   Shot: 1, StringBuilder: 3, Table: 1, char: 1, int: 1, long: 1, string: 2, uint: 5,
 }
 
+/**
+ * Each using directive the helper has, by what follows `using` (whitespace made single), by its uses. A directive can
+ * name a type under another name (`using C = System.Console;`) or bring in a type's members (`using static ...`), and a
+ * use of either would pass the patterns and the call list unseen, so a directive not here fails until it is reviewed.
+ */
+const REVIEWED_USINGS = {
+  System: 1,
+  'System.Collections.Generic': 1,
+  'System.Diagnostics': 1,
+  'System.Drawing': 1,
+  'System.Drawing.Imaging': 1,
+  'System.IO': 1,
+  'System.Runtime.InteropServices': 1,
+  'System.Text': 1,
+  'System.Text.RegularExpressions': 1,
+  'System.Windows.Automation': 1,
+}
+
+/** A using directive (not a using statement, whose `using` a parenthesis follows), on one line. */
+const USING = /\busing\s+(?!\()([^;{}()\n]*);/g
+
 /** A C# extern declaration's start: `static extern` or `extern static`, whatever its attribute is spelled like. */
 const EXTERN = /\b(?:static\s+extern|extern\s+static)\b/g
 
@@ -144,7 +169,8 @@ function helperUses(cs) {
   }
   const calls = [...cs.matchAll(/\b([A-Za-z_][A-Za-z0-9_]*)\s*\.\s*([A-Z][A-Za-z0-9]*)\s*\(/g)].map(m => ({ key: `${m[1]}.${m[2]}`, line: lineOf(m.index) }))
   const built = [...cs.matchAll(/\bnew\s+([A-Za-z_][A-Za-z0-9_.]*)/g)].map(m => ({ key: m[1], line: lineOf(m.index) }))
-  return { imports, calls, built, externs: [...cs.matchAll(/\bextern\b/g)].length }
+  const usings = [...cs.matchAll(USING)].map(m => ({ key: m[1].replace(/\s+/g, ' ').trim(), line: lineOf(m.index) }))
+  return { imports, calls, built, usings, externs: [...cs.matchAll(/\bextern\b/g)].length }
 }
 
 /** The helper's uses, counted as the reviewed lists count them. */
@@ -155,7 +181,14 @@ function counted(cs) {
     for (const u of list) out[u.key] = (out[u.key] ?? 0) + 1
     return out
   }
-  return { imports: Object.fromEntries(uses.imports.map(i => [i.key, i.lines.length])), calls: tally(uses.calls), built: tally(uses.built), externs: uses.externs, declared: uses.imports.length }
+  return {
+    imports: Object.fromEntries(uses.imports.map(i => [i.key, i.lines.length])),
+    calls: tally(uses.calls),
+    built: tally(uses.built),
+    usings: tally(uses.usings),
+    externs: uses.externs,
+    declared: uses.imports.length,
+  }
 }
 
 /** What in `cs` differs from the reviewed counts, with the lines each differing entry is used on. */
@@ -167,6 +200,7 @@ function unreviewed(cs) {
     [counts.imports, REVIEWED_IMPORTS, uses.imports.map(i => ({ key: i.key, lines: [i.declared, ...i.lines] }))],
     [counts.calls, REVIEWED_CALLS, uses.calls.map(c => ({ key: c.key, lines: [c.line] }))],
     [counts.built, REVIEWED_BUILT, uses.built.map(b => ({ key: b.key, lines: [b.line] }))],
+    [counts.usings, REVIEWED_USINGS, uses.usings.map(u => ({ key: u.key, lines: [u.line] }))],
   ]) {
     for (const key of new Set([...Object.keys(list), ...Object.keys(reviewed)])) {
       if (list[key] !== reviewed[key]) found.push({ key, lines: entries.filter(e => e.key === key).flatMap(e => e.lines) })
@@ -243,6 +277,10 @@ test('each kind of acting call, planted on a line of its own in a copy of the he
     'Console.Title = "x";',
     'Console.OutputEncoding = Encoding.UTF8;',
     'System.Console . CursorVisible = false;',
+    'Console.Title += " (read)";',
+    'Console.CursorLeft -= 1;',
+    'Console.Title ??= "x";',
+    '[Console]::Title += \' (read)\'',
     'object pattern = element.GetCurrentPattern(InvokePattern.Pattern);',
     'element.SetFocus();',
     '((InvokePattern)pattern).Invoke();',
@@ -263,13 +301,13 @@ test('each kind of acting call, planted on a line of its own in a copy of the he
   }
 })
 
-test('the helper makes exactly the uses reviewed, by count: each extern declaration and its call sites, each qualified call, each type built', () => {
+test('the helper makes exactly the uses reviewed, by count: each extern declaration and its call sites, each qualified call, each type built, each using directive', () => {
   assert.deepEqual(unreviewed(desktop.HELPER_CS), [])
   const counts = counted(desktop.HELPER_CS)
   assert.equal(counts.externs, counts.declared, 'every extern is a declaration this test reads')
 })
 
-test('a new entry point however its attribute is spelled, or another use of one reviewed, fails the counts on its own line', () => {
+test('a new entry point however its attribute is spelled, another use of one reviewed, or a using directive not reviewed (an alias of a type among them), fails the counts on its own line', () => {
   const plants = [
     // A new import, with a space before its attribute's parenthesis, and with its modifiers the other way round.
     '[DllImport ("user32.dll")] static extern bool ShowOwnedPopups(IntPtr window, bool show);',
@@ -281,6 +319,10 @@ test('a new entry point however its attribute is spelled, or another use of one 
     'static Bitmap Another() { return new Bitmap(1, 1); }',
     // A screen read through a call not reviewed.
     'static void Screen2(Graphics graphics) { graphics.CopyFromScreen(0, 0, 0, 0, new Size(1, 1)); }',
+    // A type under another name, and a type's members brought in: each a using directive not reviewed.
+    'using Con = System.Console;',
+    'using static System.Console;',
+    'using   Forms =  System.Windows.Forms ;',
   ]
   for (const plant of plants) {
     const copy = planted(plant)
