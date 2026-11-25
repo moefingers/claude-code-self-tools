@@ -168,7 +168,6 @@ test('a hand-started tab has no stamp: past the tab, to the placement\'s window'
   expect(commands).toEqual([{ command: 'exit' }])
 })
 
-/** The host's platform, when the runtime says it; undefined when it doesn't (the test then runs). */
 test("the plain window's place (#5, a restart window with no name): one launch of the plain window, which places itself; the caller's lines move nothing. Where the restart's own look for placement.json finds none (loadPlacement's first read, its $.fs.exists, as this file's hook answered it: off Windows, where this file's other placement tests fail for the same miss), it ends there, the engine's tests having no skip", async ($, on) => {
   const placed = JSON.stringify({ v: 1, layout: [], restart: { prefer: ['window'], window: { rect: [-1600, 120, 1200, 800], maximized: true } } })
   const { scripts, commands, clock, placementAsks } = engine(on, { placement: placed })
@@ -177,20 +176,26 @@ test("the plain window's place (#5, a restart window with no name): one launch o
   // The restart reads placement.json by loadPlacement, whose first read, and its one "not read" with no error, is
   // `if (!(await $.fs.exists(placementPath(state)))) return { placement: null }`. Its answer, as this file's hook gave
   // it, decides: asked and answered "not there" every time, nothing here can be shown. Never asked (the restart no
-  // longer reads it), or found, it runs on, and fails where the restart goes wrong.
-  if (placementAsks.length > 0 && placementAsks.every(found => !found)) return
-  expect(scripts).toHaveLength(1)
+  // longer reads it), or found, it runs on, and fails where the restart goes wrong. The engine's tests print nothing
+  // on a pass, so each assertion's message names the branch it is in.
+  const missed = 'branch: every look for placement.json answered "not there", so its checks are not run'
+  if (placementAsks.length > 0 && placementAsks.every(found => !found)) {
+    expect(placementAsks.length, missed).toBeGreaterThan(0)
+    return
+  }
+  const ran = `branch: placement.json was found (${placementAsks.length} looks: ${JSON.stringify(placementAsks)}) or never looked for, so its checks run`
+  expect(scripts, ran).toHaveLength(1)
   const script = scripts[0] ?? ''
-  expect(script).toContain('$window = Start-Process -FilePath')
-  expect(script).not.toContain('Start-Process $wtExe')
-  expect(script).toContain("$transport = 'window'")
+  expect(script, ran).toContain('$window = Start-Process -FilePath')
+  expect(script, ran).not.toContain('Start-Process $wtExe')
+  expect(script, ran).toContain("$transport = 'window'")
   // In the window's own script alone, as checked literals.
   const inner = script.indexOf("$inner = '")
   const call = script.indexOf('$placeSaid = [ClaudeSelfToolsPlace]::Place([int]-1600, [int]120, [int]1200, [int]800, $true, $true)')
-  expect(inner).toBeGreaterThan(0)
-  expect(call).toBeGreaterThan(inner)
-  expect(script.indexOf('$windowPath = ')).toBeGreaterThan(call)
-  expect(commands).toEqual([{ command: 'exit' }])
+  expect(inner, ran).toBeGreaterThan(0)
+  expect(call, ran).toBeGreaterThan(inner)
+  expect(script.indexOf('$windowPath = '), ran).toBeGreaterThan(call)
+  expect(commands, ran).toEqual([{ command: 'exit' }])
 })
 
 test('a stamp that is not of its shape counts as none', async ($, on) => {
