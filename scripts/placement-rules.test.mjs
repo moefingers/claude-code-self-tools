@@ -81,6 +81,71 @@ const scriptsOf = m => ({
 })
 const wtLineOf = script => /^\s*\$wtLine = '(.*)'\r?$/m.exec(script)?.[1]?.split("''").join("'")
 
+/** Where the window's own script sits in a launch script: its single-quoted literal's first character and its closing quote. */
+function innerAt(script) {
+  const at = script.indexOf("$inner = '")
+  if (at < 0) throw new Error('no window script in it')
+  const from = at + "$inner = '".length
+  for (let i = from; i < script.length; i += 1) {
+    if (script[i] === "'" && script[i + 1] === "'") {
+      i += 1
+      continue
+    }
+    if (script[i] === "'") return { from, end: i }
+  }
+  throw new Error('the window script is not closed')
+}
+/** The window's own script, out of a launch script: its single-quoted literal, quotes undoubled. */
+function innerOf(script) {
+  const { from, end } = innerAt(script)
+  return script.slice(from, end).split("''").join("'")
+}
+/** A launch script with its window's own script taken out: the caller's own lines alone. */
+function outerOf(script) {
+  const { from, end } = innerAt(script)
+  return `${script.slice(0, from - 1)}<the window script>${script.slice(end + 1)}`
+}
+
+/**
+ * The reviewed list (#5): every function the window's own C# (PLACE_CS) imports, as it imports it, and no other.
+ * Two of them act on a window, SetWindowPos and ShowWindowAsync, each held below to the one call reviewed; the
+ * rest read (and SetThreadDpiAwarenessContext sets the thread's own DPI awareness, put back as it was). An edit
+ * that adds, drops or changes one fails here until it is reviewed and this list changed with it.
+ */
+const REVIEWED_IMPORTS = [
+  '[DllImport("kernel32.dll")] static extern IntPtr GetConsoleWindow();',
+  '[DllImport("user32.dll")] static extern IntPtr GetWindow(IntPtr window, uint relation);',
+  '[DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern int GetClassNameW(IntPtr window, StringBuilder name, int size);',
+  '[DllImport("user32.dll")] static extern bool IsIconic(IntPtr window);',
+  '[DllImport("user32.dll")] static extern bool IsZoomed(IntPtr window);',
+  '[DllImport("user32.dll")] static extern IntPtr SetThreadDpiAwarenessContext(IntPtr context);',
+  '[DllImport("user32.dll")] static extern IntPtr MonitorFromRect(ref Box rect, uint fallback);',
+  '[DllImport("user32.dll")] static extern bool GetMonitorInfoW(IntPtr monitor, ref MonitorInfo info);',
+  '[DllImport("user32.dll", SetLastError = true)] static extern bool SetWindowPos(IntPtr window, IntPtr after, int x, int y, int width, int height, uint flags);',
+  '[DllImport("user32.dll")] static extern bool ShowWindowAsync(IntPtr window, int show);',
+]
+
+/** What the window's C# never names: nothing that finds, lists, raises, focuses, closes or types into a window, nor reads a value from outside. */
+const FORBIDDEN_IN_PLACE = ['FindWindow', 'EnumWindows', 'EnumChildWindows', 'EnumThreadWindows', 'GetTopWindow', 'GetDesktopWindow', 'WindowFromPoint', 'GetForegroundWindow', 'SetForegroundWindow', 'BringWindowToTop', 'SetActiveWindow', 'SetFocus', 'AttachThreadInput', 'SendMessage', 'PostMessage', 'MoveWindow', 'SetWindowPlacement', 'ShowWindow(', 'DestroyWindow', 'CloseWindow', 'SetWindowLong', 'SetParent', 'SendInput', 'keybd_event', 'mouse_event', 'Environment', 'System.IO', 'Process', 'Registry', 'Console.']
+
+/** Fixed monitors for the clamp: a left-hand one at a negative origin, the primary, and a right-hand one with its taskbar along the top. Made up. */
+const LEFT = { monitor: [-1920, 0, 0, 1080], work: [-1920, 0, 0, 1040] }
+const PRIMARY = { monitor: [0, 0, 2560, 1440], work: [0, 0, 2560, 1400] }
+const TOP_BAR = { monitor: [2560, 0, 4480, 1080], work: [2560, 48, 4480, 1080] }
+/** Each row: what it shows, the rect asked for, and where clampToMonitors puts it among LEFT, PRIMARY and TOP_BAR. */
+const CLAMP_ROWS = [
+  ['inside the primary monitor: as asked', [100, 100, 1280, 800], [100, 100, 1280, 800]],
+  ['wholly off every monitor, far right and down: onto the nearest, inside its work area', [30000, 30000, 800, 600], [3680, 480, 800, 600]],
+  ['wholly off every monitor, far left: onto the left-hand monitor', [-30000, 100, 800, 600], [-1920, 100, 800, 600]],
+  ['across the left-hand and the primary, more on the primary: wholly on the primary', [-300, 100, 1000, 600], [0, 100, 1000, 600]],
+  ['across the left-hand and the primary, more on the left-hand: wholly on the left-hand', [-900, 100, 1000, 600], [-1000, 100, 1000, 600]],
+  ['larger than the work area: the whole work area', [100, 100, 4000, 3000], [0, 0, 2560, 1400]],
+  ['a negative origin on the left-hand monitor: as asked', [-1800, 50, 800, 600], [-1800, 50, 800, 600]],
+  ["past the left-hand monitor's left edge: moved onto it", [-2100, 50, 800, 600], [-1920, 50, 800, 600]],
+  ['under a taskbar along the top: just below it', [3000, 0, 800, 600], [3000, 48, 800, 600]],
+  ["past the primary's work area at the bottom: up into it", [500, 1300, 800, 600], [500, 800, 800, 600]],
+]
+
 /** Each check takes a machine module: the real one, or a copy with a fault in it. */
 const CHECKS = {
   launchArguments(m) {
@@ -772,6 +837,132 @@ const CHECKS = {
     assert.ok(wtLineOf(m.launchScriptText(launchInput({ where: { tab: { window: 'a', title: 'a' } }, left: { size: 12, mtime: 34 } }))).includes('-LeftSize 12 -LeftMtime 34'))
     assert.ok(wtLineOf(m.launchScriptText(launchInput({ where: { tab: { window: 'a', title: 'a' } }, left: { exitAt: 56 } }))).includes('-LeftExitAt 56'))
   },
+  placeFile(m) {
+    // #5: a window with no name is the plain window, at its place; a named window and a layout window take maximized.
+    const read = file => m.readPlacement(JSON.stringify(file))
+    const plain = read({ v: 1, layout: [], launch: { prefer: ['window'], window: { rect: [-1920, 0, 1280, 800] } }, restart: { prefer: ['window'], window: { maximized: true } } })
+    assert.deepEqual(plain.placement.launch.window, { rect: [-1920, 0, 1280, 800] }, 'no name: the plain window, at its rect')
+    assert.deepEqual(plain.placement.restart.window, { maximized: true })
+    const named = read({ v: 1, layout: [{ window: 'w1', pos: [2100, 300], maximized: true, tabs: ['t'], folder: 'C:\\work' }], launch: { prefer: ['window'], window: { name: 'w2', maximized: true } } })
+    assert.equal(named.placement.layout[0].maximized, true)
+    assert.deepEqual(named.placement.launch.window, { name: 'w2', maximized: true })
+    // A file valid before reads as it read: nothing added to a named window that names no new key.
+    assert.deepEqual(read({ v: 1, layout: [], launch: { prefer: ['window'], window: { name: 'w2', pos: [1, 2], size: [100, 30] } } }).placement.launch.window, { name: 'w2', pos: [1, 2], size: [100, 30] })
+    // Each refusal says what is wrong: a named window's rect as not built, naming pos and size.
+    const said = window => (read({ v: 1, layout: [], launch: { prefer: ['window'], window } }).errors ?? []).join('; ')
+    assert.match(said({ name: 'w1', rect: [0, 0, 800, 600] }), /^launch\.window has a rect, which a named window does not take \(not built\): give it pos, in pixels, and size, in columns and rows$/)
+    assert.match((read({ v: 1, layout: [{ window: 'a', rect: [0, 0, 800, 600], tabs: ['t'], folder: 'C:\\work' }] }).errors ?? []).join('; '), /^layout\[0\] has a rect, which a named window does not take \(not built\)/)
+    assert.match(said({ pos: [0, 0], maximized: true }), /^launch\.window has no name, so it is the plain window, which takes rect and maximized: pos and size are a named window's$/)
+    assert.match(said({}), /^launch\.window has no name and no rect or maximized: name a window, or give the plain window its place$/)
+    assert.match(said({ maximized: false }), /maximized that is not true/)
+    assert.match(said({ rect: [0, 0, 319, 600] }), /rect that is not four whole numbers \[x, y, width, height\]: x and y within 32768, a width of 320 to 32768 and a height of 200 to 32768/)
+    assert.match(said({ name: 'w1', maximized: 'true' }), /maximized that is not true/)
+    assert.match(said({ rect: [0, 0, 800, 600], colour: 'red' }), /launch\.window has an unknown key colour/)
+    // isRect's edges, as RECT_LIMITS says them.
+    assert.deepEqual(m.RECT_LIMITS, { coordinate: 32768, minWidth: 320, minHeight: 200, max: 32768 })
+    for (const good of [[-32768, 32768, 320, 200], [32768, -32768, 32768, 32768]]) assert.equal(m.isRect(good), true, JSON.stringify(good))
+    for (const bad of [[0, 0, 319, 200], [0, 0, 320, 199], [32769, 0, 320, 200], [0, -32769, 320, 200], [0, 0, 32769, 200], [0, 0, 320, 32769], [0, 0, 320.5, 200], [0, 0, 320], [0, 0, 320, 200, 1], '0,0,320,200', null]) assert.equal(m.isRect(bad), false, JSON.stringify(bad))
+  },
+  plainLegs(m) {
+    // The plain window at its place, as a leg: for a launch of another process, and for a restart.
+    const placed = placementOf(m, { launch: { prefer: ['slot', 'window'], window: { rect: [0, 0, 1280, 800] } }, restart: { prefer: ['window'], window: { maximized: true } } })
+    assert.deepEqual(m.pickLaunchTransport(probeOf(m, { slots: [] }), placed, PICK).where, { window: { rect: [0, 0, 1280, 800] } }, 'no slot idle: the plain window at its rect')
+    const mine = { replacing: true, using: 'restart', configCount: 1, needsLeft: false, stamp: {} }
+    const restart = m.pickLaunchTransport(probeOf(m), placed, mine)
+    assert.deepEqual([restart.where, restart.then], [{ window: { maximized: true } }, [{ window: true }]], 'a restart: the plain window maximized, then the plain window as it opens')
+    // A window a launch opened keeps its session ahead of the plain window's place: it is a plain window already.
+    const hosted = { token: T, pane: { pid: 20, started: '134062345678901240', v: 3, hosted: true } }
+    assert.deepEqual(m.pickLaunchTransport(probeOf(m), placed, { ...mine, pane: hosted }), { where: { pane: { token: T } } }, 'no new window each move')
+    // A named window still comes before it.
+    assert.deepEqual(m.pickLaunchTransport(probeOf(m), placementOf(m), { ...mine, pane: hosted }), { where: { window: { name: 'claude-overflow', pos: [1920, 0], size: [140, 60] } }, then: [{ pane: { token: T } }] })
+    // A layout window's maximized rides on its tab, for wt to create it maximized when it isn't there.
+    const max = placementOf(m, { layout: [{ window: 'claude-4', maximized: true, tabs: ['s10'], folder: 'C:\\work' }] })
+    assert.deepEqual(m.pickLaunchTransport(probeOf(m, { slots: [idleRunner(m, { child: 100 })] }), max, { ...PICK, title: 'lane-x' }).where, { tab: { window: 'claude-4', title: 'lane-x', maximized: true } })
+    // Which places are the plain window.
+    assert.deepEqual([{ window: true }, { window: { rect: [0, 0, 800, 600] } }, { window: { maximized: true } }, { window: { name: 'a' } }, { window: { name: 'a', maximized: true } }, 'auto', { slot: SLOT }, { tab: { window: 'a', title: 'a' } }, { pane: { token: T } }].map(m.isPlainWindow), [true, true, true, false, false, false, false, false, false])
+  },
+  placeLaunch(m) {
+    // The plain window, placed: today's window script, with exactly the placing lines right after its module path.
+    const plainIn = launchInput({ claim: `launch:${FRESH}` })
+    const unplaced = innerOf(m.launchScriptText(plainIn))
+    const lines = unplaced.split('\r\n')
+    const at = lines.findIndex(line => line.startsWith('if ($PSVersionTable.PSEdition -ne "Core") {')) + 1
+    assert.equal(at, 5, 'after the start signal, the file, the two preferences and the module path')
+    for (const place of [{ rect: [-1600, 120, 1200, 800] }, { maximized: true }, { rect: [2100, 300, 900, 600], maximized: true }]) {
+      const placed = innerOf(m.launchScriptText({ ...plainIn, where: { window: place } }))
+      assert.equal(placed, [...lines.slice(0, at), ...m.windowPlaceLines(place), ...lines.slice(at)].join('\r\n'), `${JSON.stringify(place)}: the placing lines, and nothing else`)
+      assert.ok(placed.indexOf('[ClaudeSelfToolsPlace]::Place(') < placed.indexOf('$env:CLAUDE_SELF_TOOLS_WT_WINDOW = $null'), 'before anything else, and before the wait')
+    }
+    assert.ok(!unplaced.includes('ClaudeSelfToolsPlace') && !unplaced.includes('Add-Type'), 'an unplaced window has none of it')
+    // A failure is said in one line, and the session goes on: all of it in one try, whose catch says why.
+    const block = m.windowPlaceLines({ maximized: true })
+    assert.deepEqual([block.length, block[0], block[1], block[4].startsWith('} catch { $placeSaid = "it could not be placed (" + $_.Exception.Message'), block[5]], [6, '$placeSaid = "not tried"', 'try {', true, 'if ($placeSaid -cne "placed") { Write-Host ("This window is not where placement.json puts it: " + $placeSaid + ". The session goes on here.") }'])
+    assert.ok(!block.some(line => /\bexit\b|\bthrow\b|Read-Host|Start-Sleep/.test(line)), 'nothing in it stops or holds the window')
+    // The place is checked again in the launch: numbers within RECT_LIMITS, maximized true, at least one, nothing else.
+    for (const bad of [{ rect: [0, 0, 319, 600] }, { rect: [0, 0, 800] }, { rect: ['0', '0', '800', '600'] }, { maximized: false }, {}, { pos: [0, 0] }, { rect: [0, 0, 800, 600], extra: 1 }]) {
+      assert.throws(() => m.launchScriptText({ ...plainIn, where: { window: bad } }), /plain window/, JSON.stringify(bad))
+    }
+    // Remote Control and a first prompt go to it as to the plain window; a start in it may wait, as in the plain one.
+    assert.ok(innerOf(m.launchScriptText({ ...plainIn, where: { window: { maximized: true } }, remoteControl: 'lane-y' })).includes(' -RemoteControl $rcName'))
+    assert.ok(m.launchScriptText({ ...plainIn, kind: 'start', id: FRESH, name: 'lane-x', checks: { fresh: true }, where: { window: { maximized: true } } }).includes('$inner = '))
+    // A named window maximized: -M on wt's line, before --pos; its fallback plain window is not placed.
+    const named = m.launchScriptText(launchInput({ where: { window: { name: 'claude-overflow', pos: [2100, 300], maximized: true } } }))
+    assert.ok(wtLineOf(named).startsWith('-w claude-overflow -M --pos 2100,300 nt '), wtLineOf(named))
+    assert.ok(!innerOf(named).includes('ClaudeSelfToolsPlace'), "a named window's fallback is the plain window unplaced")
+    assert.ok(wtLineOf(m.launchScriptText(launchInput({ where: { tab: { window: 'claude-4', title: 't', maximized: true } } }))).startsWith('-w claude-4 -M nt '))
+    assert.throws(() => m.wtTabLine({ powershell: POWERSHELL, stateDir: STATE, window: 'a', title: 'a', folder: 'C:\\work', maximized: false, run: { idle: true } }), /maximized/)
+    assert.throws(() => m.launchScriptText(launchInput({ kind: 'start', id: FRESH, name: 'lane-x', checks: { fresh: true }, where: { window: { name: 'a', maximized: true } } })), /a start in a tab waits for nothing/, 'a named window is still a tab')
+    // Nothing on the caller's side acts on a window: outside the window's own script, the launch has none of it.
+    for (const where of [{ window: { rect: [0, 0, 800, 600], maximized: true } }, { window: true }, 'auto']) {
+      const outer = outerOf(m.launchScriptText({ ...plainIn, where }))
+      assert.ok(outer.includes('$inner = <the window script>'), 'the window script taken out')
+      assert.ok(!/SetWindowPos|ShowWindow|ClaudeSelfToolsPlace|MoveWindow|SetForegroundWindow|SetWindowPlacement/.test(outer), `${JSON.stringify(where)}: the caller's lines act on no window`)
+    }
+  },
+  actingCalls(m) {
+    // #5's limits, held as text: the window's C# imports the reviewed list and no more; the two acting calls are
+    // each made once, with the reviewed arguments, on the window of its own console; its inputs are checked numbers.
+    const cs = m.PLACE_CS
+    assert.deepEqual(cs.match(/\[DllImport\([^\]]*\)\] static extern [^;]+;/g), REVIEWED_IMPORTS)
+    assert.equal(cs.split('[DllImport(').length - 1, REVIEWED_IMPORTS.length, 'no import of another shape')
+    assert.deepEqual(cs.match(/\bSetWindowPos\([^)]*\)/g), ['SetWindowPos(IntPtr window, IntPtr after, int x, int y, int width, int height, uint flags)', 'SetWindowPos(own, IntPtr.Zero, at[0], at[1], at[2], at[3], 0x4214)'])
+    assert.deepEqual(cs.match(/\bShowWindowAsync\([^)]*\)/g), ['ShowWindowAsync(IntPtr window, int show)', 'ShowWindowAsync(own, 3)'], 'SW_MAXIMIZE alone')
+    assert.deepEqual(cs.match(/\bown = [^;]+;/g), ['own = IntPtr.Zero;', 'own = console;', 'own = GetWindow(console, 4);'], 'its own window: its console window, or that window\'s owner (GW_OWNER)')
+    assert.deepEqual(cs.match(/\bconsole = [^;]+;/g), ['console = GetConsoleWindow();'])
+    assert.deepEqual(cs.match(/\bat = [^;]+;/g), ['at = Clamp(x, y, width, height, info.Work.Left, info.Work.Top, info.Work.Right, info.Work.Bottom);'])
+    assert.ok(cs.includes('if (kind == "ConsoleWindowClass") own = console; else if (kind == "PseudoConsoleWindow") { own = GetWindow(console, 4); if (own == IntPtr.Zero || ClassOf(own) != "CASCADIA_HOSTING_WINDOW_CLASS") return '), 'the classic console\'s window, or the Windows Terminal window that owns the pseudoconsole; else nothing')
+    const iconic = cs.indexOf('if (IsIconic(own) || IsZoomed(own)) return ')
+    assert.ok(iconic > 0 && iconic < cs.indexOf('SetWindowPos(own'), 'a window minimized or maximized as it opened is left as it is')
+    const aware = cs.indexOf('IntPtr before = SetThreadDpiAwarenessContext(new IntPtr(-4)); if (before == IntPtr.Zero) return ')
+    assert.ok(aware > 0 && aware < cs.indexOf('MonitorFromRect(ref asked'), 'per-monitor DPI awareness before any coordinate is read, and nothing placed without it')
+    assert.ok(cs.includes('} finally { SetThreadDpiAwarenessContext(before); }'), "the thread's awareness put back")
+    assert.equal(m.PLACE_SWP_FLAGS, 0x0004 | 0x0010 | 0x0200 | 0x4000, 'SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_ASYNCWINDOWPOS, and nothing that shows, hides or reframes')
+    for (const name of FORBIDDEN_IN_PLACE) assert.ok(!cs.includes(name), name)
+    assert.ok(!/['\u2018-\u201b]/.test(cs), 'no single quote: it sits in a single-quoted literal')
+    // Its PowerShell passes only checked numbers, as [int] literals, and two flags: never a string or a variable.
+    for (const place of [{ rect: [-32768, 32768, 320, 200] }, { rect: [0, 0, 32768, 32768], maximized: true }, { maximized: true }]) {
+      const calls = m.windowPlaceLines(place).filter(line => line.includes('::Place('))
+      assert.equal(calls.length, 1)
+      assert.match(calls[0], /^ {2}\$placeSaid = \[ClaudeSelfToolsPlace\]::Place\(\[int\]-?\d{1,5}, \[int\]-?\d{1,5}, \[int\]\d{1,5}, \[int\]\d{1,5}, \$(true|false), \$(true|false)\)$/, calls[0])
+    }
+    for (const bad of [{ rect: [0, 0, 100, 100] }, { rect: [0, 0, 800, 600.5] }, { rect: ['0', '0', '800', '600'] }, { maximized: false }, {}]) assert.throws(() => m.windowPlaceLines(bad), JSON.stringify(bad))
+    const inner = innerOf(m.launchScriptText(launchInput({ claim: `launch:${FRESH}`, where: { window: { rect: [0, 0, 800, 600] } } })))
+    assert.equal(inner.split('Add-Type').length, 2, 'one Add-Type')
+    assert.equal(inner.split('[ClaudeSelfToolsPlace]::').length, 2, 'Place called once; nothing else of the type')
+  },
+  clampRule(m) {
+    // The clamp as a pure function, every row in one run, each that differs listed.
+    const monitors = [LEFT, PRIMARY, TOP_BAR]
+    const wrong = CLAMP_ROWS.map(([name, rect, want]) => [name, rect, want, m.clampToMonitors(rect, monitors)]).filter(([, , want, got]) => JSON.stringify(got) !== JSON.stringify(want))
+    assert.deepEqual(wrong.map(([name, rect, want, got]) => `${name}: ${JSON.stringify(rect)} gave ${JSON.stringify(got)}, not ${JSON.stringify(want)}`), [])
+    // Wherever it was asked for, the window ends wholly inside one monitor's work area.
+    for (const [name, rect] of CLAMP_ROWS) {
+      const [x, y, w, h] = m.clampToMonitors(rect, monitors)
+      assert.ok(monitors.some(({ work: [l, t, r, b] }) => x >= l && y >= t && x + w <= r && y + h <= b), name)
+    }
+    assert.throws(() => m.clampToMonitors([0, 0, 800, 600], []), /no monitor/)
+    assert.deepEqual(m.clampToWork([5000, -5000, 800, 600], [0, 0, 1920, 1040]), [1120, 0, 800, 600])
+  },
 }
 
 for (const [name, check] of Object.entries(CHECKS)) test(`the rules: ${name}`, () => check(real))
@@ -915,6 +1106,36 @@ const FAULTS = [
   ['WF-M-1: the window not setting its start signal', 'windowSignal', '    `try { $launchSignal = [Threading.EventWaitHandle]::OpenExisting(${literal(v.signal)}); try { [void]$launchSignal.Set() } finally { $launchSignal.Dispose() } } catch { }`,\n', ''],
   ["WF-M-1: a start signal already there taken as this launch's own", 'windowSignal', "'  if (-not $windowSignalNew) { throw (", "'  if ($false) { throw ("],
   ['WF-M-1: the start signal never disposed', 'windowSignal', "          '} finally { $windowSignal.Dispose() }',\n", "          '}',\n"],
+  ['#5: a rect let through on a named window', 'placeFile', "    if (value.rect !== undefined) errors.push(`${where} has a rect, which a named window does not take (not built): give it pos, in pixels, and size, in columns and rows`)\n", ''],
+  ['#5: maximized false taken', 'placeFile', '      if (value.maximized === true) out.maximized = true\n      else errors.push(', '      out.maximized = true\n      if (false) errors.push('],
+  ['#5: the plain window taken with no place', 'placeFile', '    if (value.rect === undefined && value.maximized === undefined) errors.push(', '    if (false) errors.push('],
+  ['#5: pos taken on the plain window', 'placeFile', '    if (value.pos !== undefined || value.size !== undefined) errors.push(', '    if (false) errors.push('],
+  ['#5: a window with no name read as a named one', 'placeFile', '    if (value.name === undefined) return plainOf(value, `${where}.window`)\n', ''],
+  ['#5: a rect past its bounds taken', 'placeFile', '(width as number) >= RECT_LIMITS.minWidth && ', ''],
+  ['#5: the placing lines in an unplaced window too', 'placeLaunch', '    ...(v.place === undefined ? [] : windowPlaceLines(v.place)),', '    ...windowPlaceLines(v.place ?? { maximized: true }),'],
+  ['#5: the placing lines dropped from a placed window', 'placeLaunch', "...(v.place === undefined ? {} : { place: v.place }) })", '})'],
+  ["#5: a named window's maximized not reaching wt", 'placeLaunch', "    ...(input.maximized === true ? ['-M'] : []),\n", ''],
+  ['#5: a bad rect let through the launch', 'placeLaunch', "  if (value.rect !== undefined && !isRect(value.rect)) throw new Error(`the plain window's rect", "  if (false) throw new Error(`the plain window's rect"],
+  ["#5: the caller's side acting on a window", 'placeLaunch', '          ...SWEEP_WINDOW_FILES,\n', "          ...SWEEP_WINDOW_FILES,\n          '[void]SetWindowPos',\n"],
+  ['#5: a failure to place that stops the window', 'placeLaunch', `'} catch { $placeSaid = "it could not be placed (" + $_.Exception.Message + ")" }',`, `'} catch { throw },',`],
+  ["#5: another import in the window's C#", 'actingCalls', `  '[DllImport("user32.dll")] static extern bool ShowWindowAsync(IntPtr window, int show);',\n`, `  '[DllImport("user32.dll")] static extern bool ShowWindowAsync(IntPtr window, int show);',\n  '[DllImport("user32.dll")] static extern bool SetForegroundWindow(IntPtr window);',\n`],
+  ['#5: SetWindowPos activating the window', 'actingCalls', 'export const PLACE_SWP_FLAGS = 0x4214', 'export const PLACE_SWP_FLAGS = 0x4204'],
+  ['#5: SetWindowPos changing the Z order', 'actingCalls', 'export const PLACE_SWP_FLAGS = 0x4214', 'export const PLACE_SWP_FLAGS = 0x4210'],
+  ['#5: the window found by its title', 'actingCalls', "  'IntPtr console = GetConsoleWindow();',", `  'IntPtr console = FindWindow(null, "claude");',`],
+  ['#5: another window taken as its own', 'actingCalls', 'if (kind == "ConsoleWindowClass") own = console;', 'if (kind == "ConsoleWindowClass") own = GetWindow(console, 2);'],
+  ['#5: a pseudoconsole owner taken whatever its class', 'actingCalls', ' || ClassOf(own) != "CASCADIA_HOSTING_WINDOW_CLASS")', ')'],
+  ['#5: a window that opened maximized moved all the same', 'actingCalls', "  'if (IsIconic(own) || IsZoomed(own)) return \"it opened minimized or maximized, so it is left as it is\";',\n", ''],
+  ['#5: the place read DPI-unaware', 'actingCalls', 'IntPtr before = SetThreadDpiAwarenessContext(new IntPtr(-4));', 'IntPtr before = new IntPtr(1);'],
+  ['#5: maximize swapped for another show command', 'actingCalls', 'ShowWindowAsync(own, 3)', 'ShowWindowAsync(own, 1)'],
+  ['#5: a string reaching the call', 'actingCalls', '`  $placeSaid = [ClaudeSelfToolsPlace]::Place([int]${rect[0]}, ', "`  $placeSaid = [ClaudeSelfToolsPlace]::Place('${rect[0]}', "],
+  ['#5: windowPlaceLines taking an unchecked rect', 'actingCalls', '  if (place.rect !== undefined && !isRect(place.rect)) throw new Error(`not a rect: ${JSON.stringify(place.rect)}`)\n', ''],
+  ['#5: the clamp not shrinking a window', 'clampRule', '  const w = Math.min(width, right - left)\n', '  const w = width\n'],
+  ['#5: a rect off every monitor left there (no nearest monitor)', 'clampRule', '  if (overlap(best.monitor) === 0) for (const m of monitors) if (gap(m.monitor) < gap(best.monitor)) best = m\n', ''],
+  ['#5: the monitor that holds less of the rect taken', 'clampRule', '  for (const m of monitors) if (overlap(m.monitor) > overlap(best.monitor)) best = m\n', '  for (const m of monitors) if (overlap(m.monitor) > 0 && overlap(m.monitor) < overlap(best.monitor)) best = m\n'],
+  ['#5: the clamp moving past the work area on the left', 'clampRule', '  return [Math.max(left, Math.min(x, right - w)), Math.max(top, Math.min(y, bottom - h)), w, h]', '  return [Math.min(x, right - w), Math.max(top, Math.min(y, bottom - h)), w, h]'],
+  ['#5: a hosted window opening a new plain window each move', 'plainLegs', '.legs.filter(leg => !isPlainWindow(leg))', '.legs'],
+  ["#5: a layout window's maximized dropped from its tab", 'plainLegs', ', ...(home?.maximized === undefined ? {} : { maximized: home.maximized })', ''],
+  ['#5: the plain window read as a named one', 'plainLegs', "where.window === true || !('name' in where.window)", 'where.window === true'],
 ]
 
 describe("the window script sweep's names follow LAUNCH_ID", () => {

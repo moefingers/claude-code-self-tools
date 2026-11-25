@@ -127,7 +127,7 @@ describe('-WhatIf, the default, for the design\'s example', { skip: !isWindows &
     const placement = machine.readPlacement(textOf(file)).placement
     for (const w of placement.layout) {
       w.tabs.forEach((tab, i) => {
-        const line = machine.wtTabLine({ powershell: WINDOWS_POWERSHELL, stateDir: state, window: w.window, title: tab, ...(i === 0 ? { pos: w.pos, size: w.size } : {}), folder, run: { idle: true } })
+        const line = machine.wtTabLine({ powershell: WINDOWS_POWERSHELL, stateDir: state, window: w.window, title: tab, ...(i === 0 ? { pos: w.pos, size: w.size, maximized: w.maximized } : {}), folder, run: { idle: true } })
         assert.ok(ran.out.includes(`[${w.window} / ${tab}] wt.exe ${line}`), `${line}\nin:\n${ran.out}`)
       })
     }
@@ -135,6 +135,18 @@ describe('-WhatIf, the default, for the design\'s example', { skip: !isWindows &
     assert.equal(ran.out.match(/--pos/g).length, 2, 'one per window')
     // The slot runner isn't in the temporary folder: it says so, and -Apply would refuse.
     assert.match(ran.out, /note: the slot runner is not at /)
+  })
+
+  test('a maximized window (#5): -M on its first tab only, before --pos, by the same string the machine code builds', () => {
+    const file = fixture.good.find(c => c.name === 'a maximized layout window and a maximized named window').file
+    const path = join(work, 'maximized.json')
+    writeFileSync(path, textOf(file))
+    const ran = runLayout(['-Placement', path])
+    assert.equal(ran.code, 0, ran.out)
+    const state = join(work, 'local', 'claude-self-tools')
+    const line = machine.wtTabLine({ powershell: WINDOWS_POWERSHELL, stateDir: state, window: 'w1', title: 't', pos: [2100, 300], maximized: true, folder: join(work, 'a folder'), run: { idle: true } })
+    assert.ok(line.startsWith('-w w1 -M --pos 2100,300 nt '), line)
+    assert.ok(ran.out.includes(`[w1 / t] wt.exe ${line}`), `${line}\nin:\n${ran.out}`)
   })
 
   test('no placement.json: it says where the presets are, and runs nothing', () => {
@@ -145,10 +157,10 @@ describe('-WhatIf, the default, for the design\'s example', { skip: !isWindows &
 })
 
 /**
- * The module path line claude-slot.ps1 and claude-layout.ps1 keep this release, their pins unchanged
- * since 5b4f138: one path made of three, harmless in Windows PowerShell 5.1, which loads its core modules
- * from $PSHOME whatever the path. PSMODULEPATH_RESET is the fixed line; these two take it in a release that
- * re-vendors the coordinator.
+ * The module path line claude-slot.ps1 and claude-layout.ps1 keep this release, as at 5b4f138 (the layout
+ * script's pin moved for #5's keys; its module path line did not): one path made of three, harmless in Windows
+ * PowerShell 5.1, which loads its core modules from $PSHOME whatever the path. PSMODULEPATH_RESET is the fixed
+ * line; these two take it in a release that re-vendors the coordinator.
  */
 const KEPT_RESET = '$env:PSModulePath = @([Environment]::GetFolderPath("MyDocuments") + "\\WindowsPowerShell\\Modules", [Environment]::GetFolderPath("ProgramFiles") + "\\WindowsPowerShell\\Modules", [Environment]::GetFolderPath("System") + "\\WindowsPowerShell\\v1.0\\Modules") -join ";"'
 
@@ -225,6 +237,31 @@ describe('planted faults in the layout script and the validators, each caught', 
     const lastCase = fixture.bad.find(c => c.name === 'a window called last')
     assert.equal(psTakes(lastCase.file, path, 'fault').code, 0, 'the copy takes it')
     assert.ok('errors' in machine.readPlacement(textOf(lastCase.file)), 'readPlacement still refuses it')
+  })
+
+  test("#5: a named window's rect accepted by the PowerShell validator alone: the two then disagree on the shared list", () => {
+    const { path } = copyWith('rect', "if (Test-Has $value 'rect') { Add-Fault ($where + ' has a rect, which", "if ($false) { Add-Fault ($where + ' has a rect, which")
+    const rectCase = fixture.bad.find(c => c.name === 'a rect on a named window')
+    assert.equal(psTakes(rectCase.file, path, 'fault').code, 0, 'the copy takes it')
+    assert.ok('errors' in machine.readPlacement(textOf(rectCase.file)), 'readPlacement still refuses it')
+  })
+
+  test('#5: a key given as null read as absent again by the PowerShell validator: the two then disagree', () => {
+    const { path } = copyWith('null', 'function Test-Has($value, $name) { return ($null -ne $value.PSObject.Properties[$name]) }', 'function Test-Has($value, $name) { return ($null -ne $value.$name) }')
+    const nullCase = fixture.bad.find(c => c.name === 'a pos of null')
+    assert.equal(psTakes(nullCase.file, path, 'fault').code, 0, 'the copy takes it')
+    assert.ok('errors' in machine.readPlacement(textOf(nullCase.file)), 'readPlacement still refuses it')
+  })
+
+  test("#5: -M left off a maximized window's first tab: its line no longer the machine code's", () => {
+    const { path } = copyWith('max', "    if ($first -and $w.maximized -eq $true) { $elements += @('-M') }\n", '')
+    const file = fixture.good.find(c => c.name === 'a maximized layout window and a maximized named window').file
+    const placementFile = join(work, 'maximized-fault.json')
+    writeFileSync(placementFile, textOf(file))
+    const ran = runLayout(['-Placement', placementFile], path)
+    assert.equal(ran.code, 0, ran.out)
+    assert.ok(!ran.out.includes(' -M '), 'the copy prints no -M')
+    assert.ok(machine.wtTabLine({ powershell: WINDOWS_POWERSHELL, stateDir: join(work, 'local', 'claude-self-tools'), window: 'w1', title: 't', pos: [2100, 300], maximized: true, folder: join(work, 'a folder'), run: { idle: true } }).includes(' -M '), 'the machine code builds one')
   })
 
   test('`last` accepted by readPlacement alone: the two then disagree on the shared list', async () => {

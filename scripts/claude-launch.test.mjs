@@ -285,9 +285,9 @@ test("every PSModulePath reset sets Windows PowerShell 5.1's three module folder
     ['the machine code (PSMODULEPATH_RESET)', machine.PSMODULEPATH_RESET],
     ['claude-launch.ps1', lineOf(script, 'claude-launch.ps1')],
   ]
-  // claude-slot.ps1 and claude-layout.ps1 keep their line this release, and so their pins (SLOT_SCRIPT_SHA256,
-  // LAYOUT_SCRIPT_SHA256, as at 5b4f138): one path made of three, harmless in 5.1, which loads its core
-  // modules from $PSHOME. The fix waits for a release that re-vendors the coordinator.
+  // claude-slot.ps1 and claude-layout.ps1 keep their line this release, as at 5b4f138 (the layout script's pin,
+  // LAYOUT_SCRIPT_SHA256, moved for #5's keys; its line did not): one path made of three, harmless in 5.1, which
+  // loads its core modules from $PSHOME. The fix waits for a release that re-vendors the coordinator.
   for (const name of ['claude-slot.ps1', 'claude-layout.ps1']) assert.ok(!lineOf(readFileSync(join(slot, name), 'utf8'), name).startsWith('$env:PSModulePath = @(('), `${name} keeps its line this release`)
   for (const [name, line] of resets) {
     const ran = spawnSync(join(process.env.SystemRoot ?? 'C:\\Windows', 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe'), ['-NoProfile', '-NonInteractive', '-Command', `${line}; $env:PSModulePath`], { encoding: 'utf8', windowsHide: true })

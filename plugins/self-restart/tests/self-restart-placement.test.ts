@@ -161,6 +161,25 @@ test('a hand-started tab has no stamp: past the tab, to the placement\'s window'
   expect(commands).toEqual([{ command: 'exit' }])
 })
 
+test("the plain window's place (#5, a restart window with no name): one launch of the plain window, which places itself; the caller's lines move nothing", async ($, on) => {
+  const placed = JSON.stringify({ v: 1, layout: [], restart: { prefer: ['window'], window: { rect: [-1600, 120, 1200, 800], maximized: true } } })
+  const { scripts, commands, clock } = engine(on, { placement: placed })
+  await $.session.start(start)
+  await restart($, clock)
+  expect(scripts).toHaveLength(1)
+  const script = scripts[0] ?? ''
+  expect(script).toContain('$window = Start-Process -FilePath')
+  expect(script).not.toContain('Start-Process $wtExe')
+  expect(script).toContain("$transport = 'window'")
+  // In the window's own script alone, as checked literals.
+  const inner = script.indexOf("$inner = '")
+  const call = script.indexOf('$placeSaid = [ClaudeSelfToolsPlace]::Place([int]-1600, [int]120, [int]1200, [int]800, $true, $true)')
+  expect(inner).toBeGreaterThan(0)
+  expect(call).toBeGreaterThan(inner)
+  expect(script.indexOf('$windowPath = ')).toBeGreaterThan(call)
+  expect(commands).toEqual([{ command: 'exit' }])
+})
+
 test('a stamp that is not of its shape counts as none', async ($, on) => {
   const { scripts, clock } = engine(on, { env: { CLAUDE_SELF_TOOLS_WT_WINDOW: 'last' }, placement: FILE })
   await $.session.start(start)
