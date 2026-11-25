@@ -8,7 +8,7 @@
 // - This session's own console: the script attaches, for a moment, to the console of the process Claude Code names as
 //   its own (CLAUDE_PID), only once that process is shown to be one the script runs under. In that attach it reads the
 //   console's window, and the processes attached to the console. It goes on only when every one of them is this script,
-//   that process, an ancestor of it or a descendant of it, none other than that process with its image name, and the
+//   that process, an ancestor of it or a descendant of it, none but that process and this script with its image name, and the
 //   console has a window that shows as a pane; then, for desktop_read, it reads the visible part of the screen buffer
 //   through a handle opened for reading only. It writes nothing to the console, and detaches in a finally. The
 //   session's own window is that console window's owner when it is a pseudoconsole shown by Windows Terminal, or the
@@ -333,8 +333,9 @@ public static class SelfDesktop {
     return Under(self, claude, ids, parents, starts) ? null : "the process Claude Code names as its own (" + claude + ") is not one this script runs under, so its console is not attached to";
   }
   // Why the console is not taken for this session's own: a process on it is neither this script, the process Claude
-  // Code names, an ancestor of that process, nor a descendant of it; or a process other than that one carries its image
-  // name, wherever it sits (another Claude Code process means its text is on this screen). Null when none is.
+  // Code names, an ancestor of that process, nor a descendant of it; or a process other than that one and this script
+  // carries its image name, wherever it sits (another Claude Code process means its text is on this screen). Null when
+  // none is. This script is passed over first: it is this read itself, whatever its image name.
   public static string SharingWhy(uint self, uint claude, uint[] attached, uint[] ids, uint[] parents, long[] starts, string[] names) {
     int own = IndexOf(ids, claude);
     if (own < 0 || attached == null) return "the processes on this session's console couldn't be told apart";
