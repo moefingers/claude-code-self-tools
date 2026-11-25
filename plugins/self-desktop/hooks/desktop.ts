@@ -409,6 +409,25 @@ public static class SelfDesktop {
     if (whyAfter != null) return whyAfter;
     return windowAfter == windowBefore && windowAfter != 0 ? null : "this session's console is shown by another window now";
   }
+  // A window handle as a number, and back. Microsoft, "Interprocess communication" (Programming Guide for 64-bit
+  // Windows, learn.microsoft.com/en-us/windows/win32/winprog64/interprocess-communication): "64-bit versions of
+  // Windows use 32-bit handles for interoperability. When sharing a handle between 32-bit and 64-bit applications, only
+  // the lower 32 bits are significant, so it is safe to truncate the handle (when passing it from 64-bit to 32-bit) or
+  // sign-extend the handle (when passing it from 32-bit to 64-bit)." So a handle is printed as its lower 32 bits, from
+  // 0 to 2^32 - 1, whatever its upper bits (a handle with bit 31 set may come sign-extended, and would print negative);
+  // and a number is made a handle again by sign-extending those 32 bits, the one widening that page calls safe.
+  public static long HandleNumber(long value) {
+    return value & 0xFFFFFFFFL;
+  }
+  public static long HandleValue(long number) {
+    return (long)unchecked((int)(uint)number);
+  }
+  static string HandleText(IntPtr window) {
+    return HandleNumber(window.ToInt64()).ToString();
+  }
+  static IntPtr HandleOf(long number) {
+    return new IntPtr(HandleValue(number));
+  }
 
   // ---- Processes: a snapshot, for programs' names, this script's ancestry and who shares the console. ----
   static Dictionary<uint, ProcessEntry> Processes() {
@@ -620,7 +639,7 @@ public static class SelfDesktop {
   static string OwnJson(Own own, Dictionary<uint, ProcessEntry> all) {
     if (own == null) return "null";
     if (own.Window == IntPtr.Zero) return Obj(F("why", Q(own.Why)), F("console", Q(own.ConsoleClass)));
-    return Obj(F("window", own.Window.ToInt64().ToString()), F("kind", Q(own.Kind)), F("program", Q(ProgramOf(own.Window, all))), F("title", Q(Cut(TitleOf(own.Window)))));
+    return Obj(F("window", HandleText(own.Window)), F("kind", Q(own.Kind)), F("program", Q(ProgramOf(own.Window, all))), F("title", Q(Cut(TitleOf(own.Window)))));
   }
   static string PaneJson(Own own) {
     Pane pane = own.Pane;
@@ -694,7 +713,7 @@ public static class SelfDesktop {
         Box frame = new Box();
         bool framed = !minimized && Frame(window, out frame);
         List<string> fields = new List<string>();
-        fields.Add(F("window", window.ToInt64().ToString()));
+        fields.Add(F("window", HandleText(window)));
         fields.Add(F("program", Q(program)));
         fields.Add(F("terminal", B(terminal)));
         fields.Add(F("own", B(mine)));
@@ -707,7 +726,7 @@ public static class SelfDesktop {
         if (terminal || mine) fields.Add(F("title", Q(Cut(TitleOf(window)))));
         listed.Add(Obj(fields));
       }
-      return "{" + Head(before != IntPtr.Zero) + "," + F("own", OwnJson(own, all)) + "," + F("front", front.ToInt64().ToString()) + "," + F("monitors", "[" + string.Join(",", monitors.ToArray()) + "]") + "," + F("windows", "[" + string.Join(",", listed.ToArray()) + "]") + "," + F("cut", B(cut)) + "}";
+      return "{" + Head(before != IntPtr.Zero) + "," + F("own", OwnJson(own, all)) + "," + F("front", HandleText(front)) + "," + F("monitors", "[" + string.Join(",", monitors.ToArray()) + "]") + "," + F("windows", "[" + string.Join(",", listed.ToArray()) + "]") + "," + F("cut", B(cut)) + "}";
     } finally {
       if (before != IntPtr.Zero) SetThreadDpiAwarenessContext(before);
     }
@@ -809,10 +828,10 @@ public static class SelfDesktop {
     IntPtr before = SetThreadDpiAwarenessContext(PER_MONITOR_AWARE_V2);
     try {
       Dictionary<uint, ProcessEntry> all = Processes();
-      IntPtr window = new IntPtr(handle);
+      IntPtr window = HandleOf(handle);
       string program = ProgramOf(window, all);
       string kind = KindOf(window, program);
-      return "{" + Head(before != IntPtr.Zero) + "," + F("window", Obj(F("window", handle.ToString()), F("kind", Q(kind)), F("program", Q(program)))) + "," + F("tree", Tree(window, kind, all, deny)) + "}";
+      return "{" + Head(before != IntPtr.Zero) + "," + F("window", Obj(F("window", HandleText(window)), F("kind", Q(kind)), F("program", Q(program)))) + "," + F("tree", Tree(window, kind, all, deny)) + "}";
     } finally {
       if (before != IntPtr.Zero) SetThreadDpiAwarenessContext(before);
     }
@@ -896,7 +915,7 @@ public static class SelfDesktop {
     IntPtr before = SetThreadDpiAwarenessContext(PER_MONITOR_AWARE_V2);
     try {
       Dictionary<uint, ProcessEntry> all = Processes();
-      return "{" + Head(before != IntPtr.Zero) + "," + F("capture", ShotJson(Shoot(new IntPtr(handle), all, deny, folder, name))) + "}";
+      return "{" + Head(before != IntPtr.Zero) + "," + F("capture", ShotJson(Shoot(HandleOf(handle), all, deny, folder, name))) + "}";
     } finally {
       if (before != IntPtr.Zero) SetThreadDpiAwarenessContext(before);
     }

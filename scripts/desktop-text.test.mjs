@@ -109,9 +109,9 @@ const REVIEWED_CALLS = {
   'CutRows.ToString': 1, 'Directory.CreateDirectory': 1, 'Dpi.ToString': 1, 'File.Delete': 1, 'File.Exists': 1, 'GC.KeepAlive': 3,
   'Graphics.FromImage': 1, 'Height.ToString': 1, 'Marshal.GetLastWin32Error': 4, 'Marshal.SizeOf': 4, 'Math.Min': 3, 'Math.Round': 4,
   'Path.Combine': 1, 'Path.IsPathRooted': 1, 'Process.GetCurrentProcess': 1, 'Process.GetProcessById': 1, 'ProgrammaticName.Replace': 1,
-  'Rectangle.Intersect': 1, 'Rows.ToString': 1, 'StartTime.ToUniversalTime': 1, 'Width.ToString': 1, 'Window.ToInt64': 3, 'all.TryGetValue': 2,
+  'Rectangle.Intersect': 1, 'Rows.ToString': 1, 'StartTime.ToUniversalTime': 1, 'Width.ToString': 1, 'Window.ToInt64': 2, 'all.TryGetValue': 2,
   'b.Append': 4, 'depth.ToString': 1, 'double.IsInfinity': 2, 'double.IsNaN': 1, 'element.GetCurrentPropertyValue': 1, 'element.GetRuntimeId': 1,
-  'fields.Add': 22, 'fields.ToArray': 1, 'found.Add': 1, 'front.ToInt64': 1, 'graphics.GetHdc': 1, 'graphics.ReleaseHdc': 1, 'handle.ToString': 1,
+  'fields.Add': 22, 'fields.ToArray': 1, 'found.Add': 1, 'graphics.GetHdc': 1, 'graphics.ReleaseHdc': 1,
   'ids.Add': 1, 'ids.Contains': 1, 'ids.ToArray': 1, 'lines.Add': 1, 'lines.ToArray': 1, 'listed.Add': 1, 'listed.ToArray': 1, 'monitors.Add': 1,
   'monitors.ToArray': 1, 'name.ToString': 1, 'nodes.Add': 1, 'nodes.ToArray': 1, 'part.Save': 1, 'part.ToString': 1, 'parts.Add': 1,
   'parts.ToArray': 1, 'programs.Add': 2, 'programs.ToArray': 1, 'roots.Add': 2, 'roots.AddRange': 1, 'roots.ToArray': 1, 'rows.Add': 1,
@@ -121,7 +121,7 @@ const REVIEWED_CALLS = {
 
 /** Each type the helper builds, by its uses: its own records, collections, strings, a bitmap of its own, rectangles. */
 const REVIEWED_BUILT = {
-  Bitmap: 1, Box: 1, Dictionary: 1, IntPtr: 4, List: 13, MonitorInfo: 1, Own: 1, Pane: 1, ProcessEntry: 1, Rectangle: 2, Regex: 1, Screen: 1,
+  Bitmap: 1, Box: 1, Dictionary: 1, IntPtr: 3, List: 13, MonitorInfo: 1, Own: 1, Pane: 1, ProcessEntry: 1, Rectangle: 2, Regex: 1, Screen: 1,
   Shot: 1, StringBuilder: 3, Table: 1, char: 1, int: 1, long: 1, string: 2, uint: 5,
 }
 
@@ -495,6 +495,15 @@ const RULES = [
   ['after the picture: another window shows the console, not kept', '[SelfDesktop]::AfterPicture(5, 6, $null)', /shown by another window now/],
   ['after the picture: no window found again, not kept', '[SelfDesktop]::AfterPicture(5, 0, $null)', /shown by another window now/],
   ['after the picture: what the look again found, not kept', "[SelfDesktop]::AfterPicture(5, 5, 'a program that is not this session''s own shares it')", "a program that is not this session's own shares it"],
+  // A window handle as the helper prints it (its lower 32 bits) and makes it again (those 32 bits sign-extended).
+  ['handle printed: a small handle as it is', '[SelfDesktop]::HandleNumber(74565)', 74565],
+  ['handle printed: one with bit 31 set, sign-extended, as its lower 32 bits', '[SelfDesktop]::HandleNumber(-2147483648)', 2147483648],
+  ['handle printed: all 32 bits set, sign-extended', '[SelfDesktop]::HandleNumber(-1)', 4294967295],
+  ['handle printed: upper bits set by any other means are dropped', '[SelfDesktop]::HandleNumber(4294967296 + 74565)', 74565],
+  ['handle made again: a small number as it is', '[SelfDesktop]::HandleValue(74565)', 74565],
+  ['handle made again: bit 31 set, sign-extended', '[SelfDesktop]::HandleValue(2147483648)', -2147483648],
+  ['handle made again: all 32 bits set, sign-extended', '[SelfDesktop]::HandleValue(4294967295)', -1],
+  ['handle round trip: printed, then made again, is the sign-extended handle', '[SelfDesktop]::HandleValue([SelfDesktop]::HandleNumber(-2147483000))', -2147483000],
 ]
 
 test("the helper's pure rules answer as the privacy rules say, for fixed values: no window read, no console attached", { skip: ON_WINDOWS }, () => {

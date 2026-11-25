@@ -114,7 +114,8 @@ public class SelfDesktopTestForm : Form {
       // A window its launcher asked to start hidden is shown again, still without taking the focus: the test's own window.
       if (!IsWindowVisible(form.Handle)) ShowWindow(form.Handle, 4);
       Point probe = form.PointToScreen(new Point(form.ClientSize.Width - 30, form.ClientSize.Height - 30));
-      Console.Out.WriteLine("{\"window\":" + form.Handle.ToInt64() + ",\"device\":\"" + Screen.FromHandle(form.Handle).DeviceName.Replace("\\", "\\\\") + "\",\"text\":" + Rect(text.Handle) + ",\"masked\":" + Rect(masked.Handle) + ",\"button\":" + Rect(button.Handle) + ",\"probe\":[" + probe.X + "," + probe.Y + "],\"report\":" + form.Report() + "}");
+      // Its handle as the helper prints a handle: the lower 32 bits, the only ones significant.
+      Console.Out.WriteLine("{\"window\":" + (form.Handle.ToInt64() & 0xFFFFFFFFL) + ",\"device\":\"" + Screen.FromHandle(form.Handle).DeviceName.Replace("\\", "\\\\") + "\",\"text\":" + Rect(text.Handle) + ",\"masked\":" + Rect(masked.Handle) + ",\"button\":" + Rect(button.Handle) + ",\"probe\":[" + probe.X + "," + probe.Y + "],\"report\":" + form.Report() + "}");
       Console.Out.Flush();
       Thread reader = new Thread(delegate () {
         string line;
