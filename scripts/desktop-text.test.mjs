@@ -513,15 +513,16 @@ const NULL_STRING = '[System.Management.Automation.Language.NullString]::Value'
   // An empty reason found again is a reason: the picture is not kept (the reason comes back, not null).
   ['after the picture: an empty reason found again, not kept', "[SelfDesktop]::AfterPicture(5, 5, '')", ''],
   ['after the picture: what the look again found, not kept', "[SelfDesktop]::AfterPicture(5, 5, 'a program that is not this session''s own shares it')", "a program that is not this session's own shares it"],
-  // A window handle as the helper prints it (its lower 32 bits) and makes it again (those 32 bits sign-extended).
-  ['handle printed: a small handle as it is', '[SelfDesktop]::HandleNumber(74565)', 74565],
-  ['handle printed: one with bit 31 set, sign-extended, as its lower 32 bits', '[SelfDesktop]::HandleNumber(-2147483648)', 2147483648],
-  ['handle printed: all 32 bits set, sign-extended', '[SelfDesktop]::HandleNumber(-1)', 4294967295],
-  ['handle printed: upper bits set by any other means are dropped', '[SelfDesktop]::HandleNumber(4294967296 + 74565)', 74565],
-  ['handle made again: a small number as it is', '[SelfDesktop]::HandleValue(74565)', 74565],
-  ['handle made again: bit 31 set, sign-extended', '[SelfDesktop]::HandleValue(2147483648)', -2147483648],
-  ['handle made again: all 32 bits set, sign-extended', '[SelfDesktop]::HandleValue(4294967295)', -1],
-  ['handle round trip: printed, then made again, is the sign-extended handle', '[SelfDesktop]::HandleValue([SelfDesktop]::HandleNumber(-2147483000))', -2147483000],
+  // A window handle as the helper prints it (its lower 32 bits) and makes it again (those 32 bits sign-extended). Each
+  // number is cast to [long], the parameter's type, so none rests on how Windows PowerShell types a literal.
+  ['handle printed: a small handle as it is', '[SelfDesktop]::HandleNumber([long]74565)', 74565],
+  ['handle printed: one with bit 31 set, sign-extended, as its lower 32 bits', '[SelfDesktop]::HandleNumber([long]-2147483648)', 2147483648],
+  ['handle printed: all 32 bits set, sign-extended', '[SelfDesktop]::HandleNumber([long]-1)', 4294967295],
+  ['handle printed: upper bits set by any other means are dropped', '[SelfDesktop]::HandleNumber([long]4295041861)', 74565],
+  ['handle made again: a small number as it is', '[SelfDesktop]::HandleValue([long]74565)', 74565],
+  ['handle made again: bit 31 set, sign-extended', '[SelfDesktop]::HandleValue([long]2147483648)', -2147483648],
+  ['handle made again: all 32 bits set, sign-extended', '[SelfDesktop]::HandleValue([long]4294967295)', -1],
+  ['handle round trip: printed, then made again, is the sign-extended handle', '[SelfDesktop]::HandleValue([SelfDesktop]::HandleNumber([long]-2147483000))', -2147483000],
 ]
 
 test("the helper's pure rules answer as the privacy rules say, for fixed values: no window read, no console attached", { skip: ON_WINDOWS }, () => {
