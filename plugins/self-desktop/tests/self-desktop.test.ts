@@ -447,7 +447,7 @@ test('a capture 10 minutes old is deleted at a call, though the plugin is off, a
     { ...entry(captureName(8), 'file', 600), isLink: true },
   ]
   expect(await call($, LIST)).toBe(OFF)
-  expect(deletions).toEqual([deleteScript(FOLDER, [old])])
+  expect(deletions).toEqual([deleteScript(DATA, [old])])
   for (const kept of [captureName(2), 'notes.txt', captureName(3), 'capture-1.png', captureName(8)]) expect(deletions[0]).not.toContain(kept)
 })
 
@@ -455,20 +455,25 @@ test("a session's start deletes the old captures too; with none, nothing runs", 
   const old = captureName(4)
   const { deletions, argvs } = engine(on, { captures: [entry(old, 'file', 60)] })
   await $.session.start(START)
-  expect(deletions).toEqual([deleteScript(FOLDER, [old])])
+  expect(deletions).toEqual([deleteScript(DATA, [old])])
   expect(argvs).toHaveLength(1)
 })
 
-test("the captures that are old: files named as the plugin names them, 10 minutes old or more, never a link; the deletion takes the plugin's own captures folder and those names alone", () => {
-  const entries = [entry(captureName(5), 'file', 10), entry(captureName(6), 'file', 9), entry('other.png', 'file', 60), entry(captureName(7), 'dir', 60), { ...entry(captureName(9), 'file', 60), isLink: true }]
+test("the captures that are old: files named as the plugin names them, 10 minutes old or more, never a link; the deletion builds the plugin's own captures folder from its data folder, and takes those names alone", () => {
+  // A link as the engine lists one is kind `other` with isLink; one marked a file with isLink is skipped as well.
+  const link = { name: captureName(10), kind: 'other' as const, size: 0, mtimeMs: 0, isLink: true }
+  const entries = [entry(captureName(5), 'file', 10), entry(captureName(6), 'file', 9), entry('other.png', 'file', 60), entry(captureName(7), 'dir', 60), { ...entry(captureName(9), 'file', 60), isLink: true }, link]
   expect(staleCaptures(entries, NOW)).toEqual([captureName(5)])
-  expect(() => deleteScript(FOLDER, [])).toThrow()
-  expect(() => deleteScript(FOLDER, ['notes.txt'])).toThrow()
-  expect(() => deleteScript(FOLDER, [`..\\${captureName(5)}`])).toThrow()
-  expect(() => deleteScript('C:\\path\\to\\elsewhere', [captureName(5)])).toThrow()
-  expect(() => deleteScript("C:\\path\\to\\a'b\\captures", [captureName(5)])).toThrow()
-  const script = deleteScript(FOLDER, [captureName(5)])
+  expect(() => deleteScript(DATA, [])).toThrow()
+  expect(() => deleteScript(DATA, ['notes.txt'])).toThrow()
+  expect(() => deleteScript(DATA, [`..\\${captureName(5)}`])).toThrow()
+  // A data folder a script wouldn't take builds no deletion.
+  for (const bad of ['', 'relative\\path', "C:\\path\\to\\a'b", 'C:\\path\\..\\x', 'C:/path/x']) expect(() => deleteScript(bad, [captureName(5)])).toThrow()
+  // The captures folder is built here, never given: a folder named captures, passed in, is a data folder like any other.
+  expect(deleteScript(FOLDER, [captureName(5)])).toContain(`$folder = '${FOLDER}\\captures'`)
+  const script = deleteScript(DATA, [captureName(5)])
   expect(script).toContain(`$folder = '${FOLDER}'`)
+  expect(deleteScript(`${DATA}\\`, [captureName(5)])).toBe(script)
   expect(script).toContain(`$names = @('${captureName(5)}')`)
   // Only inside the folder: the path is the folder joined with the name, and a path that leaves it is kept, not deleted.
   expect(script).toContain('if ([IO.Path]::GetDirectoryName($path) -ne $folder) { [void]$kept.Add($i); continue }')
@@ -653,7 +658,7 @@ test("a picture of a Windows Terminal window isn't built: refused outright, sayi
   expect(await call($, CAPTURE)).toBe(`Captured nothing: this session's window is WindowsTerminal.exe "claude" (window 1001, Windows Terminal), and ${TERMINAL_NOT_BUILT}`)
   expect(TERMINAL_NOT_BUILT).toContain('a zoomed pane takes the others out of it')
   const name = /^\$name = '([^']*)'\r?$/m.exec(scripts[0] ?? '')?.[1] ?? ''
-  expect(deletions).toEqual([deleteScript(FOLDER, [name])])
+  expect(deletions).toEqual([deleteScript(DATA, [name])])
   expect(toasts).toEqual([])
 })
 
@@ -696,7 +701,7 @@ test('a capture that times out, answers garbled, or fails: the name it chose is 
   world.scripts = 'capture hangs'
   world.removal = 'deleted'
   expect(await call($, CAPTURE)).toMatch(/^Captured nothing: its script didn't answer \(.*still running after 60000 ms.*\)\. The picture it had saved was deleted\.$/)
-  expect(deletions.at(-1)).toBe(deleteScript(FOLDER, [lastName()]))
+  expect(deletions.at(-1)).toBe(deleteScript(DATA, [lastName()]))
   // An answer that can't be read, and a file that can't be deleted.
   world.scripts = 'garbled'
   world.removal = 'kept'
@@ -805,7 +810,7 @@ test('the scripts: fixed text around checked numbers; a process id or a handle o
   expect(() => captureScript({ own: PID }, { ...file, folder: 'captures' })).toThrow()
   expect(() => captureScript({ own: 0 }, file)).toThrow()
   // No script sets anything of a console: not its code pages, not its title.
-  for (const script of [listScript(PID), readScript({ own: PID }), captureScript({ own: PID }, file), deleteScript([`${FOLDER}\\${file.name}`])]) {
+  for (const script of [listScript(PID), readScript({ own: PID }), captureScript({ own: PID }, file), deleteScript(DATA, [file.name])]) {
     expect(script).not.toMatch(/OutputEncoding|InputEncoding|\[Console\]::Title|RawUI|Write-Host/)
     expect(script.startsWith("$ErrorActionPreference = 'Stop'\r\n$ProgressPreference = 'SilentlyContinue'\r\n$env:PSModulePath = ")).toBe(true)
   }

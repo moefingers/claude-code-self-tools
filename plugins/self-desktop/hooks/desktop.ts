@@ -990,16 +990,16 @@ export function staleCaptures(entries: readonly { readonly name: string; readonl
   return entries.filter(e => e.kind === 'file' && e.isLink !== true && CAPTURE_NAME.test(e.name) && e.mtimeMs <= cutoff).map(e => e.name)
 }
 
-/** The plugin's own captures folder as a deletion takes it: a folder a script takes, named `captures`. */
-const isCapturesFolder = (folder: string): boolean => isSafeFolder(folder) && /\\captures$/.test(folder)
-
 /**
- * The script that deletes, in the plugin's own captures `folder` and only there, the captures `names` (each a name this
- * plugin makes, so no separator, no `..`). It compiles nothing and reads no window. Its one JSON line says, by each
- * name's place in `names`, which were deleted, which weren't there, and which are still there (kept).
+ * The script that deletes the captures `names` (each a name this plugin makes, so no separator, no `..`) in the plugin's
+ * own captures folder and only there. It is given the plugin's data folder, and builds the captures folder under it
+ * itself, so no other folder, even one named `captures`, can be given. It compiles nothing and reads no window. Its one
+ * JSON line says, by each name's place in `names`, which were deleted, which weren't there, and which are still there
+ * (kept).
  */
-export function deleteScript(folder: string, names: readonly string[]): string {
-  if (!isCapturesFolder(folder) || names.length === 0 || names.some(name => !CAPTURE_NAME.test(name))) throw new Error("a deletion takes the plugin's own captures folder and names this plugin made, and only those")
+export function deleteScript(dataFolder: string, names: readonly string[]): string {
+  const folder = capturesFolder(dataFolder)
+  if (folder === undefined || names.length === 0 || names.some(name => !CAPTURE_NAME.test(name))) throw new Error("a deletion takes the plugin's data folder and names this plugin made, and only those")
   return [
     ...PREAMBLE,
     `$folder = ${literal(folder)}`,

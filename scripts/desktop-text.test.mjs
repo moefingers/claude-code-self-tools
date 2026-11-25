@@ -325,7 +325,8 @@ test("the plugin's PowerShell plumbing is the shared machine code's: the bootstr
 
 /** Every script the plugin builds, by name: the tools', the cleaning's, and the live tests' own. */
 function scripts() {
-  const file = { folder: 'C:\\path\\to\\data\\captures', name: 'capture-0b6f3a52-1c2d-4e5f-8a9b-0c1d2e3f4a5b.png' }
+  const data = 'C:\\path\\to\\data'
+  const file = { folder: desktop.capturesFolder(data), name: 'capture-0b6f3a52-1c2d-4e5f-8a9b-0c1d2e3f4a5b.png' }
   return {
     'list, own window': desktop.listScript(4242),
     'list, no own window': desktop.listScript(undefined),
@@ -333,7 +334,7 @@ function scripts() {
     'read, a test window': desktop.readScript({ window: 777 }),
     'capture, own window': desktop.captureScript({ own: 4242 }, file),
     'capture, a test window': desktop.captureScript({ window: 777 }, file),
-    'deletion of captures': desktop.deleteScript(file.folder, [file.name]),
+    'deletion of captures': desktop.deleteScript(data, [file.name]),
   }
 }
 

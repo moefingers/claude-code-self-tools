@@ -25,7 +25,7 @@
 // for these tools. The cleaning runs at session.start too.
 // No lease in this step, decided on principle: two readers can't clobber each other; one comes with the first step that
 // acts. Nothing here hooks an event Claude Code's built-in guard passes over.
-import type { EngineInterface, Register } from 'claude-code'
+import type { EngineInterface, FsEntry, Register } from 'claude-code'
 import {
   argumentsOf,
   captureAnswer,
@@ -195,9 +195,11 @@ async function cleanCaptures($: EngineInterface): Promise<void> {
     if ((await platformOf($)) !== 'windows') return
     const m = await machineOf($)
     if (typeof m === 'string') return
-    const folder = capturesFolder(m.dataFolder)
-    if (folder === undefined) return
-    let entries: readonly { readonly name: string; readonly kind: string; readonly mtimeMs: number; readonly isLink?: boolean }[]
+    const data = m.dataFolder
+    const folder = capturesFolder(data)
+    if (data === undefined || folder === undefined) return
+    // The engine's FsEntry: a link is kind `other` with isLink, so a link is never taken for a file.
+    let entries: readonly FsEntry[]
     try {
       entries = await $.fs.list(folder)
     } catch {
@@ -206,16 +208,19 @@ async function cleanCaptures($: EngineInterface): Promise<void> {
     }
     const stale = staleCaptures(entries, await $.clock.now())
     if (stale.length === 0) return
-    await runScript($, m.powershell, deleteScript(folder, stale), CLEAN_MS)
+    await runScript($, m.powershell, deleteScript(data, stale), CLEAN_MS)
   } catch {
     // The next call or start tries again.
   }
 }
 
-/** Deletes the one picture a capture call chose `name` for, in the plugin's own `folder`: what became of it. Never throws. */
-async function removeChosen($: EngineInterface, powershell: string, folder: string, name: string): Promise<Removal> {
+/**
+ * Deletes the one picture a capture call chose `name` for, in the captures folder under the plugin's data folder `data`:
+ * what became of it. Never throws.
+ */
+async function removeChosen($: EngineInterface, powershell: string, data: string, name: string): Promise<Removal> {
   try {
-    const ran = await runScript($, powershell, deleteScript(folder, [name]), CLEAN_MS)
+    const ran = await runScript($, powershell, deleteScript(data, [name]), CLEAN_MS)
     return 'failed' in ran ? 'unknown' : (parseRemovals(ran.stdout, 1)[0] ?? 'unknown')
   } catch {
     return 'unknown'
@@ -262,9 +267,10 @@ async function captureOwn($: EngineInterface): Promise<string> {
   const m = await machineOf($)
   if (typeof m === 'string') return `Captured nothing: ${m}.`
   if (m.processId === undefined) return NO_PROCESS
-  const folder = capturesFolder(m.dataFolder)
-  if (folder === undefined) {
-    return `Captured nothing: this plugin's own folder (CLAUDE_PLUGIN_DATA) ${m.dataFolder === undefined ? "wasn't given by Claude Code" : "isn't one a script takes (a drive-absolute path with no quote, control character, or . or .. part)"}, so there is nowhere to keep a picture.`
+  const data = m.dataFolder
+  const folder = capturesFolder(data)
+  if (data === undefined || folder === undefined) {
+    return `Captured nothing: this plugin's own folder (CLAUDE_PLUGIN_DATA) ${data === undefined ? "wasn't given by Claude Code" : "isn't one a script takes (a drive-absolute path with no quote, control character, or . or .. part)"}, so there is nowhere to keep a picture.`
   }
   const name = `capture-${crypto.randomUUID()}.png`
   // Every outcome but a picture handed back deletes the name chosen here (a refusal, a timeout, an answer that can't be
@@ -289,7 +295,7 @@ async function captureOwn($: EngineInterface): Promise<string> {
       }
     }
   } finally {
-    if (!handedBack) removal = await removeChosen($, m.powershell, folder, name)
+    if (!handedBack) removal = await removeChosen($, m.powershell, data, name)
   }
   return `${said}${leftoverSaid(`${folder}\\${name}`, removal, helperDeleted)}`
 }
