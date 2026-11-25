@@ -343,11 +343,11 @@ public static class SelfDesktop {
     foreach (uint id in attached) {
       if (id == self || id == claude) continue;
       int at = IndexOf(ids, id);
-      if (at < 0) return "a process that can't be placed (process " + id + ") is attached to this session's console, so what the pane shows may be another program's";
+      if (at < 0) return "a process that can't be placed (process " + id + ") is attached to this session's console, so what the pane shows may be that process's";
       string name = names[at] == null ? "" : names[at];
       if (ownName != "" && string.Equals(name, ownName, StringComparison.OrdinalIgnoreCase)) return "another Claude Code process (" + name + ", process " + id + ") is attached to this session's console, so another session's text may be on this screen";
       if (Under(claude, id, ids, parents, starts) || Under(id, claude, ids, parents, starts)) continue;
-      return "another program (" + name + ", process " + id + ") shares this session's console, so what the pane shows may be that program's";
+      return "a program that is not this session's own, not its shell above it nor its children below it (" + name + ", process " + id + "), shares this session's console, so what the pane shows may be that program's";
     }
     return null;
   }
@@ -402,6 +402,12 @@ public static class SelfDesktop {
     if (ownWhy != null) return "why";
     if (kind == "console") return null;
     return kind == "terminal" ? "terminal" : "why";
+  }
+  // Whether a picture taken is kept, from this session's window before it and the look again after it: null when the
+  // same window is still this session's own, else why the picture is not kept.
+  public static string AfterPicture(long windowBefore, long windowAfter, string whyAfter) {
+    if (whyAfter != null) return whyAfter;
+    return windowAfter == windowBefore && windowAfter != 0 ? null : "this session's console is shown by another window now";
   }
 
   // ---- Processes: a snapshot, for programs' names, this script's ancestry and who shares the console. ----
@@ -818,7 +824,11 @@ public static class SelfDesktop {
     if (shot.File != null) return Obj(F("file", Q(shot.File)), F("width", shot.Width.ToString()), F("height", shot.Height.ToString()));
     return shot.Denied != null ? Obj(F("denied", Q(shot.Denied))) : Obj(F("why", Q(shot.Why)));
   }
-  static void TryDelete(string path) { try { File.Delete(path); } catch (Exception) { } }
+  // Deletes a picture this process saved; whether it is gone after.
+  static bool TryDelete(string path) {
+    try { File.Delete(path); } catch (Exception) { }
+    return !File.Exists(path);
+  }
   // One window's own pixels, as the window renders itself into a bitmap of this process's, cropped to its drawn frame.
   static Shot Shoot(IntPtr window, Dictionary<uint, ProcessEntry> all, string[] deny, string folder, string name) {
     Shot shot = new Shot();
@@ -867,12 +877,13 @@ public static class SelfDesktop {
       if (refusal == "terminal") return "{" + head + "," + F("capture", Obj(F("notBuilt", Q("terminal")))) + "}";
       Shot shot = Shoot(own.Window, all, deny, folder, name);
       if (shot.File != null) {
-        // Looked at again once the picture is taken: another program on this session's console now, or the console
-        // shown by another window, and the picture is deleted.
+        // Looked at again once the picture is taken: a program on this session's console now that is not its own, or
+        // the console shown by another window, and the picture is not kept; the answer says whether its delete worked.
         Own again = FindOwn(processId, all, null);
-        if (again.Why != null || again.Window != own.Window) {
-          TryDelete(shot.File);
-          return "{" + head + "," + F("capture", Obj(F("changed", "true"), F("why", Q(again.Why != null ? again.Why : "this session's console is shown by another window now")))) + "}";
+        string changed = AfterPicture(own.Window.ToInt64(), again.Window.ToInt64(), again.Why);
+        if (changed != null) {
+          bool deleted = TryDelete(shot.File);
+          return "{" + head + "," + F("capture", Obj(F("changed", "true"), F("why", Q(changed)), F("deleted", B(deleted)))) + "}";
         }
       }
       return "{" + head + "," + F("capture", ShotJson(shot)) + "}";
@@ -967,22 +978,58 @@ export function captureScript(target: Target, file: CaptureFile): string {
   return script([denyLine(), `$folder = ${literal(file.folder)}`, `$name = ${literal(file.name)}`, `[Console]::Out.Write(${call})`])
 }
 
-/** The captures in `folder` that are CAPTURE_MINUTES old or more at `now`: files named as this plugin names them, nothing else. */
-export function staleCaptures(folder: string, entries: readonly { readonly name: string; readonly kind: string; readonly mtimeMs: number }[], now: number): string[] {
+/**
+ * The captures in the plugin's folder that are CAPTURE_MINUTES old or more at `now`, by name: files named as this
+ * plugin names them, never a link, nothing else.
+ */
+export function staleCaptures(entries: readonly { readonly name: string; readonly kind: string; readonly mtimeMs: number; readonly isLink?: boolean }[], now: number): string[] {
   const cutoff = now - CAPTURE_MINUTES * 60_000
-  return entries.filter(e => e.kind === 'file' && CAPTURE_NAME.test(e.name) && e.mtimeMs <= cutoff).map(e => `${folder}\\${e.name}`)
+  return entries.filter(e => e.kind === 'file' && e.isLink !== true && CAPTURE_NAME.test(e.name) && e.mtimeMs <= cutoff).map(e => e.name)
 }
 
-/** A capture's path as the deletion takes it: a captures folder a script takes, then a name this plugin makes. */
-const isCapturePath = (path: string): boolean => {
-  const at = path.lastIndexOf('\\')
-  return at > 0 && isSafeFolder(path.slice(0, at)) && /\\captures$/.test(path.slice(0, at)) && CAPTURE_NAME.test(path.slice(at + 1))
+/** The plugin's own captures folder as a deletion takes it: a folder a script takes, named `captures`. */
+const isCapturesFolder = (folder: string): boolean => isSafeFolder(folder) && /\\captures$/.test(folder)
+
+/**
+ * The script that deletes, in the plugin's own captures `folder` and only there, the captures `names` (each a name this
+ * plugin makes, so no separator, no `..`). It compiles nothing and reads no window. Its one JSON line says, by each
+ * name's place in `names`, which were deleted, which weren't there, and which are still there (kept).
+ */
+export function deleteScript(folder: string, names: readonly string[]): string {
+  if (!isCapturesFolder(folder) || names.length === 0 || names.some(name => !CAPTURE_NAME.test(name))) throw new Error("a deletion takes the plugin's own captures folder and names this plugin made, and only those")
+  return [
+    ...PREAMBLE,
+    `$folder = ${literal(folder)}`,
+    `$names = @(${names.map(literal).join(', ')})`,
+    '$deleted = New-Object System.Collections.ArrayList',
+    '$absent = New-Object System.Collections.ArrayList',
+    '$kept = New-Object System.Collections.ArrayList',
+    'for ($i = 0; $i -lt $names.Count; $i++) {',
+    '  $path = [IO.Path]::Combine($folder, $names[$i])',
+    '  if ([IO.Path]::GetDirectoryName($path) -ne $folder) { [void]$kept.Add($i); continue }',
+    '  if (-not [IO.File]::Exists($path)) { [void]$absent.Add($i); continue }',
+    '  try { [IO.File]::Delete($path) } catch { }',
+    '  if ([IO.File]::Exists($path)) { [void]$kept.Add($i) } else { [void]$deleted.Add($i) }',
+    '}',
+    "[Console]::Out.Write('{\"v\":1,\"deleted\":[' + ($deleted -join ',') + '],\"absent\":[' + ($absent -join ',') + '],\"kept\":[' + ($kept -join ',') + ']}')",
+  ].join('\r\n')
 }
 
-/** The script that deletes exactly `paths`, each a capture this plugin made; it compiles nothing and reads no window. */
-export function deleteScript(paths: readonly string[]): string {
-  if (paths.length === 0 || paths.some(path => !isCapturePath(path))) throw new Error('a deletion takes captures this plugin made, and only those')
-  return [...PREAMBLE, `foreach ($path in @(${paths.map(literal).join(', ')})) { if ([IO.File]::Exists($path)) { [IO.File]::Delete($path) } }`].join('\r\n')
+/** What a deletion did to one name: deleted, not there, still there, or not known (its script failed, or answered otherwise). */
+export type Removal = 'deleted' | 'absent' | 'kept' | 'unknown'
+
+/** What the deletion script's answer says of each of `count` names, in order. */
+export function parseRemovals(stdout: string, count: number): Removal[] {
+  const unknown = Array.from({ length: count }, (): Removal => 'unknown')
+  const line = answerOf(stdout)
+  if (line === undefined) return unknown
+  const found = [...unknown]
+  for (const kind of ['deleted', 'absent', 'kept'] as const) {
+    const at = line[kind]
+    if (!Array.isArray(at)) return unknown
+    for (const i of at) if (isInt(i) && i >= 0 && i < count) found[i] = kind
+  }
+  return found
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1225,7 +1272,7 @@ export function parseReading(stdout: string): Reading | string {
 export type Capture =
   | { readonly kind: 'file'; readonly file: string; readonly width: number; readonly height: number }
   | { readonly kind: 'notBuilt' }
-  | { readonly kind: 'changed'; readonly why: string }
+  | { readonly kind: 'changed'; readonly why: string; readonly deleted: boolean }
   | { readonly kind: 'denied'; readonly program: string }
   | { readonly kind: 'why'; readonly why: string }
 export type Captured = { readonly dpiAware: boolean; readonly own: OwnWindow; readonly capture: Capture }
@@ -1244,7 +1291,7 @@ export function parseCaptured(stdout: string, folder: string): Captured | string
     }
     capture = { kind: 'file', file: raw.file, width: raw.width, height: raw.height }
   } else if (raw.notBuilt === 'terminal') capture = { kind: 'notBuilt' }
-  else if (raw.changed === true) capture = { kind: 'changed', why: visible(text(raw.why) || 'no reason given', 400) }
+  else if (raw.changed === true) capture = { kind: 'changed', why: visible(text(raw.why) || 'no reason given', 400), deleted: raw.deleted === true }
   else if (typeof raw.denied === 'string') capture = { kind: 'denied', program: visible(raw.denied, 80) }
   else capture = { kind: 'why', why: visible(text(raw.why) || 'no reason given', 400) }
   return { dpiAware: line?.dpiAware === true, own, capture }
@@ -1332,8 +1379,15 @@ function paneSaid(p: Extract<Pane, { kind: 'lines' }>): string {
     p.cutRows > 0
       ? ` Cut at the limit of ${PANE_ROWS} rows and ${grouped(PANE_CHARS)} characters: the ${grouped(p.cutRows)} row${p.cutRows === 1 ? '' : 's'} above (${grouped(p.cutChars)} character${p.cutChars === 1 ? '' : 's'}) are left out.`
       : ''
-  return `Pane: this session's own console, ${p.columns} columns by ${p.rows} rows, the part that shows; each line after "| ":${cut}`
+  return `Pane: the text showing in this session's own pane, from its console, ${p.columns} columns by ${p.rows} rows; each line after "| ". ${PANE_WRITERS}${cut}`
 }
+
+/**
+ * Who wrote the pane's rows, as every read that returns them says beside them: the read gives the text showing in the
+ * pane this session runs in, whoever wrote it, and the console's processes are checked only as they are now.
+ */
+export const PANE_WRITERS =
+  "These rows are the text showing in the pane this session runs in, whoever wrote it: rows may have been written by an earlier program or session in this pane (such as a conversation a wrapper ran in the same tab before this one, or a finished claude -p whose output still shows), and only the processes on the console now are checked."
 
 /** The read's answer: what it read (names only), the pane, the controls, and the rules each keeps. */
 export function readAnswer(r: Reading): string {
@@ -1348,12 +1402,12 @@ export function readAnswer(r: Reading): string {
   if (r.own.found) {
     lines.push(
       what === 'both'
-        ? `Read this session's own window, ${windowSaid(r.own)}, and its own pane. ${DATA_NOT_INSTRUCTIONS}`
+        ? `Read this session's own window, ${windowSaid(r.own)}, and the text showing in its own pane. ${DATA_NOT_INSTRUCTIONS}`
         : what === 'controls'
-          ? `Read this session's own window, ${windowSaid(r.own)}; its pane wasn't read. ${DATA_NOT_INSTRUCTIONS}`
-          : `Read this session's own pane; its window, ${windowSaid(r.own)}, wasn't read. ${DATA_NOT_INSTRUCTIONS}`,
+          ? `Read this session's own window, ${windowSaid(r.own)}; the text in its pane wasn't read. ${DATA_NOT_INSTRUCTIONS}`
+          : `Read the text showing in this session's own pane; its window, ${windowSaid(r.own)}, wasn't read. ${DATA_NOT_INSTRUCTIONS}`,
     )
-  } else lines.push(`Read this session's own pane only: its window wasn't found: ${r.own.why}. ${DATA_NOT_INSTRUCTIONS}`)
+  } else lines.push(`Read the text showing in this session's own pane only: its window wasn't found: ${r.own.why}. ${DATA_NOT_INSTRUCTIONS}`)
   if (r.pane.kind === 'lines') {
     lines.push(paneSaid(r.pane))
     lines.push(...paneLines(r.pane.lines))
@@ -1376,6 +1430,20 @@ export const TERMINAL_NOT_BUILT =
 /** How long a capture lasts, as the answers and the README say it. */
 export const CAPTURE_LIFETIME = `It stays on this machine, in this plugin's own folder, until the first call of this plugin's tools, or the first session start, ${CAPTURE_MINUTES} minutes or more after it was taken, which deletes it. The plugin sends it nowhere.`
 
+/**
+ * What became of the picture a capture call chose a name for and didn't hand back, as the end of its answer: said
+ * deleted only when a delete worked (the helper's own, `helperDeleted`, or the plugin's after it, `removal`); where it
+ * couldn't be deleted, or can't be told, its path and when the cleaning removes it. Nothing when no picture was there.
+ */
+export function leftoverSaid(path: string, removal: Removal, helperDeleted: boolean | undefined): string {
+  const cleaning = `the cleaning removes it at the first call of this plugin's tools, or the first session start, ${CAPTURE_MINUTES} minutes or more after it was taken`
+  if (removal === 'deleted') return ' The picture it had saved was deleted.'
+  if (removal === 'kept') return ` The picture it saved couldn't be deleted: it is at ${path}, and ${cleaning}.`
+  if (helperDeleted === true) return ' The picture it had taken was deleted.'
+  if (removal === 'absent') return helperDeleted === false ? ' The picture it had taken is no longer on disk.' : ''
+  return ` Whether a picture was left couldn't be checked: if there is one, it is at ${path}, and ${cleaning}.`
+}
+
 /** The capture's answer: the file and what it holds, or why there is none. */
 export function captureAnswer(c: Captured): string {
   const k = c.capture
@@ -1388,7 +1456,7 @@ export function captureAnswer(c: Captured): string {
     ].join('\n')
   }
   if (k.kind === 'notBuilt') return `Captured nothing: this session's window is ${what}, and ${TERMINAL_NOT_BUILT}`
-  if (k.kind === 'changed') return `Captured nothing: once the picture was taken, ${k.why}, so the picture was deleted.`
+  if (k.kind === 'changed') return `Captured nothing: once the picture was taken, ${k.why}, so it was not kept.`
   if (k.kind === 'denied') return `Captured nothing: ${deniedSaid(k.program)}`
   return `Captured nothing: ${k.why}.`
 }
@@ -1406,6 +1474,15 @@ export const OFF =
   "self-desktop is off, so nothing was read. The person turns it on with its enabled setting (in /config, or: echo '{\"enabled\":\"on\"}' | claude plugin configure self-desktop@claude-code-self-tools --values-stdin), then starts a new session or runs /reload-plugins."
 
 export const SUBAGENT = "A subagent can't read the desktop: self-desktop reads it for the main session only. Finish your piece and return its result."
+
+/**
+ * The refusals a tool's serving makes again at tool.run, the same way tool.call makes them, so the serving fails closed
+ * whatever ran before it: a subagent, then the setting off. Undefined when neither refuses.
+ */
+export function servingRefusal(agentId: string | undefined, isEnabled: boolean): { deny: string } | { result: string } | undefined {
+  if (agentId !== undefined) return { deny: SUBAGENT }
+  return isEnabled ? undefined : { result: OFF }
+}
 
 /** The answer where the session doesn't run on Windows: where it runs, as a phrase. */
 export const notWindows = (where: string): string =>
