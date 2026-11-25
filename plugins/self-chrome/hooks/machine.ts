@@ -3563,7 +3563,7 @@ export function pickTransport(
 //   runs; the wrapper's copy beside it at its own hash's name (wrapperScriptPath), never refused on;
 // - `auto`: this pane's slot when its runner is verified and takes the folder, else the window, decided
 //   in the script (self-restart's choice).
-// A plain window (`{ window: true }`) alone takes Remote Control and a first prompt (`remoteControl`,
+// A plain window (`{ window: true }`, or placed: `{ window: { rect?, maximized? } }`) alone takes Remote Control and a first prompt (`remoteControl`,
 // `promptFile`), handed to claude-launch.ps1 as -RemoteControl and -PromptFile: the prompt by its file's
 // path, never its text, which no command line of the launch's carries (Windows Terminal's splits at `;`).
 // A launch of another process (no waitForExit) must ask for the floor and input idle, and each is read
@@ -3628,24 +3628,48 @@ export const FALLBACK = /^fallback (.{1,1000}?)\s*$/m
  * - `{ pane: { token } }`: the caller's own tab, through the claude wrapper's ticket;
  * - `{ slot: id }`: a slot runner, by its id (`<pid>-<created>`): the caller's own pane's, for a launch
  *   that replaces its caller; else an idle one elsewhere;
- * - `{ tab: { window, title, pos?, size? } }`: a tab in that named window, running the slot runner, under this launch's own claim;
- * - `{ window: { name, pos?, size? } }`: a new named window, as the tab, where Windows Terminal can;
+ * - `{ tab: { window, title, pos?, size?, maximized? } }`: a tab in that named window, running the slot runner, under this launch's own claim;
+ * - `{ window: { name, pos?, size?, maximized? } }`: a new named window, as the tab, where Windows Terminal can;
  * - `{ window: true }`: a new window, running claude-launch.ps1;
- * - `'auto'`: this pane's slot when its runner is verified and takes the folder, else the window.
+ * - `{ window: { rect?, maximized? } }`: that new window, which places itself (PlainPlace, windowPlaceLines);
+ * - `'auto'`: this pane's slot when its runner is verified and takes the folder, else the window, unplaced.
  * The pane and 'auto' are for a launch that replaces its caller (`waitForExit`).
  */
 export type LaunchWhere =
   | { readonly pane: { readonly token: string } }
   | { readonly slot: string }
   | { readonly tab: WtTab }
-  | { readonly window: true | WtWindow }
+  | { readonly window: true | WtWindow | PlainPlace }
   | 'auto'
 
-/** A window by placement: its name, and where it opens when it isn't there yet. */
-export type WtWindow = { readonly name: string; readonly pos?: readonly [number, number]; readonly size?: readonly [number, number] }
+/** A window by placement: its name, and where it opens when it isn't there yet (`maximized`: wt's -M). */
+export type WtWindow = { readonly name: string; readonly pos?: readonly [number, number]; readonly size?: readonly [number, number]; readonly maximized?: true }
 
 /** A tab by placement: the named window it goes in, its label, and where that window opens when it isn't there yet. */
-export type WtTab = { readonly window: string; readonly title: string; readonly pos?: readonly [number, number]; readonly size?: readonly [number, number] }
+export type WtTab = { readonly window: string; readonly title: string; readonly pos?: readonly [number, number]; readonly size?: readonly [number, number]; readonly maximized?: true }
+
+/** A rectangle in virtual-screen pixels, as SetWindowPos takes a window's: left, top, width, height. */
+export type PixelRect = readonly [number, number, number, number]
+
+/**
+ * The plain window's place, which its own script sets (windowPlaceLines): `rect`, its window's rectangle, brought
+ * onto the work area of the monitor that holds most of it (clampToMonitors); `maximized`, maximized, on the monitor
+ * that holds `rect` when both are given. At least one. A window object with no name in placement.json.
+ */
+export type PlainPlace = { readonly rect?: PixelRect; readonly maximized?: true }
+
+/** A rect's bounds: x and y within 32768, as `pos`; a width and a height that still show a terminal, up to 32768. */
+export const RECT_LIMITS = { coordinate: 32768, minWidth: 320, minHeight: 200, max: 32768 } as const
+
+/** Whether `value` is a PixelRect within RECT_LIMITS: four whole numbers. */
+export function isRect(value: unknown): value is PixelRect {
+  if (!Array.isArray(value) || value.length !== 4 || !value.every(n => typeof n === 'number' && Number.isInteger(n))) return false
+  const [x, y, width, height] = value as number[]
+  return Math.abs(x as number) <= RECT_LIMITS.coordinate && Math.abs(y as number) <= RECT_LIMITS.coordinate && (width as number) >= RECT_LIMITS.minWidth && (width as number) <= RECT_LIMITS.max && (height as number) >= RECT_LIMITS.minHeight && (height as number) <= RECT_LIMITS.max
+}
+
+/** Whether a place is the plain window (unplaced, or placed by its own script), not a named one, a tab, a slot or a ticket. */
+export const isPlainWindow = (where: LaunchWhere): boolean => where !== 'auto' && 'window' in where && (where.window === true || !('name' in where.window))
 
 /**
  * The checks the launch script makes in the same run as it places the launch:
@@ -3708,7 +3732,7 @@ export type LaunchInput = {
   readonly noPlainFallback?: boolean
   /**
    * Remote Control at launch (claude-launch.ps1 -RemoteControl): `true`, under the start's name (a resume's
-   * is unnamed: Claude Code names it), or a name of its own (AREA_NAME). Only with `{ window: true }`, whose
+   * is unnamed: Claude Code names it), or a name of its own (AREA_NAME). Only with a plain window, placed or not, whose
    * script runs claude-launch.ps1 itself: the claude wrapper's ticket, a slot's record and a tab's line carry
    * neither this nor `promptFile` (the slot runner would need them in its record and its arguments first).
    */
@@ -3717,8 +3741,8 @@ export type LaunchInput = {
    * A first prompt (claude-launch.ps1 -PromptFile): the path of a UTF-8 file whose text claude gets once, as
    * its first prompt. A path of launchFolderFault's shape (absolute, no quote, control character or `;`): it
    * travels as a path, never the text. The launch reads it before the claim, by claude-launch.ps1's own checks
-   * (PROMPT_CHECK), and refuses (`prompt`), saying why, what the window would refuse. Only with
-   * `{ window: true }`, as `remoteControl`.
+   * (PROMPT_CHECK), and refuses (`prompt`), saying why, what the window would refuse. Only with a plain
+   * window, placed or not, as `remoteControl`.
    */
   readonly promptFile?: string
 }
@@ -4109,12 +4133,15 @@ export type TabRun =
 
 /**
  * The one string wt.exe is given for a tab (Start-Process's -ArgumentList, which joins an array with
- * spaces and quotes nothing): the window by name, its place when it isn't there yet, `nt` with the title
- * and the folder, `--`, then Windows PowerShell by its known path running the slot script from its one
+ * spaces and quotes nothing): the window by name, its place when it isn't there yet (`-M`, maximized, then
+ * `--pos` and `--size`: wt ignores all three for a window that is there already, #5's table), `nt` with the
+ * title and the folder, `--`, then Windows PowerShell by its known path running the slot script from its one
  * place, and what the tab is opened to do, each value pattern-checked, with the launcher it runs by this
- * release's pin. Nothing else: no prompt, no assignment, no permission flag.
+ * release's pin. Nothing else: no prompt, no assignment, no permission flag. `-M` is `--maximized`, "Launches
+ * the terminal maximized" (https://learn.microsoft.com/en-us/windows/terminal/command-line-arguments); with
+ * `--pos`, maximized on the monitor that holds that point (measured in #5 on Windows Terminal 1.24, two monitors).
  */
-export function wtTabLine(input: { readonly powershell: string; readonly stateDir: string; readonly window: string; readonly title: string; readonly pos?: readonly [number, number]; readonly size?: readonly [number, number]; readonly folder: string; readonly run: TabRun }): string {
+export function wtTabLine(input: { readonly powershell: string; readonly stateDir: string; readonly window: string; readonly title: string; readonly pos?: readonly [number, number]; readonly size?: readonly [number, number]; readonly maximized?: true; readonly folder: string; readonly run: TabRun }): string {
   if (!POWERSHELL_PATH.test(input.powershell)) throw new Error(`not Windows PowerShell by its known path: ${JSON.stringify(input.powershell)}`)
   if (!isWindowName(input.window)) throw new Error(`not a window Windows Terminal takes by name: ${JSON.stringify(input.window)}`)
   if (!TAB_LABEL.test(input.title)) throw new Error(`not a tab's label: ${JSON.stringify(input.title)}`)
@@ -4150,9 +4177,11 @@ export function wtTabLine(input: { readonly powershell: string; readonly stateDi
     const left = run.left === undefined ? [] : 'size' in run.left ? ['-LeftSize', String(run.left.size), '-LeftMtime', String(run.left.mtime)] : ['-LeftExitAt', String(run.left.exitAt)]
     doing = ['-Resume', run.resume, ...waits, ...named, ...left, ...claim(run.claim), '-Launcher', LAUNCH_SCRIPT_SHA256]
   }
+  if (input.maximized !== undefined && input.maximized !== true) throw new Error(`maximized is true or left out: ${JSON.stringify(input.maximized)}`)
   return [
     '-w',
     input.window,
+    ...(input.maximized === true ? ['-M'] : []),
     ...place(input.pos, '--pos', (x, y) => isPos(x) && isPos(y)),
     ...place(input.size, '--size', isSize),
     'nt',
@@ -4204,7 +4233,7 @@ function checkLaunch(input: LaunchInput) {
     if (typeof input.name !== 'string' || !AREA_NAME.test(input.name)) throw new Error(`a start's name is not a session name: ${JSON.stringify(input.name)}`)
     if (checks.fresh !== true) throw new Error('a start checks that its id is new (checks.fresh)')
     if (where === 'auto' || (typeof where === 'object' && 'pane' in where)) throw new Error("a start goes to a slot, a tab or a window: the claude wrapper's ticket and 'auto' resume")
-    if (typeof where === 'object' && waitFor !== undefined && ('tab' in where || ('window' in where && where.window !== true))) throw new Error('a start in a tab waits for nothing: only a resume in one does')
+    if (typeof where === 'object' && waitFor !== undefined && ('tab' in where || ('window' in where && !isPlainWindow(where)))) throw new Error('a start in a tab waits for nothing: only a resume in one does')
     if (input.left !== undefined) throw new Error('a left record is a resumed conversation\'s')
   } else if (input.kind === 'resume') {
     if (input.name !== undefined) throw new Error('a resume takes no name')
@@ -4222,8 +4251,10 @@ function checkLaunch(input: LaunchInput) {
       : { resume: id, claim: input.claim, ...(waitFor === undefined ? {} : { waitFor }), configDirs, ...(input.left === undefined ? {} : { left: input.left }) }
   const tabOf = (tab: WtTab): string => {
     if (!LAUNCH_CLAIM.test(input.claim)) throw new Error("a tab's or a named window's slot runner takes only a launch's own claim, launch:<uuid>")
-    return wtTabLine({ powershell: input.powershell, stateDir: state, window: tab.window, title: tab.title, ...(tab.pos === undefined ? {} : { pos: tab.pos }), ...(tab.size === undefined ? {} : { size: tab.size }), folder, run: tabRun() })
+    return wtTabLine({ powershell: input.powershell, stateDir: state, window: tab.window, title: tab.title, ...(tab.pos === undefined ? {} : { pos: tab.pos }), ...(tab.size === undefined ? {} : { size: tab.size }), ...(tab.maximized === undefined ? {} : { maximized: tab.maximized }), folder, run: tabRun() })
   }
+  /** The plain window's place, checked again here (readPlacement checked it): only checked numbers reach its script. */
+  let place: PlainPlace | undefined
   if (where === 'auto') {
     if (waitFor === undefined) throw new Error("'auto' is for a launch that replaces its caller (waitForExit)")
     if (!input.claim.startsWith('launch:')) throw new Error("'auto' names a launch's claim; the slot's is its own")
@@ -4245,12 +4276,12 @@ function checkLaunch(input: LaunchInput) {
     if (input.claim !== `slot:${where.slot}`) throw new Error("a slot's launch names that slot's claim")
   } else if ('window' in where) {
     if (!input.claim.startsWith('launch:')) throw new Error("a window names a launch's claim")
-    if (where.window !== true) {
+    if (where.window !== true && 'name' in where.window) {
       const named = where.window
-      wtLine = tabOf({ window: named.name, title: input.name ?? `resume-${id.slice(0, 8)}`, ...(named.pos === undefined ? {} : { pos: named.pos }), ...(named.size === undefined ? {} : { size: named.size }) })
+      wtLine = tabOf({ window: named.name, title: input.name ?? `resume-${id.slice(0, 8)}`, ...(named.pos === undefined ? {} : { pos: named.pos }), ...(named.size === undefined ? {} : { size: named.size }), ...(named.maximized === undefined ? {} : { maximized: named.maximized }) })
       stamp = { window: named.name, tab: input.name ?? `resume-${id.slice(0, 8)}` }
       label = named.name
-    }
+    } else if (where.window !== true) place = checkPlainPlace(where.window)
   } else throw new Error('not a place to launch to')
   if (input.left !== undefined) leftRecheck(input.left)
   if (input.deadline !== undefined && !isCount(input.deadline)) throw new Error('the deadline is not a time')
@@ -4263,8 +4294,18 @@ function checkLaunch(input: LaunchInput) {
     if (fault !== undefined) throw new Error(`the prompt file ${JSON.stringify(promptFile)} ${fault}, so a launch never takes it: it takes an absolute path with no quote, control character, semicolon, < > | ? * or /, and no '.' or '..' part`)
   }
   // Only a plain window runs claude-launch.ps1 itself: the wrapper's ticket, a slot's record and a tab's line carry neither.
-  if ((remoteControl !== undefined || promptFile !== undefined) && !(typeof where === 'object' && 'window' in where && where.window === true)) throw new Error("Remote Control and a first prompt at launch go to a plain window ({ window: true }) alone: the claude wrapper's ticket, a slot's record and a tab's line carry neither")
-  return { id, folder, state, configDirs, tool, checks, where, waitFor, label, ticket, wtLine, stamp, maxSessions, heavyRoot, deadline: input.deadline, remoteControl, promptFile }
+  if ((remoteControl !== undefined || promptFile !== undefined) && !isPlainWindow(where)) throw new Error("Remote Control and a first prompt at launch go to a plain window ({ window: true }, placed or not) alone: the claude wrapper's ticket, a slot's record and a tab's line carry neither")
+  return { id, folder, state, configDirs, tool, checks, where, waitFor, label, ticket, wtLine, stamp, maxSessions, heavyRoot, deadline: input.deadline, remoteControl, promptFile, place }
+}
+
+/** A plain window's place, checked: a rect within RECT_LIMITS, maximized true, at least one, nothing else. Throws otherwise. */
+function checkPlainPlace(value: PlainPlace): PlainPlace {
+  if (!isRecord(value)) throw new Error('the plain window\'s place is not an object')
+  for (const key of Object.keys(value)) if (key !== 'rect' && key !== 'maximized') throw new Error(`the plain window's place has an unknown key ${key}: it takes rect and maximized (pos and size are a named window's)`)
+  if (value.rect !== undefined && !isRect(value.rect)) throw new Error(`the plain window's rect is not four whole numbers [x, y, width, height] in RECT_LIMITS: ${JSON.stringify(value.rect)}`)
+  if (value.maximized !== undefined && value.maximized !== true) throw new Error(`the plain window's maximized is true or left out: ${JSON.stringify(value.maximized)}`)
+  if (value.rect === undefined && value.maximized === undefined) throw new Error("the plain window's place names neither a rect nor maximized")
+  return { ...(value.rect === undefined ? {} : { rect: [value.rect[0], value.rect[1], value.rect[2], value.rect[3]] as const }), ...(value.maximized === undefined ? {} : { maximized: true as const }) }
 }
 
 /**
@@ -4404,6 +4445,147 @@ const WRITE_REFUSED = [
   '}',
 ]
 
+// ---------------------------------------------------------------------------------------------
+// The plain window places its own window (#5): the one thing a self tool does to a window. Only the window's
+// own script acts, on the window it finds from its own console in its own process; nothing on the caller's
+// side moves anything. Its only inputs are the checked numbers of a PlainPlace, as literals.
+
+/** A rectangle as Windows gives one: left, top, right, bottom, in virtual-screen pixels. */
+export type ScreenBox = readonly [number, number, number, number]
+
+/** A monitor as GetMonitorInfo reads it: its rectangle and its work area, in virtual-screen coordinates. */
+export type MonitorBox = { readonly monitor: ScreenBox; readonly work: ScreenBox }
+
+/**
+ * `rect` within `work`: no wider or taller than the work area, then moved the least that puts it wholly inside.
+ * The arithmetic of PLACE_CS's Clamp, line for line (scripts/window-place-live.test.mjs compares the two on Windows).
+ */
+export function clampToWork(rect: PixelRect, work: ScreenBox): PixelRect {
+  const [x, y, width, height] = rect
+  const [left, top, right, bottom] = work
+  const w = Math.min(width, right - left)
+  const h = Math.min(height, bottom - top)
+  return [Math.max(left, Math.min(x, right - w)), Math.max(top, Math.min(y, bottom - h)), w, h]
+}
+
+/**
+ * Where the plain window's script puts `rect` among `monitors`: on the work area of the monitor MonitorFromRect
+ * picks with MONITOR_DEFAULTTONEAREST, clamped (clampToWork), so a rectangle wholly off every monitor still lands
+ * on one. The pick as Microsoft's page states it (https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-monitorfromrect):
+ * the monitor with the largest area of intersection with the rectangle. For a rectangle that meets none, the page
+ * says only "the display monitor that is nearest to the rectangle": here the smallest gap between the two
+ * rectangles (across plus down), ties to the first; a stand-in for Windows' own measure, which no page gives.
+ * A rectangle across two monitors goes wholly onto the one that holds more of it. Throws with no monitor.
+ */
+export function clampToMonitors(rect: PixelRect, monitors: readonly MonitorBox[]): PixelRect {
+  if (monitors.length === 0) throw new Error('no monitor to place a window on')
+  const [x, y, width, height] = rect
+  const overlap = ([left, top, right, bottom]: ScreenBox): number => Math.max(0, Math.min(right, x + width) - Math.max(left, x)) * Math.max(0, Math.min(bottom, y + height) - Math.max(top, y))
+  const gap = ([left, top, right, bottom]: ScreenBox): number => Math.max(0, left - (x + width), x - right) + Math.max(0, top - (y + height), y - bottom)
+  let best = monitors[0] as MonitorBox
+  for (const m of monitors) if (overlap(m.monitor) > overlap(best.monitor)) best = m
+  if (overlap(best.monitor) === 0) for (const m of monitors) if (gap(m.monitor) < gap(best.monitor)) best = m
+  return clampToWork(rect, best.work)
+}
+
+/** SetWindowPos's flags for the place: SWP_NOZORDER (0x0004) | SWP_NOACTIVATE (0x0010) | SWP_NOOWNERZORDER (0x0200) | SWP_ASYNCWINDOWPOS (0x4000). */
+export const PLACE_SWP_FLAGS = 0x4214
+
+/**
+ * The C# the window compiles (Add-Type) to place its own window, one line, of C# 5 (Windows PowerShell 5.1's
+ * compiler; PowerShell 7's takes it too). `Place` finds the window from the process's own console: GetConsoleWindow,
+ * and that window itself when it is the classic console's (class ConsoleWindowClass), or, when it is a pseudoconsole's
+ * (PseudoConsoleWindow), its owner by GetWindow(GW_OWNER = 4), only when that is a Windows Terminal window
+ * (CASCADIA_HOSTING_WINDOW_CLASS, #5's table). Anything else, or a window already minimized or maximized (Windows
+ * Terminal's launchMode, say): nothing is done, and it says why. Then per-monitor DPI awareness for its thread alone
+ * (SetThreadDpiAwarenessContext(-4), DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2; Windows PowerShell 5.1 is DPI-unaware,
+ * #5), put back as it was before it returns. With a rect: the monitor MonitorFromRect picks (MONITOR_DEFAULTTONEAREST,
+ * 2), its work area (GetMonitorInfoW's rcWork), Clamp (clampToWork's arithmetic), then SetWindowPos with
+ * PLACE_SWP_FLAGS: no Z-order change, no activation, posted to the window's own thread rather than waited on. With
+ * maximized: ShowWindowAsync(SW_MAXIMIZE = 3), after the rect when both are given, so it maximizes on that rect's
+ * monitor and restores to the rect. ShowWindow has no maximize that doesn't activate (its page's table), so a maximized
+ * window is activated, as a new window is when it opens. Answers "placed", or why not, as one line of text.
+ * It takes no handle, name, title or process id from outside; it never enumerates windows.
+ * Pages: GetConsoleWindow https://learn.microsoft.com/en-us/windows/console/getconsolewindow (in a pseudoconsole, "a
+ * window handle for message queue purposes only"); GetWindow https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-getwindow;
+ * GetClassNameW https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-getclassnamew; IsIconic
+ * https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-isiconic; IsZoomed
+ * https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-iszoomed; SetThreadDpiAwarenessContext
+ * https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-setthreaddpiawarenesscontext (NULL for a
+ * context it refuses; Windows 10 1607 and later) and https://learn.microsoft.com/en-us/windows/win32/hidpi/dpi-awareness-context;
+ * MonitorFromRect (above); GetMonitorInfoW https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-getmonitorinfow
+ * and MONITORINFO https://learn.microsoft.com/en-us/windows/win32/api/winuser/ns-winuser-monitorinfo; SetWindowPos
+ * https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-setwindowpos; ShowWindowAsync
+ * https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-showwindowasync and ShowWindow's values
+ * https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-showwindow. From memory alone, no page read:
+ * the class names ConsoleWindowClass and PseudoConsoleWindow, MONITOR_DEFAULTTONEAREST's value 2 (its page names it
+ * without a number), and that a top-level window's "client coordinates" in SetWindowPos are the virtual screen's.
+ */
+export const PLACE_CS = [
+  'using System; using System.Runtime.InteropServices; using System.Text;',
+  'public static class ClaudeSelfToolsPlace {',
+  '[StructLayout(LayoutKind.Sequential)] public struct Box { public int Left; public int Top; public int Right; public int Bottom; }',
+  '[StructLayout(LayoutKind.Sequential)] public struct MonitorInfo { public uint Size; public Box Whole; public Box Work; public uint Flags; }',
+  '[DllImport("kernel32.dll")] static extern IntPtr GetConsoleWindow();',
+  '[DllImport("user32.dll")] static extern IntPtr GetWindow(IntPtr window, uint relation);',
+  '[DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern int GetClassNameW(IntPtr window, StringBuilder name, int size);',
+  '[DllImport("user32.dll")] static extern bool IsIconic(IntPtr window);',
+  '[DllImport("user32.dll")] static extern bool IsZoomed(IntPtr window);',
+  '[DllImport("user32.dll")] static extern IntPtr SetThreadDpiAwarenessContext(IntPtr context);',
+  '[DllImport("user32.dll")] static extern IntPtr MonitorFromRect(ref Box rect, uint fallback);',
+  '[DllImport("user32.dll")] static extern bool GetMonitorInfoW(IntPtr monitor, ref MonitorInfo info);',
+  '[DllImport("user32.dll", SetLastError = true)] static extern bool SetWindowPos(IntPtr window, IntPtr after, int x, int y, int width, int height, uint flags);',
+  '[DllImport("user32.dll")] static extern bool ShowWindowAsync(IntPtr window, int show);',
+  'static string ClassOf(IntPtr window) { StringBuilder name = new StringBuilder(256); return GetClassNameW(window, name, name.Capacity) > 0 ? name.ToString() : ""; }',
+  'public static int[] Clamp(int x, int y, int width, int height, int left, int top, int right, int bottom) { int w = Math.Min(width, right - left); int h = Math.Min(height, bottom - top); return new int[] { Math.Max(left, Math.Min(x, right - w)), Math.Max(top, Math.Min(y, bottom - h)), w, h }; }',
+  'public static string Place(int x, int y, int width, int height, bool hasRect, bool maximized) {',
+  'IntPtr console = GetConsoleWindow();',
+  'if (console == IntPtr.Zero) return "it has no console window";',
+  'string kind = ClassOf(console);',
+  'IntPtr own = IntPtr.Zero;',
+  'if (kind == "ConsoleWindowClass") own = console;',
+  'else if (kind == "PseudoConsoleWindow") { own = GetWindow(console, 4); if (own == IntPtr.Zero || ClassOf(own) != "CASCADIA_HOSTING_WINDOW_CLASS") return "its console is a pseudoconsole that no Windows Terminal window owns"; }',
+  'else return "its console window is of class " + kind + ", neither the classic console nor Windows Terminal";',
+  'if (IsIconic(own) || IsZoomed(own)) return "it opened minimized or maximized, so it is left as it is";',
+  'IntPtr before = SetThreadDpiAwarenessContext(new IntPtr(-4));',
+  'if (before == IntPtr.Zero) return "per-monitor DPI awareness could not be set for its thread";',
+  'try {',
+  'if (hasRect) {',
+  'Box asked = new Box(); asked.Left = x; asked.Top = y; asked.Right = x + width; asked.Bottom = y + height;',
+  'MonitorInfo info = new MonitorInfo(); info.Size = (uint)Marshal.SizeOf(typeof(MonitorInfo));',
+  'IntPtr monitor = MonitorFromRect(ref asked, 2);',
+  'if (monitor == IntPtr.Zero || !GetMonitorInfoW(monitor, ref info)) return "the monitor for its rectangle could not be read";',
+  'int[] at = Clamp(x, y, width, height, info.Work.Left, info.Work.Top, info.Work.Right, info.Work.Bottom);',
+  `if (!SetWindowPos(own, IntPtr.Zero, at[0], at[1], at[2], at[3], 0x${PLACE_SWP_FLAGS.toString(16)})) return "SetWindowPos failed with error " + Marshal.GetLastWin32Error();`,
+  '}',
+  'if (maximized && !ShowWindowAsync(own, 3)) return "it could not be maximized";',
+  'return "placed";',
+  '} finally { SetThreadDpiAwarenessContext(before); }',
+  '}',
+  '}',
+].join(' ')
+
+/**
+ * The lines that place the plain window (PlainPlace), in its own script, right after its start signal, its
+ * file's deletion and the module path: PLACE_CS compiled, then Place called with the place's checked numbers as
+ * literals. Whatever fails is caught: the window says in one line what it could not do, and the session goes on.
+ */
+export function windowPlaceLines(place: PlainPlace): string[] {
+  const rect = place.rect ?? [0, 0, 0, 0]
+  if (place.rect !== undefined && !isRect(place.rect)) throw new Error(`not a rect: ${JSON.stringify(place.rect)}`)
+  if (place.maximized !== undefined && place.maximized !== true) throw new Error('maximized is true or left out')
+  if (place.rect === undefined && place.maximized === undefined) throw new Error('a place names a rect or maximized')
+  const flag = (on: boolean): string => (on ? '$true' : '$false')
+  return [
+    '$placeSaid = "not tried"',
+    'try {',
+    `  Add-Type -ErrorAction Stop -TypeDefinition ${literal(PLACE_CS)}`,
+    `  $placeSaid = [ClaudeSelfToolsPlace]::Place([int]${rect[0]}, [int]${rect[1]}, [int]${rect[2]}, [int]${rect[3]}, ${flag(place.rect !== undefined)}, ${flag(place.maximized === true)})`,
+    '} catch { $placeSaid = "it could not be placed (" + $_.Exception.Message + ")" }',
+    'if ($placeSaid -cne "placed") { Write-Host ("This window is not where placement.json puts it: " + $placeSaid + ". The session goes on here.") }',
+  ]
+}
+
 /**
  * The new window's script, run by PowerShell 7 or Windows PowerShell 5.1 (the window's interpreter
  * rule: PWSH_PATH when it is there) from its own file (`file`, windowScriptPath) after the launch script
@@ -4421,9 +4603,10 @@ const WRITE_REFUSED = [
  * conversation. A run that
  * throws (a claude.exe an update holds, say) is caught and said, with the
  * way to resume by hand, never a window that closes on it. Values only as single-quoted literals or
- * checked numbers.
+ * checked numbers. With a `place`, the window places itself (windowPlaceLines) right after its module path, before
+ * anything waits; without one, not a line of it is there.
  */
-function windowScript(v: { id: string; kind: 'resume' | 'start'; name?: string; folder: string; state: string; configDirs: readonly string[]; by: string; file: string; signal: string; waitFor?: ProcessRef; left?: LeftStat; remoteControl?: true | string; promptFile?: string }): string {
+function windowScript(v: { id: string; kind: 'resume' | 'start'; name?: string; folder: string; state: string; configDirs: readonly string[]; by: string; file: string; signal: string; waitFor?: ProcessRef; left?: LeftStat; remoteControl?: true | string; promptFile?: string; place?: PlainPlace }): string {
   const resume = v.kind === 'resume'
   // A line that runs as it is printed: the script's whole path, and the folder quoted, whatever it holds
   // (neither can hold a quote). The copy kept for use by hand: the one this window pins may be what changed.
@@ -4460,6 +4643,8 @@ function windowScript(v: { id: string; kind: 'resume' | 'start'; name?: string; 
     // alone on the path would load 5.1's copies of its own core modules, through a hidden Windows
     // PowerShell kept for the window's whole life (its compatibility session).
     `if ($PSVersionTable.PSEdition -ne "Core") { ${PSMODULEPATH_RESET} }`,
+    // Its own window, placed where placement.json puts the plain window: before the wait, so it waits there.
+    ...(v.place === undefined ? [] : windowPlaceLines(v.place)),
     // Its session is in no tab of a named window: the stamp of the one that launched it would send a later `same` there.
     '$env:CLAUDE_SELF_TOOLS_WT_WINDOW = $null',
     '$env:CLAUDE_SELF_TOOLS_WT_TAB = $null',
@@ -4744,7 +4929,7 @@ export function launchScriptText(input: LaunchInput): string {
         const launchId = input.claim.slice('launch:'.length)
         const file = windowScriptPath(v.state, launchId)
         const signal = windowSignalName(launchId)
-        const inner = windowScript({ id: v.id, kind: input.kind, ...(input.name === undefined ? {} : { name: input.name }), folder: v.folder, state: v.state, configDirs: v.configDirs, by: input.claim, file, signal, ...(v.waitFor === undefined ? {} : { waitFor: v.waitFor }), ...(input.left === undefined ? {} : { left: input.left }), ...(v.remoteControl === undefined ? {} : { remoteControl: v.remoteControl }), ...(v.promptFile === undefined ? {} : { promptFile: v.promptFile }) })
+        const inner = windowScript({ id: v.id, kind: input.kind, ...(input.name === undefined ? {} : { name: input.name }), folder: v.folder, state: v.state, configDirs: v.configDirs, by: input.claim, file, signal, ...(v.waitFor === undefined ? {} : { waitFor: v.waitFor }), ...(input.left === undefined ? {} : { left: input.left }), ...(v.remoteControl === undefined ? {} : { remoteControl: v.remoteControl }), ...(v.promptFile === undefined ? {} : { promptFile: v.promptFile }), ...(v.place === undefined ? {} : { place: v.place }) })
         return { file, signal, inner }
       })()
     : undefined
@@ -5090,14 +5275,14 @@ export function launchScriptText(input: LaunchInput): string {
 /** A place a launch may go, in a `prefer` list. */
 export type PlacementLeg = 'slot' | 'tab' | 'window'
 
-/** A window of the layout: its name, where it opens, its tabs' labels, and the folder they start in. */
-export type LayoutWindow = { readonly window: string; readonly pos?: readonly [number, number]; readonly size?: readonly [number, number]; readonly tabs: readonly string[]; readonly folder: string }
+/** A window of the layout: its name, where it opens (`maximized`: wt's -M), its tabs' labels, and the folder they start in. */
+export type LayoutWindow = { readonly window: string; readonly pos?: readonly [number, number]; readonly size?: readonly [number, number]; readonly maximized?: true; readonly tabs: readonly string[]; readonly folder: string }
 
-/** Where launches go: `tab.window` by name, at most `maxTabs` beyond the layout's. */
-export type PlacementLaunch = { readonly prefer: readonly PlacementLeg[]; readonly tab?: { readonly window: string; readonly maxTabs: number }; readonly window?: WtWindow }
+/** Where launches go: `tab.window` by name, at most `maxTabs` beyond the layout's; `window` a named one, or the plain window's place (no name). */
+export type PlacementLaunch = { readonly prefer: readonly PlacementLeg[]; readonly tab?: { readonly window: string; readonly maxTabs: number }; readonly window?: WtWindow | PlainPlace }
 
-/** Where a restart goes: `tab.window` by name, or `same`: the tab's own stamp's window. */
-export type PlacementRestart = { readonly prefer: readonly PlacementLeg[]; readonly tab?: { readonly window: string }; readonly window?: WtWindow }
+/** Where a restart goes: `tab.window` by name, or `same`: the tab's own stamp's window; `window` as launch's. */
+export type PlacementRestart = { readonly prefer: readonly PlacementLeg[]; readonly tab?: { readonly window: string }; readonly window?: WtWindow | PlainPlace }
 
 /** placement.json, read. `limits` as the file gives them: the slot runner's and a launch's defaults fill the rest. */
 export type Placement = {
@@ -5118,7 +5303,10 @@ const isWholeIn = (value: unknown, low: number, high: number): value is number =
  * each thing wrong; a bad file means no placement at all. Window names letters, digits, `_` and `-`, never
  * `0`, `last`, `new`, `-1` or all digits (a name WT reads as special, T-L6); tab labels; folders absolute,
  * with no quote, control character, `;` or `%` (that one is there, the layout script checks: this is pure);
- * `pos` within 32768, `size` 20 to 400 columns and 5 to 200 rows; `prefer` from the fixed set, each once;
+ * `pos` within 32768, `size` 20 to 400 columns and 5 to 200 rows; `maximized` true, for a layout window and a
+ * named one (wt's -M) and the plain window; `rect` (isRect: x and y within 32768, 320 to 32768 wide, 200 to 32768
+ * tall) for the plain window alone, a `window` with no name, which takes rect, maximized or both and no pos or size
+ * (a named window's rect is not built: refused, naming pos and size); `prefer` from the fixed set, each once;
  * `workspaces` window names to workspace ids; `limits.minFreeGb` 1 to 64, `limits.maxSessions` 1 to 40;
  * `afterBoot.fltFix` an absolute .ps1 of the same shape; unknown keys refused, naming them.
  */
@@ -5136,8 +5324,9 @@ export function readPlacement(text: string): { readonly placement: Placement } |
   }
   keys(raw, ['v', 'layout', 'launch', 'restart', 'workspaces', 'limits', 'afterBoot'], 'the file')
   if (raw.v !== 1) errors.push('it is not version 1')
-  const placeOf = (value: Record<string, unknown>, where: string): { pos?: [number, number]; size?: [number, number] } => {
-    const out: { pos?: [number, number]; size?: [number, number] } = {}
+  /** A named window's place (a layout window's too): pos, size and maximized; a rect refused, as not built. */
+  const placeOf = (value: Record<string, unknown>, where: string): { pos?: [number, number]; size?: [number, number]; maximized?: true } => {
+    const out: { pos?: [number, number]; size?: [number, number]; maximized?: true } = {}
     if (value.pos !== undefined) {
       if (Array.isArray(value.pos) && value.pos.length === 2 && isPos(value.pos[0]) && isPos(value.pos[1])) out.pos = [value.pos[0], value.pos[1]]
       else errors.push(`${where} has a pos that is not two whole numbers within 32768`)
@@ -5146,6 +5335,26 @@ export function readPlacement(text: string): { readonly placement: Placement } |
       if (Array.isArray(value.size) && value.size.length === 2 && isSize(value.size[0], value.size[1])) out.size = [value.size[0] as number, value.size[1] as number]
       else errors.push(`${where} has a size that is not 20-400 columns and 5-200 rows`)
     }
+    if (value.maximized !== undefined) {
+      if (value.maximized === true) out.maximized = true
+      else errors.push(`${where} has a maximized that is not true (leave it out for a window that is not maximized)`)
+    }
+    if (value.rect !== undefined) errors.push(`${where} has a rect, which a named window does not take (not built): give it pos, in pixels, and size, in columns and rows`)
+    return out
+  }
+  /** The plain window's place (a window with no name): rect, maximized or both; never pos or size. */
+  const plainOf = (value: Record<string, unknown>, where: string): PlainPlace => {
+    const out: { rect?: PixelRect; maximized?: true } = {}
+    if (value.pos !== undefined || value.size !== undefined) errors.push(`${where} has no name, so it is the plain window, which takes rect and maximized: pos and size are a named window's`)
+    if (value.rect !== undefined) {
+      if (isRect(value.rect)) out.rect = [value.rect[0], value.rect[1], value.rect[2], value.rect[3]]
+      else errors.push(`${where} has a rect that is not four whole numbers [x, y, width, height]: x and y within 32768, a width of 320 to 32768 and a height of 200 to 32768`)
+    }
+    if (value.maximized !== undefined) {
+      if (value.maximized === true) out.maximized = true
+      else errors.push(`${where} has a maximized that is not true (leave it out for a window that is not maximized)`)
+    }
+    if (value.rect === undefined && value.maximized === undefined) errors.push(`${where} has no name and no rect or maximized: name a window, or give the plain window its place`)
     return out
   }
   const preferOf = (value: unknown, where: string): PlacementLeg[] => {
@@ -5161,12 +5370,14 @@ export function readPlacement(text: string): { readonly placement: Placement } |
     }
     return seen
   }
-  const namedWindow = (value: unknown, where: string): WtWindow | undefined => {
+  /** A section's window: by its name, a named window of Windows Terminal; with none, the plain window's place. */
+  const windowOf = (value: unknown, where: string): WtWindow | PlainPlace | undefined => {
     if (!isRecord(value)) {
       errors.push(`${where}.window is not an object`)
       return undefined
     }
-    keys(value, ['name', 'pos', 'size'], `${where}.window`)
+    keys(value, ['name', 'pos', 'size', 'rect', 'maximized'], `${where}.window`)
+    if (value.name === undefined) return plainOf(value, `${where}.window`)
     if (!isWindowName(value.name)) errors.push(`${where}.window.name is not a name Windows Terminal takes as one`)
     return { name: value.name as string, ...placeOf(value, `${where}.window`) }
   }
@@ -5180,7 +5391,7 @@ export function readPlacement(text: string): { readonly placement: Placement } |
         errors.push(`${here} is not an object`)
         return
       }
-      keys(value, ['window', 'pos', 'size', 'tabs', 'folder'], here)
+      keys(value, ['window', 'pos', 'size', 'maximized', 'rect', 'tabs', 'folder'], here)
       if (!isWindowName(value.window)) errors.push(`${here}.window is not a name Windows Terminal takes as one`)
       else if (names.has(value.window)) errors.push(`${here}.window names a window twice`)
       else names.add(value.window)
@@ -5215,7 +5426,7 @@ export function readPlacement(text: string): { readonly placement: Placement } |
           tab = { window: raw.launch.tab.window as string, maxTabs: raw.launch.tab.maxTabs as number }
         }
       }
-      const window = raw.launch.window === undefined ? undefined : namedWindow(raw.launch.window, 'launch')
+      const window = raw.launch.window === undefined ? undefined : windowOf(raw.launch.window, 'launch')
       launch = { prefer, ...(tab === undefined ? {} : { tab }), ...(window === undefined ? {} : { window }) }
     }
   }
@@ -5234,7 +5445,7 @@ export function readPlacement(text: string): { readonly placement: Placement } |
           tab = { window: raw.restart.tab.window as string }
         }
       }
-      const window = raw.restart.window === undefined ? undefined : namedWindow(raw.restart.window, 'restart')
+      const window = raw.restart.window === undefined ? undefined : windowOf(raw.restart.window, 'restart')
       restart = { prefer, ...(tab === undefined ? {} : { tab }), ...(window === undefined ? {} : { window }) }
     }
   }
@@ -5411,11 +5622,12 @@ function placedLegs(probe: Probe, placement: Placement | null, opts: PickOptions
       }
       const home = placement.layout.find(w => w.window === window)
       const title = section.tab.window === 'same' && opts.stamp?.tab !== undefined && TAB_LABEL.test(opts.stamp.tab) ? opts.stamp.tab : (opts.title ?? 'overflow')
-      legs.push({ tab: { window, title, ...(home?.pos === undefined ? {} : { pos: home.pos }), ...(home?.size === undefined ? {} : { size: home.size }) } })
+      legs.push({ tab: { window, title, ...(home?.pos === undefined ? {} : { pos: home.pos }), ...(home?.size === undefined ? {} : { size: home.size }), ...(home?.maximized === undefined ? {} : { maximized: home.maximized }) } })
     }
     if (leg === 'window') {
+      // A named window, or the plain window at its place (no name: no workspace tag can name it).
       const named = section.window ?? placement.launch?.window
-      if (named !== undefined && taggedElsewhere(named.name)) said.push(`window ${named.name} is tagged for another workspace`)
+      if (named !== undefined && 'name' in named && taggedElsewhere(named.name)) said.push(`window ${named.name} is tagged for another workspace`)
       else if (named !== undefined) legs.push({ window: named })
       else said.push('the placement names no window')
     }
@@ -5452,8 +5664,9 @@ export function pickLaunchTransport(probe: Probe, placement: Placement | null, o
     // A window a launch opened (its wrapper hosted, the pane file says): the places placement.json names
     // come first, so a session that landed in a plain window only because its tab or named window was
     // refused goes back to it; this window is the fallback, before a new one. A tab you typed `claude`
-    // in, or a window with no placement to follow, keeps the session, as ever.
-    const placedFirst = paneOk && tab.pane.hosted === true ? placedLegs(probe, placement, opts).legs : []
+    // in, or a window with no placement to follow, keeps the session, as ever. The plain window's place is
+    // never one of them: this is a plain window already, and a new one each move would only add windows.
+    const placedFirst = paneOk && tab.pane.hosted === true ? placedLegs(probe, placement, opts).legs.filter(leg => !isPlainWindow(leg)) : []
     if (paneOk && placedFirst.length === 0) return { where: { pane: { token: tab.token } } }
     const slot = probe.slot
     if (slot !== null && slotVerified(slot)) return { where: { slot: slot.id } }
