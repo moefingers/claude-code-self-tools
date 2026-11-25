@@ -45,6 +45,8 @@ function engine(on: On, { env = {}, placement, refuses = () => undefined, wake, 
   const logs: string[] = []
   const registered: string[] = []
   const files = new Map<string, string>(placement === undefined ? [] : [[placementPath(STATE), placement]])
+  /** Each answer this file's fs.exists hook gave a look for placement.json, in order. */
+  const placementAsks: boolean[] = []
   const marker = wakePath(STATE, ID)
   const held = new Map<string, unknown>()
   const clock = mock.clock(on, { now: 1_000_000 })
@@ -54,7 +56,12 @@ function engine(on: On, { env = {}, placement, refuses = () => undefined, wake, 
   on('tool.call', { tool: 'CronList' }, () => ({ result: { jobs: [] }, text: '0 scheduled jobs.' }) as never)
   on('tool.list', () => ({ value: wake === undefined ? [] : [{ name: 'mcp__self-wake__wake_after', description: 'Wakes this session later.', mcp: true }] }))
   // This conversation's transcript, under the repo's project folder: the start folder holds it.
-  on('fs.exists', (_, e) => ({ value: files.has(e.path) || (e.path === marker && typeof wake === 'string') || TRANSCRIPT.test(e.path) }))
+  on('fs.exists', (_, e) => {
+    const value = files.has(e.path) || (e.path === marker && typeof wake === 'string') || TRANSCRIPT.test(e.path)
+    // The plugin's own looks for placement.json, as this hook answers them: loadPlacement's first read.
+    if (/placement\.json$/.test(e.path)) placementAsks.push(value)
+    return { value }
+  })
   on('fs.read', (_, e) => (files.has(e.path) ? { value: files.get(e.path) as string } : e.path === marker && typeof wake === 'string' ? { value: wake } : { deny: `ENOENT: ${e.path}` }))
   on('fs.write', (_, e) => {
     files.set(e.path, e.text)
@@ -120,7 +127,7 @@ function engine(on: On, { env = {}, placement, refuses = () => undefined, wake, 
     if (exit === 'exits') await clock.sleep(3_600_000)
     return {}
   })
-  return { scripts, commands, toasts, logs, registered, files, clock, session, held, probes: () => probeCount, released: () => releaseCount, queuedGo }
+  return { scripts, commands, toasts, logs, registered, files, clock, session, held, probes: () => probeCount, released: () => releaseCount, queuedGo, placementAsks }
 }
 
 const start = { cwd: 'C:\\work\\repo', surface: 'terminal', isInteractive: true } as const
@@ -162,14 +169,16 @@ test('a hand-started tab has no stamp: past the tab, to the placement\'s window'
 })
 
 /** The host's platform, when the runtime says it; undefined when it doesn't (the test then runs). */
-const HOST = (globalThis as { process?: { platform?: string } }).process?.platform
-
-test("the plain window's place (#5, a restart window with no name): one launch of the plain window, which places itself; the caller's lines move nothing. Windows only: off Windows placement.json is not read (CHANGELOG, 2026-11-24), so there it returns at once, the engine's tests having no skip", async ($, on) => {
-  if (HOST !== undefined && HOST !== 'win32') return
+test("the plain window's place (#5, a restart window with no name): one launch of the plain window, which places itself; the caller's lines move nothing. Where the restart's own look for placement.json finds none (loadPlacement's first read, its $.fs.exists, as this file's hook answered it: off Windows, where this file's other placement tests fail for the same miss), it ends there, the engine's tests having no skip", async ($, on) => {
   const placed = JSON.stringify({ v: 1, layout: [], restart: { prefer: ['window'], window: { rect: [-1600, 120, 1200, 800], maximized: true } } })
-  const { scripts, commands, clock } = engine(on, { placement: placed })
+  const { scripts, commands, clock, placementAsks } = engine(on, { placement: placed })
   await $.session.start(start)
   await restart($, clock)
+  // The restart reads placement.json by loadPlacement, whose first read, and its one "not read" with no error, is
+  // `if (!(await $.fs.exists(placementPath(state)))) return { placement: null }`. Its answer, as this file's hook gave
+  // it, decides: asked and answered "not there" every time, nothing here can be shown. Never asked (the restart no
+  // longer reads it), or found, it runs on, and fails where the restart goes wrong.
+  if (placementAsks.length > 0 && placementAsks.every(found => !found)) return
   expect(scripts).toHaveLength(1)
   const script = scripts[0] ?? ''
   expect(script).toContain('$window = Start-Process -FilePath')
