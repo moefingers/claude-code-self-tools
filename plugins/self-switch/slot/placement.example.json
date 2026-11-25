@@ -7,7 +7,7 @@
     { "window": "claude-4", "pos": [960, 540], "size": [160, 42], "tabs": ["overflow-1", "overflow-2", "overflow-3"], "folder": "C:\\path\\to\\work" }
   ],
   "launch": { "prefer": ["slot", "tab", "window"], "tab": { "window": "claude-4", "maxTabs": 2 }, "window": { "name": "claude-overflow", "pos": [1920, 0], "size": [140, 60] } },
-  "restart": { "prefer": ["slot", "tab", "window"], "tab": { "window": "same" } },
+  "restart": { "prefer": ["slot", "tab", "window"], "tab": { "window": "same" }, "window": { "rect": [100, 80, 1280, 860] } },
   "workspaces": { "claude-4": "default" },
   "limits": { "minFreeGb": 5, "maxSessions": 12 }
 }

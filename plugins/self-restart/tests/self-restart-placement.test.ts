@@ -45,6 +45,8 @@ function engine(on: On, { env = {}, placement, refuses = () => undefined, wake, 
   const logs: string[] = []
   const registered: string[] = []
   const files = new Map<string, string>(placement === undefined ? [] : [[placementPath(STATE), placement]])
+  /** Each answer this file's fs.exists hook gave a look for placement.json, in order. */
+  const placementAsks: boolean[] = []
   const marker = wakePath(STATE, ID)
   const held = new Map<string, unknown>()
   const clock = mock.clock(on, { now: 1_000_000 })
@@ -54,7 +56,12 @@ function engine(on: On, { env = {}, placement, refuses = () => undefined, wake, 
   on('tool.call', { tool: 'CronList' }, () => ({ result: { jobs: [] }, text: '0 scheduled jobs.' }) as never)
   on('tool.list', () => ({ value: wake === undefined ? [] : [{ name: 'mcp__self-wake__wake_after', description: 'Wakes this session later.', mcp: true }] }))
   // This conversation's transcript, under the repo's project folder: the start folder holds it.
-  on('fs.exists', (_, e) => ({ value: files.has(e.path) || (e.path === marker && typeof wake === 'string') || TRANSCRIPT.test(e.path) }))
+  on('fs.exists', (_, e) => {
+    const value = files.has(e.path) || (e.path === marker && typeof wake === 'string') || TRANSCRIPT.test(e.path)
+    // The plugin's own looks for placement.json, as this hook answers them: loadPlacement's first read.
+    if (/placement\.json$/.test(e.path)) placementAsks.push(value)
+    return { value }
+  })
   on('fs.read', (_, e) => (files.has(e.path) ? { value: files.get(e.path) as string } : e.path === marker && typeof wake === 'string' ? { value: wake } : { deny: `ENOENT: ${e.path}` }))
   on('fs.write', (_, e) => {
     files.set(e.path, e.text)
@@ -120,7 +127,7 @@ function engine(on: On, { env = {}, placement, refuses = () => undefined, wake, 
     if (exit === 'exits') await clock.sleep(3_600_000)
     return {}
   })
-  return { scripts, commands, toasts, logs, registered, files, clock, session, held, probes: () => probeCount, released: () => releaseCount, queuedGo }
+  return { scripts, commands, toasts, logs, registered, files, clock, session, held, probes: () => probeCount, released: () => releaseCount, queuedGo, placementAsks }
 }
 
 const start = { cwd: 'C:\\work\\repo', surface: 'terminal', isInteractive: true } as const
@@ -159,6 +166,36 @@ test('a hand-started tab has no stamp: past the tab, to the placement\'s window'
   await restart($, clock)
   expect(scripts[0]).toContain('-w claude-overflow --pos 1920,0 --size 140,60 nt ')
   expect(commands).toEqual([{ command: 'exit' }])
+})
+
+test("the plain window's place (#5, a restart window with no name): one launch of the plain window, which places itself; the caller's lines move nothing. Where the restart's own look for placement.json finds none (loadPlacement's first read, its $.fs.exists, as this file's hook answered it: off Windows, where this file's other placement tests fail for the same miss), it ends there, the engine's tests having no skip", async ($, on) => {
+  const placed = JSON.stringify({ v: 1, layout: [], restart: { prefer: ['window'], window: { rect: [-1600, 120, 1200, 800], maximized: true } } })
+  const { scripts, commands, clock, placementAsks } = engine(on, { placement: placed })
+  await $.session.start(start)
+  await restart($, clock)
+  // The restart reads placement.json by loadPlacement, whose first read, and its one "not read" with no error, is
+  // `if (!(await $.fs.exists(placementPath(state)))) return { placement: null }`. Its answer, as this file's hook gave
+  // it, decides: asked and answered "not there" every time, nothing here can be shown. Never asked (the restart no
+  // longer reads it), or found, it runs on, and fails where the restart goes wrong. The engine's tests print nothing
+  // on a pass, so each assertion's message names the branch it is in.
+  const missed = 'branch: every look for placement.json answered "not there", so its checks are not run'
+  if (placementAsks.length > 0 && placementAsks.every(found => !found)) {
+    expect(placementAsks.length, missed).toBeGreaterThan(0)
+    return
+  }
+  const ran = `branch: placement.json was found (${placementAsks.length} looks: ${JSON.stringify(placementAsks)}) or never looked for, so its checks run`
+  expect(scripts, ran).toHaveLength(1)
+  const script = scripts[0] ?? ''
+  expect(script, ran).toContain('$window = Start-Process -FilePath')
+  expect(script, ran).not.toContain('Start-Process $wtExe')
+  expect(script, ran).toContain("$transport = 'window'")
+  // In the window's own script alone, as checked literals.
+  const inner = script.indexOf("$inner = '")
+  const call = script.indexOf('$placeSaid = [ClaudeSelfToolsPlace]::Place([int]-1600, [int]120, [int]1200, [int]800, $true, $true)')
+  expect(inner, ran).toBeGreaterThan(0)
+  expect(call, ran).toBeGreaterThan(inner)
+  expect(script.indexOf('$windowPath = '), ran).toBeGreaterThan(call)
+  expect(commands, ran).toEqual([{ command: 'exit' }])
 })
 
 test('a stamp that is not of its shape counts as none', async ($, on) => {

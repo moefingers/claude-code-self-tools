@@ -32,13 +32,29 @@ before(() => {
 })
 after(() => rmSync(work, { recursive: true, force: true }))
 
-/** A fixture file's text, its placeholders the test's own folder and script. */
-const textOf = file =>
-  JSON.stringify(file)
-    .split('{{FOLDER}}')
-    .join(JSON.stringify(join(work, 'a folder')).slice(1, -1))
-    .split('{{FILE}}')
-    .join(JSON.stringify(join(work, 'flt.ps1')).slice(1, -1))
+/** `text` with its placeholders put in: `folder` and `file`, each JSON-escaped. */
+const fill = (text, folder, file) => text.split('{{FOLDER}}').join(JSON.stringify(folder).slice(1, -1)).split('{{FILE}}').join(JSON.stringify(file).slice(1, -1))
+
+/**
+ * The folder and the .ps1 file readPlacement gets, of the shape it takes on every platform. readPlacement checks a
+ * folder's shape alone (it is pure; the layout script checks the folder is there), and takes only a drive-absolute
+ * Windows path: on Linux the test's own temporary folder is a POSIX path, which it refuses, so a good file with a
+ * folder in it would read as bad there for a reason that is no row's.
+ */
+const SHAPED_FOLDER = 'C:\\path\\to\\a folder'
+const SHAPED_FILE = 'C:\\path\\to\\flt.ps1'
+
+/** A fixture file's text for the layout script, which checks its folder and its script are there: the test's own. */
+const textOf = file => fill(JSON.stringify(file), join(work, 'a folder'), join(work, 'flt.ps1'))
+
+/** A fixture file's text for readPlacement: the folder and the script of the shape it takes, on every platform. */
+const shapedOf = file => fill(JSON.stringify(file), SHAPED_FOLDER, SHAPED_FILE)
+
+/** A raw fixture file's text as written, for the layout script: never rewritten through JSON.stringify. */
+const rawOf = text => fill(text, join(work, 'a folder'), join(work, 'flt.ps1'))
+
+/** A raw fixture file's text as written, for readPlacement, as shapedOf. */
+const shapedRawOf = text => fill(text, SHAPED_FOLDER, SHAPED_FILE)
 
 /** The layout script, -WhatIf or as given: hidden, in the temporary folder. Never -Apply. */
 function runLayout(args, script = LAYOUT) {
@@ -59,6 +75,13 @@ function psTakes(file, script = LAYOUT, tag = 'case') {
   return runLayout(['-WhatIf', '-Placement', path], script)
 }
 
+/** The PowerShell validator's verdict on a raw fixture file's text, written as it is. */
+function psTakesRaw(text, script = LAYOUT, tag = 'raw') {
+  const path = join(work, `${tag}-${createHash('sha256').update(rawOf(text)).digest('hex').slice(0, 16)}.json`)
+  writeFileSync(path, rawOf(text))
+  return runLayout(['-WhatIf', '-Placement', path], script)
+}
+
 test('the layout script is pinned by a release hash, ASCII with LF line ends; nothing checks it at run time', () => {
   assert.equal(createHash('sha256').update(layoutBytes).digest('hex'), machine.LAYOUT_SCRIPT_SHA256)
   assert.ok(layoutBytes.every(b => b < 128))
@@ -70,13 +93,19 @@ test('the layout script is pinned by a release hash, ASCII with LF line ends; no
 
 test('readPlacement takes each good file and refuses each bad one', () => {
   for (const { name, file } of fixture.good) {
-    const read = machine.readPlacement(textOf(file))
+    const read = machine.readPlacement(shapedOf(file))
     assert.ok('placement' in read, `${name}: ${JSON.stringify(read.errors)}`)
   }
   for (const { name, file } of fixture.bad) {
-    const read = machine.readPlacement(textOf(file))
+    const read = machine.readPlacement(shapedOf(file))
     assert.ok('errors' in read && read.errors.length > 0, `${name} was taken`)
   }
+})
+
+test('readPlacement takes and refuses each raw file as JSON writes it: 100.0 and 1e3 are whole numbers, 100.5, 1e400 and "100" are not', () => {
+  assert.ok(fixture.raw.length >= 10 && fixture.raw.some(c => c.good) && fixture.raw.some(c => !c.good))
+  const wrong = fixture.raw.filter(({ good, text }) => ('placement' in machine.readPlacement(shapedRawOf(text))) !== good).map(({ name, good }) => `${name}: ${good ? 'refused' : 'taken'}`)
+  assert.deepEqual(wrong, [], 'every row, in one run')
 })
 
 test('an unknown key is refused by its name; a BOM is read past; not JSON says so', () => {
@@ -112,6 +141,22 @@ describe('the validator in PowerShell', { skip: !isWindows && 'Windows only', co
       assert.ok(!ran.out.includes('wt.exe'), 'prints no command for a bad file')
     })
   }
+  // The same raw text readPlacement reads: how ConvertFrom-Json types a number (5.1 and 7 differ) changes nothing.
+  for (const { name, good, text } of [...(fixture.raw ?? [])]) {
+    test(`${good ? 'takes' : 'refuses'}, as written: ${name}`, () => {
+      const ran = psTakesRaw(text)
+      assert.equal(ran.code, good ? 0 : 2, ran.out)
+      if (!good) assert.ok(!ran.out.includes('wt.exe'), 'prints no command for a bad file')
+    })
+  }
+  test('a pos and a size written 0.0 and 1.2e2 reach wt as 0 and 120, as wtTabLine writes them', () => {
+    const { text } = fixture.raw.find(c => c.name === 'a pos and a size written 0.0, 1.2e2 and 30.0')
+    const ran = psTakesRaw(text, LAYOUT, 'written')
+    assert.equal(ran.code, 0, ran.out)
+    const line = machine.wtTabLine({ powershell: WINDOWS_POWERSHELL, stateDir: join(work, 'local', 'claude-self-tools'), window: 'a', title: 't', pos: [0, 0], size: [120, 30], folder: join(work, 'a folder'), run: { idle: true } })
+    assert.ok(line.includes(' --pos 0,0 --size 120,30 nt '), line)
+    assert.ok(ran.out.includes(`[a / t] wt.exe ${line}`), `${line}\nin:\n${ran.out}`)
+  })
 })
 
 describe('-WhatIf, the default, for the design\'s example', { skip: !isWindows && 'Windows only' }, () => {
@@ -127,7 +172,7 @@ describe('-WhatIf, the default, for the design\'s example', { skip: !isWindows &
     const placement = machine.readPlacement(textOf(file)).placement
     for (const w of placement.layout) {
       w.tabs.forEach((tab, i) => {
-        const line = machine.wtTabLine({ powershell: WINDOWS_POWERSHELL, stateDir: state, window: w.window, title: tab, ...(i === 0 ? { pos: w.pos, size: w.size } : {}), folder, run: { idle: true } })
+        const line = machine.wtTabLine({ powershell: WINDOWS_POWERSHELL, stateDir: state, window: w.window, title: tab, ...(i === 0 ? { pos: w.pos, size: w.size, maximized: w.maximized } : {}), folder, run: { idle: true } })
         assert.ok(ran.out.includes(`[${w.window} / ${tab}] wt.exe ${line}`), `${line}\nin:\n${ran.out}`)
       })
     }
@@ -135,6 +180,18 @@ describe('-WhatIf, the default, for the design\'s example', { skip: !isWindows &
     assert.equal(ran.out.match(/--pos/g).length, 2, 'one per window')
     // The slot runner isn't in the temporary folder: it says so, and -Apply would refuse.
     assert.match(ran.out, /note: the slot runner is not at /)
+  })
+
+  test('a maximized window (#5): -M on its first tab only, before --pos, by the same string the machine code builds', () => {
+    const file = fixture.good.find(c => c.name === 'a maximized layout window and a maximized named window').file
+    const path = join(work, 'maximized.json')
+    writeFileSync(path, textOf(file))
+    const ran = runLayout(['-Placement', path])
+    assert.equal(ran.code, 0, ran.out)
+    const state = join(work, 'local', 'claude-self-tools')
+    const line = machine.wtTabLine({ powershell: WINDOWS_POWERSHELL, stateDir: state, window: 'w1', title: 't', pos: [2100, 300], maximized: true, folder: join(work, 'a folder'), run: { idle: true } })
+    assert.ok(line.startsWith('-w w1 -M --pos 2100,300 nt '), line)
+    assert.ok(ran.out.includes(`[w1 / t] wt.exe ${line}`), `${line}\nin:\n${ran.out}`)
   })
 
   test('no placement.json: it says where the presets are, and runs nothing', () => {
@@ -145,10 +202,10 @@ describe('-WhatIf, the default, for the design\'s example', { skip: !isWindows &
 })
 
 /**
- * The module path line claude-slot.ps1 and claude-layout.ps1 keep this release, their pins unchanged
- * since 5b4f138: one path made of three, harmless in Windows PowerShell 5.1, which loads its core modules
- * from $PSHOME whatever the path. PSMODULEPATH_RESET is the fixed line; these two take it in a release that
- * re-vendors the coordinator.
+ * The module path line claude-slot.ps1 and claude-layout.ps1 keep this release, as at 5b4f138 (the layout
+ * script's pin moved for #5's keys; its module path line did not): one path made of three, harmless in Windows
+ * PowerShell 5.1, which loads its core modules from $PSHOME whatever the path. PSMODULEPATH_RESET is the fixed
+ * line; these two take it in a release that re-vendors the coordinator.
  */
 const KEPT_RESET = '$env:PSModulePath = @([Environment]::GetFolderPath("MyDocuments") + "\\WindowsPowerShell\\Modules", [Environment]::GetFolderPath("ProgramFiles") + "\\WindowsPowerShell\\Modules", [Environment]::GetFolderPath("System") + "\\WindowsPowerShell\\v1.0\\Modules") -join ";"'
 
@@ -224,7 +281,54 @@ describe('planted faults in the layout script and the validators, each caught', 
     const { path } = copyWith('last', "$name -notmatch '^(new|last|_quake)\\z'", "$name -notmatch '^(new|_quake)\\z'")
     const lastCase = fixture.bad.find(c => c.name === 'a window called last')
     assert.equal(psTakes(lastCase.file, path, 'fault').code, 0, 'the copy takes it')
-    assert.ok('errors' in machine.readPlacement(textOf(lastCase.file)), 'readPlacement still refuses it')
+    assert.ok('errors' in machine.readPlacement(shapedOf(lastCase.file)), 'readPlacement still refuses it')
+  })
+
+  test("#5: a named window's rect accepted by the PowerShell validator alone: the two then disagree on the shared list", () => {
+    const { path } = copyWith('rect', "if (Test-Has $value 'rect') { Add-Fault ($where + ' has a rect, which", "if ($false) { Add-Fault ($where + ' has a rect, which")
+    const rectCase = fixture.bad.find(c => c.name === 'a rect on a named window')
+    assert.equal(psTakes(rectCase.file, path, 'fault').code, 0, 'the copy takes it')
+    assert.ok('errors' in machine.readPlacement(shapedOf(rectCase.file)), 'readPlacement still refuses it')
+  })
+
+  test('#5: a key given as null read as absent again by the PowerShell validator: the two then disagree', () => {
+    const { path } = copyWith('null', 'function Test-Has($value, $name) { return ($null -ne $value.PSObject.Properties[$name]) }', 'function Test-Has($value, $name) { return ($null -ne $value.$name) }')
+    const nullCase = fixture.bad.find(c => c.name === 'a pos of null')
+    assert.equal(psTakes(nullCase.file, path, 'fault').code, 0, 'the copy takes it')
+    assert.ok('errors' in machine.readPlacement(shapedOf(nullCase.file)), 'readPlacement still refuses it')
+  })
+
+  test('#5: a whole number read by its type again (Int32 and Int64 alone): 100.0 and 1e3 refused by the copy, taken by readPlacement', () => {
+    const { path } = copyWith('whole', "@('System.Int32', 'System.Int64', 'System.Decimal', 'System.Double', 'System.Numerics.BigInteger') -cnotcontains", "@('System.Int32', 'System.Int64') -cnotcontains")
+    const { text } = fixture.raw.find(c => c.name === 'a rect written with a zero fraction and with exponents')
+    assert.equal(psTakesRaw(text, path, 'fault').code, 2, 'the copy refuses it')
+    assert.ok('placement' in machine.readPlacement(shapedRawOf(text)), 'readPlacement takes it')
+  })
+
+  test('#5: a whole number read as a fraction (no floor): 100.5 taken by the copy, refused by readPlacement', () => {
+    const { path } = copyWith('floor', ' -and [math]::Floor($number) -eq $number', '')
+    const { text } = fixture.raw.find(c => c.name === 'a rect with a half')
+    assert.equal(psTakesRaw(text, path, 'fault').code, 0, 'the copy takes it')
+    assert.ok('errors' in machine.readPlacement(shapedRawOf(text)), 'readPlacement refuses it')
+  })
+
+  test('#5: a pos written 0.0 handed to wt as written: its line no longer the machine code\'s', () => {
+    const { path } = copyWith('format', "('{0},{1}' -f [long][double]$w.pos[0], [long][double]$w.pos[1])", "('{0},{1}' -f $w.pos[0], $w.pos[1])")
+    const { text } = fixture.raw.find(c => c.name === 'a pos and a size written 0.0, 1.2e2 and 30.0')
+    const ran = psTakesRaw(text, path, 'fault')
+    assert.equal(ran.code, 0, ran.out)
+    assert.ok(!ran.out.includes(' --pos 0,0 '), `the copy writes the number as JSON gave it:\n${ran.out}`)
+  })
+
+  test("#5: -M left off a maximized window's first tab: its line no longer the machine code's", () => {
+    const { path } = copyWith('max', "    if ($first -and $w.maximized -eq $true) { $elements += @('-M') }\n", '')
+    const file = fixture.good.find(c => c.name === 'a maximized layout window and a maximized named window').file
+    const placementFile = join(work, 'maximized-fault.json')
+    writeFileSync(placementFile, textOf(file))
+    const ran = runLayout(['-Placement', placementFile], path)
+    assert.equal(ran.code, 0, ran.out)
+    assert.ok(!ran.out.includes(' -M '), 'the copy prints no -M')
+    assert.ok(machine.wtTabLine({ powershell: WINDOWS_POWERSHELL, stateDir: join(work, 'local', 'claude-self-tools'), window: 'w1', title: 't', pos: [2100, 300], maximized: true, folder: join(work, 'a folder'), run: { idle: true } }).includes(' -M '), 'the machine code builds one')
   })
 
   test('`last` accepted by readPlacement alone: the two then disagree on the shared list', async () => {
@@ -235,7 +339,7 @@ describe('planted faults in the layout script and the validators, each caught', 
     writeFileSync(path, faulty)
     const copy = await import(pathToFileURL(path).href)
     const lastCase = fixture.bad.find(c => c.name === 'a window called last')
-    assert.ok('placement' in copy.readPlacement(textOf(lastCase.file)), 'the copy takes it')
+    assert.ok('placement' in copy.readPlacement(shapedOf(lastCase.file)), 'the copy takes it')
     assert.equal(psTakes(lastCase.file).code, 2, 'the validator still refuses it')
   })
 })
