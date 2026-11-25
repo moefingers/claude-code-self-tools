@@ -1299,7 +1299,9 @@ export type Captured = { readonly dpiAware: boolean; readonly own: OwnWindow; re
 /**
  * A capture of this session's own window, as the plugin takes it. A picture is only the file this call asked for:
  * exactly `file.folder` and `file.name`, as the script was given them. Any other path, even one shaped like a capture
- * in the same folder, is no picture.
+ * in the same folder, is no picture. The plugin decides which pictures it takes, not the script's answer: a picture of
+ * a Windows Terminal window isn't built, and a window of a program on the deny list is never captured, whatever the
+ * script sent with it.
  */
 export function parseCaptured(stdout: string, file: CaptureFile): Captured | string {
   const line = answerOf(stdout)
@@ -1309,7 +1311,9 @@ export function parseCaptured(stdout: string, file: CaptureFile): Captured | str
   let capture: Capture
   if (typeof raw.file === 'string') {
     if (raw.file !== `${file.folder}\\${file.name}` || !isInt(raw.width) || !isInt(raw.height)) return "the capture's answer names a file this plugin didn't ask for"
-    capture = { kind: 'file', file: raw.file, width: raw.width, height: raw.height }
+    if (own.found && own.kind !== 'console') capture = { kind: 'notBuilt' }
+    else if (own.found && isDenied(own.program)) capture = { kind: 'denied', program: own.program }
+    else capture = { kind: 'file', file: raw.file, width: raw.width, height: raw.height }
   } else if (raw.notBuilt === 'terminal') capture = { kind: 'notBuilt' }
   else if (raw.changed === true) capture = { kind: 'changed', why: visible(text(raw.why) || 'no reason given', 400), deleted: raw.deleted === true }
   else if (typeof raw.denied === 'string') capture = { kind: 'denied', program: visible(raw.denied, 80) }

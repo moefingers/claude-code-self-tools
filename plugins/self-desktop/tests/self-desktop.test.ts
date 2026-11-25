@@ -793,6 +793,23 @@ test("the capture's other refusals: the deny list, a minimized window, a shared 
   }
 })
 
+test("the plugin decides which pictures it takes, not the script's answer: a picture of a Windows Terminal window, or of a program on the deny list, is no picture though the script hands one back; the name chosen is deleted", ON, async ($, on) => {
+  const world: World = { removal: 'deleted' }
+  const { toasts, scripts, deletions } = engine(on, world)
+  await $.session.start(START)
+  const lastName = () => /^\$name = '([^']*)'\r?$/m.exec(scripts.at(-1) ?? '')?.[1] ?? ''
+  // The exact file the call chose, with the window it found a Windows Terminal window's.
+  world.capture = file => ({ v: 1, dpiAware: true, own: OWN, capture: { file, width: 1280, height: 1392 } })
+  expect(await call($, CAPTURE)).toBe(`Captured nothing: this session's window is WindowsTerminal.exe "claude" (window 1001, Windows Terminal), and ${TERMINAL_NOT_BUILT} The picture it had saved was deleted.`)
+  expect(deletions.at(-1)).toBe(deleteScript(DATA, [lastName()]))
+  // The exact file, with the window's program on the deny list.
+  world.capture = file => ({ v: 1, dpiAware: true, own: { ...CONSOLE_OWN, program: 'KeePassXC.exe' }, capture: { file, width: 10, height: 10 } })
+  expect(await call($, CAPTURE)).toBe(`Captured nothing: ${deniedSaid('KeePassXC.exe')} The picture it had saved was deleted.`)
+  expect(deletions.at(-1)).toBe(deleteScript(DATA, [lastName()]))
+  expect(deletions).toHaveLength(2)
+  expect(toasts).toEqual([])
+})
+
 // ---------------------------------------------------------------------------------------------
 // Failures.
 
