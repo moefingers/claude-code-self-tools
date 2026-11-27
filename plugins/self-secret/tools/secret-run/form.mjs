@@ -48,10 +48,12 @@
 // opens learns neither the form's address, nonce and all, nor a way back to
 // its window. A link is no script, so the policy stays as it is.
 
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
+import { statSync } from "node:fs";
 import { createServer } from "node:http";
 import { platform } from "node:os";
+import { system32 } from "./where.mjs";
 
 const MAX_BODY = 64 * 1024;
 
@@ -178,29 +180,177 @@ const page = (title, inner) =>
 <meta name=viewport content="width=device-width,initial-scale=1"><style>${STYLE}</style></head>
 <body>${inner}</body></html>`;
 
+// How the form opens. On Windows, when the person's default browser for http is Chrome or Edge, it
+// opens as that browser's app window, small and with no tabs or address bar; anything else (another
+// default, none found, a read that fails, macOS, Linux) opens it as before: cmd's start, open or
+// xdg-open, a tab in the default browser.
+//
+// The default is read from HTTP_DEFAULT_KEY by one reg.exe query with fixed words, which changes nothing
+// (Microsoft's reg query reference: /s queries "all subkeys and value names recursively", /v names the
+// value). The value read is the UserChoice subkey's ProgId. No Microsoft page read names that key:
+// Microsoft's "Windows app defaults platform" page says the defaults are "obfuscated in registry data
+// stores" and points apps to IApplicationAssociationRegistration::QueryCurrentDefault, a COM call Node
+// can't make without starting PowerShell. So the query takes every ProgId value under the http key, and
+// names a browser only when they all agree: a newer Windows that keeps the choice in another subkey as
+// well (UserChoiceLatest, reported in Microsoft's community answers and not confirmed here) and holds
+// another browser there gets the old open, never a browser that may not be the default.
+//
+// The app window takes Chromium's own switches (chrome/common/chrome_switches.h): --app "Specifies that
+// the associated value should be launched in "application" mode", and --window-size "Specify the initial
+// window size: --window-size=w,h". Nothing else is passed: no profile, no --user-data-dir. Chromium reads
+// --window-size from the browser process's own command line (browser_window_state.cc, from
+// base::CommandLine::ForCurrentProcess()), so a browser that is already running is likely to keep its own
+// size for the window: the size is asked for, not promised (the read is in the source; what a running
+// browser then does is not seen). Edge takes Chromium's switches (from memory). No --window-position: the
+// primary work area's centre would need a Windows PowerShell start to read, and how Chromium takes a
+// position on a scaled display isn't sure from here, so the browser places the window.
+//
+// The browser is started without windowsHide. Node's windowsHide puts SW_HIDE in the child's STARTUPINFO
+// (libuv, src/win/process.c; that windowsHide sets that flag is from memory of Node's own source), and
+// Windows shows a program's first window by it (Microsoft's ShowWindow page: nCmdShow "is ignored the
+// first time an application calls ShowWindow, if the program that launched the application provides a
+// STARTUPINFO structure"), so a browser that wasn't running could start hidden. A browser has no console
+// to hide; cmd, open and xdg-open keep windowsHide, as before.
+//
+// The address, nonce and all, is an argument of the browser it starts, as it was of cmd's start before:
+// a process of the same user can read it there, and its nonce is spent once the window has opened it.
+
+/** The key whose ProgId values name the person's default browser for http, on Windows. */
+export const HTTP_DEFAULT_KEY =
+  "HKCU\\Software\\Microsoft\\Windows\\Shell\\Associations\\UrlAssociations\\http";
+
+/** reg.exe's words for the one read of it: every ProgId value under that key and its subkeys. */
+export const REG_QUERY = ["query", HTTP_DEFAULT_KEY, "/s", "/v", "ProgId"];
+
 /**
- * Opens the URL in the default browser. SECRET_PASTE_NO_BROWSER=1 leaves
- * it to the caller (a test, or a session with no desktop). Says whether it
- * tried.
+ * The ProgId every ProgId value in reg query's output gives, or null when
+ * there is none, one is empty or of another type than REG_SZ, or they differ.
+ * Pure.
+ */
+export function agreedProgId(output) {
+  const found = [];
+  for (const line of String(output ?? "").split(/\r?\n/)) {
+    const m = /^\s+ProgId\s+(REG_\w+)\s*(.*?)\s*$/i.exec(line);
+    if (!m) continue;
+    if (m[1].toUpperCase() !== "REG_SZ" || !m[2]) return null;
+    found.push(m[2]);
+  }
+  return found.length && found.every((p) => p === found[0]) ? found[0] : null;
+}
+
+/**
+ * The browsers whose app window the form opens in, by their http ProgId:
+ * each one's program, and where it is looked for, in order: an environment
+ * variable that names a folder as Windows does, and the folder under it.
+ */
+export const APP_BROWSERS = {
+  ChromeHTML: {
+    exe: "chrome.exe",
+    under: [
+      ["ProgramFiles", "Google\\Chrome\\Application"],
+      ["ProgramFiles(x86)", "Google\\Chrome\\Application"],
+      ["LOCALAPPDATA", "Google\\Chrome\\Application"],
+    ],
+  },
+  MSEdgeHTM: {
+    exe: "msedge.exe",
+    under: [
+      ["ProgramFiles(x86)", "Microsoft\\Edge\\Application"],
+      ["ProgramFiles", "Microsoft\\Edge\\Application"],
+    ],
+  },
+};
+
+/**
+ * The program of the default browser, when its ProgId is one of
+ * APP_BROWSERS and it is found at one of its places, else null. env names
+ * the folders; exists(path) says whether a file is there. A Windows path is
+ * built as text, never by Node's path, so it reads the same anywhere. Pure.
+ */
+export function appBrowserPath(progId, env, exists) {
+  const browser = Object.hasOwn(APP_BROWSERS, progId ?? "")
+    ? APP_BROWSERS[progId]
+    : null;
+  if (!browser) return null;
+  for (const [variable, folder] of browser.under) {
+    const base = env[variable];
+    // A folder on a drive (X:\...), as Windows sets these; anything else is passed over.
+    if (typeof base !== "string" || !/^[A-Za-z]:\\/.test(base)) continue;
+    const path = `${base.replace(/\\+$/, "")}\\${folder}\\${browser.exe}`;
+    // So by construction; checked, so that no later way of finding it hands over another program.
+    if (!path.toLowerCase().endsWith(`\\${browser.exe}`)) continue;
+    if (exists(path)) return path;
+  }
+  return null;
+}
+
+/**
+ * The command that opens the form's address: { program, args, hide }, or
+ * null when SECRET_PASTE_NO_BROWSER is set (a test, or a session with no
+ * desktop). On Windows, the app window of the default browser when that is
+ * one of APP_BROWSERS and installed; else the platform's own open, as
+ * before. hide is the spawn's windowsHide: true for a console program only.
+ * progId() gives the default browser's ProgId, or null when it can't be
+ * read; it is asked on Windows only. Pure: it reads only what it is given.
+ */
+export function openCommand({ platform, env, url, progId, exists }) {
+  if (env.SECRET_PASTE_NO_BROWSER) return null;
+  if (platform === "darwin")
+    return { program: "open", args: [url], hide: true };
+  if (platform !== "win32")
+    return { program: "xdg-open", args: [url], hide: true };
+  const browser = appBrowserPath(progId(), env, exists);
+  return browser
+    ? {
+        program: browser,
+        args: [`--app=${url}`, "--window-size=520,560"],
+        hide: false,
+      }
+    : { program: "cmd", args: ["/c", "start", "", url], hide: true };
+}
+
+/** The default browser's ProgId for http, by REG_QUERY, or null when it can't be read or its values disagree. */
+function readProgId() {
+  const r = spawnSync(system32("reg.exe"), REG_QUERY, {
+    encoding: "utf8",
+    windowsHide: true,
+    timeout: 5_000,
+  });
+  return r.status === 0 ? agreedProgId(r.stdout) : null;
+}
+
+/** Whether a file is at the path. */
+function isFile(path) {
+  try {
+    return statSync(path).isFile();
+  } catch {
+    // Not there, or not to be looked at: no program to start either way.
+    return false;
+  }
+}
+
+/**
+ * Opens the URL as openCommand says, detached and unwaited for. Says
+ * whether it tried.
  */
 export function openBrowser(url) {
-  if (process.env.SECRET_PASTE_NO_BROWSER) return false;
-  const p = platform();
-  const [cmd, args] =
-    p === "win32"
-      ? ["cmd", ["/c", "start", "", url]]
-      : p === "darwin"
-        ? ["open", [url]]
-        : ["xdg-open", [url]];
+  const command = openCommand({
+    platform: platform(),
+    env: process.env,
+    url,
+    progId: readProgId,
+    exists: isFile,
+  });
+  if (!command) return false;
   const fail = (err) =>
     console.error(
       `Couldn't auto-launch browser (${err.message}). Open the URL manually.`,
     );
   try {
-    const child = spawn(cmd, args, {
+    const child = spawn(command.program, command.args, {
       stdio: "ignore",
       detached: true,
-      windowsHide: true,
+      windowsHide: command.hide,
     });
     child.on("error", fail);
     child.unref();
