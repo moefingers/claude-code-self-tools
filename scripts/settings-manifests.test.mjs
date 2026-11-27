@@ -58,7 +58,7 @@ test('the manifests were found, every plugin with a userConfig among them', () =
 test('every field off the list is refused with exactly the owner-only line, at the call and at the serving, its row there, shown and unlocked', () => {
   assert.equal(settings.OWNER_ONLY, 'owner only: /config by hand')
   assert.equal(settings.MARKETPLACE, 'claude-code-self-tools')
-  const off =[...FIELDS.filter(f => !settings.MAY_SET.includes(f.key)), ...LATER]
+  const off = [...FIELDS.filter(f => !settings.MAY_SET.includes(f.key)), ...LATER]
   assert.ok(off.length >= 15 + LATER.length, `fields off the list: ${off.length}`)
   const said = off.map(f => {
     const row = rowOf(f)
