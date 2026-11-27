@@ -59,7 +59,7 @@ const SET_DESCRIPTION = [
   "Changes one plugin option on this machine, through Claude Code's own /config writer, as the person would in /config: only an option on a fixed list, each claude-code-self-tools plugin's updateCheck and self-compact.compactReminder.",
   `Every other option is the owner's to change in /config by hand, and is refused with "${OWNER_ONLY}".`,
   '`key` is the option exactly as settings_read names it; `value` its new value, of its kind.',
-  "It answers with the value before and after, passes on another plugin's or Claude Code's refusal as it came, and says which open sessions need /reload-plugins to see the change.",
+  "It answers with the value before and after, passes on another plugin's or Claude Code's refusal as it came, and says that this session reloads that plugin on its own, while other open sessions may need /reload-plugins to see the change.",
   'It answers at once and queues nothing.',
 ].join(' ')
 

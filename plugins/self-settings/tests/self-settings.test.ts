@@ -334,7 +334,7 @@ test('a value that looks like a secret: the rule, as a table', () => {
 test('the words: the owner-only line, who sees a change, and the note on sensitive fields', () => {
   expect([OWNER_ONLY, reloadSaid('self-compact'), SENSITIVE_NOTE]).toEqual([
     'owner only: /config by hand',
-    'This session needs no /reload-plugins: Claude Code reloads self-compact here when one of its options changes. Every other open session needs /reload-plugins to see it.',
+    'This session reloads self-compact on its own. Other open sessions may need /reload-plugins to see it.',
     'A sensitive field has no row in /config, and self-settings never reads its value; it names one, and knows each default, only for the plugins of its own marketplace, claude-code-self-tools.',
   ])
 })

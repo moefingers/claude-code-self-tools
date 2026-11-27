@@ -329,13 +329,13 @@ export function planSet(input: object, listed: readonly unknown[], marketplaces:
 }
 
 /**
- * Which sessions see a change. The engine's types (2.1.331, `Register`): a plugin's options "are fixed for this
- * activation: a change to them reloads the plugin and `register` runs again with the new object", and `$.config.set`
- * changes a row "as if the person did in the menu". So this session reloads that plugin itself; nothing tells another
- * session, which read its options when it loaded the plugin.
+ * Which sessions see a change, saying only what the engine's types (2.1.331) say. `Register` (d.ts :12710-12711): a
+ * plugin's options "are fixed for this activation: a change to them reloads the plugin and `register` runs again with
+ * the new object", and `$.config.set` changes a row "as if the person did in the menu" (:3984); so this session reloads
+ * that plugin on its own. They don't say whether another session picks the change up by itself (a changed settings
+ * answer "takes effect as a changed settings file does", :4579-4583), so the words say it may need /reload-plugins.
  */
-export const reloadSaid = (plugin: string): string =>
-  `This session needs no /reload-plugins: Claude Code reloads ${named(plugin)} here when one of its options changes. Every other open session needs /reload-plugins to see it.`
+export const reloadSaid = (plugin: string): string => `This session reloads ${named(plugin)} on its own. Other open sessions may need /reload-plugins to see it.`
 
 /** What the row reads after a change: the rows listed again, or why they couldn't be. */
 export type After = { readonly listed: readonly unknown[] } | { readonly failed: string }
