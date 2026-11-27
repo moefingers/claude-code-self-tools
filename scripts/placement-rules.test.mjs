@@ -262,6 +262,8 @@ const CHECKS = {
     }
     assert.equal(m.probeScript({ ids: [T], configDirs: [CONFIG], stateDir: STATE, slots: true, heavySlotRoot: null }).split('\r\n').indexOf(m.PSMODULEPATH_RESET), 2)
     assert.equal(m.relockScript({ stateDir: STATE, id: T, by: `launch:${T}`, holder: { pid: 1, created: '1' } }).split('\r\n').indexOf(m.PSMODULEPATH_RESET), 2)
+    // #91: launch_sessions' two Windows Terminal reads, each reset first too.
+    for (const [name, script] of [['wtVersionScript', m.wtVersionScript()], ['wtExeScript', m.wtExeScript(STATE)]]) assert.equal(script.split('\r\n').indexOf(m.PSMODULEPATH_RESET), 2, name)
   },
   inputIdle(m) {
     assert.equal(m.inputIdle(probeOf(m)), true)
@@ -978,7 +980,12 @@ const CHECKS = {
     // Windows Terminal, read as a tab's launch reads it, two reads of one thing each: 1.19 or later; and wt.exe there.
     assert.deepEqual(['wt 1.24.10921.0', 'wt 1.19.1', 'wt 1.18.3', 'wt none', 'garbled'].map(m.wtVersionFault), [undefined, undefined, 'Windows Terminal is 1.18.3, older than the 1.19 a tab needs', 'Windows Terminal 1.19 or later is not installed (no version could be read)', "Windows Terminal's version could not be read"])
     assert.deepEqual(['wtexe yes', 'wtexe no', 'garbled'].map(m.wtExeFault), [undefined, 'wt.exe is not at %LOCALAPPDATA%\\Microsoft\\WindowsApps, where a launch runs it from', 'whether wt.exe is there could not be read'])
-    for (const script of [m.wtVersionScript(), m.wtExeScript(STATE)]) assert.ok(!/wt\.exe['"]?\s|Start-Process|&\s*\$wtExe/.test(script), 'neither read runs wt')
+    // Neither runs wt: no start of a process, no call operator on its path, nothing that invokes a file. wtExeScript names
+    // wt.exe as a path alone: built by Join-Path, then only asked whether it is there (Test-Path).
+    for (const script of [m.wtVersionScript(), m.wtExeScript(STATE)]) assert.ok(!/Start-Process|Invoke-Item|Invoke-Expression|&\s*\$wtExe|&\s*['"][^'"]*wt\.exe|\.\s+\$wtExe|cmd(\.exe)?\s+\/c/i.test(script), 'neither read runs wt')
+    const exeScript = m.wtExeScript(STATE)
+    assert.equal(exeScript.split('$wtExe').length - 1, 2, '$wtExe set once, used once')
+    assert.ok(exeScript.includes("$wtExe = Join-Path (Split-Path -Parent $state) 'Microsoft\\WindowsApps\\wt.exe'") && exeScript.includes('(Test-Path -LiteralPath $wtExe -PathType Leaf)'), 'wt.exe named as a path, then only tested for')
     assert.ok(!m.wtVersionScript().includes('wt.exe') && !m.wtExeScript(STATE).includes('Get-AppxPackage'), 'each reads one thing')
   },
   plainLegs(m) {

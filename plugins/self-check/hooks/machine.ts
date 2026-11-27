@@ -6102,7 +6102,8 @@ export function openWindows(probe: Probe): ReadonlySet<string> | undefined {
  *    in file order (a free cell whose window holds a live slot is taken);
  * 3. overflow: the sessions past the free cells go as further tabs into those same free cells, in turn, in the same
  *    order; with no free cell, into the fixed windows, in turn, and a note says so; with neither, each is refused.
- * Never into a window the grid doesn't name, and so never into an unplaced one. A window's first step is `new` (with
+ * Never into a window the grid doesn't name. (A window seen open that closes before its join step is opened again by
+ * that tab, unplaced: a race the plan can't see.) A window's first step is `new` (with
  * its place) unless it is open already; every later one `join`s it: what the plan says. The run reads it again as it
  * goes (launch_sessions' runGridSteps), so a step whose window's first tab was refused opens that window itself.
  * Throws on a list or a grid of another shape: a name or an id twice in the list, a name in two fixed slots, more than
@@ -6200,6 +6201,8 @@ export function wtExeScript(stateDir: string): string {
   const state = checkFolder('the state folder', stateDir)
   return [
     "$ErrorActionPreference = 'Stop'",
+    "$ProgressPreference = 'SilentlyContinue'",
+    PSMODULEPATH_RESET,
     `$state = ${literal(state)}`,
     "$wtExe = Join-Path (Split-Path -Parent $state) 'Microsoft\\WindowsApps\\wt.exe'",
     "[Console]::Out.WriteLine('wtexe ' + $(if (Test-Path -LiteralPath $wtExe -PathType Leaf) { 'yes' } else { 'no' }))",
