@@ -310,6 +310,28 @@ export async function post(url, fields) {
 }
 
 /**
+ * Posts form fields the way the page's script does: by fetch, as the
+ * browser that opened the form, asking for the JSON answer. Resolves
+ * { status, headers, text, answer }, answer the parsed JSON or null; rejects
+ * when nothing answers at the address.
+ */
+export async function scriptPost(url, fields) {
+  const res = await browse(url, {
+    method: "POST",
+    body: new URLSearchParams(fields),
+    headers: { accept: "application/json" },
+  });
+  const text = await res.text();
+  let answer = null;
+  try {
+    answer = JSON.parse(text);
+  } catch {
+    // Not JSON: a bare refusal, as any request gets.
+  }
+  return { status: res.status, headers: res.headers, text, answer };
+}
+
+/**
  * One request with exactly the headers given (Host, Origin and
  * Sec-Fetch-Site included), as a browser or another page would send it.
  */

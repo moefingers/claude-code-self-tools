@@ -327,7 +327,7 @@ export function serveBroker() {
       onListening: (url) => tell({ type: "url", url }),
       onRejected: (reason) => tell({ type: "rejected", reason }),
       successText: (reached) =>
-        `Received.${reached ? ` The key reached ${reached}.` : ""} Held until ${clock(Date.now() + Math.min(minutes, MAX_HOLD_MINUTES) * 60_000)}. Running the command — you can close this tab.`,
+        `Received.${reached ? ` The key reached ${reached}.` : ""} Held until ${clock(Date.now() + Math.min(minutes, MAX_HOLD_MINUTES) * 60_000)}. Running the command.`,
     });
     if (result.status !== "ok") {
       await tell({

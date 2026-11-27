@@ -40,18 +40,47 @@
 // The same words are said in the page as the person pastes, by the page's one
 // script, built from the two functions below and allowed by its hash alone. It
 // takes the paste itself, because a text field drops a line break silently,
-// joining two lines into one; it never shows a character of the value, and,
-// the policy having no connect-src, can send nothing anywhere.
+// joining two lines into one; it never shows a character of the value.
+//
+// The same script sends the form. It posts the value by fetch to the form's own
+// address, with the form's cookie and through every check the form's own POST
+// goes through, asking for the answer as JSON (wantsJson): the end state
+// reached, and the words to show, never the value. It draws the answer in
+// place, so the page never navigates and its window keeps its one history
+// entry. The policy's connect-src is the form's own origin ('self'), so the
+// script can reach nothing else. Without script, the form posts as a plain
+// form, and its answers are what they always were.
+//
+// So the window can close itself (MDN, Window.close(): a window the browser's
+// own UI opened "may only be closed if they have not been navigated (history
+// length remains 1)"; an app window is opened by the browser's command line,
+// not by a script). The first GET's trade of the nonce for the cookie is a 303
+// to "/", which the browser follows inside that one navigation, adding no entry
+// (from memory of the Fetch standard; not seen). The page closes at an end:
+//   accepted: it says what was received, and what the key reached, for 1.5 s;
+//   cancelled, closed (the form ended, or nothing answers at its address any
+//     more), or expired (its deadline, which the page is given, as the time
+//     left, in the field's data-left): at once.
+// The first end wins, and empties the field, so the value stays in the page
+// no longer. A deadline that comes while a value is out waits for its answer,
+// which ends the page itself, or, if it is a refusal, ends it as expired. A
+// refused value leaves it open, the reason shown and the field empty, to paste
+// again; its deadline closes it if no one does. While a value is being
+// checked, Submit waits and Cancel still works. Where the browser keeps the
+// window open all the same (it may, for a tab), the page says DONE a moment
+// later.
 //
 // A profile can name the page where the key is made. The form links to it
 // under the prompt, in a new tab, with rel="noopener noreferrer": the page it
 // opens learns neither the form's address, nonce and all, nor a way back to
 // its window. A link is no script, so the policy stays as it is.
 
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
+import { statSync } from "node:fs";
 import { createServer } from "node:http";
 import { platform } from "node:os";
+import { system32 } from "./where.mjs";
 
 const MAX_BODY = 64 * 1024;
 
@@ -100,17 +129,33 @@ export function shapeVerdict(value, shape, spacesInside) {
   return { ok: true, words: "" };
 }
 
+/** What the page says once the form has ended, by an answer or by nothing answering at its address. */
+const CLOSED = "This form has closed.";
+/** What the page says at the form's deadline, and what a request after it is told. */
+const EXPIRED = "This form ran out of time. Nothing was run.";
+/** What the page says when the browser keeps the window open after the script asked it to close. */
+const DONE = "Done. You can close this window.";
+/** What the page says once the person cancels. */
+const CANCELLED = "Cancelled. Nothing was run.";
+
 /**
- * The page's one script: what the person hears as they paste or type. Its
- * line breaks are made \n: a function's source keeps a checkout's \r\n, which
- * a browser's parser drops, and the hash it then takes would not be the
- * policy's.
+ * The page's one script: what the person hears as they paste or type, and
+ * the form sent by fetch, its answer drawn in place, and the window closed at
+ * an end. Its line breaks are made \n: a function's source keeps a checkout's
+ * \r\n, which a browser's parser drops, and the hash it then takes would not
+ * be the policy's.
  */
 const SCRIPT = `(() => {
 ${trimNotes}
 ${shapeVerdict}
-const field = document.querySelector("input[name=v]");
+const WORDS = ${JSON.stringify({ closed: CLOSED, expired: EXPIRED, done: DONE })};
+const ENDS = ["cancelled", "closed", "expired"];
+const form = document.querySelector("form");
+const field = form.querySelector("input[name=v]");
 const status = document.getElementById("status");
+const error = document.getElementById("error");
+const heading = document.querySelector("h1");
+const submitButton = form.querySelector("button:not([formaction])");
 const shape = field.dataset.pattern ? { pattern: field.dataset.pattern, says: field.dataset.says } : null;
 const spacesInside = field.dataset.spaces === "1";
 const say = (state, text) => { status.dataset.state = state; status.textContent = text; };
@@ -122,19 +167,84 @@ const tell = (raw, pasted) => {
   const verdict = v.ok ? (around ? "Otherwise it looks right." : "It looks right.") : v.words;
   say(v.ok ? "fits" : "wrong", [around, verdict].filter(Boolean).join(" "));
 };
-field.addEventListener("paste", (e) => {
-  const raw = e.clipboardData ? e.clipboardData.getData("text") : null;
-  if (raw === null) return;
+if (field.dataset.trim === "1") {
+  field.addEventListener("paste", (e) => {
+    const raw = e.clipboardData ? e.clipboardData.getData("text") : null;
+    if (raw === null) return;
+    e.preventDefault();
+    const t = trimNotes(raw);
+    if (t.inside && !spacesInside) {
+      field.value = "";
+      return say("wrong", "That paste has a space or line break inside the key, so it wasn't put in. Copy the key alone and paste it again.");
+    }
+    field.value = t.value;
+    tell(raw, true);
+  });
+  field.addEventListener("input", () => tell(field.value, false));
+}
+const shut = () => {
+  window.close();
+  setTimeout(() => {
+    if (window.closed) return;
+    const p = document.createElement("p");
+    p.textContent = WORDS.done;
+    document.body.append(p);
+  }, 500);
+};
+let deadline = null;
+let ended = false;
+const end = (words, after) => {
+  if (ended) return;
+  ended = true;
+  field.value = "";
+  clearTimeout(deadline);
+  const p = document.createElement("p");
+  p.textContent = words;
+  document.body.replaceChildren(heading, p);
+  setTimeout(shut, after);
+};
+let busy = false;
+let due = false;
+const expire = () => { if (busy) due = true; else end(WORDS.expired, 0); };
+const left = Number(field.dataset.left);
+if (left >= 0 && left <= 2147483647) deadline = setTimeout(expire, left);
+form.addEventListener("submit", async (e) => {
+  if (!("submitter" in e)) return;
   e.preventDefault();
-  const t = trimNotes(raw);
-  if (t.inside && !spacesInside) {
-    field.value = "";
-    return say("wrong", "That paste has a space or line break inside the key, so it wasn't put in. Copy the key alone and paste it again.");
+  const cancel = e.submitter !== null && e.submitter.getAttribute("formaction") === "/cancel";
+  if (busy && !cancel) return;
+  if (!cancel) {
+    busy = true;
+    submitButton.disabled = true;
+    say("", "Checking the key.");
   }
-  field.value = t.value;
-  tell(raw, true);
+  let res;
+  try {
+    res = await fetch(cancel ? "/cancel" : "/", {
+      method: "POST",
+      body: new URLSearchParams(cancel ? {} : { v: field.value }),
+      headers: { Accept: "application/json" },
+      credentials: "same-origin",
+      cache: "no-store",
+      redirect: "manual",
+    });
+  } catch {
+    return end(WORDS.closed, 0);
+  }
+  const answer = await res.json().catch(() => null);
+  const state = answer ? answer.state : null;
+  if (state === "accepted") return end(answer.words, 1500);
+  if (ENDS.includes(state)) return end(answer.words, 0);
+  error.textContent = state === "refused" ? answer.words : "The form's answer couldn't be read (HTTP " + res.status + "). Try again.";
+  error.hidden = false;
+  if (cancel) return;
+  busy = false;
+  if (due) return end(WORDS.expired, 0);
+  submitButton.disabled = false;
+  field.value = "";
+  say("", "");
+  field.focus();
 });
-field.addEventListener("input", () => tell(field.value, false));
 })();`.replace(/\r\n?/g, "\n");
 
 const HEADERS = {
@@ -144,8 +254,16 @@ const HEADERS = {
   "Referrer-Policy": "same-origin",
   "X-Content-Type-Options": "nosniff",
   "X-Frame-Options": "DENY",
-  "Content-Security-Policy": `default-src 'none'; script-src 'sha256-${createHash("sha256").update(SCRIPT).digest("base64")}'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'`,
+  // connect-src 'self': the script's fetch reaches the form's own origin, and nothing else.
+  "Content-Security-Policy": `default-src 'none'; script-src 'sha256-${createHash("sha256").update(SCRIPT).digest("base64")}'; connect-src 'self'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'`,
 };
+
+/**
+ * Whether a request asks for the form's answer as JSON, as the page's
+ * script does: an Accept of application/json alone. A browser's own form
+ * POST never sends that.
+ */
+export const wantsJson = (headers) => headers.accept === "application/json";
 
 const STYLE = `:root{color-scheme:light dark}
 body{font-family:system-ui,-apple-system,sans-serif;max-width:500px;margin:50px auto;padding:20px;background:Canvas;color:CanvasText}
@@ -178,29 +296,178 @@ const page = (title, inner) =>
 <meta name=viewport content="width=device-width,initial-scale=1"><style>${STYLE}</style></head>
 <body>${inner}</body></html>`;
 
+// How the form opens. On Windows, when the person's default browser for http is Chrome or Edge, it
+// opens as that browser's app window, small and with no tabs or address bar; anything else (another
+// default, none found, a read that fails, macOS, Linux) opens it as before: cmd's start, open or
+// xdg-open, a tab in the default browser.
+//
+// The default is read from HTTP_DEFAULT_KEY by one reg.exe query with fixed words, which changes nothing
+// (Microsoft's reg query reference: /s queries "all subkeys and value names recursively", /v names the
+// value). The value read is the UserChoice subkey's ProgId. No Microsoft page read names that key:
+// Microsoft's "Windows app defaults platform" page says the defaults are "obfuscated in registry data
+// stores" and points apps to IApplicationAssociationRegistration::QueryCurrentDefault, a COM call Node
+// can't make without starting PowerShell. So the query takes every ProgId value under the http key, and
+// names a browser only when they all agree: a newer Windows that keeps the choice in another subkey as
+// well (UserChoiceLatest, reported in Microsoft's community answers and not confirmed here) and holds
+// another browser there gets the old open, never a browser that may not be the default.
+//
+// The app window takes Chromium's own switches (chrome/common/chrome_switches.h): --app "Specifies that
+// the associated value should be launched in "application" mode", and --window-size "Specify the initial
+// window size: --window-size=w,h". Nothing else is passed: no profile, no --user-data-dir. Chromium reads
+// --window-size from the browser process's own command line (browser_window_state.cc, from
+// base::CommandLine::ForCurrentProcess()), so a browser that is already running is likely to keep its own
+// size for the window: the size is asked for, not promised (the read is in the source; what a running
+// browser then does is not seen). Edge takes Chromium's switches (from memory). No --window-position: the
+// primary work area's centre would need a Windows PowerShell start to read, and how Chromium takes a
+// position on a scaled display isn't sure from here, so the browser places the window.
+//
+// The browser is started without windowsHide. Node's windowsHide puts SW_HIDE in the child's STARTUPINFO
+// (libuv, src/win/process.c; that windowsHide sets that flag is from memory of Node's own source), and
+// Windows shows a program's first window by it (Microsoft's ShowWindow page: nCmdShow "is ignored the
+// first time an application calls ShowWindow, if the program that launched the application provides a
+// STARTUPINFO structure"), so a browser that wasn't running could start hidden. A browser has no console
+// to hide; cmd, open and xdg-open keep windowsHide, as before.
+//
+// The address, nonce and all, is an argument of the browser it starts, as it was of cmd's start before
+// (and is of open or xdg-open): a process of the same user can read it there, and on Linux another
+// user's can too, through /proc. Its nonce is spent once the window has opened it.
+
+/** The key whose ProgId values name the person's default browser for http, on Windows. */
+export const HTTP_DEFAULT_KEY =
+  "HKCU\\Software\\Microsoft\\Windows\\Shell\\Associations\\UrlAssociations\\http";
+
+/** reg.exe's words for the one read of it: every ProgId value under that key and its subkeys. */
+export const REG_QUERY = ["query", HTTP_DEFAULT_KEY, "/s", "/v", "ProgId"];
+
 /**
- * Opens the URL in the default browser. SECRET_PASTE_NO_BROWSER=1 leaves
- * it to the caller (a test, or a session with no desktop). Says whether it
- * tried.
+ * The ProgId every ProgId value in reg query's output gives, or null when
+ * there is none, one is empty or of another type than REG_SZ, or they differ.
+ * Pure.
+ */
+export function agreedProgId(output) {
+  const found = [];
+  for (const line of String(output ?? "").split(/\r?\n/)) {
+    const m = /^\s+ProgId\s+(REG_\w+)\s*(.*?)\s*$/i.exec(line);
+    if (!m) continue;
+    if (m[1].toUpperCase() !== "REG_SZ" || !m[2]) return null;
+    found.push(m[2]);
+  }
+  return found.length && found.every((p) => p === found[0]) ? found[0] : null;
+}
+
+/**
+ * The browsers whose app window the form opens in, by their http ProgId:
+ * each one's program, and where it is looked for, in order: an environment
+ * variable that names a folder as Windows does, and the folder under it.
+ */
+export const APP_BROWSERS = {
+  ChromeHTML: {
+    exe: "chrome.exe",
+    under: [
+      ["ProgramFiles", "Google\\Chrome\\Application"],
+      ["ProgramFiles(x86)", "Google\\Chrome\\Application"],
+      ["LOCALAPPDATA", "Google\\Chrome\\Application"],
+    ],
+  },
+  MSEdgeHTM: {
+    exe: "msedge.exe",
+    under: [
+      ["ProgramFiles(x86)", "Microsoft\\Edge\\Application"],
+      ["ProgramFiles", "Microsoft\\Edge\\Application"],
+    ],
+  },
+};
+
+/**
+ * The program of the default browser, when its ProgId is one of
+ * APP_BROWSERS and it is found at one of its places, else null. env names
+ * the folders; exists(path) says whether a file is there. A Windows path is
+ * built as text, never by Node's path, so it reads the same anywhere. Pure.
+ */
+export function appBrowserPath(progId, env, exists) {
+  const browser = Object.hasOwn(APP_BROWSERS, progId ?? "")
+    ? APP_BROWSERS[progId]
+    : null;
+  if (!browser) return null;
+  for (const [variable, folder] of browser.under) {
+    const base = env[variable];
+    // A folder on a drive (X:\...), as Windows sets these; anything else is passed over.
+    if (typeof base !== "string" || !/^[A-Za-z]:\\/.test(base)) continue;
+    const path = `${base.replace(/\\+$/, "")}\\${folder}\\${browser.exe}`;
+    // So by construction; checked, so that no later way of finding it hands over another program.
+    if (!path.toLowerCase().endsWith(`\\${browser.exe}`)) continue;
+    if (exists(path)) return path;
+  }
+  return null;
+}
+
+/**
+ * The command that opens the form's address: { program, args, hide }, or
+ * null when SECRET_PASTE_NO_BROWSER is set (a test, or a session with no
+ * desktop). On Windows, the app window of the default browser when that is
+ * one of APP_BROWSERS and installed; else the platform's own open, as
+ * before. hide is the spawn's windowsHide: true for a console program only.
+ * progId() gives the default browser's ProgId, or null when it can't be
+ * read; it is asked on Windows only. Pure: it reads only what it is given.
+ */
+export function openCommand({ platform, env, url, progId, exists }) {
+  if (env.SECRET_PASTE_NO_BROWSER) return null;
+  if (platform === "darwin")
+    return { program: "open", args: [url], hide: true };
+  if (platform !== "win32")
+    return { program: "xdg-open", args: [url], hide: true };
+  const browser = appBrowserPath(progId(), env, exists);
+  return browser
+    ? {
+        program: browser,
+        args: [`--app=${url}`, "--window-size=520,560"],
+        hide: false,
+      }
+    : { program: "cmd", args: ["/c", "start", "", url], hide: true };
+}
+
+/** The default browser's ProgId for http, by REG_QUERY, or null when it can't be read or its values disagree. */
+function readProgId() {
+  const r = spawnSync(system32("reg.exe"), REG_QUERY, {
+    encoding: "utf8",
+    windowsHide: true,
+    timeout: 5_000,
+  });
+  return r.status === 0 ? agreedProgId(r.stdout) : null;
+}
+
+/** Whether a file is at the path. */
+function isFile(path) {
+  try {
+    return statSync(path).isFile();
+  } catch {
+    // Not there, or not to be looked at: no program to start either way.
+    return false;
+  }
+}
+
+/**
+ * Opens the URL as openCommand says, detached and unwaited for. Says
+ * whether it tried.
  */
 export function openBrowser(url) {
-  if (process.env.SECRET_PASTE_NO_BROWSER) return false;
-  const p = platform();
-  const [cmd, args] =
-    p === "win32"
-      ? ["cmd", ["/c", "start", "", url]]
-      : p === "darwin"
-        ? ["open", [url]]
-        : ["xdg-open", [url]];
+  const command = openCommand({
+    platform: platform(),
+    env: process.env,
+    url,
+    progId: readProgId,
+    exists: isFile,
+  });
+  if (!command) return false;
   const fail = (err) =>
     console.error(
       `Couldn't auto-launch browser (${err.message}). Open the URL manually.`,
     );
   try {
-    const child = spawn(cmd, args, {
+    const child = spawn(command.program, command.args, {
       stdio: "ignore",
       detached: true,
-      windowsHide: true,
+      windowsHide: command.hide,
     });
     child.on("error", fail);
     child.unref();
@@ -250,12 +517,20 @@ export function cookiesNamed(header, name) {
  *
  * check(value) resolves { ok, reason, reached } and never shows the value;
  * without one, any value passes. emptyEnds makes an empty submission end
- * it ("empty") rather than ask again. successText(reached) is the last
- * page's words. With trim (the default), the value is trimmed, and one
- * without its shape ({ pattern, says }, or none) or with whitespace inside
- * (unless spacesInside) is refused before check is asked. url, an https
- * address its caller has checked (profiles.mjs), is the page where the key
- * is made, linked under the prompt.
+ * it ("empty") rather than ask again. successText(reached) is what the end
+ * says once a value passes. With trim (the default), the value is trimmed,
+ * and one without its shape ({ pattern, says }, or none) or with whitespace
+ * inside (unless spacesInside) is refused before check is asked. url, an
+ * https address its caller has checked (profiles.mjs), is the page where
+ * the key is made, linked under the prompt.
+ *
+ * A request that asks for JSON (wantsJson: the page's script) is answered
+ * { state, words }, never the value: state is "accepted" (200), "refused"
+ * (422, words the reason, the form still open), "cancelled" (200), "closed"
+ * (200 for the empty value that ends it with emptyEnds, else 410: the form
+ * ended before or while the request was served) or "expired" (410: it ended
+ * at its timeout). The refusals before it is served (403, 404, 405, 413) are
+ * the same for it as for any request.
  */
 export function captureSecret({
   title,
@@ -271,7 +546,7 @@ export function captureSecret({
   onListening = () => {},
   onRejected = () => {},
   successText = (reached) =>
-    `Received.${reached ? ` The key reached ${reached}.` : ""} Running the command — you can close this tab.`,
+    `Received.${reached ? ` The key reached ${reached}.` : ""} Running the command.`,
 }) {
   return new Promise((resolve) => {
     const nonce = randomBytes(24).toString("base64url");
@@ -285,17 +560,22 @@ export function captureSecret({
     /** Whether the printed address has been opened: its nonce is then spent. */
     let traded = false;
     let finished = false;
+    /** The status the form resolved with, once it has. */
+    let endedAs = null;
     let checking = false;
     let lastError = null;
 
     const finish = (result) => {
       if (finished) return;
       finished = true;
+      endedAs = result.status;
       clearTimeout(timer);
       server.close();
       server.closeIdleConnections();
       resolve(result);
     };
+    /** When the form's time runs out, by this process's clock: the page is told the time left. */
+    const deadline = Date.now() + timeoutSec * 1000;
     const timer = setTimeout(
       () => finish({ status: "timeout" }),
       timeoutSec * 1000,
@@ -313,6 +593,34 @@ export function captureSecret({
       res.writeHead(303, { ...HEADERS, ...set, Location: "/" });
       res.end();
     };
+    /** The answer the page's script reads: the state reached and the words to show, never the value. */
+    const sendState = (res, status, state, words, last = false) => {
+      res.writeHead(status, {
+        ...HEADERS,
+        "Content-Type": "application/json; charset=utf-8",
+        ...(last ? { Connection: "close" } : {}),
+      });
+      res.end(JSON.stringify({ state, words }));
+    };
+    /**
+     * The answer to a request the form ended before serving, 410: expired
+     * when it ended at its timeout, else closed, saying nothing was run
+     * unless a value passed. As JSON for the page's script, else as a page.
+     */
+    const sendEnded = (res, json) => {
+      const state = endedAs === "timeout" ? "expired" : "closed";
+      const words =
+        state === "expired"
+          ? EXPIRED
+          : endedAs === "ok"
+            ? CLOSED
+            : `${CLOSED} Nothing was run.`;
+      if (json) sendState(res, 410, state, words, true);
+      else send(res, 410, endPage(words), true);
+    };
+    /** Asks again, lastError saying why: as JSON for the page's script, else by sending the browser back to the form. */
+    const askAgain = (res, json) =>
+      json ? sendState(res, 422, "refused", lastError) : backToForm(res);
     const withPass = (req) =>
       cookiesNamed(req.headers.cookie, cookie).some((v) => sameNonce(v, pass));
     const formPage = () =>
@@ -321,14 +629,14 @@ export function captureSecret({
         `<h1>${htmlEscape(title)}</h1>
 <p>${htmlEscape(prompt)}</p>
 ${url ? `<p><a href="${htmlEscape(url)}" target=_blank rel="noopener noreferrer">Make one at ${htmlEscape(new URL(url).host)}</a> (opens in a new tab)</p>` : ""}
-${lastError ? `<p class=error role=alert>${htmlEscape(lastError)}</p>` : ""}
+<p id=error class=error role=alert${lastError ? `>${htmlEscape(lastError)}` : " hidden>"}</p>
 <form method=post action="/">
-<input name=v type=text aria-label="${htmlEscape(title)}" autocomplete=off autocapitalize=off autocorrect=off spellcheck=false autofocus required${trim ? ` aria-describedby=status${shape ? ` data-pattern="${htmlEscape(shape.pattern)}" data-says="${htmlEscape(shape.says)}"` : ""}${spacesInside ? " data-spaces=1" : ""}` : ""}>
-${trim ? `<p id=status class=status role=status aria-live=polite></p>` : ""}
+<input name=v type=text aria-label="${htmlEscape(title)}" autocomplete=off autocapitalize=off autocorrect=off spellcheck=false autofocus required aria-describedby=status data-left=${Math.max(0, deadline - Date.now())}${trim ? ` data-trim=1${shape ? ` data-pattern="${htmlEscape(shape.pattern)}" data-says="${htmlEscape(shape.says)}"` : ""}${spacesInside ? " data-spaces=1" : ""}` : ""}>
+<p id=status class=status role=status aria-live=polite></p>
 <div class=row><button type=submit>Submit</button><button type=submit class=secondary formaction="/cancel" formnovalidate>Cancel</button></div>
 </form>
 ${note ? `<p class=note>${htmlEscape(note)}</p>` : ""}
-${trim ? `<script>${SCRIPT}</script>` : ""}`,
+<script>${SCRIPT}</script>`,
       );
     const endPage = (text) =>
       page(title, `<h1>${htmlEscape(title)}</h1><p>${htmlEscape(text)}</p>`);
@@ -347,7 +655,11 @@ ${trim ? `<script>${SCRIPT}</script>` : ""}`,
         return;
       }
       const url = new URL(req.url, `http://${here}`);
+      const json = wantsJson(req.headers);
       if (finished) {
+        // The page's script, its window still open, is told the form has ended; anything else
+        // finds nothing, as before.
+        if (json && withPass(req)) return sendEnded(res, true);
         res.writeHead(404, HEADERS).end();
         return;
       }
@@ -364,7 +676,7 @@ ${trim ? `<script>${SCRIPT}</script>` : ""}`,
             res,
             404,
             endPage(
-              "This address opens the form once, and it has been opened: the form is in the tab that opened it first.",
+              "This address opens the form once, and it has been opened: the form is in the window that opened it first.",
             ),
           );
         }
@@ -384,7 +696,8 @@ ${trim ? `<script>${SCRIPT}</script>` : ""}`,
       if (url.pathname === "/" && req.method === "GET")
         return send(res, 200, formPage());
       if (url.pathname === "/cancel" && req.method === "POST") {
-        send(res, 200, endPage("Cancelled. Nothing was run."), true);
+        if (json) sendState(res, 200, "cancelled", CANCELLED, true);
+        else send(res, 200, endPage(CANCELLED), true);
         return finish({ status: "cancelled" });
       }
       if (url.pathname !== "/" || req.method !== "POST") {
@@ -402,7 +715,9 @@ ${trim ? `<script>${SCRIPT}</script>` : ""}`,
         } else chunks.push(c);
       });
       req.on("end", async () => {
-        if (finished || size > MAX_BODY) return;
+        if (size > MAX_BODY) return;
+        // Ended while the body came in (a second POST after a first passed, say): answered, not left waiting.
+        if (finished) return sendEnded(res, json);
         const raw =
           new URLSearchParams(Buffer.concat(chunks).toString("utf8")).get(
             "v",
@@ -413,24 +728,26 @@ ${trim ? `<script>${SCRIPT}</script>` : ""}`,
         const value = pasted.value;
         if (!value) {
           if (emptyEnds) {
-            send(res, 200, endPage("Empty value. Nothing was run."), true);
+            const words = "Empty value. Nothing was run.";
+            if (json) sendState(res, 200, "closed", words, true);
+            else send(res, 200, endPage(words), true);
             return finish({ status: "empty" });
           }
           lastError = "Nothing was pasted.";
-          return backToForm(res);
+          return askAgain(res, json);
         }
         if (trim) {
           const shaped = shapeVerdict(value, shape, spacesInside);
           if (!shaped.ok) {
             lastError = `${shaped.words} Nothing was checked.`;
             onRejected(shaped.words);
-            return backToForm(res);
+            return askAgain(res, json);
           }
         }
         if (checking) {
           lastError =
             "The last key is still being checked; try again in a moment.";
-          return backToForm(res);
+          return askAgain(res, json);
         }
         checking = true;
         let result;
@@ -441,26 +758,15 @@ ${trim ? `<script>${SCRIPT}</script>` : ""}`,
           result = { ok: false, reason: "the check itself failed" };
         }
         checking = false;
-        if (finished)
-          return send(
-            res,
-            410,
-            endPage("This form has closed. Nothing was run."),
-            true,
-          );
+        if (finished) return sendEnded(res, json);
         if (!result.ok) {
           lastError = `That key didn't work: ${result.reason}`;
           onRejected(result.reason);
-          return backToForm(res);
+          return askAgain(res, json);
         }
-        send(
-          res,
-          200,
-          endPage(
-            `${pasted.found ? `Trimmed ${pasted.found}. ` : ""}${successText(result.reached)}`,
-          ),
-          true,
-        );
+        const words = `${pasted.found ? `Trimmed ${pasted.found}. ` : ""}${successText(result.reached)}`;
+        if (json) sendState(res, 200, "accepted", words, true);
+        else send(res, 200, endPage(`${words} You can close this window.`), true);
         finish({ status: "ok", value, reached: result.reached ?? null });
       });
     });
