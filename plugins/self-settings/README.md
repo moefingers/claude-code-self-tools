@@ -61,11 +61,13 @@ Reading another machine's settings.
 
 ## Tests
 
-`tests/self-settings.test.ts` (with the engine stood in: the whole read answer, filters, sensitive fields, the secret rule as a table; every option on the list changed, a hook's refusal passed on, a value a hook changed, a value that looks like a secret never shown back; a locked row, a hidden row, a key that isn't a plugin's, another owner's row, unfit values, and every near-miss spelling refused, at the call and again at the serving; a subagent refused), `tests/update-check.test.ts` (the shared update check's), and `scripts/settings-manifests.test.mjs` (every field of every manifest in the repository refused unless the list names it, every entry a field that is there and isn't sensitive, the list the frozen one, and the table the manifests' own).
+`tests/self-settings.test.ts` (with the engine stood in: the whole read answer, filters, sensitive fields, `agents may set` against `settings_set`'s own verdict row by row, the secret rule as a table; every option on the list changed, a hook's refusal passed on, a value a hook changed, the answer and the toast for each way the read back goes, a value that looks like a secret never shown back; a locked row, a hidden row, a key that isn't a plugin's, another owner's row, unfit values, a plugin of that name from another marketplace only, from both, from none, or marketplaces that can't be read, and every near-miss spelling refused, at the call and again at the serving, each where it is refused; a subagent refused, but for a key off the list, which gets the owner-only line), `tests/update-check.test.ts` (the shared update check's), and `scripts/settings-manifests.test.mjs` (every field of every manifest in the repository refused unless the list names it, a subagent's call too, every entry a field that is there and isn't sensitive, the list the frozen one, and the table the manifests' own).
 
 ## What ran
 
-Nothing yet: the tests and the type check were written with the plugin and have not run.
+- **The cloud gate on the first round's head (`b2ef37b`):** `claude plugin validate plugins/self-settings --strict` passed, and the steps that fail on `main` failed there the same way. Two of the plugin's tests failed on it, expecting `deny` where a refusal made at the serving comes back as the call's error result; this round fixes them.
+- **The plugin's tests on this round:** the cloud gate.
+- **Not shown by any run:** a tool called in a session, the plugin loaded or installed; a real `/config` row's key spelled `<plugin>.<field>`; another session seeing a change; and `settings_set` changing `self-settings.updateCheck`, which reloads this plugin in the middle of its own call (the read back after it is caught if it fails).
 
 ## Update check
 

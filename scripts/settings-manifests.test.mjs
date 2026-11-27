@@ -125,6 +125,10 @@ test("KNOWN is the manifests' own: each field's default and whether it is sensit
   const fromKnown = Object.entries(settings.KNOWN)
     .flatMap(([plugin, fields]) => Object.entries(fields).map(([field, spec]) => line(`${plugin}.${field}`, spec)))
     .sort()
-  assert.deepEqual(fromKnown, fromManifests)
+  assert.deepEqual(
+    fromKnown,
+    fromManifests,
+    "KNOWN differs from the manifests: edit KNOWN in plugins/self-settings/hooks/settings.ts to name each plugin's userConfig fields as its plugin.json declares them",
+  )
   assert.ok(Object.isFrozen(settings.KNOWN))
 })
