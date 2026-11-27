@@ -42,9 +42,14 @@
 //    its first look and at its place); the restore rectangle of a maximized window (recorded, not asserted); a move
 //    later than the unplaced test's observation window; monitors at different scales; a full-screen window.
 //
-// Run with `node --test "scripts/*.test.mjs"`; part 2 with SELF_PLACE_LIVE=1 set as well.
+// 3. #90 and #91, live too (only with SELF_PLACE_LIVE=1): at most two more windows, one at a time: a plain window
+//    flush against a left edge, and, only with SELF_PLACE_WT=1 as well (it runs wt.exe), a named window placed by its
+//    first tab through the slot runner's own lines. Its own block, below, says how.
+//
+// Run with `node --test "scripts/*.test.mjs"`; parts 2 and 3 with SELF_PLACE_LIVE=1 set as well.
 import assert from 'node:assert/strict'
 import { spawnSync } from 'node:child_process'
+import { randomUUID } from 'node:crypto'
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -479,5 +484,146 @@ describe('the plain window places itself, live (#5)', { skip: liveSkip, concurre
     const { result } = opened
     assert.equal(result.placeSaid, undefined, `no placing line ran: ${seen(opened)}`)
     assert.deepEqual(result.rectAfter, result.rectBefore, `where it opened, ${WATCH_MS / 1000} s later: ${seen(opened)}`)
+  })
+})
+
+// #90 and #91, live: at most two windows of the test's own, one at a time, each running only the test's own script,
+// which ends by itself (every wait in it is bounded), so its tab and its window close. Only with SELF_PLACE_LIVE=1.
+// 1. A plain window flush against its work area's left edge (#90): the shipped placing lines are asked for a rect 64 px
+//    past that edge; the clamp brings it back to the window's own border, so its drawn frame starts at the edge.
+// 2. A named window placed by its first tab (#91), only with SELF_PLACE_WT=1 as well: it runs wt.exe, so it runs only in
+//    a guarded run. wt.exe -w <a name made for this run alone> nt, its tab running the test's script,
+//    which holds the slot runner's own place lines byte for byte ($PlaceCs, Set-OwnPlace and the lines they read, cut from
+//    claude-slot.ps1), with the test's own -Place and -Claim. The starter makes the launch's two events first, as launch()
+//    does, then starts wt, and waits on them for PLACE_WAIT_MS, as launch() does.
+// Focus: the plain window opens with SW_SHOWNOACTIVATE (as above). wt.exe has no option that opens a window without
+// focus (its command-line page lists none), so the named window takes it. Each records the window in front before it
+// and after its place, as a fact, never a failure. Never the person's own windows: the plain window keeps the guard
+// above; the named window's name is new for this run, and the shipped lines move it only while it holds one console.
+const FLUSH_WINDOWS = 2
+/** The longest the named window may take: wt's start, the place's compile, its wait, and the starter's look for its result (an estimate's bound). */
+const NAMED_LIMIT_MS = machine.PLACE_WAIT_MS + WINDOW_LIMIT_MS
+const wtWanted = process.env.SELF_PLACE_WT === '1'
+
+describe('flush against an edge, and a first tab placing its named window, live (#90, #91)', { skip: liveSkip, concurrency: 1 }, () => {
+  let screens
+  /** The test's C# built by Windows PowerShell 5.1, for the named window's tab, which runs in 5.1. */
+  let dll51
+  before(() => {
+    assert.ok(LIVE?.shell !== undefined, LIVE?.why ?? 'the shipped shell rule was not read')
+    process.stdout.write(`window-place-live (#90, #91): opens at most ${FLUSH_WINDOWS} windows, one at a time: a plain window (at most ${STARTER_LIMIT_MS / 1000} s)${wtWanted ? `, then a named Windows Terminal window through wt.exe (at most ${NAMED_LIMIT_MS / 1000} s)` : '; the named window is skipped without SELF_PLACE_WT=1'}. Each runs only this test's script, which ends by itself.\n`)
+    work = mkdtempSync(join(tmpdir(), 'window-flush-'))
+    dll = join(work, 'place-test.dll')
+    const compiled = hidden(`Add-Type -ErrorAction Stop -TypeDefinition ${psq(TEST_CS)} -OutputAssembly ${psq(dll)}`, LIVE.shell)
+    assert.ok(compiled.code === 0 && existsSync(dll), `the test's C# compiled: ${compiled.out}${compiled.err}`)
+    // The named window's tab runs Windows PowerShell 5.1, as the shipped slot runner does, so it loads a DLL 5.1 built.
+    // What that rests on, from memory, not a run: an assembly Add-Type builds under PowerShell 7 references .NET's newer
+    // System.Runtime, which .NET Framework 4.8 under 5.1 cannot bind, so 5.1 could not load the DLL built in LIVE.shell.
+    dll51 = join(work, 'place-test-51.dll')
+    const compiled51 = hidden(`Add-Type -ErrorAction Stop -TypeDefinition ${psq(TEST_CS)} -OutputAssembly ${psq(dll51)}`, WINDOWS_POWERSHELL)
+    assert.ok(compiled51.code === 0 && existsSync(dll51), `the test's C# compiled in Windows PowerShell 5.1: ${compiled51.out}${compiled51.err}`)
+    const read = hidden([`Add-Type -ErrorAction Stop -Path ${psq(dll)}`, `[Console]::Out.WriteLine(${T}::Monitors())`].join('\r\n'), LIVE.shell)
+    assert.equal(read.code, 0, `${read.out}${read.err}`)
+    screens = read.out.trim().split(/\r?\n/).at(-1).split(';').map(row => row.split(',').map(Number)).map(n => ({ monitor: n.slice(0, 4), work: n.slice(4, 8), primary: n[8] === 1 }))
+  })
+  after(() => {
+    if (work !== undefined) rmSync(work, { recursive: true, force: true })
+  })
+
+  test('#90: a plain window flush against its work area\'s left edge: its drawn frame at the edge, its rectangle past it by its own border', t => {
+    const primary = screens.find(s => s.primary)
+    const rect = [primary.work[0] - 64, primary.work[1] + 60, 640, 400]
+    const opened = openWindow({ place: { rect }, until: `((@(${T}::OwnRect()) -join ",") -ne ($result.rectBefore -join ","))` })
+    if (!settled(t, opened)) return
+    const { result } = opened
+    const [ax, ay, aw, ah] = result.rectAfter
+    const border = Array.isArray(result.frameAfter) && result.frameAfter.length === 4 ? machine.overhangOf([ax, ay, ax + aw, ay + ah], result.frameAfter) : machine.NO_OVERHANG
+    t.diagnostic(`its border, read after the move: ${JSON.stringify(border)}; its frame ${JSON.stringify(result.frameAfter)} on the work area ${JSON.stringify(result.work)}`)
+    assert.equal(result.placeSaid, 'placed', seen(opened))
+    assert.ok(rectNear(result.rectAfter, machine.clampToWork(rect, result.work, border)), `at clampToWork(${JSON.stringify(rect)}, ${JSON.stringify(result.work)}, ${JSON.stringify(border)}): ${seen(opened)}`)
+    if (border[0] === 0) return t.skip(`its border read as none (${JSON.stringify(result.frameAfter)}), so flush is the work area's own edge`)
+    assert.ok(near(result.frameAfter[0], result.work[0], POS_TOLERANCE), `its drawn frame starts at the work area's left edge: ${seen(opened)}`)
+  })
+
+  test('#91: a named window placed by its first tab, through the slot runner\'s own lines (wt.exe; only with SELF_PLACE_WT=1)', { skip: !wtWanted && 'runs wt.exe: only in the guarded run, with SELF_PLACE_WT=1' }, t => {
+    const wtExe = join(process.env.LOCALAPPDATA ?? '', 'Microsoft', 'WindowsApps', 'wt.exe')
+    if (!existsSync(wtExe)) return t.skip(`no wt.exe at ${wtExe}`)
+    const primary = screens.find(s => s.primary)
+    const rect = [primary.work[0] + 150, primary.work[1] + 110, 700, 450]
+    const uuid = randomUUID()
+    const name = `self-place-test-${uuid.slice(0, 8)}`
+    // The slot runner's own lines, byte for byte: what it reads, $PlaceCs, Set-OwnPlace and Send-PlaceWord, called as it calls them.
+    const runner = readFileSync(join(ROOT, 'plugins', 'self-switch', 'slot', 'claude-slot.ps1'), 'utf8')
+    const lineOf = start => runner.split('\n').find(line => line.startsWith(start))
+    const functionOf = name => {
+      const at = runner.indexOf(`function ${name}`)
+      return at < 0 ? undefined : runner.slice(at, runner.indexOf('\n}\n', at) + 2)
+    }
+    const placing = [functionOf('Set-OwnPlace {'), functionOf('Send-PlaceWord(')]
+    const call = lineOf('    if ($Place) { ')?.trim().replace(/^if \(\$Place\) \{ (.*) \}$/, '$1')
+    const shipped = ['$LaunchClaim = ', '$PlaceArg = ', '$PlacedSignal = ', '$UnplacedSignal = ', '$PlaceCs = '].map(lineOf)
+    assert.ok(placing.every(f => f !== undefined) && call === 'Send-PlaceWord (Set-OwnPlace)' && shipped.every(line => line !== undefined), 'the slot runner holds its place lines')
+    const dir = mkdtempSync(join(work, 'named-'))
+    const files = { script: join(dir, 'tab.ps1'), result: join(dir, 'result.json') }
+    for (const path of Object.values(files)) assert.ok(!/['";%]/.test(path), 'no quote, semicolon or % in a path wt or the scripts take')
+    const target = `@(${T}::OwnRect())`
+    const lines = [
+      '$ErrorActionPreference = "Stop"',
+      '$result = [ordered]@{}',
+      'try {',
+      `  Add-Type -ErrorAction Stop -Path ${psq(dll51)}`,
+      `  $result.frontAtStart = ${T}::Foreground()`,
+      `  $result.own = ${T}::OwnLow()`,
+      `  $result.kind = ${T}::OwnKind()`,
+      `  $result.rectBefore = ${target}`,
+      ...shipped,
+      `$Place = '${machine.placeArgument(rect)}'`,
+      `$Claim = 'launch:${uuid}'`,
+      ...placing,
+      '  $clock = [Diagnostics.Stopwatch]::StartNew()',
+      `  ${call}`,
+      '  $result.placeMs = $clock.ElapsedMilliseconds',
+      `  $settle = [Diagnostics.Stopwatch]::StartNew(); while ($settle.ElapsedMilliseconds -lt ${SETTLE_LIMIT_MS} -and ((${target} -join ",") -eq ($result.rectBefore -join ","))) { Start-Sleep -Milliseconds ${POLL_MS} }`,
+      `  $result.rectAfter = ${target}`,
+      `  $result.frameAfter = @(${T}::OwnFrame())`,
+      `  $result.work = @(${T}::OwnWork())`,
+      '  if ($result.kind -like "PseudoConsoleWindow*") { $result.hosted = [ClaudeSelfToolsPlace]::Hosted([IntPtr]::new([long]$result.own), [IntPtr]::new([long][ClaudeSelfToolsPlaceTest]::ConsoleLow())) }',
+      `  $result.frontAfter = ${T}::Foreground()`,
+      '} catch { $result.error = $_.Exception.Message }',
+      `[IO.File]::WriteAllText(${psq(files.result)}, (ConvertTo-Json -Compress -Depth 4 -InputObject $result))`,
+      'exit 0',
+    ]
+    writeFileSync(files.script, `\ufeff${lines.join('\r\n')}`)
+    const wtLine = ['-w', name, 'nt', '--title', 'place-test', '--suppressApplicationTitle', '--', WINDOWS_POWERSHELL, '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', files.script].map(machine.wtArgument).join(' ')
+    // The starter: the launch's two events first, as launch() makes them, then wt, then the wait on them, then a bounded look for the result.
+    const starter = [
+      `Add-Type -ErrorAction Stop -Path ${psq(dll)}`,
+      '$placedNew = $false',
+      '$unplacedNew = $false',
+      `$placedSignal = [Threading.EventWaitHandle]::new($false, [Threading.EventResetMode]::ManualReset, ${psq(machine.placeSignalName(uuid, 'placed'))}, [ref]$placedNew)`,
+      `$unplacedSignal = [Threading.EventWaitHandle]::new($false, [Threading.EventResetMode]::ManualReset, ${psq(machine.placeSignalName(uuid, 'unplaced'))}, [ref]$unplacedNew)`,
+      `$frontBefore = ${T}::Foreground()`,
+      '$clock = [Diagnostics.Stopwatch]::StartNew()',
+      `[void](Start-Process ${psq(wtExe)} -ArgumentList ${psq(wtLine)} -PassThru)`,
+      `$seen = [Threading.WaitHandle]::WaitAny([Threading.WaitHandle[]]@($placedSignal, $unplacedSignal), ${machine.PLACE_WAIT_MS})`,
+      '$signalMs = $clock.ElapsedMilliseconds',
+      `$look = [Diagnostics.Stopwatch]::StartNew(); while ($look.ElapsedMilliseconds -lt ${WINDOW_LIMIT_MS} -and -not (Test-Path -LiteralPath ${psq(files.result)})) { Start-Sleep -Milliseconds 100 }`,
+      '[Console]::Out.WriteLine((ConvertTo-Json -Compress -InputObject ([ordered]@{ frontBefore = $frontBefore; seen = $seen; signalMs = $signalMs; fresh = ($placedNew -and $unplacedNew) })))',
+    ].join('\r\n')
+    const ran = hidden(starter, LIVE.shell, NAMED_LIMIT_MS + 10_000)
+    assert.equal(ran.code, 0, `${ran.out}${ran.err}`)
+    const record = JSON.parse(ran.out.trim().split(/\r?\n/).at(-1))
+    assert.ok(existsSync(files.result), `the tab wrote nothing (its window may still be open, named ${name}: close it by hand): ${JSON.stringify(record)}`)
+    const result = JSON.parse(readFileSync(files.result, 'utf8').replace(/^\ufeff/, ''))
+    const opened = { result, record }
+    t.diagnostic(`the place's event: ${record.seen === 0 ? 'placed' : record.seen === 1 ? 'unplaced' : 'none'} ${record.signalMs} ms after wt started; the place took ${result.placeMs} ms in the tab`)
+    t.diagnostic(`the window in front: before ${record.frontBefore}; as the tab began ${result.frontAtStart}; after its place ${result.frontAfter} (${result.frontAfter === result.own ? 'the new window' : 'another'})`)
+    assert.equal(result.error, undefined, seen(opened))
+    assert.equal(record.fresh, true, 'both events were this run\'s own')
+    assert.equal(result.hosted, 1, `a new named window holds its first tab's console alone: ${seen(opened)}`)
+    assert.equal(record.seen, 0, `its first tab said placed, within ${machine.PLACE_WAIT_MS / 1000} s: ${seen(opened)}`)
+    const [ax, ay, aw, ah] = result.rectAfter
+    const border = Array.isArray(result.frameAfter) && result.frameAfter.length === 4 ? machine.overhangOf([ax, ay, ax + aw, ay + ah], result.frameAfter) : machine.NO_OVERHANG
+    assert.ok(rectNear(result.rectAfter, machine.clampToWork(rect, result.work, border)), `at its rect, exactly in pixels (wt alone sizes in cells): ${seen(opened)}`)
   })
 })

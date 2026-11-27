@@ -9,5 +9,13 @@
   "launch": { "prefer": ["slot", "tab", "window"], "tab": { "window": "claude-4", "maxTabs": 2 }, "window": { "name": "claude-overflow", "pos": [1920, 0], "size": [140, 60] } },
   "restart": { "prefer": ["slot", "tab", "window"], "tab": { "window": "same" }, "window": { "rect": [100, 80, 1280, 860] } },
   "workspaces": { "claude-4": "default" },
-  "limits": { "minFreeGb": 5, "maxSessions": 12 }
+  "limits": { "minFreeGb": 5, "maxSessions": 12 },
+  "grid": {
+    "windows": [
+      { "window": "grid-1", "rect": [-7, 0, 974, 527], "tabs": ["alpha", "beta"] },
+      { "window": "grid-2", "rect": [953, 0, 974, 527] },
+      { "window": "grid-3", "rect": [-7, 520, 974, 527] },
+      { "window": "grid-4", "maximized": true }
+    ]
+  }
 }

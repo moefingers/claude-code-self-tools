@@ -12,7 +12,9 @@
     { "name": "a rect a half under the least height, written 1.995e2", "good": false, "text": "{\"v\": 1, \"layout\": [], \"launch\": {\"prefer\": [\"window\"], \"window\": {\"rect\": [0, 0, 320, 1.995e2]}}}" },
     { "name": "a size with a half", "good": false, "text": "{\"v\": 1, \"layout\": [{\"window\": \"a\", \"size\": [120.5, 30], \"tabs\": [\"t\"], \"folder\": \"{{FOLDER}}\"}]}" },
     { "name": "a pos with a boolean", "good": false, "text": "{\"v\": 1, \"layout\": [{\"window\": \"a\", \"pos\": [true, 0], \"tabs\": [\"t\"], \"folder\": \"{{FOLDER}}\"}]}" },
-    { "name": "the version written 1.5", "good": false, "text": "{\"v\": 1.5, \"layout\": []}" }
+    { "name": "the version written 1.5", "good": false, "text": "{\"v\": 1.5, \"layout\": []}" },
+    { "name": "a grid window's rect written -7e0, 0.0 and 4.94e2", "good": true, "text": "{\"v\": 1, \"layout\": [], \"grid\": {\"windows\": [{\"window\": \"a-1\", \"rect\": [-7e0, 0.0, 4.94e2, 523]}]}}" },
+    { "name": "a grid window's rect with a half", "good": false, "text": "{\"v\": 1, \"layout\": [], \"grid\": {\"windows\": [{\"window\": \"a-1\", \"rect\": [-7.5, 0, 494, 523]}]}}" }
   ],
   "good": [
     { "name": "the design's example", "file": { "v": 1, "layout": [ { "window": "claude-1", "pos": [0, 0], "size": [160, 42], "tabs": ["s1", "s2", "s3"], "folder": "{{FOLDER}}" }, { "window": "claude-2", "pos": [960, 0], "size": [160, 42], "tabs": ["s4", "s5", "s6"], "folder": "{{FOLDER}}" } ], "launch": { "prefer": ["slot", "tab", "window"], "tab": { "window": "claude-2", "maxTabs": 2 }, "window": { "name": "claude-overflow", "pos": [1920, 0], "size": [140, 60] } }, "restart": { "prefer": ["slot", "tab", "window"], "tab": { "window": "same" } }, "workspaces": { "claude-2": "default" }, "limits": { "minFreeGb": 5, "maxSessions": 12 } } },
@@ -30,7 +32,11 @@
     { "name": "the plain window maximized, for a restart", "file": { "v": 1, "layout": [], "restart": { "prefer": ["window"], "window": { "maximized": true } } } },
     { "name": "the plain window at a rect and maximized", "file": { "v": 1, "layout": [], "launch": { "prefer": ["window"], "window": { "rect": [2100, 300, 900, 600], "maximized": true } } } },
     { "name": "the edges of a rect", "file": { "v": 1, "layout": [], "launch": { "prefer": ["window"], "window": { "rect": [-32768, 32768, 320, 200] } }, "restart": { "prefer": ["window"], "window": { "rect": [32768, -32768, 32768, 32768] } } } },
-    { "name": "a maximized layout window and a maximized named window", "file": { "v": 1, "layout": [ { "window": "w1", "pos": [2100, 300], "maximized": true, "tabs": ["t"], "folder": "{{FOLDER}}" } ], "launch": { "prefer": ["window"], "window": { "name": "w2", "pos": [0, 0], "size": [120, 30], "maximized": true } } } }
+    { "name": "a maximized layout window and a maximized named window", "file": { "v": 1, "layout": [ { "window": "w1", "pos": [2100, 300], "maximized": true, "tabs": ["t"], "folder": "{{FOLDER}}" } ], "launch": { "prefer": ["window"], "window": { "name": "w2", "pos": [0, 0], "size": [120, 30], "maximized": true } } } },
+    { "name": "a grid of a fixed slot, a free cell and a maximized free cell", "file": { "v": 1, "layout": [], "grid": { "windows": [ { "window": "a-1", "rect": [-7, 0, 494, 523], "tabs": ["alpha", "beta"] }, { "window": "a-2", "rect": [473, 0, 494, 523] }, { "window": "b-1", "maximized": true } ] } } },
+    { "name": "a grid of one free cell, beside a layout and a launch", "file": { "v": 1, "layout": [ { "window": "w1", "tabs": ["t"], "folder": "{{FOLDER}}" } ], "launch": { "prefer": ["slot"] }, "grid": { "windows": [ { "window": "g1", "maximized": true } ] } } },
+    { "name": "the edges of a grid window's rect, and a session name of 40 characters", "file": { "v": 1, "layout": [], "grid": { "windows": [ { "window": "e1", "rect": [-32768, 32768, 320, 200], "tabs": ["a0123456789012345678901234567890123456-z"] }, { "window": "e2", "rect": [32768, -32768, 32768, 32768] } ] } } },
+    { "name": "a grid of 16 windows", "file": { "v": 1, "layout": [], "grid": { "windows": [ { "window": "g1", "maximized": true }, { "window": "g2", "maximized": true }, { "window": "g3", "maximized": true }, { "window": "g4", "maximized": true }, { "window": "g5", "maximized": true }, { "window": "g6", "maximized": true }, { "window": "g7", "maximized": true }, { "window": "g8", "maximized": true }, { "window": "g9", "maximized": true }, { "window": "g10", "maximized": true }, { "window": "g11", "maximized": true }, { "window": "g12", "maximized": true }, { "window": "g13", "maximized": true }, { "window": "g14", "maximized": true }, { "window": "g15", "maximized": true }, { "window": "g16", "maximized": true } ] } } }
   ],
   "bad": [
     { "name": "a list, not an object", "file": [] },
@@ -104,6 +110,37 @@
     { "name": "a pos of null", "file": { "v": 1, "layout": [ { "window": "a", "pos": null, "tabs": ["t"], "folder": "{{FOLDER}}" } ] } },
     { "name": "a launch of null", "file": { "v": 1, "layout": [], "launch": null } },
     { "name": "a minFreeGb of null", "file": { "v": 1, "layout": [], "limits": { "minFreeGb": null } } },
-    { "name": "an afterBoot of null", "file": { "v": 1, "layout": [], "afterBoot": null } }
+    { "name": "an afterBoot of null", "file": { "v": 1, "layout": [], "afterBoot": null } },
+    { "name": "two layout windows whose names differ only in case, Alpha and alpha", "file": { "v": 1, "layout": [ { "window": "Alpha", "tabs": ["t"], "folder": "{{FOLDER}}" }, { "window": "alpha", "tabs": ["t"], "folder": "{{FOLDER}}" } ] } },
+    { "name": "two layout windows I1 and i1 (one name, ordinal and ignoring case, whatever the culture)", "file": { "v": 1, "layout": [ { "window": "I1", "tabs": ["t"], "folder": "{{FOLDER}}" }, { "window": "i1", "tabs": ["t"], "folder": "{{FOLDER}}" } ] } },
+    { "name": "a layout window's tabs Alpha and alpha", "file": { "v": 1, "layout": [ { "window": "a", "tabs": ["Alpha", "alpha"], "folder": "{{FOLDER}}" } ] } },
+    { "name": "a layout window's tabs I1 and i1", "file": { "v": 1, "layout": [ { "window": "a", "tabs": ["I1", "i1"], "folder": "{{FOLDER}}" } ] } },
+    { "name": "two grid windows I1 and i1", "file": { "v": 1, "layout": [], "grid": { "windows": [ { "window": "I1", "maximized": true }, { "window": "i1", "maximized": true } ] } } },
+    { "name": "a grid that is a list","file": { "v": 1, "layout": [], "grid": [] } },
+    { "name": "a grid of null", "file": { "v": 1, "layout": [], "grid": null } },
+    { "name": "a grid with no windows key", "file": { "v": 1, "layout": [], "grid": {} } },
+    { "name": "a grid of no windows", "file": { "v": 1, "layout": [], "grid": { "windows": [] } } },
+    { "name": "a grid of 17 windows", "file": { "v": 1, "layout": [], "grid": { "windows": [ { "window": "g1", "maximized": true }, { "window": "g2", "maximized": true }, { "window": "g3", "maximized": true }, { "window": "g4", "maximized": true }, { "window": "g5", "maximized": true }, { "window": "g6", "maximized": true }, { "window": "g7", "maximized": true }, { "window": "g8", "maximized": true }, { "window": "g9", "maximized": true }, { "window": "g10", "maximized": true }, { "window": "g11", "maximized": true }, { "window": "g12", "maximized": true }, { "window": "g13", "maximized": true }, { "window": "g14", "maximized": true }, { "window": "g15", "maximized": true }, { "window": "g16", "maximized": true }, { "window": "g17", "maximized": true } ] } } },
+    { "name": "an unknown key in grid", "file": { "v": 1, "layout": [], "grid": { "windows": [ { "window": "a", "maximized": true } ], "rows": 2 } } },
+    { "name": "an unknown key in a grid window", "file": { "v": 1, "layout": [], "grid": { "windows": [ { "window": "a", "maximized": true, "pos": [0, 0] } ] } } },
+    { "name": "a grid window that is not an object", "file": { "v": 1, "layout": [], "grid": { "windows": [ "a" ] } } },
+    { "name": "a grid window called last", "file": { "v": 1, "layout": [], "grid": { "windows": [ { "window": "last", "maximized": true } ] } } },
+    { "name": "a grid window with no name", "file": { "v": 1, "layout": [], "grid": { "windows": [ { "maximized": true } ] } } },
+    { "name": "a grid window named twice", "file": { "v": 1, "layout": [], "grid": { "windows": [ { "window": "a", "maximized": true }, { "window": "a", "rect": [0, 0, 800, 600] } ] } } },
+    { "name": "two grid windows whose names differ only in case", "file": { "v": 1, "layout": [], "grid": { "windows": [ { "window": "Top", "maximized": true }, { "window": "top", "maximized": true } ] } } },
+    { "name": "a grid window with both a rect and maximized", "file": { "v": 1, "layout": [], "grid": { "windows": [ { "window": "a", "rect": [0, 0, 800, 600], "maximized": true } ] } } },
+    { "name": "a grid window with neither a rect nor maximized", "file": { "v": 1, "layout": [], "grid": { "windows": [ { "window": "a", "tabs": ["alpha"] } ] } } },
+    { "name": "a grid window's rect too narrow", "file": { "v": 1, "layout": [], "grid": { "windows": [ { "window": "a", "rect": [0, 0, 319, 600] } ] } } },
+    { "name": "a grid window's rect of null", "file": { "v": 1, "layout": [], "grid": { "windows": [ { "window": "a", "rect": null } ] } } },
+    { "name": "a grid window maximized false", "file": { "v": 1, "layout": [], "grid": { "windows": [ { "window": "a", "maximized": false } ] } } },
+    { "name": "a grid window's tabs empty", "file": { "v": 1, "layout": [], "grid": { "windows": [ { "window": "a", "maximized": true, "tabs": [] } ] } } },
+    { "name": "a grid window's tabs of null", "file": { "v": 1, "layout": [], "grid": { "windows": [ { "window": "a", "maximized": true, "tabs": null } ] } } },
+    { "name": "a grid tab with a capital", "file": { "v": 1, "layout": [], "grid": { "windows": [ { "window": "a", "maximized": true, "tabs": ["Alpha"] } ] } } },
+    { "name": "a grid tab with a space", "file": { "v": 1, "layout": [], "grid": { "windows": [ { "window": "a", "maximized": true, "tabs": ["al pha"] } ] } } },
+    { "name": "a grid tab starting with a hyphen", "file": { "v": 1, "layout": [], "grid": { "windows": [ { "window": "a", "maximized": true, "tabs": ["-alpha"] } ] } } },
+    { "name": "a grid tab of 41 characters", "file": { "v": 1, "layout": [], "grid": { "windows": [ { "window": "a", "maximized": true, "tabs": ["a01234567890123456789012345678901234567-z"] } ] } } },
+    { "name": "a grid tab that is a number", "file": { "v": 1, "layout": [], "grid": { "windows": [ { "window": "a", "maximized": true, "tabs": [7] } ] } } },
+    { "name": "a session named twice in one grid window", "file": { "v": 1, "layout": [], "grid": { "windows": [ { "window": "a", "maximized": true, "tabs": ["alpha", "alpha"] } ] } } },
+    { "name": "a session named in two grid windows", "file": { "v": 1, "layout": [], "grid": { "windows": [ { "window": "a", "maximized": true, "tabs": ["alpha"] }, { "window": "b", "maximized": true, "tabs": ["beta", "alpha"] } ] } } }
   ]
 }

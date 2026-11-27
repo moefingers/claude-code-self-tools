@@ -40,7 +40,29 @@ function runnerProblems(text) {
   const has = line => text.includes(line)
   const code = text.split('\n').filter(line => !line.trimStart().startsWith('#')).join('\n')
 
-  need(has('param([switch]$Idle, [string]$Start, [string]$Name, [string]$Resume, [string]$WaitFor, [string]$ConfigDirs, [string]$LeftSize, [string]$LeftMtime, [string]$LeftExitAt, [string]$Launcher, [string]$Claim)'), 'its parameters')
+  need(has('param([switch]$Idle, [string]$Start, [string]$Name, [string]$Resume, [string]$WaitFor, [string]$ConfigDirs, [string]$LeftSize, [string]$LeftMtime, [string]$LeftExitAt, [string]$Launcher, [string]$Claim, [string]$Place, [switch]$Prompt)'), 'its parameters')
+
+  // #91: -Place, its own window's place. The C# is PLACE_CS byte for byte (so its reviewed list of calls holds here too),
+  // compiled and called once, with four checked whole numbers and a rect alone; then one of its launch's two events, by its claim.
+  need(has(`$PlaceCs = '${machine.PLACE_CS}'\n`) && (text.match(/^\$PlaceCs = /gm) ?? []).length === 1, 'the place C# is PLACE_CS, written by embed-launch')
+  need(has(`$PlacedSignal = '${machine.PLACE_SIGNAL_PREFIX.placed}'\n`) && has(`$UnplacedSignal = '${machine.PLACE_SIGNAL_PREFIX.unplaced}'\n`), "the place's events are its launch's")
+  need(has("$PlaceArg = '^r(-?[0-9]{1,5}),(-?[0-9]{1,5}),([0-9]{1,5}),([0-9]{1,5})\\z'") && has('if ([math]::Abs($x) -gt 32768 -or [math]::Abs($y) -gt 32768 -or $w -lt 320 -or $w -gt 32768 -or $h -lt 200 -or $h -gt 32768) {'), "-Place's numbers checked as a rect is")
+  need((code.match(/\[ClaudeSelfToolsPlace\]::/g) ?? []).join() === '[ClaudeSelfToolsPlace]::' && has('        $said = [ClaudeSelfToolsPlace]::Place([int]$x, [int]$y, [int]$w, [int]$h, $true, $false)\n'), 'Place called once, with the checked numbers and a rect alone; nothing else of the type')
+  need((code.match(/Add-Type/g) ?? []).length === 1 && has('Add-Type -ErrorAction Stop -TypeDefinition $PlaceCs'), 'one Add-Type, of PLACE_CS alone')
+  need(has("    if ($Claim -cnotmatch $LaunchClaim) { $said = '-Place goes with a launch''s own -Claim' }") && has('  $signalName = $(if ($said -ceq \'placed\') { $PlacedSignal } else { $UnplacedSignal }) + $Claim.Substring(7)') && has('function Send-PlaceWord($said) {\n  if ($Claim -cnotmatch $LaunchClaim) { return }\n'), "the event named from its own checked -Claim alone")
+  need(!/SetWindowPos|ShowWindow|MoveWindow|FindWindow|EnumWindows|SetForegroundWindow|GetForegroundWindow/.test(code.split('\n').filter(line => !line.startsWith('$PlaceCs = ')).join('\n')), 'no window call of its own outside PLACE_CS')
+  // Info 14: the place and the word to the launch are two functions; the place returns what it said.
+  need(has('  return $said\n}\n') && !text.slice(text.indexOf('function Set-OwnPlace {'), text.indexOf('function Send-PlaceWord(')).includes('EventWaitHandle'), 'the place sends no word itself')
+  const placeAt = text.indexOf('    if ($Place) { Send-PlaceWord (Set-OwnPlace) }\n')
+  need(placeAt > 0 && placeAt < text.indexOf("Write-Beacon 'running'\n    $asked = Get-Asked") && text.indexOf('if ($Start -or $Resume -or $Name -or $WaitFor -or $Launcher -or $Claim -or $Place -or $Prompt) {') < placeAt, 'its own window placed first, before anything waits')
+  // -Prompt: the file by its own claim, handed to the launcher, deleted once claude has ended, and on each refusal of its own.
+  need(has("  if ($Prompt -and $Claim -cmatch $LaunchClaim) { $promptPath = Join-Path $state ('prompts\\' + $Claim.Substring(7) + '.txt') }") && has('  if ($null -ne $promptPath) { $run.PromptFile = $promptPath }') && !/PromptFile\s*=\s*\$Prompt\b/.test(code), "a first prompt's file built from -Claim, never off the command line")
+  const deleted = text.indexOf("\n  if ($run.ContainsKey('PromptFile')) { Remove-Prompt $run.PromptFile }\n")
+  need(deleted > text.indexOf('try { & $launcherPath @run }') && deleted < text.indexOf('$gaveBack = $null -ne $heldId'), 'the prompt file deleted once claude has ended')
+  const refusedAt = text.indexOf("    Remove-Prompt $promptPath\n    Write-Host ('This tab did not run what it was opened for: ' + $why + '.')")
+  need(refusedAt > text.indexOf('function Get-Asked {') && refusedAt < text.indexOf('function Get-NewestLauncher'), 'the prompt file deleted when the tab refuses')
+  const hashAt = text.indexOf("    if ($run.ContainsKey('PromptFile')) { Remove-Prompt $run.PromptFile }; return\n")
+  need(hashAt > text.indexOf('if ($actual -cne $sha) {') && hashAt < text.indexOf('try { & $launcherPath @run }'), 'the prompt file deleted when the launcher has another hash')
   need(text.indexOf(KEPT_RESET) > 0 && text.indexOf(KEPT_RESET) < text.indexOf('$me = Get-CimInstance'), 'PSModulePath reset at the top')
   need(!code.includes('Get-FileHash') && !/\bbash\b|\bmsys\b|\/proc\//i.test(code), 'no Get-FileHash, no bash')
   for (const flag of ['--permission-mode', '--dangerously-skip-permissions', 'bypassPermissions', '--allow-dangerously', 'acceptEdits']) need(!has(flag), `no ${flag}`)
@@ -234,7 +256,16 @@ for (const [name, from, to, expect] of [
   ['the launcher pinned in the runner', '$MaxAgeMs = 120000', `$MaxAgeMs = 120000\n$pin = '${machine.LAUNCH_SCRIPT_SHA256}'`, /no launcher hash of its own/],
   ['a marker cleared here', '$policy = [Environment]', "$env:NO_COLOR = ''; $policy = [Environment]", /no launch environment/],
   ['WT_SESSION cleared', '$policy = [Environment]', "Remove-Item Env:WT_SESSION; $policy = [Environment]", /WT_SESSION/],
-  ['the execution policy not put back', "finally { [Environment]::SetEnvironmentVariable('PSExecutionPolicyPreference', $policy, [EnvironmentVariableTarget]::Process) }", 'finally { }', /execution policy put back/],
+  ['#91: a place C# of its own, not PLACE_CS', "$PlaceCs = 'using System;", "$PlaceCs = 'using System.IO; using System;", /PLACE_CS, written by embed-launch/],
+  ['#91: -Place unchecked', 'if ([math]::Abs($x) -gt 32768 -or', 'if ($false -and [math]::Abs($x) -gt 32768 -or', /checked as a rect is/],
+  ['#91: a maximize slipped into the place', '[int]$w, [int]$h, $true, $false)', '[int]$w, [int]$h, $true, $true)', /a rect alone/],
+  ['#91: the place after the wait', '    if ($Place) { Send-PlaceWord (Set-OwnPlace) }\n', '', /placed first/],
+  ['#91: the event named off the command line', '+ $Claim.Substring(7)\n  try { $signal', '+ $Place\n  try { $signal', /its own checked -Claim/],
+  ['#91: the prompt file left behind', "\n  if ($run.ContainsKey('PromptFile')) { Remove-Prompt $run.PromptFile }\n", '\n', /deleted once claude has ended/],
+  ['#91 round 2: the prompt file left behind a refusing tab', "    Remove-Prompt $promptPath\n", '', /deleted when the tab refuses/],
+  ['#91 round 2: the prompt file left behind a launcher of another hash', "{ Remove-Prompt $run.PromptFile }; return\n", 'return\n', /another hash/],
+  ['#91 round 2: the place sending its own word again', '  return $said\n}\n', "  try { [void][Threading.EventWaitHandle]::OpenExisting($PlacedSignal).Set() } catch { }\n  return $said\n}\n", /sends no word itself/],
+  ['the execution policy not put back',"finally { [Environment]::SetEnvironmentVariable('PSExecutionPolicyPreference', $policy, [EnvironmentVariableTarget]::Process) }", 'finally { }', /execution policy put back/],
 ]) {
   test(`planted: ${name}`, () => {
     const faulty = script.split(from).join(to)

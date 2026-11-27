@@ -32,7 +32,7 @@ const DROPPED_THERE = 'Wake-ups the conversation it came from had pending were d
 /** A claude.exe that no registry accounts for yet, as one starting up reads: the verdict is unknown. */
 const starting = (p: RawProbe): void => void p.procs.push({ pid: 600, ppid: 10, created: ft(60), name: 'claude.exe' })
 
-type Run = { argv: readonly string[]; init?: Record<string, unknown>; script?: string; kind: 'probe' | 'launcher' | 'pane' | 'slot' | 'left' | 'release' | 'check' | 'git' | 'other' }
+type Run = { argv: readonly string[]; init?: Record<string, unknown>; script?: string; kind: 'probe' | 'launcher' | 'pane' | 'slot' | 'left' | 'release' | 'check' | 'wt' | 'wtexe' | 'git' | 'other' }
 
 /**
  * A switch's launch, as the shared launcher builds it: `to` resumed in `folder`, under the probe's
@@ -132,6 +132,11 @@ type Options = {
   turns?: number
   /** A user input of the process came before this load (a reload, a plugin enabled partway): its prompt's id. */
   promptId?: string
+  /** What launch_sessions' Windows Terminal reads answer: its version (wtVersionScript, `wt <version>`) and wt.exe (wtExeScript, `wtexe <yes|no>`). */
+  wt?: string
+  wtexe?: string
+  /** The tabs, by title, whose launch is refused (`live`), as a conversation open elsewhere refuses it. */
+  tabRefusals?: readonly string[]
 }
 
 /**
@@ -185,6 +190,9 @@ function engine(
     leftOut,
     turns,
     promptId,
+    wt = 'wt 1.24.10921.0',
+    wtexe = 'wtexe yes',
+    tabRefusals = [],
   }: Options = {},
 ) {
   const runs: Run[] = []
@@ -369,7 +377,11 @@ function engine(
     // ticket ('pane'), or this pane's slot ('slot'); then the left record's script, the release, the check.
     const kind = script.includes('$take = ')
       ? 'probe'
-      : script.includes('$window = Start-Process')
+      : script.includes("[Console]::Out.WriteLine('wt ' + ")
+        ? 'wt'
+        : script.includes("[Console]::Out.WriteLine('wtexe ' + ")
+          ? 'wtexe'
+        : script.includes('$window = Start-Process')
         ? 'launcher'
         : script.includes("$placed = 'pane ")
           ? 'pane'
@@ -386,6 +398,11 @@ function engine(
     if (markOn !== undefined && markOn.kind === kind) world.wake = { present: world.wake.present, marker: markOn.marker }
     /** A single-quoted PowerShell literal the script sets, unquoted. */
     const literalOf = (name: string): string | undefined => new RegExp(`^\\s*\\$${name} = '((?:[^']|'')*)'$`, 'm').exec(script)?.[1]?.split("''").join("'")
+    if (kind === 'wt') return ok(`${wt}\r\n`)
+    if (kind === 'wtexe') return ok(`${wtexe}\r\n`)
+    // A tab whose title is in tabRefusals: refused before wt starts it, its conversation open elsewhere (#91).
+    const tabTitle = /^\s*\$env:CLAUDE_SELF_TOOLS_WT_TAB = '([^']*)'$/m.exec(script)?.[1]
+    if (kind === 'launcher' && tabTitle !== undefined && tabRefusals.includes(tabTitle)) return ok('refused live it is open elsewhere: Claude Code 900 holds it (L1)\r\n')
     if (kind === 'probe') {
       if (probeFails !== undefined) return ok(probeFails, 1)
       const found = typeof world.probe === 'function' ? world.probe(script) : world.probe
@@ -402,7 +419,8 @@ function engine(
         ? ok('refused wt self-switch: a tab needs Windows Terminal 1.19 or later\r\n')
         : ok(`claim ${by}\r\nfallback Windows Terminal 1.19 or later is not here, so a plain window, not the one named\r\nlaunched window - 100\r\n`)
     }
-    if (kind === 'launcher' && script.includes('Start-Process $wtExe') && !script.includes('Start-Process -FilePath')) return ok(`claim ${by}\r\nlaunched tab ${/^\s*\$env:CLAUDE_SELF_TOOLS_WT_WINDOW = '([^']*)'$/m.exec(script)?.[1] ?? '-'}\r\n`)
+    // A tab that places its own window (#91): its launch says the place was made.
+    if (kind === 'launcher' && script.includes('Start-Process $wtExe') && !script.includes('Start-Process -FilePath')) return ok(`claim ${by}\r\n${script.includes('$placedSignal') ? 'place placed\r\n' : ''}launched tab ${/^\s*\$env:CLAUDE_SELF_TOOLS_WT_WINDOW = '([^']*)'$/m.exec(script)?.[1] ?? '-'}\r\n`)
     if (kind === 'launcher' && launcher === 'refuses') return ok('refused launcher self-switch: claude-launch.ps1 is not where it must be\r\n')
     if (kind === 'launcher') return launcher === 'opens' || launcher === 'no-wt' ? ok(`claim ${by}\r\nlaunched window - 100\r\n`) : ok('self-switch: no claude on PATH\r\n', 4)
     if (kind === 'slot') {
@@ -871,7 +889,9 @@ describe("the claude wrapper's tab", () => {
 test("the tool's description says a wake_after wake-up holds the switch, and others are dropped", async ($, on) => {
   const { described } = engine(on)
   await $.session.start(start)
-  expect(described).toHaveLength(1)
+  // switch_after_turn's, then launch_sessions' (#91), which queues nothing and says nothing of wake-ups.
+  expect(described).toHaveLength(2)
+  expect(described[1]).toMatch(/^Opens Windows Terminal windows and tabs on the person's screen/)
   expect(described[0]).toContain('Stop Monitor tasks first. A wake-up pending from wake_after holds the switch: cancel it (cancel_wake) or wait for it. A session cron (CronCreate, /loop, ScheduleWakeup) holds a switch that ends this process (to a slot, a tab or a window): delete it (CronDelete) first. Wake-ups of any other kind are dropped by the switch, so set them again in the conversation switched to if they are still needed.')
   expect(described[0]).not.toMatch(/carries this process's timers/)
 })
@@ -2996,5 +3016,156 @@ describe('#53: under the guard', () => {
     world.id = X
     await clock.advance(10_000)
     expect(lefts()).toHaveLength(1)
+  })
+})
+
+describe("launch_sessions (#91): a list of sessions where placement.json's grid puts them", () => {
+  const LAUNCH_TOOL = 'mcp__self-switch__launch_sessions'
+  /** A made-up grid of a made-up 1920 x 1040 work area: a fixed slot, a free cell, and a maximized free cell. */
+  const GRID = { windows: [{ window: 'grid-1', rect: [-7, 0, 974, 527], tabs: ['alpha', 'beta'] }, { window: 'grid-2', rect: [953, 0, 974, 527] }, { window: 'grid-3', maximized: true }] }
+  const PLACED = JSON.stringify({ v: 1, layout: [], grid: GRID })
+  /** A live slot runner stamped with window grid-2: that free cell is taken. */
+  const stamped = (): RawProbe =>
+    Object.assign(machine(), {
+      slots: [{ pid: 21, created: ft(1), id: `21-${ft(1)}`, sha256: SLOT_SCRIPT_SHA256, child: 200, beacon: { state: 'running', since: NOW - 60_000, configDir: CONFIG, window: 'grid-2', tab: 'other', sha256: SLOT_SCRIPT_SHA256 } }],
+    }) as RawProbe
+  const SESSIONS = [
+    { name: 'alpha', id: T, folder: REPO },
+    { name: 'beta', folder: REPO, prompt: 'Read notes/next.md, then begin.' },
+    { name: 'delta', folder: REPO },
+  ]
+  /** The launches run, by their wt line. */
+  const lines = (runs: readonly Run[]): string[] => runs.filter(r => r.kind === 'launcher').map(r => /^\s*\$wtLine = '(.*)'\r?$/m.exec(r.script ?? '')?.[1] ?? '')
+  /** Calls the tool, letting the clock move for the pauses between launches. */
+  async function launchNow($: TestDollar, clock: { advance: (ms: number) => Promise<void> }, input: Record<string, unknown>) {
+    const pending = $.tool.call({ tool: LAUNCH_TOOL, ...input })
+    for (let i = 0; i < 8; i++) await clock.advance(2500)
+    return pending
+  }
+
+  test('plan: true answers one line per session, in the order they would open, and opens nothing', async ($, on) => {
+    const { files, runs, clock } = engine(on, { probe: stamped })
+    files.set(placementPath(STATE), PLACED)
+    await $.session.start(start)
+    const answer = await launchNow($, clock, { sessions: SESSIONS, plan: true })
+    expect(answer.deny).toBeUndefined()
+    expect(String(answer.result).split('\n')).toEqual([
+      'Plan only: nothing was opened. In this order, 3 of the 3 sessions would open:',
+      `alpha: opens window grid-1 at [-7, 0, 974, 527] (its fixed slot), tab alpha, resumes ${T}`,
+      'beta: joins window grid-1 (its fixed slot), tab beta, starts a new session, with a first prompt',
+      'delta: opens window grid-3 maximized (a free cell), tab delta, starts a new session',
+    ])
+    expect(runs.filter(r => r.kind === 'launcher')).toEqual([])
+    expect(runs.map(r => r.kind).filter(k => k === 'wt' || k === 'wtexe' || k === 'probe' || k === 'launcher')).toEqual(['wt', 'wtexe', 'probe'])
+  })
+
+  test("running: one launch at a time in the plan's order, a tab each; the first tab of a new window carries its place, a joining tab none; each outcome said", async ($, on) => {
+    const { files, runs, clock } = engine(on, { probe: stamped })
+    files.set(placementPath(STATE), PLACED)
+    await $.session.start(start)
+    const answer = await launchNow($, clock, { sessions: SESSIONS })
+    expect(answer.deny).toBeUndefined()
+    const said = String(answer.result).split('\n')
+    expect(said[0]).toBe('Ran 3 launches of the 3 sessions asked for, one at a time, in this order:')
+    expect(said[1]).toBe(`alpha: opened window grid-1, placed at its rectangle; its tab alpha resumes ${T}, after its own last look.`)
+    expect(said[2]).toMatch(/^beta: joined window grid-1; its tab beta starts new session [0-9a-f-]{36}, after its own last look\.$/)
+    expect(said[3]).toMatch(/^delta: sent the first tab for window grid-3, maximized if Windows Terminal opened the window now; its tab delta starts new session [0-9a-f-]{36}, after its own last look\.$/)
+    const [first, second, third] = lines(runs)
+    expect(first).toMatch(new RegExp(`^-w grid-1 nt --title alpha .* -Resume ${T} .* -Place r-7,0,974,527$`))
+    expect(second).toMatch(/^-w grid-1 nt --title beta .* -Start [0-9a-f-]{36} -Name beta .* -Prompt$/)
+    expect(second).not.toContain('-Place')
+    expect(second).not.toContain('notes/next.md')
+    expect(third).toMatch(/^-w grid-3 -M nt --title delta .* -Start [0-9a-f-]{36} -Name delta /)
+    // Each a launch of another process: its own claim, the floor and the input idle, and its last look, read in its own run.
+    const scripts = runs.filter(r => r.kind === 'launcher').map(r => r.script ?? '')
+    const claims = scripts.map(s => /^\$by = '(launch:[0-9a-f-]{36})'$/m.exec(s)?.[1])
+    expect(new Set(claims).size).toBe(3)
+    for (const s of scripts) for (const refusal of ["Refuse 'memory'", "Refuse 'input'", "Refuse 'cap'"]) expect(s).toContain(refusal)
+    expect(scripts[0]).toContain("Refuse 'live'")
+    expect(scripts[1]).toContain("Refuse 'fresh'")
+    expect(scripts[1]).toContain("$promptText = 'Read notes/next.md, then begin.'")
+    for (const s of scripts) for (const flag of PERMISSION_FLAGS) expect(s).not.toContain(flag)
+  })
+
+  test('a launch refused never stops the rest: each says why', async ($, on) => {
+    const { files, runs, clock } = engine(on, { probe: stamped, launcher: 'no-wt' })
+    files.set(placementPath(STATE), PLACED)
+    await $.session.start(start)
+    const said = String((await launchNow($, clock, { sessions: SESSIONS })).result).split('\n')
+    expect(lines(runs)).toHaveLength(3)
+    expect(said.slice(1)).toEqual(['alpha', 'beta', 'delta'].map(name => `${name}: not opened (wt): the launcher refused: self-switch: a tab needs Windows Terminal 1.19 or later.`))
+  })
+
+  test("a window's first tab refused: the next tab for it opens it, with its place, and says opened (Medium 1)", async ($, on) => {
+    const { files, runs, clock } = engine(on, { probe: stamped, tabRefusals: ['alpha'] })
+    files.set(placementPath(STATE), PLACED)
+    await $.session.start(start)
+    const said = String((await launchNow($, clock, { sessions: SESSIONS })).result).split('\n')
+    const [first, second] = lines(runs)
+    expect(first).toMatch(/^-w grid-1 nt --title alpha .* -Place r-7,0,974,527$/)
+    expect(second).toMatch(/^-w grid-1 nt --title beta .* -Place r-7,0,974,527 -Prompt$/)
+    expect(said[1]).toBe('alpha: not opened (live): the launcher refused: it is open elsewhere: Claude Code 900 holds it (L1).')
+    expect(said[2]).toMatch(/^beta: opened window grid-1, placed at its rectangle; its tab beta starts new session [0-9a-f-]{36}, after its own last look\.$/)
+  })
+
+  test("a maximized window's first tab refused: the next tab for it carries -M (Medium 1)", async ($, on) => {
+    const { files, runs, clock } = engine(on, { probe: stamped, tabRefusals: ['alpha'] })
+    files.set(placementPath(STATE), JSON.stringify({ v: 1, layout: [], grid: { windows: [{ window: 'wide', maximized: true, tabs: ['alpha', 'beta'] }] } }))
+    await $.session.start(start)
+    const said = String((await launchNow($, clock, { sessions: SESSIONS.slice(0, 2) })).result).split('\n')
+    const [first, second] = lines(runs)
+    expect(first).toMatch(/^-w wide -M nt --title alpha /)
+    expect(second).toMatch(/^-w wide -M nt --title beta /)
+    expect(said[2]).toMatch(/^beta: sent the first tab for window wide, maximized if Windows Terminal opened the window now;/)
+  })
+
+  // The refusals, each in a run of its own: what it says, and that nothing launches.
+  const refusals: [string, Options, string | undefined, Record<string, unknown>, RegExp][] = [
+    ['from a subagent', {}, PLACED, { agentId: 'a1' }, /^A subagent can't open sessions/],
+    ['with no placement.json', {}, undefined, {}, /^Nothing opened: placement\.json is not there, so no window is named for the sessions/],
+    ['with no grid in it', {}, JSON.stringify({ v: 1, layout: [] }), {}, /^Nothing opened: placement\.json has no grid/],
+    ['with a bad file', {}, JSON.stringify({ v: 1, layout: [], grid: { windows: [{ window: 'a', rect: [0, 0, 800, 600], maximized: true }] } }), {}, /^Nothing opened: placement\.json is not of its shape, so its grid isn't read: grid\.windows\[0\] has both a rect and maximized/],
+    ['off Windows', { env: { SystemRoot: 'C:\\Windows', LOCALAPPDATA: LOCAL } }, PLACED, {}, /^Nothing opened: launch_sessions runs only on Windows\.$/],
+    ['with Windows Terminal older than 1.19', { wt: 'wt 1.18.3' }, PLACED, {}, /^Nothing opened: Windows Terminal is 1\.18\.3, older than the 1\.19 a tab needs\.$/],
+    ['with no wt.exe where a launch runs it', { wtexe: 'wtexe no' }, PLACED, {}, /^Nothing opened: wt\.exe is not at %LOCALAPPDATA%\\Microsoft\\WindowsApps, where a launch runs it from\.$/],
+    ['with the slot runners unread (Low 8)', { probe: () => machine() }, PLACED, {}, /^Nothing opened: the slot runners couldn't be read, so the windows already open couldn't be read/],
+  ]
+  for (const [name, options, file, extra, want] of refusals) {
+    test(`refused ${name}: said, and nothing launches`, async ($, on) => {
+      const { files, runs, clock } = engine(on, { probe: stamped, ...options })
+      if (file !== undefined) files.set(placementPath(STATE), file)
+      await $.session.start(start)
+      const answer = await launchNow($, clock, { sessions: SESSIONS, ...extra })
+      expect(String(answer.deny)).toMatch(want)
+      expect(lines(runs)).toEqual([])
+    })
+  }
+
+  test('each session is checked as launch() checks its own, before anything runs', async ($, on) => {
+    const { files, runs, clock } = engine(on, { probe: stamped })
+    files.set(placementPath(STATE), PLACED)
+    await $.session.start(start)
+    const bad: [unknown, RegExp][] = [
+      [[], /a list of 1 to 16 sessions/],
+      [Array.from({ length: 17 }, (_, i) => ({ name: `s${i}`, folder: REPO })), /a list of 1 to 16 sessions/],
+      [[{ name: 'Alpha', folder: REPO }], /\.name is not a session's name/],
+      [[{ name: 'alpha', id: 'not-an-id', folder: REPO }], /\.id is not a session id/],
+      [[{ name: 'alpha', folder: 'C:\\%TEMP%\\x' }], /holds a percent sign/],
+      [[{ name: 'alpha', folder: 'relative' }], /is not an absolute folder/],
+      [[{ name: 'alpha', folder: REPO, prompt: '/exit' }], /\.prompt starts with \//],
+      [[{ name: 'alpha', folder: REPO }, { name: 'alpha', folder: REPO }], /is in the list twice/],
+      [[{ name: 'alpha', folder: REPO, window: 'grid-2' }], /unknown key window/],
+    ]
+    for (const [sessions, want] of bad) expect(String((await launchNow($, clock, { sessions })).deny)).toMatch(want)
+    expect(String((await launchNow($, clock, { sessions: SESSIONS, plan: 'yes' })).deny)).toMatch(/`plan` is true or false/)
+    expect(runs.filter(r => r.kind === 'launcher' || r.kind === 'probe' || r.kind === 'wt' || r.kind === 'wtexe')).toEqual([])
+  })
+
+  test('its description says it opens windows and tabs on the screen, and that plan: true opens nothing', async ($, on) => {
+    const { described } = engine(on)
+    await $.session.start(start)
+    const text = described.find(d => d.startsWith('Opens Windows Terminal windows')) ?? ''
+    expect(text).toContain("on the person's screen")
+    expect(text).toContain('`plan: true` opens nothing')
   })
 })

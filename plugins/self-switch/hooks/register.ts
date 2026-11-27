@@ -107,13 +107,30 @@
 // baseline carried. Until it has, a switch waits, as it does while the id lags a SessionStart. What the guard can't
 // give it: the move at once (the id is read), and a startup's own word that the folder it found is where it started
 // (the folder is taken once the conversation's transcript is there, at its first prompt).
+//
+// A second tool, launch_sessions (#91): it opens a list of sessions the caller passes, each in a tab of a named Windows
+// Terminal window where placement.json's grid puts it, one launch at a time, and answers in the call with each one's
+// outcome; `plan: true` opens nothing. Its section is above `register`.
 import type { EngineInterface, Register, Timer } from 'claude-code'
 import type { Heartbeat, Queued, Ticket } from '../types'
 import { idleWords } from './at-idle'
 import { type ClassicIo, classicRuns, classicSeen, configureClassic, keepClassic, type Move, moveBegins, moveLook, movePending, startPartner, type StartSource, takeOwedStart } from './classic'
 import { go } from './go'
-import type { AgentLike, LaunchInput, LaunchWhere, LeftStat, Pane, Placement, Probe, ProcessRef, Transport } from './machine'
+import { runGridSteps, type RunStep, type StepOutcome } from './grid-run'
+import type { AgentLike, GridSession, LaunchInput, LaunchWhere, LeftStat, Pane, PlaceSaid, Placement, Probe, ProcessRef, Transport } from './machine'
 import {
+  AREA_NAME,
+  GRID_SESSIONS_MAX,
+  gridPlanLine,
+  LIMITS_DEFAULT,
+  openWindows,
+  planGrid,
+  promptTextFault,
+  wtExeFault,
+  wtExeScript,
+  wtFolderFault,
+  wtVersionFault,
+  wtVersionScript,
   agentsHeld,
   agentsWayOut,
   blockersText,
@@ -1100,7 +1117,7 @@ async function placeLaunch(
   $: EngineInterface,
   input: LaunchInput,
   cwd: string,
-): Promise<{ readonly said: string; readonly unclean: boolean; readonly code?: string } | { readonly placed: 'pane' | 'slot' | 'window' | 'tab'; readonly label: string; readonly fallback?: string }> {
+): Promise<{ readonly said: string; readonly unclean: boolean; readonly code?: string } | { readonly placed: 'pane' | 'slot' | 'window' | 'tab'; readonly label: string; readonly fallback?: string; readonly place?: PlaceSaid }> {
   // An input the launcher refuses to build (a folder with a semicolon, say) runs nothing: a clean refusal.
   let call: { readonly argv: readonly string[]; readonly stdin: string }
   try {
@@ -1111,7 +1128,7 @@ async function placeLaunch(
   try {
     const run = await $.process.run(call.argv, { stdin: call.stdin, cwd, timeoutMs: LAUNCH_RUN_MS })
     const answer = parseLaunch(run.stdout)
-    if (run.exitCode === 0 && 'launched' in answer) return { placed: answer.launched.transport, label: answer.launched.label, ...(answer.fallback === undefined ? {} : { fallback: answer.fallback }) }
+    if (run.exitCode === 0 && 'launched' in answer) return { placed: answer.launched.transport, label: answer.launched.label, ...(answer.fallback === undefined ? {} : { fallback: answer.fallback }), ...(answer.place === undefined ? {} : { place: answer.place }) }
     if (run.stderr.trim() !== '') $.ui.log(`the launcher's error output: ${oneLine(run.stderr, 2000)}`, { to: 'debug' })
     const said = 'refused' in answer ? answer.refused.why : plainOutput(`${run.stdout} ${run.stderr}`)
     return { said: `${run.exitCode !== 0 ? `the launcher exited ${run.exitCode}` : 'the launcher refused'}${said === '' ? '' : `: ${said}`}`, unclean: run.exitCode !== 0 || !('refused' in answer), ...('refused' in answer ? { code: answer.refused.code } : {}) }
@@ -1760,6 +1777,180 @@ function lookForMove($: EngineInterface): Promise<void> {
   return moveLook($, classicIo($), move => tookMove($, move))
 }
 
+// ---------------------------------------------------------------------------------------------
+// launch_sessions (#91): a list of sessions, each opened where placement.json's grid puts it. The caller passes the
+// list; this plugin reads no other plugin's store and names no session of this machine. planGrid (machine.ts) decides
+// where each goes, from the list, the grid and the probe's slot runners; each launch is one run of the shared launcher,
+// a tab in a named window running the slot runner, with launch()'s own checks and environment, one at a time.
+
+const LAUNCH_TOOL = 'mcp__self-switch__launch_sessions'
+
+/** Between two launches of one call, as the layout script waits between tabs: Windows Terminal creates a window by name asynchronously. */
+const LAUNCH_PAUSE_MS = 2000
+
+const LAUNCH_DESCRIPTION = [
+  "Opens Windows Terminal windows and tabs on the person's screen, each session of `sessions` where placement.json's grid puts it: a window whose `tabs` name the session (its fixed slot); else a free cell, one window each, in the list's order; past the free cells, as further tabs in them, in turn.",
+  "Each session is `{ name, id?, folder, prompt? }`: with `id` it resumes that conversation; without one it starts a new session under `name`, which is its tab's title either way; `folder` is the conversation's own; `prompt` is a first prompt the session gets once.",
+  "A window that isn't open yet opens at the grid's rectangle (its first tab places it) or maximized; one open already gains a tab.",
+  '`plan: true` opens nothing: it answers what it would open, one line per session.',
+  'Every launch takes its own look first, and one refused never stops the rest: a conversation open elsewhere, too little free memory, the cap of sessions, or input on the machine in the last 60 seconds refuses it. It answers once every launch has run, one line per session.',
+  'Windows only, with Windows Terminal 1.19 or later and the slot runner copied at its pinned hash; never from a subagent.',
+].join(' ')
+
+const SUBAGENT_LAUNCH = "A subagent can't open sessions on the person's screen. Return the list to the main session, which can call launch_sessions."
+
+/** The sessions asked for, each checked as launch() checks its own (a name, an id, a folder, a prompt); or why not. */
+function sessionsOf(raw: unknown): { readonly sessions: GridSession[] } | { readonly why: string } {
+  if (!Array.isArray(raw) || raw.length < 1 || raw.length > GRID_SESSIONS_MAX) return { why: `\`sessions\` is a list of 1 to ${GRID_SESSIONS_MAX} sessions, each { name, id?, folder, prompt? }` }
+  const out: GridSession[] = []
+  for (const [at, value] of raw.entries()) {
+    const here = `sessions[${at}]`
+    if (!isRecord(value)) return { why: `${here} is not an object` }
+    for (const key of Object.keys(value)) if (!['name', 'id', 'folder', 'prompt'].includes(key)) return { why: `${here} has an unknown key ${key}: a session is { name, id?, folder, prompt? }` }
+    const { name, id, folder, prompt } = value
+    if (typeof name !== 'string' || !AREA_NAME.test(name)) return { why: `${here}.name is not a session's name: lowercase letters, digits and hyphens, at most 40, as --name takes` }
+    if (id !== undefined && (typeof id !== 'string' || !SESSION_ID.test(id))) return { why: `${here}.id is not a session id: the lowercase UUID claude --resume takes` }
+    const fault = wtFolderFault(folder)
+    if (fault !== undefined) return { why: `${here}.folder ${JSON.stringify(folder)} ${fault}, so no tab takes it` }
+    const promptFault = prompt === undefined ? undefined : promptTextFault(prompt)
+    if (promptFault !== undefined) return { why: `${here}.prompt ${promptFault}` }
+    if (out.some(s => s.name === name)) return { why: `${here}.name ${name} is in the list twice` }
+    if (id !== undefined && out.some(s => s.id === id)) return { why: `${here}.id ${String(id)} is in the list twice` }
+    out.push({ name, folder: folder as string, ...(id === undefined ? {} : { id: id as string }), ...(prompt === undefined ? {} : { prompt: prompt as string }) })
+  }
+  return { sessions: out }
+}
+
+/**
+ * Where a launched tab went, as its outcome line says it, by what is known: a tab joining a window open already; or the
+ * first tab for a window not known to be open, whose own word on its place tells the rest. It placed its window: that
+ * window held its console alone, so the tab opened it. It did not, or said nothing: the window may have been open
+ * already, so it isn't said to have opened. Maximized, there is no word: wt's -M acts only when wt creates the window.
+ */
+function whereWords(run: RunStep, place: PlaceSaid | undefined): string {
+  const w = run.step.window
+  if (run.runsAs === 'join') return `joined window ${w}`
+  if (run.place !== undefined && 'maximized' in run.place) return `sent the first tab for window ${w}, maximized if Windows Terminal opened the window now`
+  if (place === undefined) return `sent the first tab for window ${w}`
+  if (place.said === 'placed') return `opened window ${w}, placed at its rectangle`
+  if (place.said === 'unplaced') return `sent the first tab for window ${w}, which did not place it (its pane says why: a window of that name open already holds other tabs, for one)`
+  return `sent the first tab for window ${w}, its place not confirmed (${place.why ?? 'no word from its first tab'})`
+}
+
+/**
+ * One step of a grid launch: one run of the shared launcher, a tab in the step's window running the slot runner, under
+ * a claim of its own, with the checks a launch of another process makes (the floor, the input idle, and NOT LIVE for a
+ * resume or a new id for a start), and the window's place on its first tab alone. Its outcome, as one line, and
+ * whether it answered `launched`.
+ */
+async function launchStep($: EngineInterface, at: { readonly powershell: string; readonly state: string }, configDirs: readonly string[], heavySlotRoot: string | null, maxSessions: number, run: RunStep): Promise<StepOutcome> {
+  const s = run.step.session
+  const claim = `launch:${crypto.randomUUID()}`
+  const id = s.id ?? crypto.randomUUID()
+  const place = run.place === undefined ? {} : 'rect' in run.place ? { rect: run.place.rect } : { maximized: true as const }
+  const input: LaunchInput = {
+    powershell: at.powershell,
+    kind: s.id === undefined ? 'start' : 'resume',
+    id,
+    ...(s.id === undefined ? { name: s.name } : {}),
+    folder: s.folder,
+    claim,
+    configDirs,
+    stateDir: at.state,
+    where: { tab: { window: run.step.window, title: s.name, ...place } },
+    checks: { floor: true, input: true, ...(s.id === undefined ? { fresh: true } : { live: true }) },
+    maxSessions,
+    heavySlotRoot,
+    tool: 'self-switch',
+    deadline: (await $.clock.now()) + LAUNCH_DEADLINE_MS,
+    ...(s.prompt === undefined ? {} : { prompt: s.prompt }),
+  }
+  const tried = await placeLaunch($, input, s.folder)
+  if ('placed' in tried) {
+    return { line: `${s.name}: ${whereWords(run, tried.place)}; its tab ${s.name} ${s.id === undefined ? `starts new session ${id}` : `resumes ${id}`}, after its own last look.`, launched: true }
+  }
+  // A run that ended without a clean answer may have taken its claim: given back now, and once more a moment later.
+  if (tried.unclean) {
+    await release($, at.powershell, at.state, id, claim)
+    $.clock.after(LAUNCH_RETRY_MS, () => void release($, at.powershell, at.state, id, claim))
+  }
+  return { line: `${s.name}: not opened${tried.code === undefined ? '' : ` (${tried.code})`}: ${tried.said}.`, launched: false }
+}
+
+/** One fixed read of Windows Terminal, run hidden: its fault (wtVersionFault, wtExeFault), or why it couldn't be read. */
+async function wtRead($: EngineInterface, powershell: string, script: string, fault: (stdout: string) => string | undefined): Promise<string | undefined> {
+  try {
+    const call = powershellCall(powershell, script)
+    const run = await $.process.run(call.argv, { stdin: call.stdin, timeoutMs: RELEASE_MS })
+    return run.exitCode === 0 ? fault(run.stdout) : `Windows Terminal could not be read (the read exited ${run.exitCode})`
+  } catch (err) {
+    return `Windows Terminal could not be read: ${why(err)}`
+  }
+}
+
+/**
+ * launch_sessions: the list checked, placement.json's grid, Windows Terminal, the probe, the plan; then, unless `plan`,
+ * each launch in turn (runGridSteps), until the person's Stop (`signal`, the hook's own).
+ */
+async function launchSessions($: EngineInterface, input: { readonly sessions?: unknown; readonly plan?: unknown }, signal?: AbortSignal): Promise<{ readonly result: string } | { readonly deny: string }> {
+  const asked = sessionsOf(input.sessions)
+  if ('why' in asked) return { deny: `Nothing opened: ${asked.why}.` }
+  if (input.plan !== undefined && typeof input.plan !== 'boolean') return { deny: 'Nothing opened: `plan` is true or false.' }
+  const at = await machine($)
+  if ('refusal' in at) return { deny: `Nothing opened: ${at.refusal.replace('a switch runs only on Windows so far', 'launch_sessions runs only on Windows')}.` }
+  const read = await loadPlacement($, at.state)
+  if (read.errors !== undefined) return { deny: `Nothing opened: placement.json is not of its shape, so its grid isn't read: ${oneLine(read.errors.join('; '), 600)}.` }
+  const grid = read.placement?.grid
+  if (grid === undefined) return { deny: `Nothing opened: placement.json ${read.placement === null ? 'is not there' : 'has no grid'}, so no window is named for the sessions (the README's "A grid of sessions" says how to write one).` }
+  const own = await sessionId($)
+  if (own === undefined || !SESSION_ID.test(own)) return { deny: "Nothing opened: this session's id can't be read, so the machine can't be probed." }
+  const dirs = await configDirsOf($)
+  if ('refusal' in dirs) return { deny: `Nothing opened: ${dirs.refusal}.` }
+  const heavy = settings.heavySlotRoot
+  if (heavy !== '' && heavy !== undefined && !isSafeFolder(heavy)) return { deny: `Nothing opened: the heavySlotRoot setting reads ${JSON.stringify(heavy)}, not an absolute folder without quotes.` }
+  const heavySlotRoot = isSafeFolder(heavy) ? heavy.replace(/\\+$/, '') : null
+  // Windows Terminal as a tab's launch reads it, before anything else runs: its version, then wt.exe; never by running wt.
+  const versionFault = await wtRead($, at.powershell, wtVersionScript(), wtVersionFault)
+  if (versionFault !== undefined) return { deny: `Nothing opened: ${versionFault}.` }
+  const exeFault = await wtRead($, at.powershell, wtExeScript(at.state), wtExeFault)
+  if (exeFault !== undefined) return { deny: `Nothing opened: ${exeFault}.` }
+  // The windows open now: the slot runners' beacons, each with its tab's window stamp.
+  let found: Probe
+  try {
+    const call = powershellCall(at.powershell, probeScript({ ids: [own], configDirs: dirs.configDirs, stateDir: at.state, slots: true, heavySlotRoot }))
+    const run = await $.process.run(call.argv, { stdin: call.stdin, timeoutMs: PROBE_MS })
+    const parsed = run.exitCode === 0 ? parseProbe(run.stdout) : { error: `it exited ${run.exitCode}` }
+    if ('error' in parsed) return { deny: `Nothing opened: the machine probe failed (${parsed.error}), so which windows are open is unknown.` }
+    found = parsed
+  } catch (err) {
+    return { deny: `Nothing opened: the machine probe didn't run: ${why(err)}.` }
+  }
+  // Unread slot runners: the windows open now are unknown, and a free cell open already would get a second session.
+  const open = openWindows(found)
+  if (open === undefined) return { deny: "Nothing opened: the slot runners couldn't be read, so the windows already open couldn't be read, and a free cell open already could be given a second session. Try again." }
+  let plan: ReturnType<typeof planGrid>
+  try {
+    plan = planGrid(asked.sessions, grid, open)
+  } catch (err) {
+    return { deny: `Nothing opened: ${why(err)}.` }
+  }
+  const refusedLines = plan.refused.map(r => `${r.session.name}: not opened: ${r.why}.`)
+  const notes = plan.notes.map(note => `Note: ${note}.`)
+  if (input.plan === true) {
+    return { result: [`Plan only: nothing was opened. In this order, ${plan.steps.length} of the ${asked.sessions.length} sessions would open:`, ...plan.steps.map(gridPlanLine), ...refusedLines, ...notes].join('\n') }
+  }
+  const maxSessions = read.placement?.limits?.maxSessions ?? LIMITS_DEFAULT.maxSessions
+  const outcomes = await runGridSteps({
+    steps: plan.steps,
+    grid,
+    open,
+    ...(signal === undefined ? {} : { signal }),
+    pause: stop => $.clock.sleep(LAUNCH_PAUSE_MS, stop === undefined ? undefined : { signal: stop }),
+    launch: run => launchStep($, at, dirs.configDirs, heavySlotRoot, maxSessions, run),
+  })
+  return { result: [`Ran ${plan.steps.length} launches of the ${asked.sessions.length} sessions asked for, one at a time, in this order:`, ...outcomes, ...refusedLines, ...notes].join('\n') }
+}
+
 export const register: Register = (on, options) => {
   configureUpdateCheck('self-switch', options)
   // #53: the classic SessionStart's partners, which act only where no classic hook reaches this process (classic.ts).
@@ -1822,6 +2013,35 @@ export const register: Register = (on, options) => {
         additionalProperties: false,
       },
       isDeferred: false,
+    })
+    // #91: a list of sessions opened where placement.json's grid puts them. Deferred: it is called seldom, by name.
+    await $.tool.register({
+      name: 'launch_sessions',
+      description: LAUNCH_DESCRIPTION,
+      inputSchema: {
+        type: 'object',
+        properties: {
+          sessions: {
+            type: 'array',
+            description: `1 to ${GRID_SESSIONS_MAX} sessions, in the order free cells go to them.`,
+            items: {
+              type: 'object',
+              properties: {
+                name: { type: 'string', description: "The session's name (lowercase letters, digits and hyphens, as --name takes): its tab's title, and its fixed slot's key in the grid's tabs." },
+                id: { type: 'string', description: 'The conversation to resume: a session id, as claude --resume takes it. Left out: a new session starts under the name.' },
+                folder: { type: 'string', description: "The conversation's own folder: an absolute path." },
+                prompt: { type: 'string', description: 'A first prompt the session gets once, as its first message. Optional.' },
+              },
+              required: ['name', 'folder'],
+              additionalProperties: false,
+            },
+          },
+          plan: { type: 'boolean', description: 'true: open nothing, and answer what would open, one line per session.' },
+        },
+        required: ['sessions'],
+        additionalProperties: false,
+      },
+      isDeferred: true,
     })
     // The trampoline's command: registered whichever way GO_VIA says, so its hook answers a person's
     // typing or a stale entry, and validate sees it as a hook that answers its own command.
@@ -1978,6 +2198,13 @@ export const register: Register = (on, options) => {
       result: `Queued. Once this turn ends, this terminal switches to conversation ${to}: this conversation ends here, untouched, and ${to} resumes in this process, in this pane's slot, in this tab (when Claude Code was started through the claude wrapper), or in a new window, whichever applies. First the plugin checks that ${to} is open nowhere on this machine and that nothing runs under this session; if anything is, nothing moves and you are told on your next turn. If this pane runs a slot that can't be used, the switch says why, in the leaving row, a toast and the arrival, and a new window opens. A wake-up set with wake_after holds the switch until it is cancelled or has fired, and a session cron (CronCreate, /loop, ScheduleWakeup) holds one that ends this process until it is deleted; other pending wake-ups are dropped by the switch: set them again in ${to} if they are still needed. Reason: ${quoted(reason)}. Notes: ${quoted(notes)}.`,
     }
   }).catch(($, e, next) => (next.called ? next(e) : { deny: 'self-switch: queuing the switch failed; nothing is queued.' }))
+
+  // #91: launch_sessions answers in the call itself, once every launch has run: it queues nothing for the turn's end.
+  // The person's Stop (Esc) aborts `next.signal`: no launch starts after it, and the steps not run say so.
+  on('tool.call', { tool: LAUNCH_TOOL }, async ($, e, next) => {
+    if (e.agentId !== undefined) return { deny: SUBAGENT_LAUNCH }
+    return launchSessions($, e as { sessions?: unknown; plan?: unknown }, next.signal)
+  }).catch(($, e, next) => (next.called ? next(e) : { deny: 'self-switch: launch_sessions failed before it answered; what it opened, if anything, is in its own windows.' }))
 
   on('turn.complete', async ($, e, next) => {
     const done = await next(e)
