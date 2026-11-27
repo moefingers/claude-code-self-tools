@@ -3,20 +3,30 @@
 // reaches the caller scrubbed.
 //
 // Drives secret-run.mjs as a child, its browser kept shut and its state
-// folder a temporary one, posting to its form as a browser would, against a
-// stand-in check on this machine.
+// folder a temporary one, posting to its form as a browser would, and as the
+// page's script does, against a stand-in check on this machine. What the form
+// answers after its end is driven in this process (captureSecret), since
+// secret-run exits as its form ends.
 //
 //   node --test plugins/self-secret/tools/secret-run/form.test.mjs
 
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
+import { once } from "node:events";
 import { existsSync } from "node:fs";
 import { createServer } from "node:http";
 import { connect } from "node:net";
 import { networkInterfaces } from "node:os";
 import { join } from "node:path";
 import { after, before, test } from "node:test";
-import { cookiesNamed, fromAnotherPage, shapeVerdict, trimNotes } from "./form.mjs";
+import {
+  captureSecret,
+  cookiesNamed,
+  fromAnotherPage,
+  shapeVerdict,
+  trimNotes,
+  wantsJson,
+} from "./form.mjs";
 import { resolveProfile } from "./profiles.mjs";
 import {
   FAKE,
@@ -35,6 +45,7 @@ import {
   profilesFile,
   raw,
   scratch,
+  scriptPost,
 } from "./testkit.mjs";
 
 let tmp;
@@ -125,6 +136,11 @@ test("a wrong value is refused on the same page, and nothing runs until a right 
     accepted.body,
     /Trimmed 2 spaces at the start, and a line break at the end\./,
     "it says what it trimmed",
+  );
+  assert.match(
+    accepted.body,
+    /Running the command\. You can close this window\./,
+    "the plain POST's last page says the window can be closed: no script closes it",
   );
 
   const { code, stdout, stderr } = await cli.done;
@@ -280,6 +296,16 @@ test("a request without the nonce, or with another, is not found", async () => {
       404,
       "nor can a page without it cancel",
     );
+  // Asked for JSON, as the page's script asks: the same bare refusal, no answer to read.
+  for (const where of [`${url.origin}/`, `${url.origin}/cancel`]) {
+    const r = await raw(where, {
+      method: "POST",
+      headers: { Accept: "application/json" },
+      fields: { v: FAKE },
+    });
+    assert.equal(r.status, 404, `JSON asked of ${new URL(where).pathname} without the cookie`);
+    assert.equal(r.body, "", "and no answer in it");
+  }
   assert.equal(existsSync(ran), false, "nothing ran on a post without it");
   // A wrong nonce spends nothing: the printed address still opens the form.
   assert.equal((await post(url.href, { v: FAKE })).status, 200);
@@ -437,6 +463,14 @@ test("a POST a browser marks as from another page is refused before its nonce or
         fields: { v: FAKE },
       });
       assert.equal(r.status, 403, `${JSON.stringify(headers)} to ${new URL(where).pathname}`);
+      // Asked for JSON, as the page's script asks: refused the same way, with no answer to read.
+      const asJson = await raw(where, {
+        method: "POST",
+        headers: { ...headers, Cookie: cookie, Accept: "application/json" },
+        fields: { v: FAKE },
+      });
+      assert.equal(asJson.status, 403, `JSON, ${JSON.stringify(headers)} to ${new URL(where).pathname}`);
+      assert.equal(asJson.body, "");
     }
   }
   assert.equal(existsSync(ran), false, "nothing ran");
@@ -737,7 +771,11 @@ test("a value without its shape, or with a space inside, is refused before its c
   );
   assert.match(csp, /form-action 'self'/);
   assert.match(csp, /frame-ancestors 'none'/);
-  assert.doesNotMatch(csp, /connect-src/, "the page can send nothing anywhere");
+  assert.equal(
+    /connect-src ([^;]*)/.exec(csp)?.[1],
+    "'self'",
+    "the page's script can send to the form's own origin, and nowhere else",
+  );
   assert.equal(res.headers.get("referrer-policy"), "same-origin");
   assert.equal(res.headers.get("x-frame-options"), "DENY");
   assert.equal(res.headers.get("cache-control"), "no-store");
@@ -939,4 +977,358 @@ test("a command that cannot start says so, scrubbed", async () => {
   assert.equal(code, 127);
   assert.match(stderr, /couldn't start .*\[redacted\]/);
   assertNoLeak(stderr, FAKE);
+});
+
+// The page's script: it sends the form by fetch and reads the answer, so the
+// window keeps its one history entry and can close itself (form.mjs).
+
+test("only an Accept of application/json alone asks for the JSON answer", () => {
+  assert.equal(wantsJson({ accept: "application/json" }), true);
+  for (const accept of [
+    undefined,
+    "",
+    "*/*",
+    "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "application/json, text/plain",
+    "Application/JSON",
+  ])
+    assert.equal(
+      wantsJson(accept === undefined ? {} : { accept }),
+      false,
+      String(accept),
+    );
+});
+
+test("the page's one script sends the form by fetch, and closes its window only at an end", async () => {
+  const cli = launch(SECRET_RUN, [
+    ...generic("--timeout", "20"),
+    "--",
+    process.execPath,
+    "-e",
+    "",
+  ]);
+  const url = await cli.formUrl();
+  const res = await browse(url);
+  const html = await res.text();
+  // LOAD-BEARING: held as text, since no browser runs here. One script, allowed by its hash alone.
+  assert.equal(html.match(/<script/g)?.length, 1, "one script in the page");
+  const script = /<script>([\s\S]*?)<\/script>/.exec(html)?.[1];
+  const csp = res.headers.get("content-security-policy");
+  assert.equal(
+    /script-src ([^;]*)/.exec(csp)?.[1],
+    `'sha256-${createHash("sha256").update(script).digest("base64")}'`,
+  );
+  assert.equal(/connect-src ([^;]*)/.exec(csp)?.[1], "'self'");
+
+  // It sends by fetch, to the form's own two paths, with its cookie, asking for JSON; it never navigates.
+  assert.equal(script.match(/\bfetch\(/g)?.length, 1, "one fetch");
+  assert.match(script, /fetch\(cancel \? "\/cancel" : "\/", \{/);
+  assert.match(script, /method: "POST",/);
+  assert.match(script, /headers: \{ Accept: "application\/json" \},/);
+  assert.match(script, /credentials: "same-origin",/);
+  assert.match(script, /e\.preventDefault\(\);\n  if \(busy\) return;/);
+  // A browser that can't say which button was pressed gets the plain form: a Cancel is never sent as a paste.
+  assert.match(script, /\(e\) => \{\n  if \(!\("submitter" in e\)\) return;\n  e\.preventDefault\(\);/);
+  assert.match(
+    script,
+    /const cancel = e\.submitter !== null && e\.submitter\.getAttribute\("formaction"\) === "\/cancel";/,
+  );
+
+  // It closes the window in one place, which only the end calls.
+  assert.equal(script.match(/window\.close\(\)/g)?.length, 1, "one window.close()");
+  assert.match(script, /const shut = \(\) => \{\n  window\.close\(\);/);
+  assert.equal(script.match(/\bshut\b/g)?.length, 2, "shut, and its one call");
+  assert.match(script, /setTimeout\(shut, after\);/);
+
+  // The ends, and only these: the deadline, nothing answering, accepted (after 1.5 s), and the
+  // answers that end the form. A refusal is none of them: the window stays open.
+  assert.deepEqual(
+    [...script.matchAll(/\bend\(([^()]*)\)/g)].map((m) => m[1]),
+    ["WORDS.expired, 0", "WORDS.closed, 0", "answer.words, 1500", "answer.words, 0"],
+  );
+  assert.match(script, /const ENDS = \["cancelled", "closed", "expired"\];/);
+  assert.match(script, /if \(state === "accepted"\) return end\(answer\.words, 1500\);/);
+  assert.match(script, /if \(ENDS\.includes\(state\)\) return end\(answer\.words, 0\);/);
+  assert.match(
+    script,
+    /\} catch \{\n    return end\(WORDS\.closed, 0\);/,
+    "nothing answering at the form's address: closed",
+  );
+
+  // What it says itself; the fallback, for a window the browser keeps open, among them.
+  assert.deepEqual(JSON.parse(/const WORDS = (\{.*\});/.exec(script)?.[1]), {
+    closed: "This form has closed.",
+    expired: "This form ran out of time. Nothing was run.",
+    done: "Done. You can close this window.",
+  });
+  assert.match(script, /if \(window\.closed\) return;/, "the fallback only while the window is there");
+
+  // The deadline: the time left, which the page is given and closes at.
+  const left = Number(/<input name=v [^>]*data-left=(\d+)/.exec(html)?.[1]);
+  assert.ok(left > 0 && left <= 20_000, `the time left, ${left} ms`);
+  assert.match(script, /deadline = setTimeout\(\(\) => end\(WORDS\.expired, 0\), left\);/);
+
+  // Without script, the form still posts as a form.
+  assert.match(html, /<form method=post action="\/">/);
+  assert.match(html, /formaction="\/cancel"/);
+  await post(cancelUrl(url), {});
+  assert.equal((await cli.done).code, 1);
+});
+
+test("a value the page's script posts that passes is answered accepted, with what it reached, never the value", async () => {
+  const ran = join(tmp.dir, "ran-script");
+  const cli = launch(SECRET_RUN, [
+    "stand-in",
+    "--profiles",
+    profiles,
+    "--",
+    process.execPath,
+    marker,
+    ran,
+  ]);
+  const url = await cli.formUrl();
+  const accepted = await scriptPost(url, { v: `  ${FAKE}\n` });
+  assert.equal(accepted.status, 200);
+  assert.equal(
+    accepted.headers.get("content-type"),
+    "application/json; charset=utf-8",
+  );
+  assert.equal(accepted.headers.get("cache-control"), "no-store");
+  assert.deepEqual(accepted.answer, {
+    state: "accepted",
+    words:
+      "Trimmed 2 spaces at the start, and a line break at the end. Received. The key reached project stand-in (fake-project-123). Running the command.",
+  });
+  assertNoLeak(accepted.text, FAKE, "the answer");
+  assert.equal((await cli.done).code, 0);
+  assert.equal(existsSync(ran), true, "the command ran");
+});
+
+test("a value the page's script posts that is refused is answered with the reason, and the form stays open to paste again", async () => {
+  const asked = check.hits.length;
+  const cli = launch(SECRET_RUN, [
+    ...generic(
+      "--timeout",
+      "20",
+      "--shape",
+      "^fake\\+\\S+$",
+      "--shape-says",
+      "start with fake+ and have no spaces",
+    ),
+    "--",
+    process.execPath,
+    "-e",
+    "",
+  ]);
+  const url = await cli.formUrl();
+
+  const unshaped = await scriptPost(url, { v: WRONG });
+  assert.equal(unshaped.status, 422);
+  assert.deepEqual(unshaped.answer, {
+    state: "refused",
+    words:
+      "It doesn't look right: it should start with fake+ and have no spaces. Nothing was checked.",
+  });
+  assertNoLeak(unshaped.text, WRONG, "the answer");
+  const empty = await scriptPost(url, { v: "   " });
+  assert.equal(empty.status, 422);
+  assert.deepEqual(empty.answer, { state: "refused", words: "Nothing was pasted." });
+  assert.equal(check.hits.length, asked, "the check not asked yet");
+
+  // Its shape, but not the key: the check's reason.
+  const nearly = `fake+${WRONG}`;
+  const refused = await scriptPost(url, { v: nearly });
+  assert.equal(refused.status, 422);
+  assert.equal(refused.answer?.state, "refused");
+  assert.match(refused.answer?.words ?? "", /^That key didn't work: .*401/);
+  assertNoLeak(refused.text, nearly, "the answer");
+  assert.equal(check.hits.length, asked + 1);
+
+  // Still open: the form, with the last reason in it, and a right value after.
+  const again = await page(url);
+  assert.equal(again.status, 200);
+  assert.match(again.body, /<p id=error class=error role=alert>That key didn&#39;t work: .*401/);
+  assert.equal((await scriptPost(url, { v: FAKE })).answer?.state, "accepted");
+  assert.equal((await cli.done).code, 0);
+});
+
+test("the page's script cancels: it is told cancelled, nothing runs, and nothing answers at the form's address after", async () => {
+  const ran = join(tmp.dir, "ran-script-cancel");
+  const cli = launch(SECRET_RUN, [
+    ...generic("--timeout", "20"),
+    "--",
+    process.execPath,
+    marker,
+    ran,
+  ]);
+  const url = await cli.formUrl();
+  const cancelled = await scriptPost(cancelUrl(url), {});
+  assert.equal(cancelled.status, 200);
+  assert.deepEqual(cancelled.answer, {
+    state: "cancelled",
+    words: "Cancelled. Nothing was run.",
+  });
+  const { code, stderr } = await cli.done;
+  assert.equal(code, 1);
+  assert.match(stderr, /cancelled/);
+  assert.equal(existsSync(ran), false);
+  // What the page's script then meets: no answer at all, which it takes as closed (its catch).
+  await assert.rejects(scriptPost(url, { v: FAKE }));
+});
+
+/**
+ * A form served in this process, its check held until release(): its
+ * address, when the check has begun, and its end. secret-run exits as its
+ * form ends, so an answer the form gives after its end is held here.
+ */
+function heldForm(timeoutSec) {
+  let release;
+  const gate = new Promise((r) => {
+    release = r;
+  });
+  let begin;
+  const checking = new Promise((r) => {
+    begin = r;
+  });
+  let listening;
+  const address = new Promise((r) => {
+    listening = r;
+  });
+  const done = captureSecret({
+    title: "Held form",
+    prompt: "Paste a made-up key",
+    timeoutSec,
+    check: async () => {
+      begin();
+      await gate;
+      return { ok: true, reached: null };
+    },
+    onListening: listening,
+  });
+  return { address, checking, release, done };
+}
+
+/** The headers the page's script sends: the form's cookie, traded for at its printed address, and the JSON Accept. */
+async function scriptHeaders(url) {
+  const cookie = (await raw(url)).headers["set-cookie"][0].split(";")[0];
+  return { Cookie: cookie, Accept: "application/json" };
+}
+
+test("a value still being checked when the form ends is answered closed, or expired at the form's timeout", { timeout: 60_000 }, async () => {
+  for (const [ending, timeoutSec, want] of [
+    [
+      "cancelled",
+      20,
+      { state: "closed", words: "This form has closed. Nothing was run." },
+    ],
+    [
+      "timeout",
+      3,
+      { state: "expired", words: "This form ran out of time. Nothing was run." },
+    ],
+  ]) {
+    const form = heldForm(timeoutSec);
+    const url = await form.address;
+    const { origin } = new URL(url);
+    const headers = await scriptHeaders(url);
+    const value = raw(`${origin}/`, {
+      method: "POST",
+      headers,
+      fields: { v: FAKE },
+    });
+    await form.checking;
+    if (ending === "cancelled") {
+      const cancelled = await raw(`${origin}/cancel`, {
+        method: "POST",
+        headers,
+        fields: {},
+      });
+      assert.equal(cancelled.status, 200);
+      assert.deepEqual(JSON.parse(cancelled.body), {
+        state: "cancelled",
+        words: "Cancelled. Nothing was run.",
+      });
+    }
+    assert.deepEqual(await form.done, { status: ending });
+    form.release();
+    const answer = await value;
+    assert.equal(answer.status, 410, ending);
+    assert.deepEqual(JSON.parse(answer.body), want, ending);
+    assertNoLeak(answer.body, FAKE, `the answer once the form ended (${ending})`);
+  }
+});
+
+/**
+ * A POST begun now on a connection of its own, its request line and Host
+ * sent, which finish(headers, body) completes: its status and raw text, once
+ * the connection closes. The form reads its headers only when they are all
+ * there, so one finished after the form's end is a request after the end.
+ */
+async function begun(url) {
+  const { host, port } = new URL(url);
+  const sock = connect({ host: "127.0.0.1", port: Number(port) });
+  await once(sock, "connect");
+  let text = "";
+  sock.on("data", (c) => {
+    text += c;
+  });
+  const closed = once(sock, "close");
+  sock.write(`POST / HTTP/1.1\r\nHost: ${host}\r\n`);
+  return {
+    async finish(headers, body) {
+      const all = {
+        ...headers,
+        "Content-Type": "application/x-www-form-urlencoded",
+        "Content-Length": Buffer.byteLength(body),
+        Connection: "close",
+      };
+      sock.write(
+        `${Object.entries(all)
+          .map(([k, v]) => `${k}: ${v}\r\n`)
+          .join("")}\r\n${body}`,
+      );
+      await closed;
+      return { status: Number(/^HTTP\/1\.1 (\d{3}) /.exec(text)?.[1]), text };
+    },
+  };
+}
+
+test("a request the form reads once it has ended: the page's script is told closed, anything else finds nothing, as before", { timeout: 60_000 }, async () => {
+  const form = heldForm(20);
+  const url = await form.address;
+  const { origin } = new URL(url);
+  const headers = await scriptHeaders(url);
+  const body = new URLSearchParams({ v: FAKE }).toString();
+  // Begun while the form is open, so their connections outlive its end. A whole request on
+  // another connection, answered, comes after the form has read their first lines.
+  const fromScript = await begun(url);
+  const plain = await begun(url);
+  const stranger = await begun(url);
+  assert.equal((await raw(`${origin}/`, { headers: { Cookie: headers.Cookie } })).status, 200);
+  const cancelled = await raw(`${origin}/cancel`, {
+    method: "POST",
+    headers,
+    fields: {},
+  });
+  assert.equal(cancelled.status, 200);
+  assert.deepEqual(await form.done, { status: "cancelled" });
+
+  const told = await fromScript.finish(headers, body);
+  assert.equal(told.status, 410);
+  assert.ok(
+    told.text.includes(
+      JSON.stringify({
+        state: "closed",
+        words: "This form has closed. Nothing was run.",
+      }),
+    ),
+    told.text,
+  );
+  const asBefore = await plain.finish({ Cookie: headers.Cookie }, body);
+  assert.equal(asBefore.status, 404, "a plain POST after the end, as before");
+  const noCookie = await stranger.finish({ Accept: "application/json" }, body);
+  assert.equal(noCookie.status, 404, "JSON asked without the cookie, as before");
+  for (const r of [told, asBefore, noCookie])
+    assertNoLeak(r.text, FAKE, "an answer after the end");
+  form.release();
 });

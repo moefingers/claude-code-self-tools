@@ -40,8 +40,31 @@
 // The same words are said in the page as the person pastes, by the page's one
 // script, built from the two functions below and allowed by its hash alone. It
 // takes the paste itself, because a text field drops a line break silently,
-// joining two lines into one; it never shows a character of the value, and,
-// the policy having no connect-src, can send nothing anywhere.
+// joining two lines into one; it never shows a character of the value.
+//
+// The same script sends the form. It posts the value by fetch to the form's own
+// address, with the form's cookie and through every check the form's own POST
+// goes through, asking for the answer as JSON (wantsJson): the end state
+// reached, and the words to show, never the value. It draws the answer in
+// place, so the page never navigates and its window keeps its one history
+// entry. The policy's connect-src is the form's own origin ('self'), so the
+// script can reach nothing else. Without script, the form posts as a plain
+// form, and its answers are what they always were.
+//
+// So the window can close itself (MDN, Window.close(): a window the browser's
+// own UI opened "may only be closed if they have not been navigated (history
+// length remains 1)"; an app window is opened by the browser's command line,
+// not by a script). The first GET's trade of the nonce for the cookie is a 303
+// to "/", which the browser follows inside that one navigation, adding no entry
+// (from memory of the Fetch standard; not seen). The page closes at an end:
+//   accepted: it says what was received, and what the key reached, for 1.5 s;
+//   cancelled, closed (the form ended, or nothing answers at its address any
+//     more), or expired (its deadline, which the page is given, as the time
+//     left, in the field's data-left): at once.
+// A refused value leaves it open, the reason shown and the field empty, to
+// paste again; its deadline closes it if no one does. Where the browser keeps
+// the window open all the same (it may, for a tab), the page says DONE a
+// moment later.
 //
 // A profile can name the page where the key is made. The form links to it
 // under the prompt, in a new tab, with rel="noopener noreferrer": the page it
@@ -102,17 +125,33 @@ export function shapeVerdict(value, shape, spacesInside) {
   return { ok: true, words: "" };
 }
 
+/** What the page says once the form has ended, by an answer or by nothing answering at its address. */
+const CLOSED = "This form has closed.";
+/** What the page says at the form's deadline, and what a request after it is told. */
+const EXPIRED = "This form ran out of time. Nothing was run.";
+/** What the page says when the browser keeps the window open after the script asked it to close. */
+const DONE = "Done. You can close this window.";
+/** What the page says once the person cancels. */
+const CANCELLED = "Cancelled. Nothing was run.";
+
 /**
- * The page's one script: what the person hears as they paste or type. Its
- * line breaks are made \n: a function's source keeps a checkout's \r\n, which
- * a browser's parser drops, and the hash it then takes would not be the
- * policy's.
+ * The page's one script: what the person hears as they paste or type, and
+ * the form sent by fetch, its answer drawn in place, and the window closed at
+ * an end. Its line breaks are made \n: a function's source keeps a checkout's
+ * \r\n, which a browser's parser drops, and the hash it then takes would not
+ * be the policy's.
  */
 const SCRIPT = `(() => {
 ${trimNotes}
 ${shapeVerdict}
-const field = document.querySelector("input[name=v]");
+const WORDS = ${JSON.stringify({ closed: CLOSED, expired: EXPIRED, done: DONE })};
+const ENDS = ["cancelled", "closed", "expired"];
+const form = document.querySelector("form");
+const field = form.querySelector("input[name=v]");
 const status = document.getElementById("status");
+const error = document.getElementById("error");
+const heading = document.querySelector("h1");
+const buttons = form.querySelectorAll("button");
 const shape = field.dataset.pattern ? { pattern: field.dataset.pattern, says: field.dataset.says } : null;
 const spacesInside = field.dataset.spaces === "1";
 const say = (state, text) => { status.dataset.state = state; status.textContent = text; };
@@ -124,19 +163,74 @@ const tell = (raw, pasted) => {
   const verdict = v.ok ? (around ? "Otherwise it looks right." : "It looks right.") : v.words;
   say(v.ok ? "fits" : "wrong", [around, verdict].filter(Boolean).join(" "));
 };
-field.addEventListener("paste", (e) => {
-  const raw = e.clipboardData ? e.clipboardData.getData("text") : null;
-  if (raw === null) return;
+if (field.dataset.trim === "1") {
+  field.addEventListener("paste", (e) => {
+    const raw = e.clipboardData ? e.clipboardData.getData("text") : null;
+    if (raw === null) return;
+    e.preventDefault();
+    const t = trimNotes(raw);
+    if (t.inside && !spacesInside) {
+      field.value = "";
+      return say("wrong", "That paste has a space or line break inside the key, so it wasn't put in. Copy the key alone and paste it again.");
+    }
+    field.value = t.value;
+    tell(raw, true);
+  });
+  field.addEventListener("input", () => tell(field.value, false));
+}
+const shut = () => {
+  window.close();
+  setTimeout(() => {
+    if (window.closed) return;
+    const p = document.createElement("p");
+    p.textContent = WORDS.done;
+    document.body.append(p);
+  }, 500);
+};
+let deadline = null;
+const end = (words, after) => {
+  clearTimeout(deadline);
+  const p = document.createElement("p");
+  p.textContent = words;
+  document.body.replaceChildren(heading, p);
+  setTimeout(shut, after);
+};
+const left = Number(field.dataset.left);
+if (left >= 0 && left <= 2147483647) deadline = setTimeout(() => end(WORDS.expired, 0), left);
+let busy = false;
+form.addEventListener("submit", async (e) => {
+  if (!("submitter" in e)) return;
   e.preventDefault();
-  const t = trimNotes(raw);
-  if (t.inside && !spacesInside) {
-    field.value = "";
-    return say("wrong", "That paste has a space or line break inside the key, so it wasn't put in. Copy the key alone and paste it again.");
+  if (busy) return;
+  busy = true;
+  buttons.forEach((b) => { b.disabled = true; });
+  const cancel = e.submitter !== null && e.submitter.getAttribute("formaction") === "/cancel";
+  if (!cancel) say("", "Checking the key.");
+  let res;
+  try {
+    res = await fetch(cancel ? "/cancel" : "/", {
+      method: "POST",
+      body: new URLSearchParams(cancel ? {} : { v: field.value }),
+      headers: { Accept: "application/json" },
+      credentials: "same-origin",
+      cache: "no-store",
+      redirect: "manual",
+    });
+  } catch {
+    return end(WORDS.closed, 0);
   }
-  field.value = t.value;
-  tell(raw, true);
+  const answer = await res.json().catch(() => null);
+  const state = answer ? answer.state : null;
+  if (state === "accepted") return end(answer.words, 1500);
+  if (ENDS.includes(state)) return end(answer.words, 0);
+  busy = false;
+  buttons.forEach((b) => { b.disabled = false; });
+  error.textContent = state === "refused" ? answer.words : "The form's answer couldn't be read (HTTP " + res.status + "). Try again.";
+  error.hidden = false;
+  field.value = "";
+  say("", "");
+  field.focus();
 });
-field.addEventListener("input", () => tell(field.value, false));
 })();`.replace(/\r\n?/g, "\n");
 
 const HEADERS = {
@@ -146,8 +240,16 @@ const HEADERS = {
   "Referrer-Policy": "same-origin",
   "X-Content-Type-Options": "nosniff",
   "X-Frame-Options": "DENY",
-  "Content-Security-Policy": `default-src 'none'; script-src 'sha256-${createHash("sha256").update(SCRIPT).digest("base64")}'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'`,
+  // connect-src 'self': the script's fetch reaches the form's own origin, and nothing else.
+  "Content-Security-Policy": `default-src 'none'; script-src 'sha256-${createHash("sha256").update(SCRIPT).digest("base64")}'; connect-src 'self'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'`,
 };
+
+/**
+ * Whether a request asks for the form's answer as JSON, as the page's
+ * script does: an Accept of application/json alone. A browser's own form
+ * POST never sends that.
+ */
+export const wantsJson = (headers) => headers.accept === "application/json";
 
 const STYLE = `:root{color-scheme:light dark}
 body{font-family:system-ui,-apple-system,sans-serif;max-width:500px;margin:50px auto;padding:20px;background:Canvas;color:CanvasText}
@@ -400,12 +502,20 @@ export function cookiesNamed(header, name) {
  *
  * check(value) resolves { ok, reason, reached } and never shows the value;
  * without one, any value passes. emptyEnds makes an empty submission end
- * it ("empty") rather than ask again. successText(reached) is the last
- * page's words. With trim (the default), the value is trimmed, and one
- * without its shape ({ pattern, says }, or none) or with whitespace inside
- * (unless spacesInside) is refused before check is asked. url, an https
- * address its caller has checked (profiles.mjs), is the page where the key
- * is made, linked under the prompt.
+ * it ("empty") rather than ask again. successText(reached) is what the end
+ * says once a value passes. With trim (the default), the value is trimmed,
+ * and one without its shape ({ pattern, says }, or none) or with whitespace
+ * inside (unless spacesInside) is refused before check is asked. url, an
+ * https address its caller has checked (profiles.mjs), is the page where
+ * the key is made, linked under the prompt.
+ *
+ * A request that asks for JSON (wantsJson: the page's script) is answered
+ * { state, words }, never the value: state is "accepted" (200), "refused"
+ * (422, words the reason, the form still open), "cancelled" (200), "closed"
+ * (200 for the empty value that ends it with emptyEnds, else 410: the form
+ * ended before or while the request was served) or "expired" (410: it ended
+ * at its timeout). The refusals before it is served (403, 404, 405, 413) are
+ * the same for it as for any request.
  */
 export function captureSecret({
   title,
@@ -421,7 +531,7 @@ export function captureSecret({
   onListening = () => {},
   onRejected = () => {},
   successText = (reached) =>
-    `Received.${reached ? ` The key reached ${reached}.` : ""} Running the command — you can close this tab.`,
+    `Received.${reached ? ` The key reached ${reached}.` : ""} Running the command.`,
 }) {
   return new Promise((resolve) => {
     const nonce = randomBytes(24).toString("base64url");
@@ -435,17 +545,22 @@ export function captureSecret({
     /** Whether the printed address has been opened: its nonce is then spent. */
     let traded = false;
     let finished = false;
+    /** The status the form resolved with, once it has. */
+    let endedAs = null;
     let checking = false;
     let lastError = null;
 
     const finish = (result) => {
       if (finished) return;
       finished = true;
+      endedAs = result.status;
       clearTimeout(timer);
       server.close();
       server.closeIdleConnections();
       resolve(result);
     };
+    /** When the form's time runs out, by this process's clock: the page is told the time left. */
+    const deadline = Date.now() + timeoutSec * 1000;
     const timer = setTimeout(
       () => finish({ status: "timeout" }),
       timeoutSec * 1000,
@@ -463,6 +578,34 @@ export function captureSecret({
       res.writeHead(303, { ...HEADERS, ...set, Location: "/" });
       res.end();
     };
+    /** The answer the page's script reads: the state reached and the words to show, never the value. */
+    const sendState = (res, status, state, words, last = false) => {
+      res.writeHead(status, {
+        ...HEADERS,
+        "Content-Type": "application/json; charset=utf-8",
+        ...(last ? { Connection: "close" } : {}),
+      });
+      res.end(JSON.stringify({ state, words }));
+    };
+    /**
+     * The answer to a request the form ended before serving, 410: expired
+     * when it ended at its timeout, else closed, saying nothing was run
+     * unless a value passed. As JSON for the page's script, else as a page.
+     */
+    const sendEnded = (res, json) => {
+      const state = endedAs === "timeout" ? "expired" : "closed";
+      const words =
+        state === "expired"
+          ? EXPIRED
+          : endedAs === "ok"
+            ? CLOSED
+            : `${CLOSED} Nothing was run.`;
+      if (json) sendState(res, 410, state, words, true);
+      else send(res, 410, endPage(words), true);
+    };
+    /** Asks again, lastError saying why: as JSON for the page's script, else by sending the browser back to the form. */
+    const askAgain = (res, json) =>
+      json ? sendState(res, 422, "refused", lastError) : backToForm(res);
     const withPass = (req) =>
       cookiesNamed(req.headers.cookie, cookie).some((v) => sameNonce(v, pass));
     const formPage = () =>
@@ -471,14 +614,14 @@ export function captureSecret({
         `<h1>${htmlEscape(title)}</h1>
 <p>${htmlEscape(prompt)}</p>
 ${url ? `<p><a href="${htmlEscape(url)}" target=_blank rel="noopener noreferrer">Make one at ${htmlEscape(new URL(url).host)}</a> (opens in a new tab)</p>` : ""}
-${lastError ? `<p class=error role=alert>${htmlEscape(lastError)}</p>` : ""}
+<p id=error class=error role=alert${lastError ? `>${htmlEscape(lastError)}` : " hidden>"}</p>
 <form method=post action="/">
-<input name=v type=text aria-label="${htmlEscape(title)}" autocomplete=off autocapitalize=off autocorrect=off spellcheck=false autofocus required${trim ? ` aria-describedby=status${shape ? ` data-pattern="${htmlEscape(shape.pattern)}" data-says="${htmlEscape(shape.says)}"` : ""}${spacesInside ? " data-spaces=1" : ""}` : ""}>
-${trim ? `<p id=status class=status role=status aria-live=polite></p>` : ""}
+<input name=v type=text aria-label="${htmlEscape(title)}" autocomplete=off autocapitalize=off autocorrect=off spellcheck=false autofocus required aria-describedby=status data-left=${Math.max(0, deadline - Date.now())}${trim ? ` data-trim=1${shape ? ` data-pattern="${htmlEscape(shape.pattern)}" data-says="${htmlEscape(shape.says)}"` : ""}${spacesInside ? " data-spaces=1" : ""}` : ""}>
+<p id=status class=status role=status aria-live=polite></p>
 <div class=row><button type=submit>Submit</button><button type=submit class=secondary formaction="/cancel" formnovalidate>Cancel</button></div>
 </form>
 ${note ? `<p class=note>${htmlEscape(note)}</p>` : ""}
-${trim ? `<script>${SCRIPT}</script>` : ""}`,
+<script>${SCRIPT}</script>`,
       );
     const endPage = (text) =>
       page(title, `<h1>${htmlEscape(title)}</h1><p>${htmlEscape(text)}</p>`);
@@ -497,7 +640,11 @@ ${trim ? `<script>${SCRIPT}</script>` : ""}`,
         return;
       }
       const url = new URL(req.url, `http://${here}`);
+      const json = wantsJson(req.headers);
       if (finished) {
+        // The page's script, its window still open, is told the form has ended; anything else
+        // finds nothing, as before.
+        if (json && withPass(req)) return sendEnded(res, true);
         res.writeHead(404, HEADERS).end();
         return;
       }
@@ -514,7 +661,7 @@ ${trim ? `<script>${SCRIPT}</script>` : ""}`,
             res,
             404,
             endPage(
-              "This address opens the form once, and it has been opened: the form is in the tab that opened it first.",
+              "This address opens the form once, and it has been opened: the form is in the window that opened it first.",
             ),
           );
         }
@@ -534,7 +681,8 @@ ${trim ? `<script>${SCRIPT}</script>` : ""}`,
       if (url.pathname === "/" && req.method === "GET")
         return send(res, 200, formPage());
       if (url.pathname === "/cancel" && req.method === "POST") {
-        send(res, 200, endPage("Cancelled. Nothing was run."), true);
+        if (json) sendState(res, 200, "cancelled", CANCELLED, true);
+        else send(res, 200, endPage(CANCELLED), true);
         return finish({ status: "cancelled" });
       }
       if (url.pathname !== "/" || req.method !== "POST") {
@@ -552,7 +700,9 @@ ${trim ? `<script>${SCRIPT}</script>` : ""}`,
         } else chunks.push(c);
       });
       req.on("end", async () => {
-        if (finished || size > MAX_BODY) return;
+        if (size > MAX_BODY) return;
+        // Ended while the body came in (a second POST after a first passed, say): answered, not left waiting.
+        if (finished) return sendEnded(res, json);
         const raw =
           new URLSearchParams(Buffer.concat(chunks).toString("utf8")).get(
             "v",
@@ -563,24 +713,26 @@ ${trim ? `<script>${SCRIPT}</script>` : ""}`,
         const value = pasted.value;
         if (!value) {
           if (emptyEnds) {
-            send(res, 200, endPage("Empty value. Nothing was run."), true);
+            const words = "Empty value. Nothing was run.";
+            if (json) sendState(res, 200, "closed", words, true);
+            else send(res, 200, endPage(words), true);
             return finish({ status: "empty" });
           }
           lastError = "Nothing was pasted.";
-          return backToForm(res);
+          return askAgain(res, json);
         }
         if (trim) {
           const shaped = shapeVerdict(value, shape, spacesInside);
           if (!shaped.ok) {
             lastError = `${shaped.words} Nothing was checked.`;
             onRejected(shaped.words);
-            return backToForm(res);
+            return askAgain(res, json);
           }
         }
         if (checking) {
           lastError =
             "The last key is still being checked; try again in a moment.";
-          return backToForm(res);
+          return askAgain(res, json);
         }
         checking = true;
         let result;
@@ -591,26 +743,15 @@ ${trim ? `<script>${SCRIPT}</script>` : ""}`,
           result = { ok: false, reason: "the check itself failed" };
         }
         checking = false;
-        if (finished)
-          return send(
-            res,
-            410,
-            endPage("This form has closed. Nothing was run."),
-            true,
-          );
+        if (finished) return sendEnded(res, json);
         if (!result.ok) {
           lastError = `That key didn't work: ${result.reason}`;
           onRejected(result.reason);
-          return backToForm(res);
+          return askAgain(res, json);
         }
-        send(
-          res,
-          200,
-          endPage(
-            `${pasted.found ? `Trimmed ${pasted.found}. ` : ""}${successText(result.reached)}`,
-          ),
-          true,
-        );
+        const words = `${pasted.found ? `Trimmed ${pasted.found}. ` : ""}${successText(result.reached)}`;
+        if (json) sendState(res, 200, "accepted", words, true);
+        else send(res, 200, endPage(`${words} You can close this window.`), true);
         finish({ status: "ok", value, reached: result.reached ?? null });
       });
     });
