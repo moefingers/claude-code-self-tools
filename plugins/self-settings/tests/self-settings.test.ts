@@ -298,13 +298,21 @@ test('a value that looks like a secret: the rule, as a table', () => {
     // A prefix inside a word is no token's.
     ['risk-averse', false],
     ['heyJude', false],
-    // A long run: letters alone, digits alone, one short of 24, and two runs of 12 either side of a hyphen.
+    // A long run: letters alone, digits alone, one short of 24, and runs of 12 cut by a `/` (a path) or a space.
     ['a'.repeat(30), false],
     ['1'.repeat(30), false],
     [built('ab1'.repeat(7), 'ab'), false],
-    [built('ab1'.repeat(4), '-', 'ab1'.repeat(4)), false],
+    [built('ab1'.repeat(4), '/', 'ab1'.repeat(4)), false],
+    [built('ab1'.repeat(4), ' ', 'ab1'.repeat(4)), false],
+    [built('claude-code-self-tools', '-and-more'), false],
     [built('ab1'.repeat(8)), true],
     [built('0123456789', 'abcdef'.repeat(3)), true],
+    // A run of the base64 alphabets but `/`: one cut by `-`, `_`, `+` or `=` into short runs is still one run.
+    [built('ab1'.repeat(4), '-', 'ab1'.repeat(4)), true],
+    [built('k3y', '-', 'ab12cd34', '_', 'ef56gh78', '-', 'ij'), true],
+    [built('QUJD', '+', 'ZGVm', 'MTIz', '+', 'NDU2', 'Nzg5', '=='), true],
+    // It leans toward hiding: a long name with a digit in it is hidden too.
+    [built('my-long-marketplace-name-', '2'), true],
     // A token's known prefix, at the start or after a character that is no letter or digit.
     [built('s', 'k-', 'abc'), true],
     [built('gh', 'p_', 'abc'), true],
@@ -317,13 +325,21 @@ test('a value that looks like a secret: the rule, as a table', () => {
     [built('xo', 'xb-', '123'), true],
     [built('ey', 'J', 'hbGc'), true],
     [built('AK', 'IA', 'ABCDEFGH'), true],
+    [built('AI', 'za', 'SyA1b2C3d4', '-', 'E5f6G7h8I9j0K1l2', '-', 'M3n4o5p6'), true],
+    [built('AI', 'za', 'b'), true],
+    [built('x', 'AI', 'za', 'b'), false],
     [built('-----', 'BEGIN', ' OPENSSH PRIVATE KEY-----'), true],
     [built('token=', 's', 'k-', 'abc'), true],
     [built('Bearer ', 'ey', 'J', 'x'), true],
-    // A URL with a login, or with a query string.
+    // A URL with a login (a password holding a `/` too), with a query string, or with a fragment; each put together
+    // here, never written whole. An `@` anywhere after the scheme is taken for a login: it leans toward hiding.
     [built('https://', 'someone', ':', 'pw', '@', 'example.com/x'), true],
     [built('https://', 'someone', '@', 'example.com'), true],
+    [built('https://', 'u', ':', 'p/w', '@', 'host'), true],
+    [built('https://example.com/', 'users/', '@', 'name'), true],
     ['https://example.com/x?page=2', true],
+    [built('https://app/cb', '#', 'access_token=', 'abc'), true],
+    [built('https://example.com/a', '#', 'top'), true],
   ]
   expect(cases.map(([text]) => [text, looksSecret(text)])).toEqual(cases)
 })

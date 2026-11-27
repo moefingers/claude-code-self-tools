@@ -93,18 +93,24 @@ export const KNOWN: Known = Object.freeze({
  * A token's known prefix at the start of a word (the value's start, or after a character that is no letter or digit),
  * or a PEM block's header anywhere.
  */
-const TOKEN_PREFIX = /(?:^|[^A-Za-z0-9])(?:sk-|ghp_|gho_|ghs_|ghu_|ghr_|github_pat_|glpat-|xox|eyJ|AKIA)|-----BEGIN/
-/** A URL with a login in it: a user name, and maybe a password, before its host. */
-const URL_LOGIN = /[A-Za-z][A-Za-z0-9+.-]*:\/\/[^\s/?#@]*@/
-/** A URL with a query string: `scheme://host/path?...`. */
-const URL_QUERY = /[A-Za-z][A-Za-z0-9+.-]*:\/\/[^\s?#]*\?/
-/** A run of letters and digits, 24 or more long. */
-const LONG_RUN = /[A-Za-z0-9]{24,}/g
+const TOKEN_PREFIX = /(?:^|[^A-Za-z0-9])(?:sk-|ghp_|gho_|ghs_|ghu_|ghr_|github_pat_|glpat-|xox|eyJ|AKIA|AIza)|-----BEGIN/
+/**
+ * A URL with a login in it: a user name, and maybe a password, before its host. Anything but whitespace and `@` may
+ * come between the scheme and the `@`, so a password holding a `/`, a `?` or a `#` is caught too.
+ */
+const URL_LOGIN = /[A-Za-z][A-Za-z0-9+.-]*:\/\/[^\s@]*@/
+/** A URL with a query string or a fragment, where a token often rides (`#access_token=...`). */
+const URL_QUERY = /[A-Za-z][A-Za-z0-9+.-]*:\/\/[^\s?#]*[?#]/
+/**
+ * A run of 24 or more characters of the base64 and base64url alphabets but `/` (letters, digits, `_`, `+`, `=`, `-`),
+ * so a token cut by those into short runs of letters and digits is still one run; `/` stays out, so a path is shown.
+ */
+const LONG_RUN = /[A-Za-z0-9_+=-]{24,}/g
 
 /**
- * Whether `text` looks like a secret, whatever field holds it: a known token prefix, a URL with a login or a query
- * string, or a run of 24 or more letters and digits that mixes both. It leans toward hiding: a long name with a digit
- * in it is hidden too.
+ * Whether `text` looks like a secret, whatever field holds it: a known token prefix, a URL with a login, a query string
+ * or a fragment, or a long run (LONG_RUN) that holds both a letter and a digit. It leans toward hiding: a long name
+ * with a digit in it is hidden too.
  */
 export function looksSecret(text: string): boolean {
   if (TOKEN_PREFIX.test(text) || URL_LOGIN.test(text) || URL_QUERY.test(text)) return true
