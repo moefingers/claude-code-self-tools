@@ -141,7 +141,8 @@ async function serveSet($: EngineInterface, e: object & { readonly agentId?: str
   } catch (err) {
     after = { failed: why(err) }
   }
-  tellPerson($, toastSaid(change))
+  // The toast says what the option reads now, read back, not the value asked: a hook may have written another.
+  tellPerson($, toastSaid(change, after))
   return { result: setAnswer(change, after) }
 }
 

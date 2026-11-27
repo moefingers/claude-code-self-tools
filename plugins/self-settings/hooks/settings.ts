@@ -357,23 +357,35 @@ export const reloadSaid = (plugin: string): string => `This session reloads ${na
 /** What the row reads after a change: the rows listed again, or why they couldn't be. */
 export type After = { readonly listed: readonly unknown[] } | { readonly failed: string }
 
+/** The value the option reads after a change, from the rows listed again; or why there is none to read. */
+function readBack(key: string, after: After): { readonly value: ConfigValue } | { readonly missing: string } {
+  if ('failed' in after) return { missing: `it couldn't be read back (${after.failed})` }
+  const rows = rowsOf(after.listed).filter(row => row.key === key)
+  const [row] = rows
+  if (row === undefined || rows.length > 1) return { missing: `/config has ${row === undefined ? 'no row' : 'more than one row'} of that name to read it back from now` }
+  return { value: row.value }
+}
+
 /** settings_set's answer once the change was written: the value before, the value read back, and who sees it. */
 export function setAnswer(change: Change, after: After): string {
   const lead = `Set ${named(change.key)}: it was ${shown(change.before)}`
+  const back = readBack(change.key, after)
   let now: string
-  if ('failed' in after) now = `, and was asked to be ${shown(change.value)}; it couldn't be read back (${after.failed})`
-  else {
-    const rows = rowsOf(after.listed).filter(row => row.key === change.key)
-    const [row] = rows
-    if (row === undefined || rows.length > 1) now = `, and was asked to be ${shown(change.value)}; /config has ${row === undefined ? 'no row' : 'more than one row'} of that name to read it back from now`
-    else if (sameValue(row.value, change.value)) now = `, and now reads ${shown(row.value)}`
-    else now = `, and now reads ${shown(row.value)} (asked ${shown(change.value)}: a hook may have changed it)`
-  }
+  if ('missing' in back) now = `, and was asked to be ${shown(change.value)}; ${back.missing}`
+  else if (sameValue(back.value, change.value)) now = `, and now reads ${shown(back.value)}`
+  else now = `, and now reads ${shown(back.value)} (asked ${shown(change.value)}: a hook may have changed it)`
   return `${lead}${now}. ${reloadSaid(change.plugin)}`
 }
 
-/** The toast for the person: what was set, the value masked as the answer masks it. */
-export const toastSaid = (change: Change): string => `self-settings set ${named(change.key)} to ${shown(change.value)}`
+/**
+ * The toast for the person: the value the option reads now, read back after the change (a hook may have written
+ * another than the one asked), masked as the answer masks it; or, when it couldn't be read back, the value asked.
+ */
+export function toastSaid(change: Change, after: After): string {
+  const back = readBack(change.key, after)
+  if ('missing' in back) return `self-settings set ${named(change.key)} (asked ${shown(change.value)}); its value couldn't be read back`
+  return `self-settings set ${named(change.key)}: it now reads ${shown(back.value)}`
+}
 
 // ---------------------------------------------------------------------------------------------
 // settings_read's answer.

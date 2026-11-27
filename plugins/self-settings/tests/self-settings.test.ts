@@ -6,6 +6,7 @@ import { expect, test } from 'claude-code/testing'
 import type { Engine } from 'claude-code/testing'
 import type { ConfigRow, ConfigValue, On } from 'claude-code'
 import {
+  type After,
   type Known,
   looksSecret,
   MARKETPLACE,
@@ -19,7 +20,9 @@ import {
   reloadSaid,
   SENSITIVE_NOTE,
   SET_TAKES,
+  setAnswer,
   SUBAGENT,
+  toastSaid,
 } from '../hooks/settings'
 
 // Each tool's name keeps its literal type (as const), so $.tool.call and $.tool.run take it as an MCP tool's name.
@@ -368,7 +371,7 @@ test('every option on the list is changed through $.config.set, read back, said 
   expect({ answers, sets, toasts }).toEqual({
     answers: asks.map(({ key, value }) => [key, `result: Set ${key}: it was ${isReminder(key) ? '""' : '"on"'}, and now reads ${JSON.stringify(value)}. ${reloadSaid(pluginOf(key))}`]),
     sets: asks.map(({ key, value }) => `${key}=${JSON.stringify(value)}`),
-    toasts: asks.map(({ key, value }) => `self-settings set ${key} to ${JSON.stringify(value)}`),
+    toasts: asks.map(({ key, value }) => `self-settings set ${key}: it now reads ${JSON.stringify(value)}`),
   })
   expect(MAY_SET).toHaveLength(18)
 })
@@ -384,13 +387,35 @@ test("a hook's refusal of a change is passed on as it came, from the serving, an
   })
 })
 
-test('a change is read back: a value a hook changed is said, beside the one asked', async ($, on) => {
-  const { sets } = engine(on, { rows: [updateCheck('self-wake')], clamp: 'on' })
+test('a change is read back: a value a hook changed is said beside the one asked, and the toast says the value read back', async ($, on) => {
+  const { sets, toasts } = engine(on, { rows: [updateCheck('self-wake')], clamp: 'on' })
   await $.session.start(START)
-  expect({ answer: await set($, { key: 'self-wake.updateCheck', value: 'off' }), sets }).toEqual({
+  expect({ answer: await set($, { key: 'self-wake.updateCheck', value: 'off' }), sets, toasts }).toEqual({
     answer: `result: Set self-wake.updateCheck: it was "on", and now reads "on" (asked "off": a hook may have changed it). ${reloadSaid('self-wake')}`,
     sets: ['self-wake.updateCheck="off"'],
+    toasts: ['self-settings set self-wake.updateCheck: it now reads "on"'],
   })
+})
+
+test('what a change says, and toasts, for each way the read back goes: as asked, changed by a hook, no row, two rows, a failed read', () => {
+  const change = { key: 'self-wake.updateCheck', plugin: 'self-wake', value: 'off', before: 'on' } as const
+  const lead = 'Set self-wake.updateCheck: it was "on"'
+  const reload = reloadSaid('self-wake')
+  const unread = 'self-settings set self-wake.updateCheck (asked "off"); its value couldn\'t be read back'
+  const afters: After[] = [
+    { listed: [updateCheck('self-wake', 'off')] },
+    { listed: [updateCheck('self-wake', 'on')] },
+    { listed: [] },
+    { listed: [updateCheck('self-wake', 'off'), updateCheck('self-wake', 'off')] },
+    { failed: 'the list timed out' },
+  ]
+  expect(afters.map(after => [setAnswer(change, after), toastSaid(change, after)])).toEqual([
+    [`${lead}, and now reads "off". ${reload}`, 'self-settings set self-wake.updateCheck: it now reads "off"'],
+    [`${lead}, and now reads "on" (asked "off": a hook may have changed it). ${reload}`, 'self-settings set self-wake.updateCheck: it now reads "on"'],
+    [`${lead}, and was asked to be "off"; /config has no row of that name to read it back from now. ${reload}`, unread],
+    [`${lead}, and was asked to be "off"; /config has more than one row of that name to read it back from now. ${reload}`, unread],
+    [`${lead}, and was asked to be "off"; it couldn't be read back (the list timed out). ${reload}`, unread],
+  ])
 })
 
 test('a value that looks like a secret is never shown back, in the answer or the toast', async ($, on) => {
@@ -399,7 +424,7 @@ test('a value that looks like a secret is never shown back, in the answer or the
   const answer = await set($, { key: 'self-compact.compactReminder', value: TOKEN })
   expect({ answer, toasts }).toEqual({
     answer: `result: Set self-compact.compactReminder: it was "", and now reads (looks like a secret; not shown). ${reloadSaid('self-compact')}`,
-    toasts: ['self-settings set self-compact.compactReminder to (looks like a secret; not shown)'],
+    toasts: ['self-settings set self-compact.compactReminder: it now reads (looks like a secret; not shown)'],
   })
 })
 
