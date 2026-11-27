@@ -174,6 +174,8 @@ function engine(on: On, world: World = {}) {
   const isMac = platform === 'macos'
   let running: Proc[] = world.running ?? []
   let looks = 0
+  /** How many times the plugin asked for the session's sign-in. */
+  let asks = 0
   const scripts: string[] = []
   const starts: string[] = []
   const argvs: string[][] = []
@@ -231,7 +233,9 @@ function engine(on: On, world: World = {}) {
     return undefined
   }
   // This session's sign-in: its kind and account id, as the engine answers them; refused, or a call that throws.
+  // Each call is counted, so a case can show that nothing was asked.
   on('session.identity', () => {
+    asks += 1
     const identity = world.identity ?? { kind: 'claude.ai', accountId: accountId(1) }
     if (identity === 'denied') return { deny: 'privacy: a plugin in the user tier is not told who the session is' }
     if (identity === 'throws') throw new Error('the identity could not be read')
@@ -344,7 +348,7 @@ function engine(on: On, world: World = {}) {
     commands.push(`${e.command} ${e.args}`)
     return {}
   })
-  return { scripts, starts, releases, argvs, reads, stats, existed, lists, commands, prompts, toasts, described, store, clock, session, macLock: () => macLockThere }
+  return { scripts, starts, releases, argvs, reads, stats, existed, lists, commands, prompts, toasts, described, store, clock, session, macLock: () => macLockThere, identityAsks: () => asks }
 }
 
 /**
@@ -861,7 +865,15 @@ test("a file is read only when its stat shows a plain file, no link, within its 
 // email, no @ and no path, and the plugin reads .claude.json and Local State alone.
 
 /** A start's case: its world, the answer's lines it must hold, and the files it reads (left out: both). */
-type StartCase = { readonly name: string; readonly world?: World; readonly lines: readonly string[]; readonly started: boolean; readonly reads?: readonly string[] }
+type StartCase = {
+  readonly name: string
+  readonly world?: World
+  readonly lines: readonly string[]
+  readonly started: boolean
+  readonly reads?: readonly string[]
+  /** How many times the session's sign-in is asked (left out: once). */
+  readonly asks?: number
+}
 
 const PIN = "Left for the person: pin the profile: call chrome_ensure again with `profile` set to one of Chrome's profile folders (\"Default\", \"Profile 3\"), or set the profile setting to one."
 const NOT_PICKED = `Did: nothing: ${MATCH} can't be picked:`
@@ -949,6 +961,7 @@ const START_CASES: readonly StartCase[] = [
     lines: [`${NOT_PICKED} Chrome's user data folder can't be listed, so no profile folder can be checked.`, "Left for the person: call chrome_ensure again in a moment, or start Chrome by hand, on the profile whose Claude in Chrome is signed in to Claude Code's account."],
     started: false,
     reads: [],
+    asks: 0,
   },
   { name: '.claude.json not there', world: { claim: { fault: 'missing' } }, lines: [`${NOT_PICKED} Claude Code's .claude.json isn't there, or can't be looked at.`, PIN], started: false, reads: [] },
   { name: '.claude.json over the cap: not read', world: { claim: { fault: 'huge' } }, lines: [`${NOT_PICKED} Claude Code's .claude.json is over 4 MiB, which isn't read.`, PIN], started: false, reads: [] },
@@ -1000,6 +1013,7 @@ for (const c of START_CASES) {
     if (c.started) expect(argumentsOf(fakes.starts[0] ?? '')).toBe('--profile-directory="Profile 3" --restore-last-session')
     else expect(said).toMatch(/^Reconnect: not queued: Chrome isn't known to run\./m)
     expect(fakes.reads).toEqual([...(c.reads ?? [CLAIM_WINDOWS, LOCAL_STATE_WINDOWS])])
+    expect(fakes.identityAsks()).toBe(c.asks ?? 1)
     heldToFolders(said, fakes)
   })
 }
@@ -1095,6 +1109,7 @@ test("a named profile when Chrome's user data folder can't be listed: nothing st
   expect(want.filter(line => !lines.includes(line))).toEqual([])
   expect(fakes.starts).toEqual([])
   expect([...fakes.reads, ...fakes.stats]).toEqual([])
+  expect(fakes.identityAsks()).toBe(0)
   heldToFolders(said, fakes)
 })
 
@@ -1111,6 +1126,7 @@ test("macOS with no home folder, a named profile: Chrome's user data folder isn'
   expect(fakes.argvs.some(a => a[0] === '/usr/bin/open')).toBe(false)
   expect(fakes.reads).toEqual([])
   expect(fakes.lists).toEqual([])
+  expect(fakes.identityAsks()).toBe(0)
   heldToFolders(said, fakes)
 })
 
@@ -1127,6 +1143,7 @@ test("macOS with no home folder, nothing named: the match can't check a folder, 
   expect(fakes.argvs.some(a => a[0] === '/usr/bin/open')).toBe(false)
   expect(fakes.reads).toEqual([])
   expect(fakes.lists).toEqual([])
+  expect(fakes.identityAsks()).toBe(0)
   heldToFolders(said, fakes)
 })
 
