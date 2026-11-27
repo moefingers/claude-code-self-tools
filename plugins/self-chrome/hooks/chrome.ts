@@ -226,11 +226,10 @@ export const mayHoldClaudeAccount = (session: SessionSignIn): boolean => !sessio
 
 /**
  * What a .claude.json says of Claude Code's account, held against the session's own sign-in: the email of its Claude
- * account (`sessionAsked`: whether the session's account was asked and is the file's); none in the file (an older
- * Claude Code, a cloud provider, logged out); unknown, when the text isn't a JSON object (caught mid-write, say); or,
- * from the session: a sign-in on no Claude account (`session-none`), on another account than the file's
- * (`session-other`), or one whose account isn't known yet (`session-unconfirmed`: a host's token before the server
- * answered).
+ * account (`sessionAsked`: whether the session's account was asked and is the file's); none in the file (no login
+ * with an email recorded there); unknown, when the text isn't a JSON object (caught mid-write, say); or, from the
+ * session: a sign-in on no Claude account (`session-none`), on another account than the file's (`session-other`), or
+ * one that names no account id (`session-unconfirmed`: a host's token before the server answered, say).
  */
 export type ClaudeAccount =
   | { readonly kind: 'email'; readonly email: string; readonly sessionAsked: boolean }
@@ -345,7 +344,7 @@ export type AccountPick =
   | { readonly kind: 'session-none' }
   /** The session runs on another account than .claude.json records. */
   | { readonly kind: 'session-other' }
-  /** The session's account isn't known yet. */
+  /** The session's sign-in names no account id. */
   | { readonly kind: 'session-unconfirmed' }
   /** Chrome's user data folder can't be listed, so no folder can be checked. */
   | { readonly kind: 'unlisted' }
@@ -398,11 +397,11 @@ export function pickReason(pick: NoPick): string {
     case 'claim-unclear':
       return "Claude Code's .claude.json doesn't read as a JSON object just now (caught mid-write, say)"
     case 'session-none':
-      return "this session isn't signed in to a Claude account (an API key, a Console login, a cloud provider, or no login, as Claude Code says of it)"
+      return "this session isn't signed in to a Claude account (Claude Code calls its sign-in an API key, a Console login, a cloud provider or no login, or a kind this plugin reads as none)"
     case 'session-other':
       return 'this session runs on another account than the one .claude.json records'
     case 'session-unconfirmed':
-      return "this session's account isn't known yet (a token its host handed it, before the server answered), so the one .claude.json records can't be confirmed"
+      return "this session's own sign-in names no account id (a token its host handed it, before the server answered, say), so the one .claude.json records can't be confirmed"
     case 'unlisted':
       return "Chrome's user data folder can't be listed, so no profile folder can be checked"
     case 'no-local-state':
@@ -424,7 +423,7 @@ export function accountRefusal(pick: NoPick, folders: readonly string[] | undefi
   if (pick.kind === 'no-local-state' && pick.fault === 'unplaced') return { why, fix: byHand }
   if (pick.kind === 'unlisted') return { why, fix: `call chrome_ensure again in a moment, or ${byHand}` }
   const pin = `pin the profile: call chrome_ensure again with \`profile\` set to one of Chrome's profile folders${foldersSaid(folders)}, or set the profile setting to one`
-  return { why, fix: pick.kind === 'claim-unclear' || pick.kind === 'session-unconfirmed' ? `call chrome_ensure again in a moment, or ${pin}` : pin }
+  return { why, fix: pick.kind === 'claim-unclear' ? `call chrome_ensure again in a moment, or ${pin}` : pin }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -923,8 +922,11 @@ export type StartProfile =
   /** The account match's folder; `sessionAsked`: whether the session's own account was asked (AccountPick's). */
   | { readonly profile: string; readonly source: 'account'; readonly sessionAsked: boolean }
 
-/** Said of a matched folder when the session's own sign-in couldn't be asked: the file stood alone. Fixed words. */
-export const FILE_ONLY = "Claude Code's account is the one .claude.json records: this session's own sign-in couldn't be asked"
+/**
+ * Said of a matched folder when Claude Code didn't answer for the session's own sign-in (refused, or the call failed):
+ * the file stood alone, which is all this says. Fixed words.
+ */
+export const FILE_ONLY = "Claude Code's account was taken from .claude.json alone: Claude Code didn't answer for this session's own sign-in"
 
 /** What the tool did about starting Chrome. */
 export type Start =

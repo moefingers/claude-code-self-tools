@@ -64,9 +64,9 @@ Claude in Chrome pairs with Claude Code only from a Chrome profile whose Claude 
 - **`.claude.json` is held against this session's own sign-in.** Its `oauthAccount` is the last login's, which may not be the account this session runs on (a token its host handed it, an API key with an older login's record, credentials swapped). So the plugin asks Claude Code how this session is signed in (`$.session.identity()`), and takes its `kind` and its `accountId`, nothing else:
   - a `kind` that runs on no Claude account (`api-key`, `console`, `none`, a cloud provider, or a kind it doesn't know) counts as no account, and `.claude.json` isn't read;
   - an `accountId` that isn't `oauthAccount.accountUuid` means this session runs on another account than the file records: it starts nothing;
-  - no `accountId` where the kind should carry one (a host's token before the server answered) means the file's account can't be confirmed: it starts nothing;
+  - no `accountId` where the kind should carry one (a host's token before the server answered, say) means the file's account can't be confirmed: it starts nothing;
   - only the same id lets the file's email stand. The two ids are compared, and never kept, logged or shown.
-- **Where Claude Code won't say** (its privacy and sec-default built-ins refuse a plugin in the `user` tier, as most installed plugins are) or the call fails, the file's account stands alone, as before, and the answer says so in fixed words: "Claude Code's account is the one .claude.json records: this session's own sign-in couldn't be asked."
+- **Where Claude Code won't say** (its privacy and sec-default built-ins refuse a plugin in the `user` tier, as most installed plugins are) or the call fails, the file's account stands alone, as before, and the answer says so in fixed words: "Claude Code's account was taken from .claude.json alone: Claude Code didn't answer for this session's own sign-in."
 - **Exactly one folder matches:** the start opens it.
 - **No folder matches:** it starts nothing. It says so, lists the profile folders there by folder name, and says how to pin one (the call's `profile`, or the `profile` setting).
 - **Several match:** it starts nothing. It says how many, lists the matching folders by folder name, and says how to pin one.

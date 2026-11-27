@@ -866,11 +866,11 @@ type StartCase = { readonly name: string; readonly world?: World; readonly lines
 const PIN = "Left for the person: pin the profile: call chrome_ensure again with `profile` set to one of Chrome's profile folders (\"Default\", \"Profile 3\"), or set the profile setting to one."
 const NOT_PICKED = `Did: nothing: ${MATCH} can't be picked:`
 const STARTED_ON_3 = `Did: started Chrome, with the profile folder "Profile 3" (its Google account has the email of Claude Code's account), --restore-last-session, without ${FLAG}. It runs as PID 4321.`
-/** The fixed words said when the session's own sign-in couldn't be asked, so .claude.json stood alone. */
-const FILE_ONLY_WORDS = "Claude Code's account is the one .claude.json records: this session's own sign-in couldn't be asked"
+/** The fixed words said when Claude Code didn't answer for the session's own sign-in, so .claude.json stood alone. */
+const FILE_ONLY_WORDS = "Claude Code's account was taken from .claude.json alone: Claude Code didn't answer for this session's own sign-in"
 const STARTED_ON_3_BY_FILE = `Did: started Chrome, with the profile folder "Profile 3" (its Google account has the email of Claude Code's account; ${FILE_ONLY_WORDS}), --restore-last-session, without ${FLAG}. It runs as PID 4321.`
 const NO_ACCOUNT_IN_FILE = `${NOT_PICKED} Claude Code's .claude.json records no Claude account with an email.`
-const SESSION_NONE = `${NOT_PICKED} this session isn't signed in to a Claude account (an API key, a Console login, a cloud provider, or no login, as Claude Code says of it).`
+const SESSION_NONE = `${NOT_PICKED} this session isn't signed in to a Claude account (Claude Code calls its sign-in an API key, a Console login, a cloud provider or no login, or a kind this plugin reads as none).`
 const AGAIN_OR_PIN = `Left for the person: call chrome_ensure again in a moment, or ${PIN.slice('Left for the person: '.length)}`
 
 const START_CASES: readonly StartCase[] = [
@@ -930,9 +930,9 @@ const START_CASES: readonly StartCase[] = [
     reads: [CLAIM_WINDOWS],
   },
   {
-    name: "a host's token whose account isn't known yet: can't be confirmed, and it says to call again",
+    name: "a host's token that names no account id: can't be confirmed, and the fix is a pin",
     world: { identity: { kind: 'oauth-token' } },
-    lines: [`${NOT_PICKED} this session's account isn't known yet (a token its host handed it, before the server answered), so the one .claude.json records can't be confirmed.`, AGAIN_OR_PIN],
+    lines: [`${NOT_PICKED} this session's own sign-in names no account id (a token its host handed it, before the server answered, say), so the one .claude.json records can't be confirmed.`, PIN],
     started: false,
     reads: [CLAIM_WINDOWS],
   },
