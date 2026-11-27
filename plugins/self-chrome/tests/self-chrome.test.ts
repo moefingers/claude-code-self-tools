@@ -174,7 +174,10 @@ function engine(on: On, world: World = {}) {
   const profiles = world.profiles ?? ['Default', 'Profile 3']
   const clock = mock.clock(on, { now: NOW })
   const session = mock.session(on)
-  mock.env(on, { ...(isMac ? MAC : platform === 'windows' ? WINDOWS : {}), ...world.env })
+  // The update check off, by its own switch (update-check.ts: trafficOff, before its read of the plugin's own
+  // plugin.json): every file the records hold is then one chrome_ensure asked for. tests/update-check.test.ts runs the
+  // check against this plugin's tool.
+  mock.env(on, { ...(isMac ? MAC : platform === 'windows' ? WINDOWS : {}), CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1', ...world.env })
   on('store.get', (_, e) => ({ value: store.get(e.key) }))
   on('store.set', (_, e) => {
     store.set(e.key, JSON.parse(JSON.stringify(e.value)))
