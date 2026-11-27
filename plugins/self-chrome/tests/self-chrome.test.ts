@@ -97,6 +97,14 @@ const KILLS = /Stop-Process|taskkill|\.Kill\(|CloseMainWindow|Restart-|killall|p
 type Proc = { pid: number; exe?: string; cmd: string }
 
 /**
+ * The path the plugin asked for, from the path a fake file hook is given. On Linux a Windows path (C:\...) is a relative
+ * one, so the test kit resolves it against the plugin's folder before any hook sees it, as `<that folder>/C:\...`: that
+ * prefix is taken off, and the drive and what follows it are what the plugin asked for. On Windows, and for a POSIX
+ * path, the path is as given. Nothing is resolved with Node's path.
+ */
+const asked = (path: string): string => /^\/.*\/([A-Za-z]:\\[^/]*)$/.exec(path)?.[1] ?? path
+
+/**
  * A file the fakes hold: its text; or what its stat or read shows instead: not there, a link, over 4 MiB, a folder, or a
  * plain file whose read fails.
  */
@@ -158,7 +166,7 @@ function engine(on: On, world: World = {}) {
   const scripts: string[] = []
   const starts: string[] = []
   const argvs: string[][] = []
-  /** The paths the plugin read, stat'd, and asked to exist. */
+  /** The paths the plugin read, stat'd, asked to exist and listed, each as it asked for it (asked). */
   const reads: string[] = []
   const stats: string[] = []
   const existed: string[] = []
@@ -213,19 +221,19 @@ function engine(on: On, world: World = {}) {
   }
   // A refusal names the path, as an OS error does: no answer may repeat it.
   on('fs.read', (_, e) => {
-    reads.push(e.path)
+    reads.push(asked(e.path))
     const file = fileAt(e.path)
     return file !== undefined && 'text' in file ? { value: file.text } : { deny: `EACCES: ${e.path}` }
   })
   // Chrome's user data folder: its profile folders, and other folders and files that are no profile.
   on('fs.list', (_, e) => {
-    lists.push(e.path ?? '')
+    lists.push(asked(e.path ?? ''))
     const dirs = [...profiles, 'Crashpad', 'ShaderCache', 'Stale', 'bad.name']
     return { value: [...dirs.map(name => ({ name, kind: 'dir' as const, size: 0, mtimeMs: 0, isLink: false })), { name: 'Local State', kind: 'file' as const, size: 9, mtimeMs: 0, isLink: false }] }
   })
   // The fake files' stats; and the macOS lock folder's age: just made by another start, or long ago.
   on('fs.stat', (_, e) => {
-    stats.push(e.path)
+    stats.push(asked(e.path))
     const file = fileAt(e.path)
     if (file === undefined) return { value: { kind: 'dir' as const, size: 0, mtimeMs: world.macLock === 'stale' ? NOW - START_LOCK_MS - 1 : NOW, isLink: false } }
     const fault = 'fault' in file ? file.fault : undefined
@@ -237,7 +245,7 @@ function engine(on: On, world: World = {}) {
   // The standard install is there, and each profile folder's Preferences. Matched by the tail: a host on Windows may
   // spell a POSIX path its own way.
   on('fs.exists', (_, e) => {
-    existed.push(e.path)
+    existed.push(asked(e.path))
     const path = e.path.replace(/\\/g, '/')
     if (/\/Google Chrome\.app\/Contents\/MacOS\/Google Chrome$/.test(path)) return { value: true }
     return { value: profiles.some(p => path.endsWith(`/${p}/Preferences`)) }
@@ -335,8 +343,8 @@ function heldToFolders(said: string, fakes: ReturnType<typeof engine>): void {
   expect(said).not.toContain(HOME)
   const named = /[\\/](?:\.claude\.json|Local State)$/
   expect(fakes.reads.filter(path => !named.test(path))).toEqual([])
-  expect(fakes.stats.filter(path => !named.test(path) && !path.endsWith('/chrome-start.lock'))).toEqual([])
-  expect(fakes.existed.filter(path => !/[\\/]Preferences$/.test(path) && !path.endsWith('/Contents/MacOS/Google Chrome'))).toEqual([])
+  expect(fakes.stats.filter(path => !named.test(path) && !/[\\/]chrome-start\.lock$/.test(path))).toEqual([])
+  expect(fakes.existed.filter(path => !/[\\/]Preferences$/.test(path) && !/[\\/]Contents[\\/]MacOS[\\/]Google Chrome$/.test(path))).toEqual([])
   expect([...fakes.reads, ...fakes.stats, ...fakes.existed, ...fakes.lists].filter(path => /credentials/i.test(path))).toEqual([])
 }
 
@@ -1323,8 +1331,11 @@ test("macOS, not running: a last look, then open with the flag on the account ma
   const said = await ensure($)
   expect(said).toContain(`Did: started Chrome, with the profile folder "Profile 3" (its Google account has the email of Claude Code's account), --restore-last-session and ${FLAG}. It runs as PID 4321, and the flag took.`)
   expect(argvs.find(a => a[0] === '/usr/bin/open')).toEqual(['/usr/bin/open', '-a', '/Applications/Google Chrome.app', '--args', '--profile-directory=Profile 3', '--restore-last-session', FLAG])
-  // .claude.json in the home folder, and Local State in Chrome's own folder under it.
-  expect(reads.map(path => path.replace(/\\/g, '/'))).toEqual([CLAIM_MAC, LOCAL_STATE_MAC])
+  // .claude.json in the home folder, and Local State in Chrome's own folder under it, each read once; by the tail, as
+  // a host on Windows may spell a POSIX path its own way.
+  const macReads = reads.map(path => path.replace(/\\/g, '/'))
+  expect(macReads).toHaveLength(2)
+  expect([macReads[0]?.endsWith(CLAIM_MAC), macReads[1]?.endsWith(LOCAL_STATE_MAC)]).toEqual([true, true])
   heldToFolders(said, fakes)
   // This user's uid; the first look; the lock (its folder's parent, then the folder); the last look right before
   // open; open; then a sleep and a look until it shows; then the lock let go.
