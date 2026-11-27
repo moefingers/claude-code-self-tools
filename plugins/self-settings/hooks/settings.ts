@@ -119,13 +119,17 @@ const URL_QUERY = /[A-Za-z][A-Za-z0-9+.-]*:\/\/[^\s?#]*[?#]/
  * so a token cut by those into short runs of letters and digits is still one run; `/` stays out, so a path is shown.
  */
 const LONG_RUN = /[A-Za-z0-9_+=-]{24,}/g
+/** The longest text the rule reads: a longer one is taken for a secret unread. */
+export const MAX_SHOWN = 4096
 
 /**
- * Whether `text` looks like a secret, whatever field holds it: a known token prefix, a URL with a login, a query string
- * or a fragment, or a long run (LONG_RUN) that holds both a letter and a digit. It leans toward hiding: a long name
- * with a digit in it is hidden too.
+ * Whether `text` looks like a secret, whatever field holds it: a text over MAX_SHOWN characters, unread; a known token
+ * prefix; a URL with a login, a query string or a fragment; or a long run (LONG_RUN) that holds both a letter and a
+ * digit. It leans toward hiding: a long name with a digit in it is hidden too.
  */
 export function looksSecret(text: string): boolean {
+  // A value over 4 KB is hidden whole, and no pattern is run over it.
+  if (text.length > MAX_SHOWN) return true
   if (TOKEN_PREFIX.test(text) || URL_LOGIN.test(text) || URL_QUERY.test(text)) return true
   return (text.match(LONG_RUN) ?? []).some(run => /[A-Za-z]/.test(run) && /\d/.test(run))
 }

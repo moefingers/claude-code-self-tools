@@ -11,6 +11,7 @@ import {
   looksSecret,
   MARKETPLACE,
   marketplacesOf,
+  MAX_SHOWN,
   MAY_SET,
   NO_VALUE,
   OWNER_ONLY,
@@ -346,7 +347,12 @@ test('a value that looks like a secret: the rule, as a table', () => {
     ['https://example.com/x?page=2', true],
     [built('https://app/cb', '#', 'access_token=', 'abc'), true],
     [built('https://example.com/a', '#', 'top'), true],
+    // A text over 4 KB is hidden whole, unread by the patterns: at 4,096 characters it is still read, at 4,097 not.
+    ['a '.repeat(2048), false],
+    [built('a '.repeat(2048), 'a'), true],
+    [built('https://example.com/', 'a/'.repeat(2100)), true],
   ]
+  expect(MAX_SHOWN).toBe(4096)
   expect(cases.map(([text]) => [text, looksSecret(text)])).toEqual(cases)
 })
 
