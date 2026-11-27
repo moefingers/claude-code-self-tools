@@ -1,6 +1,6 @@
 {
   "name": "self-secret",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Lets a session run a command with a secret it never sees: the person pastes it into a form on this machine (127.0.0.1), it is checked before anything runs, handed to the one command in an environment variable, and masked in everything the command prints; a hold keeps it for later commands. The local paste of secret-run.",
   "author": { "name": "moefingers", "url": "https://github.com/moefingers" },
   "homepage": "https://github.com/moefingers/claude-code-self-tools/tree/main/plugins/self-secret#readme",
