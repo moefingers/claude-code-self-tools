@@ -99,9 +99,6 @@ export const MATCHED = "the profile folder whose Google account has the email of
 /** Where a named profile came from: the call, or the profile setting. */
 export type NamedSource = 'call' | 'setting'
 
-/** Where a start's profile came from: named (the call, the setting), or the account match. */
-export type ProfileSource = NamedSource | 'account'
-
 /**
  * The profile a start opens: the call's `profile` (checked at the call), else the profile setting (a pin), else the
  * account match (`source: 'account'`), and nothing after it: with no folder picked, nothing starts. A setting that isn't
