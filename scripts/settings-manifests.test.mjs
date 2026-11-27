@@ -63,10 +63,11 @@ test('every field off the list is refused with exactly the owner-only line, at t
   const said = off.map(f => {
     const row = rowOf(f)
     const input = { key: f.key, value: otherValue(row) }
-    return [f.key, settings.setInputOf(input), settings.callRefusal('settings_set', input), settings.planSet(input, [row], OURS)]
+    // A subagent asking for one gets the same line: it is the owner's, whoever asks.
+    return [f.key, settings.setInputOf(input), settings.callRefusal('settings_set', input), settings.callRefusal('settings_set', { ...input, agentId: 'a1' }), settings.planSet(input, [row], OURS)]
   })
   const refused = { deny: settings.OWNER_ONLY }
-  assert.deepEqual(said, off.map(f => [f.key, refused, refused, refused]))
+  assert.deepEqual(said, off.map(f => [f.key, refused, refused, refused, refused]))
 })
 
 test("every entry on the list names a field that is there and isn't sensitive, and goes through with its row there", () => {

@@ -39,7 +39,7 @@ Nothing else. Every other option, of any plugin, and every option a plugin adds 
 
 ## Where each part runs
 
-- **At `tool.call`, the refusals that need nothing read:** a subagent (what these tools read and change is the machine's, for the main session), an argument a tool doesn't take, and for `settings_set` a key off the list, first, whatever else the call carries.
+- **At `tool.call`, the refusals that need nothing read:** for `settings_set`, a key off the list first, whatever else the call carries and whoever calls (a subagent asking for one is told it is the owner's, never that the main session could change it); then a subagent (what these tools read and change is the machine's, for the main session); then an argument a tool doesn't take. The serving refuses in the same order.
 - **At `tool.run`, the serving.** A call that passes goes on to Claude Code's own permission check, and the tools are served once it is allowed. Decided on principle: a tool that reads or changes settings stays under your permission rules, as self-desktop's tools do. Each serving holds every rule again on the input it receives, whatever ran before it; `settings_set` checks the key against the list once more right before `$.config.set`.
 - **A call with no rules.** A call another plugin makes through `$.tool.call`, and a script the REPL tool runs, go through the hooks with no permission rules (the engine's 2.1.331 types, the `tool` noun). The list holds for them all the same: no call through this plugin changes an option off it.
 - **No `config.set` hook.** self-settings polices only its own tool; it doesn't judge other plugins' changes.

@@ -520,14 +520,24 @@ test('a near miss of a key on the list is another key: refused with the owner-on
   expect({ atCall, atServing, sets }).toEqual({ atCall: refused, atServing: refused, sets: [] })
 })
 
-test('a subagent is refused both tools, at the call and again at the serving, and nothing is read or changed', async ($, on) => {
-  const { sets, asked } = engine(on, { rows: [reminder('')], enabled: ENABLED })
+test('a subagent is refused both tools, at the call and again at the serving, and nothing is read or changed; a key off the list is the owner-only line even for it', async ($, on) => {
+  const { sets, asked } = engine(on, { rows: [reminder(''), row('self-desktop.enabled', 'Read the desktop', 'choice', 'off', { options: ['off', 'on'] })], enabled: ENABLED })
   await $.session.start(START)
   const answers = [
     said(await $.tool.call({ tool: READ, agentId: 'a1' })),
     said(await $.tool.call({ tool: SET, key: 'self-compact.compactReminder', value: '40%', agentId: 'a1' })),
     said(await $.tool.run({ tool: READ, tool_use_id: 't1', agentId: 'a1' })),
     said(await $.tool.run({ tool: SET, tool_use_id: 't2', key: 'self-compact.compactReminder', value: '40%', agentId: 'a1' })),
+    // Off the list: the owner's, whoever asks; never that the main session could change it.
+    said(await $.tool.call({ tool: SET, key: 'self-desktop.enabled', value: 'on', agentId: 'a1' })),
+    said(await $.tool.run({ tool: SET, tool_use_id: 't3', key: 'self-desktop.enabled', value: 'on', agentId: 'a1' })),
+    said(await $.tool.call({ tool: SET, value: 'on', agentId: 'a1' })),
+    said(await $.tool.run({ tool: SET, tool_use_id: 't4', key: 'Self-compact.compactReminder', value: '40%', agentId: 'a1' })),
   ]
-  expect({ answers, sets, ...asked }).toEqual({ answers: Array.from({ length: 4 }, () => `deny: ${SUBAGENT}`), sets: [], list: 0, settings: 0 })
+  expect({ answers, sets, ...asked }).toEqual({
+    answers: [...Array.from({ length: 4 }, () => `deny: ${SUBAGENT}`), ...Array.from({ length: 4 }, () => `deny: ${OWNER_ONLY}`)],
+    sets: [],
+    list: 0,
+    settings: 0,
+  })
 })

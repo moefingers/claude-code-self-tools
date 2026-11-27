@@ -29,6 +29,7 @@ import type { ConfigSetResult, EngineInterface, Register } from 'claude-code'
 import {
   type After,
   callRefusal,
+  keyIsOffList,
   marketplacesOf,
   type Marketplaces,
   maySet,
@@ -106,6 +107,8 @@ async function serveRead($: EngineInterface, e: object & { readonly agentId?: st
 
 /** settings_set, served: every rule again on what tool.run received and on the rows read now, then $.config.set. */
 async function serveSet($: EngineInterface, e: object & { readonly agentId?: string }): Promise<Refused | { result: string }> {
+  // A key off MAY_SET is the owner's whoever asks, a subagent included: said before the subagent's refusal.
+  if (keyIsOffList(e)) return { deny: OWNER_ONLY }
   if (e.agentId !== undefined) return { deny: SUBAGENT }
   // A key off MAY_SET is refused before anything is read; planSet holds the same rule again with the rows.
   const asked = setInputOf(e)

@@ -240,10 +240,21 @@ export function setInputOf(input: object): Asked | Refused {
   return { key, value }
 }
 
+/** Whether a settings_set input's `key` is off MAY_SET: anything but a text equal to an entry. */
+export function keyIsOffList(input: object): boolean {
+  const { key } = input as { readonly key?: unknown }
+  return typeof key !== 'string' || !maySet(key)
+}
+
 export type Tool = 'settings_read' | 'settings_set'
 
-/** What a call is refused for at tool.call, before anything is read: a subagent, then the tool's own input rules. */
+/**
+ * What a call is refused for at tool.call, before anything is read. For settings_set, a key off MAY_SET first, with
+ * OWNER_ONLY, whoever calls: a subagent asking for one is told it is the owner's, never that the main session could
+ * change it. Then a subagent, then the tool's own input rules.
+ */
 export function callRefusal(tool: Tool, input: object & { readonly agentId?: string }): Refused | undefined {
+  if (tool === 'settings_set' && keyIsOffList(input)) return { deny: OWNER_ONLY }
   if (input.agentId !== undefined) return { deny: SUBAGENT }
   const checked = tool === 'settings_read' ? readInputOf(input) : setInputOf(input)
   return 'deny' in checked ? { deny: checked.deny } : undefined
