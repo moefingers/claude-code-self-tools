@@ -90,6 +90,15 @@ function engine(on: On, world: World) {
 
 /** A call's answer as one line of text: its refusal, or its result. */
 const said = (done: { readonly deny?: string; readonly result?: unknown }): string => (done.deny !== undefined ? `deny: ${done.deny}` : `result: ${String(done.result)}`)
+
+// Where a refusal was made shows in what $.tool.call answers. One made at tool.call comes back as the { deny } it was.
+// One made at the serving, a tool.run hook's { deny }, is the call's error: from core, "when the tool reported an
+// error", the call resolves { ref, result, text, isError } (d.ts :18218-18236, ToolCallResult), its result reading
+// "Error: <text>". A $.tool.run of the serving itself answers the hook's own { deny }.
+/** A refusal made at tool.call, as $.tool.call answers it. */
+const atCall = (text: string): string => `deny: ${text}`
+/** A refusal made at the serving (tool.run), as $.tool.call answers it. */
+const atServing = (text: string): string => `result: Error: ${text}`
 const read = async ($: Engine, input: Record<string, unknown> = {}): Promise<string> => said(await $.tool.call({ tool: READ, ...input }))
 const set = async ($: Engine, input: Record<string, unknown>): Promise<string> => said(await $.tool.call({ tool: SET, ...input }))
 
@@ -284,12 +293,12 @@ test('every option on the list is changed through $.config.set, read back, said 
   expect(MAY_SET).toHaveLength(18)
 })
 
-test("a hook's refusal of a change is passed on as it came, and nothing is toasted", async ($, on) => {
+test("a hook's refusal of a change is passed on as it came, from the serving, and nothing is toasted", async ($, on) => {
   const reason = 'self-compact: a level is a percentage (40%) or a token count (400k)'
   const { sets, toasts } = engine(on, { rows: [reminder('')], deny: reason })
   await $.session.start(START)
   expect({ answer: await set($, { key: 'self-compact.compactReminder', value: '40%' }), sets, toasts }).toEqual({
-    answer: `deny: ${reason}`,
+    answer: atServing(reason),
     sets: ['self-compact.compactReminder="40%"'],
     toasts: [],
   })
@@ -333,26 +342,28 @@ test("refused, and nothing is changed: a locked row, a hidden row, a key that is
   ]
   const { sets, toasts } = engine(on, { rows })
   await $.session.start(START)
+  // A key off the list, an argument the tool doesn't take and a missing value are refused at tool.call; what needs the
+  // rows is refused at the serving.
   const asks: [Record<string, unknown>, string][] = [
-    [{ key: 'self-desktop.updateCheck', value: 'off' }, "deny: self-desktop.updateCheck is locked: a trusted source (managed settings, the organization's policy) owns its value. Nothing was changed."],
-    [{ key: 'self-wake.updateCheck', value: 'off' }, "deny: self-wake.updateCheck has no row in /config in this session (self-wake isn't enabled here, or a plugin hides the row), so nothing was changed."],
-    [{ key: 'theme', value: 'light' }, `deny: ${OWNER_ONLY}`],
-    [{ key: 'autoCompact', value: false }, `deny: ${OWNER_ONLY}`],
-    [{ key: 'self-clear.updateCheck', value: 'off' }, `deny: ${OWNER_ONLY}`],
-    [{ key: 'self-color.updateCheck', value: 'off' }, `deny: ${OWNER_ONLY}`],
-    [{ key: 'self-desktop.enabled', value: 'on' }, `deny: ${OWNER_ONLY}`],
-    [{ key: 'self-desktop.enabled', value: 'on', force: true }, `deny: ${OWNER_ONLY}`],
-    [{ value: 'on' }, `deny: ${OWNER_ONLY}`],
-    [{ key: ['self-compact.compactReminder'], value: '40%' }, `deny: ${OWNER_ONLY}`],
-    [{ key: 'self-mcp.updateCheck', value: 'off' }, "deny: /config has more than one row named self-mcp.updateCheck, so which one would change can't be known. Nothing was changed."],
-    [{ key: 'self-reload.updateCheck', value: 'maybe' }, 'deny: self-reload.updateCheck takes one of: on, off. Nothing was changed.'],
-    [{ key: 'self-exit.updateCheck', value: false }, 'deny: self-exit.updateCheck takes one of: on, off. Nothing was changed.'],
-    [{ key: 'self-compact.compactReminder', value: 40 }, 'deny: self-compact.compactReminder takes a text. Nothing was changed.'],
-    [{ key: 'self-compact.compactReminder', value: ['40%'] }, 'deny: self-compact.compactReminder takes a text. Nothing was changed.'],
-    [{ key: 'self-compact.compactReminder' }, `deny: ${NO_VALUE}`],
-    [{ key: 'self-compact.compactReminder', value: null }, `deny: ${NO_VALUE}`],
-    [{ key: 'self-compact.compactReminder', value: { levels: '40%' } }, `deny: ${NO_VALUE}`],
-    [{ key: 'self-compact.compactReminder', value: '40%', plugin: 'self-compact' }, `deny: ${SET_TAKES}`],
+    [{ key: 'self-desktop.updateCheck', value: 'off' }, atServing("self-desktop.updateCheck is locked: a trusted source (managed settings, the organization's policy) owns its value. Nothing was changed.")],
+    [{ key: 'self-wake.updateCheck', value: 'off' }, atServing("self-wake.updateCheck has no row in /config in this session (self-wake isn't enabled here, or a plugin hides the row), so nothing was changed.")],
+    [{ key: 'theme', value: 'light' }, atCall(OWNER_ONLY)],
+    [{ key: 'autoCompact', value: false }, atCall(OWNER_ONLY)],
+    [{ key: 'self-clear.updateCheck', value: 'off' }, atServing(OWNER_ONLY)],
+    [{ key: 'self-color.updateCheck', value: 'off' }, atServing(OWNER_ONLY)],
+    [{ key: 'self-desktop.enabled', value: 'on' }, atCall(OWNER_ONLY)],
+    [{ key: 'self-desktop.enabled', value: 'on', force: true }, atCall(OWNER_ONLY)],
+    [{ value: 'on' }, atCall(OWNER_ONLY)],
+    [{ key: ['self-compact.compactReminder'], value: '40%' }, atCall(OWNER_ONLY)],
+    [{ key: 'self-mcp.updateCheck', value: 'off' }, atServing("/config has more than one row named self-mcp.updateCheck, so which one would change can't be known. Nothing was changed.")],
+    [{ key: 'self-reload.updateCheck', value: 'maybe' }, atServing('self-reload.updateCheck takes one of: on, off. Nothing was changed.')],
+    [{ key: 'self-exit.updateCheck', value: false }, atServing('self-exit.updateCheck takes one of: on, off. Nothing was changed.')],
+    [{ key: 'self-compact.compactReminder', value: 40 }, atServing('self-compact.compactReminder takes a text. Nothing was changed.')],
+    [{ key: 'self-compact.compactReminder', value: ['40%'] }, atServing('self-compact.compactReminder takes a text. Nothing was changed.')],
+    [{ key: 'self-compact.compactReminder' }, atCall(NO_VALUE)],
+    [{ key: 'self-compact.compactReminder', value: null }, atCall(NO_VALUE)],
+    [{ key: 'self-compact.compactReminder', value: { levels: '40%' } }, atCall(NO_VALUE)],
+    [{ key: 'self-compact.compactReminder', value: '40%', plugin: 'self-compact' }, atCall(SET_TAKES)],
     [{ key: 'self-check.updateCheck', value: 'on' }, 'result: self-check.updateCheck already reads "on", so nothing was changed.'],
   ]
   const got: [Record<string, unknown>, string][] = []
