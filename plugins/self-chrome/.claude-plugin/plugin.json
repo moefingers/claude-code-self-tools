@@ -26,7 +26,7 @@
     "profile": {
       "type": "string",
       "title": "Chrome profile",
-      "description": "A pin: the profile folder a Chrome this plugin starts opens, by its folder's name (Default, Profile 2); it must be one of Chrome's profile folders. Empty: the one profile folder whose Google account (in Chrome's Local State) has the email of Claude Code's Claude account (in its .claude.json); with none or several, nothing starts. Set it where the two emails differ, or to start the profile Chrome used last.",
+      "description": "A pin: the profile folder a Chrome this plugin starts opens, by its folder's name (Default, Profile 2); it must be one of Chrome's profile folders. Empty: the one profile folder whose Google account (in Chrome's Local State) has the email of Claude Code's Claude account (in its .claude.json), held against this session's own sign-in where Claude Code says it, else the file alone; with none or several, or an account that can't be read or confirmed, nothing starts. Set it where the two emails differ, or to start the profile Chrome used last.",
       "default": ""
     },
     "chromePath": {
