@@ -214,6 +214,8 @@ test('read: "agents may set" says what settings_set does, row by row: a plugin o
     row('self-desktop.enabled', 'Read the desktop', 'choice', 'on', { options: ['off', 'on'] }),
     // Another plugin's row under a listed key.
     updateCheck('self-wake', 'on', { plugin: 'another-plugin' }),
+    // The compact reminder's one row, of another kind than its manifest declares (a text).
+    row('self-compact.compactReminder', 'Compact reminder', 'choice', '', { options: ['', '40%'] }),
   ]
   const marketplaces = marketplacesOf({
     [`self-compact@${MARKET}`]: true,
@@ -233,6 +235,7 @@ test('read: "agents may set" says what settings_set does, row by row: a plugin o
   const verdict = (key: string): string => ('change' in planSet({ key, value: 'off' }, rows, marketplaces) ? 'agents may set' : 'owner only')
   expect(lines.map(([key = '', may]) => [key, may, verdict(key)])).toEqual([
     ['self-compact.updateCheck', 'agents may set', 'agents may set'],
+    ['self-compact.compactReminder', 'owner only', 'owner only'],
     ['self-check.updateCheck', 'owner only', 'owner only'],
     ['self-color.updateCheck', 'owner only', 'owner only'],
     ['self-clear.updateCheck', 'owner only', 'owner only'],
@@ -443,6 +446,12 @@ test("refused, and nothing is changed: a locked row, a hidden row, a key that is
     updateCheck('self-check'),
     reminder(''),
     row('self-desktop.enabled', 'Read the desktop', 'choice', 'off', { options: ['off', 'on'] }),
+    // Rows of listed keys, of another kind than the manifests declare (each update check a choice of on and off): a text,
+    // a choice with another option, the options in another order, a boolean.
+    row('self-restart.updateCheck', 'Update check', 'text', 'on'),
+    row('self-secret.updateCheck', 'Update check', 'choice', 'on', { options: ['on', 'off', 'sometimes'] }),
+    row('self-switch.updateCheck', 'Update check', 'choice', 'on', { options: ['off', 'on'] }),
+    row('self-context.updateCheck', 'Update check', 'boolean', true),
     // self-wake.updateCheck is hidden: the engine lists no row for it, though its config.set would take it.
   ]
   const { sets, toasts, enable } = engine(on, { rows })
@@ -482,6 +491,11 @@ test("refused, and nothing is changed: a locked row, a hidden row, a key that is
     [{ key: 'self-compact.compactReminder', value: null }, 'ours', atCall(NO_VALUE)],
     [{ key: 'self-compact.compactReminder', value: { levels: '40%' } }, 'ours', atCall(NO_VALUE)],
     [{ key: 'self-compact.compactReminder', value: '40%', plugin: 'self-compact' }, 'ours', atCall(SET_TAKES)],
+    // A listed key whose one row isn't of the kind its manifest declares.
+    [{ key: 'self-restart.updateCheck', value: 'off' }, 'ours', atServing(OWNER_ONLY)],
+    [{ key: 'self-secret.updateCheck', value: 'off' }, 'ours', atServing(OWNER_ONLY)],
+    [{ key: 'self-switch.updateCheck', value: 'off' }, 'ours', atServing(OWNER_ONLY)],
+    [{ key: 'self-context.updateCheck', value: 'off' }, 'ours', atServing(OWNER_ONLY)],
     // A row of the listed key, unlocked and shown, but the plugin of that name isn't this marketplace's alone.
     [{ key: 'self-check.updateCheck', value: 'off' }, 'elsewhere only', atServing(OWNER_ONLY)],
     [{ key: 'self-check.updateCheck', value: 'off' }, 'both', atServing(OWNER_ONLY)],

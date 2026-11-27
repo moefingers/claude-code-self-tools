@@ -119,8 +119,8 @@ test('the list is the frozen one: self-compact\'s compact reminder and the updat
   )
 })
 
-test("KNOWN is the manifests' own: each field's default and whether it is sensitive, row for row", () => {
-  const line = (key, spec) => `${key} default=${JSON.stringify(spec.default)} sensitive=${spec.sensitive === true}`
+test("KNOWN is the manifests' own: each field's default, its options and whether it is sensitive, row for row", () => {
+  const line = (key, spec) => `${key} default=${JSON.stringify(spec.default)} options=${JSON.stringify(spec.options)} sensitive=${spec.sensitive === true}`
   const fromManifests = FIELDS.map(f => line(f.key, f.spec)).sort()
   const fromKnown = Object.entries(settings.KNOWN)
     .flatMap(([plugin, fields]) => Object.entries(fields).map(([field, spec]) => line(`${plugin}.${field}`, spec)))

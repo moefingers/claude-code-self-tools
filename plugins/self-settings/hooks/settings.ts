@@ -48,42 +48,55 @@ export const maySet = (key: string): boolean => MAY_SET.includes(key)
 // ---------------------------------------------------------------------------------------------
 // What self-settings knows of its own marketplace's plugins' options.
 
-/** One option as its plugin's manifest declares it: its default (none when it declares none), and whether it is sensitive. */
-export type Field = { readonly default?: ConfigValue; readonly sensitive?: true }
+/**
+ * One option as its plugin's manifest declares it: its default (none when it declares none), a string field's
+ * `options` (which make its row a choice), and whether it is sensitive.
+ */
+export type Field = { readonly default?: ConfigValue; readonly options?: readonly string[]; readonly sensitive?: true }
 
 /** Options by plugin, then by field. */
 export type Known = Readonly<Record<string, Readonly<Record<string, Field>>>>
 
+/** Every plugin's update check, as each manifest here declares it. */
+const ON_OFF: readonly string[] = Object.freeze(['on', 'off'])
+const UPDATE_CHECK: Field = Object.freeze({ default: 'on', options: ON_OFF })
+
 /**
- * Each option of this marketplace's plugins as their manifests declare it in this release: its default, and whether it
- * is sensitive. The engine hands no plugin another plugin's userConfig (a $.config.list row carries no default, and a
- * sensitive field has no row at all), so this is how settings_read tells a value that was set from a default, and names
- * a sensitive field, for these plugins; for any other plugin it says the default is unknown. A plugin installed at
- * another version may declare otherwise.
+ * Each option of this marketplace's plugins as their manifests declare it in this release: its default, its options,
+ * and whether it is sensitive. The engine hands no plugin another plugin's userConfig (a $.config.list row carries no
+ * default, and a sensitive field has no row at all), so this is how settings_read tells a value that was set from a
+ * default, and names a sensitive field, for these plugins; for any other plugin it says the default is unknown; and how
+ * settings_set knows the kind a listed option's row must have. A plugin installed at another version may declare
+ * otherwise.
  */
 export const KNOWN: Known = Object.freeze({
-  'self-check': { updateCheck: { default: 'on' }, checkAtResume: { default: 'on' }, envDedupe: { default: 'on' }, probes: { default: [] } },
-  'self-chrome': { updateCheck: { default: 'on' }, silentDebugger: { default: 'auto' }, profile: { default: '' }, chromePath: { default: '' } },
-  'self-clear': { updateCheck: { default: 'on' } },
-  'self-color': { updateCheck: { default: 'on' } },
-  'self-compact': { updateCheck: { default: 'on' }, compactReminder: { default: '' } },
-  'self-context': { updateCheck: { default: 'on' } },
-  'self-desktop': { updateCheck: { default: 'on' }, enabled: { default: 'off' } },
-  'self-exit': { updateCheck: { default: 'on' } },
-  'self-mcp': { updateCheck: { default: 'on' } },
-  'self-reload': { updateCheck: { default: 'on' } },
+  'self-check': {
+    updateCheck: UPDATE_CHECK,
+    checkAtResume: { default: 'on', options: ON_OFF },
+    envDedupe: { default: 'on', options: ON_OFF },
+    probes: { default: [] },
+  },
+  'self-chrome': { updateCheck: UPDATE_CHECK, silentDebugger: { default: 'auto', options: ['auto', 'on', 'off'] }, profile: { default: '' }, chromePath: { default: '' } },
+  'self-clear': { updateCheck: UPDATE_CHECK },
+  'self-color': { updateCheck: UPDATE_CHECK },
+  'self-compact': { updateCheck: UPDATE_CHECK, compactReminder: { default: '' } },
+  'self-context': { updateCheck: UPDATE_CHECK },
+  'self-desktop': { updateCheck: UPDATE_CHECK, enabled: { default: 'off', options: ['off', 'on'] } },
+  'self-exit': { updateCheck: UPDATE_CHECK },
+  'self-mcp': { updateCheck: UPDATE_CHECK },
+  'self-reload': { updateCheck: UPDATE_CHECK },
   'self-remote-control': {
     reconnectOnLoginChange: { default: true },
     resumeAfterLoginChange: { default: true },
     reconnectChromeOnLoginChange: { default: true },
-    updateCheck: { default: 'on' },
+    updateCheck: UPDATE_CHECK,
   },
-  'self-restart': { updateCheck: { default: 'on' } },
-  'self-secret': { updateCheck: { default: 'on' } },
-  'self-settings': { updateCheck: { default: 'on' } },
-  'self-switch': { updateCheck: { default: 'on' }, requireCoordinator: { default: 'off' }, configDirs: { default: [] }, heavySlotRoot: { default: '' } },
-  'self-update': { updateCheck: { default: 'on' }, autoUpdate: { default: '' }, reloadAfterUpdate: { default: 'on' } },
-  'self-wake': { updateCheck: { default: 'on' } },
+  'self-restart': { updateCheck: UPDATE_CHECK },
+  'self-secret': { updateCheck: UPDATE_CHECK },
+  'self-settings': { updateCheck: UPDATE_CHECK },
+  'self-switch': { updateCheck: UPDATE_CHECK, requireCoordinator: { default: 'off', options: ON_OFF }, configDirs: { default: [] }, heavySlotRoot: { default: '' } },
+  'self-update': { updateCheck: UPDATE_CHECK, autoUpdate: { default: '' }, reloadAfterUpdate: { default: 'on', options: ON_OFF } },
+  'self-wake': { updateCheck: UPDATE_CHECK },
 })
 
 // ---------------------------------------------------------------------------------------------
@@ -306,24 +319,52 @@ export function isOursAlone(marketplaces: Marketplaces, plugin: string): boolean
 /** An option settings_set may change: its one row, and the plugin it is of. */
 type Option = { readonly row: Row; readonly plugin: string }
 
+/** The kind of row a field's manifest makes: a boolean or a number by its default, a choice when it lists options, else a text. */
+function kindOfField(spec: Field): Kind {
+  if (typeof spec.default === 'boolean') return 'boolean'
+  if (typeof spec.default === 'number') return 'number'
+  return spec.options === undefined ? 'text' : 'choice'
+}
+
+/**
+ * Whether a row has the kind its field's manifest declares (`spec`, from KNOWN): that kind; a choice's options exactly,
+ * in their order; a text's value a text, or a list, as the default is. Each update check is a choice of on and off, the
+ * compact reminder a text.
+ */
+function hasDeclaredKind(row: Row, spec: Field): boolean {
+  const kind = kindOfField(spec)
+  if (row.kind !== kind) return false
+  if (kind === 'choice') {
+    const declared = spec.options ?? []
+    const listed = row.options ?? []
+    return listed.length === declared.length && listed.every((option, i) => option === declared[i])
+  }
+  if (kind === 'text') return Array.isArray(row.value) === Array.isArray(spec.default)
+  return true
+}
+
 /**
  * Whether settings_set may change the option `key` names, given the rows listed (hidden rows left out, as
- * $.config.list leaves them) and the marketplaces read: its one row, or why not. The key is on MAY_SET exactly and not
- * a field `known` marks sensitive; its plugin is enabled from this marketplace alone; exactly one row has it; a plugin
- * owns that row, the plugin the key names; it is unlocked. A key off MAY_SET, a sensitive field, a plugin that isn't
- * this marketplace's alone and a row another owner holds are refused with OWNER_ONLY alone. planSet and
+ * $.config.list leaves them) and the marketplaces read: its one row, or why not. The key is on MAY_SET exactly, a
+ * field `known` holds and doesn't mark sensitive; its plugin is enabled from this marketplace alone; exactly one row has
+ * it; a plugin owns that row, the plugin the key names; the row has the kind the field's manifest declares; it is
+ * unlocked. A key off MAY_SET, a field `known` doesn't hold or marks sensitive, a plugin that isn't this marketplace's
+ * alone, a row another owner holds and a row of another kind are refused with OWNER_ONLY alone. planSet and
  * settings_read's "agents may set" both ask this, so the two agree.
  */
 function optionOf(key: string, rows: readonly Row[], marketplaces: Marketplaces, known: Known): Option | Refused {
   const plugin = pluginOfKey(key)
   if (!maySet(key) || plugin === undefined) return { deny: OWNER_ONLY }
-  if (known[plugin]?.[key.slice(plugin.length + 1)]?.sensitive === true) return { deny: OWNER_ONLY }
+  const spec = known[plugin]?.[key.slice(plugin.length + 1)]
+  if (spec === undefined || spec.sensitive === true) return { deny: OWNER_ONLY }
   if (!isOursAlone(marketplaces, plugin)) return { deny: OWNER_ONLY }
   const matching = rows.filter(row => row.key === key)
   const [row] = matching
   if (row === undefined) return { deny: noRow(key, plugin) }
   if (matching.length > 1) return { deny: twoRows(key) }
-  if (!isPluginRow(row) || row.plugin !== plugin) return { deny: OWNER_ONLY }
+  // A plugin loaded from a folder that took a listed name, its row the only one, would pass the marketplace's rule:
+  // its row must at least be of the kind this marketplace's manifest declares.
+  if (!isPluginRow(row) || row.plugin !== plugin || !hasDeclaredKind(row, spec)) return { deny: OWNER_ONLY }
   if (row.isLocked) return { deny: lockedSaid(key) }
   return { row, plugin }
 }
