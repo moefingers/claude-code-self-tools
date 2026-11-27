@@ -17,8 +17,10 @@
 #   and bad files holds the two equal): window names of letters, digits, _ and -, never 0, last, new, _quake,
 #   -1 or all digits; tab labels; folders absolute, there, with no quote, semicolon or % (Windows Terminal expands
 #   a % in them); positions and sizes in range; maximized true; a rect only for the plain window (a launch's or a
-#   restart's window with no name), never a named one; unknown keys refused, naming them. Anything wrong, and it
-#   says what, and runs nothing.
+#   restart's window with no name), never a named one; a grid (#91) of 1 to 16 named windows, each with one of a
+#   rect and maximized, and session names as its tabs, each name in one window once; unknown keys refused, naming
+#   them. Anything wrong, and it says what, and runs nothing. It opens nothing from the grid: self-switch's
+#   launch_sessions tool does that.
 # - It needs the slot runner at %LOCALAPPDATA%\claude-self-tools\claude-slot.ps1, with the SHA-256 the
 #   plugins ship, read by .NET; and with -Apply, Windows Terminal of 1.19 or later (it forwards a tab's
 #   environment, which the tab's stamp needs).
@@ -41,7 +43,7 @@ $ProgressPreference = 'SilentlyContinue'
 $env:PSModulePath = @([Environment]::GetFolderPath("MyDocuments") + "\WindowsPowerShell\Modules", [Environment]::GetFolderPath("ProgramFiles") + "\WindowsPowerShell\Modules", [Environment]::GetFolderPath("System") + "\WindowsPowerShell\v1.0\Modules") -join ";"
 
 # The slot runner this release ships.
-$SlotSha = '80ad3f9a4a142b87098883010c6bed8d2291515dc18ef8bf3b49406e8df0c30f'
+$SlotSha = 'f16afee8fa1487aaf6ea87f0b22b07cee18d8bd314d5ef5a28e4ba2b000703cf'
 # Set by Claude Code in the processes it starts, and NO_COLOR: LAUNCH_ENV_CLEAR in the plugins' machine code.
 $Clear = 'CLAUDE_CODE_CHILD_SESSION', 'CLAUDECODE', 'CLAUDE_CODE_SESSION_ID', 'CLAUDE_PID', 'CLAUDE_EFFORT', 'CLAUDE_CODE_BRIDGE_SESSION_ID', 'CLAUDE_CODE_MESSAGING_SOCKET', 'CLAUDE_CODE_MESSAGING_TOKEN', 'CLAUDE_CODE_REMOTE', 'CLAUDE_CODE_REMOTE_SESSION_ID', 'CLAUDE_JOB_DIR', 'AI_AGENT', 'CLAUDE_CODE_ENTRYPOINT', 'CLAUDE_CODE_EXECPATH', 'CLAUDE_CODE_SESSION_ATTENDED', 'CLAUDE_CODE_SSE_PORT', 'NO_COLOR'
 foreach ($n in $Clear) { [Environment]::SetEnvironmentVariable($n, [NullString]::Value, [EnvironmentVariableTarget]::Process) }
@@ -75,6 +77,9 @@ function Test-Whole($value, $low, $high) {
 }
 function Test-WindowName($name) { return ($name -is [string] -and $name -cmatch '^[A-Za-z0-9_-]{1,40}\z' -and $name -notmatch '^-?\d+\z' -and $name -notmatch '^(new|last|_quake)\z') }
 function Test-TabLabel($label) { return ($label -is [string] -and $label -cmatch '^[A-Za-z0-9 ._-]{1,40}\z') }
+# A session's name, as --name and lanes.json take it: AREA_NAME in the plugins' machine code.
+function Test-SessionName($name) { return ($name -is [string] -and $name -cmatch '^[a-z0-9][a-z0-9-]{0,39}\z') }
+function Test-Rect($rect) { return ($rect -is [array] -and $rect.Count -eq 4 -and (Test-Whole $rect[0] -32768 32768) -and (Test-Whole $rect[1] -32768 32768) -and (Test-Whole $rect[2] 320 32768) -and (Test-Whole $rect[3] 200 32768)) }
 function Test-Shape($path) {
   if ($path -isnot [string] -or $path.Length -lt 3 -or $path.Length -gt 240) { return $false }
   if ($path -cnotmatch '^[A-Za-z]:\\' -or $path -match '[\x00-\x1f\x7f-\x9f\x22\x27\u2018-\u201e<>|?*/]' -or $path.IndexOf(':', 2) -ge 0) { return $false }
@@ -86,6 +91,9 @@ function Test-Shape($path) {
   return $true
 }
 function Test-WtFolder($path) { return ((Test-Shape $path) -and $path.IndexOf(';') -lt 0 -and $path.IndexOf('%') -lt 0) }
+# A set of names, compared ordinal and ignoring case, never by culture (a bare @{} compares by the current culture's
+# rules, from memory: under tr-TR, I and i are two letters): window names and tab labels, as readPlacement folds them.
+function New-NameSet { return [System.Collections.Hashtable]::new([System.StringComparer]::OrdinalIgnoreCase) }
 function Test-Keys($value, $allowed, $where) {
   foreach ($p in $value.PSObject.Properties) { if ($allowed -cnotcontains $p.Name) { Add-Fault ($where + ' has an unknown key ' + $p.Name) } }
 }
@@ -102,7 +110,7 @@ function Test-Place($value, $where) {
 # The plain window's place (a window with no name): rect, maximized or both; never pos or size.
 function Test-Plain($value, $where) {
   if ((Test-Has $value 'pos') -or (Test-Has $value 'size')) { Add-Fault ($where + ' has no name, so it is the plain window, which takes rect and maximized: pos and size are a named window''s') }
-  if ((Test-Has $value 'rect') -and -not ($value.rect -is [array] -and $value.rect.Count -eq 4 -and (Test-Whole $value.rect[0] -32768 32768) -and (Test-Whole $value.rect[1] -32768 32768) -and (Test-Whole $value.rect[2] 320 32768) -and (Test-Whole $value.rect[3] 200 32768))) { Add-Fault ($where + ' has a rect that is not four whole numbers [x, y, width, height]: x and y within 32768, a width of 320 to 32768 and a height of 200 to 32768') }
+  if ((Test-Has $value 'rect') -and -not (Test-Rect $value.rect)) { Add-Fault ($where + ' has a rect that is not four whole numbers [x, y, width, height]: x and y within 32768, a width of 320 to 32768 and a height of 200 to 32768') }
   Test-Maximized $value $where
   if (-not (Test-Has $value 'rect') -and -not (Test-Has $value 'maximized')) { Add-Fault ($where + ' has no name and no rect or maximized: name a window, or give the plain window its place') }
 }
@@ -125,11 +133,11 @@ function Test-Window($value, $where) {
 }
 function Get-PlacementFaults($doc) {
   if (-not (Test-Object $doc)) { Add-Fault 'it is not a JSON object'; return }
-  Test-Keys $doc @('v', 'layout', 'launch', 'restart', 'workspaces', 'limits', 'afterBoot') 'the file'
+  Test-Keys $doc @('v', 'layout', 'launch', 'restart', 'workspaces', 'limits', 'afterBoot', 'grid') 'the file'
   if (-not (Test-Whole $doc.v 1 1)) { Add-Fault 'it is not version 1' }
   if ($doc.layout -isnot [array]) { Add-Fault 'layout is not a list' }
   else {
-    $names = @{}
+    $names = New-NameSet
     $at = 0
     foreach ($w in $doc.layout) {
       $here = 'layout[' + $at + ']'
@@ -142,7 +150,7 @@ function Get-PlacementFaults($doc) {
       Test-Place $w $here
       if (-not ($w.tabs -is [array] -and $w.tabs.Count -ge 1)) { Add-Fault ($here + '.tabs is not a list of tab labels') }
       else {
-        $labels = @{}
+        $labels = New-NameSet
         foreach ($t in $w.tabs) {
           if (-not (Test-TabLabel $t)) { Add-Fault ($here + '.tabs holds something that is not a tab label') }
           elseif ($labels.ContainsKey($t)) { Add-Fault ($here + '.tabs holds a label twice') }
@@ -207,6 +215,44 @@ function Get-PlacementFaults($doc) {
     else {
       Test-Keys $doc.afterBoot @('fltFix') 'afterBoot'
       if ((Test-Has $doc.afterBoot 'fltFix') -and -not ((Test-WtFolder $doc.afterBoot.fltFix) -and $doc.afterBoot.fltFix -match '\.ps1\z' -and (Test-Path -LiteralPath $doc.afterBoot.fltFix -PathType Leaf))) { Add-Fault 'afterBoot.fltFix is not an absolute .ps1 file that is there, with no quote, semicolon or %' }
+    }
+  }
+  # The grid (#91): checked here, and nothing opened from it. launch_sessions, a self-switch tool, opens its windows.
+  if (Test-Has $doc 'grid') {
+    if (-not (Test-Object $doc.grid)) { Add-Fault 'grid is not an object' }
+    else {
+      Test-Keys $doc.grid @('windows') 'grid'
+      $list = $doc.grid.windows
+      if (-not ($list -is [array] -and $list.Count -ge 1 -and $list.Count -le 16)) { Add-Fault 'grid.windows is not a list of 1 to 16 windows' }
+      else {
+        # Two window names that differ only in case are one here, as readPlacement reads them (New-NameSet).
+        $gridNames = New-NameSet
+        $gridSessions = New-NameSet
+        $at = 0
+        foreach ($w in $list) {
+          $here = 'grid.windows[' + $at + ']'
+          $at++
+          if (-not (Test-Object $w)) { Add-Fault ($here + ' is not an object'); continue }
+          Test-Keys $w @('window', 'rect', 'maximized', 'tabs') $here
+          if (-not (Test-WindowName $w.window)) { Add-Fault ($here + '.window is not a name Windows Terminal takes as one') }
+          elseif ($gridNames.ContainsKey($w.window)) { Add-Fault ($here + '.window names a window twice') }
+          else { $gridNames[$w.window] = $true }
+          if ((Test-Has $w 'rect') -and -not (Test-Rect $w.rect)) { Add-Fault ($here + ' has a rect that is not four whole numbers [x, y, width, height]: x and y within 32768, a width of 320 to 32768 and a height of 200 to 32768') }
+          Test-Maximized $w $here
+          if ((Test-Has $w 'rect') -and (Test-Has $w 'maximized')) { Add-Fault ($here + ' has both a rect and maximized: a grid window takes one of them') }
+          elseif (-not (Test-Has $w 'rect') -and -not (Test-Has $w 'maximized')) { Add-Fault ($here + ' has neither a rect nor maximized: a grid window takes one of them') }
+          if (Test-Has $w 'tabs') {
+            if (-not ($w.tabs -is [array] -and $w.tabs.Count -ge 1 -and $w.tabs.Count -le 16)) { Add-Fault ($here + '.tabs is not a list of 1 to 16 session names') }
+            else {
+              foreach ($t in $w.tabs) {
+                if (-not (Test-SessionName $t)) { Add-Fault ($here + '.tabs holds something that is not a session name (lowercase letters, digits and hyphens, as --name takes)') }
+                elseif ($gridSessions.ContainsKey($t)) { Add-Fault ($here + '.tabs names a session that a grid window names already') }
+                else { $gridSessions[$t] = $true }
+              }
+            }
+          }
+        }
+      }
     }
   }
 }

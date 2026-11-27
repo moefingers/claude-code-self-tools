@@ -42,9 +42,14 @@
 //    its first look and at its place); the restore rectangle of a maximized window (recorded, not asserted); a move
 //    later than the unplaced test's observation window; monitors at different scales; a full-screen window.
 //
-// Run with `node --test "scripts/*.test.mjs"`; part 2 with SELF_PLACE_LIVE=1 set as well.
+// 3. #90 and #91, live too (only with SELF_PLACE_LIVE=1): at most two more windows, one at a time: a plain window
+//    flush against a left edge, and, only with SELF_PLACE_WT=1 as well (it runs wt.exe), a named window placed by its
+//    first tab through the slot runner's own lines. Its own block, below, says how.
+//
+// Run with `node --test "scripts/*.test.mjs"`; parts 2 and 3 with SELF_PLACE_LIVE=1 set as well.
 import assert from 'node:assert/strict'
 import { spawnSync } from 'node:child_process'
+import { randomUUID } from 'node:crypto'
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -90,7 +95,7 @@ function hidden(script, shell = WINDOWS_POWERSHELL, timeout = HIDDEN_LIMIT_MS) {
   return { code: run.status, out: `${run.stdout ?? ''}`, err: `${run.stderr ?? ''}` }
 }
 
-/** Each row: a rect and a work area ([left, top, right, bottom]): what PLACE_CS's Clamp and clampToWork must agree on. */
+/** Each row: a rect, a work area ([left, top, right, bottom]) and, from #90, a border ([left, right, bottom]; none when left out): what PLACE_CS's Clamp and clampToWork must agree on. */
 const CLAMP_PAIRS = [
   [[100, 100, 1280, 800], [0, 0, 2560, 1400]],
   [[30000, 30000, 800, 600], [2560, 48, 4480, 1080]],
@@ -101,13 +106,36 @@ const CLAMP_PAIRS = [
   [[3000, 0, 800, 600], [2560, 48, 4480, 1080]],
   [[5000, -5000, 800, 600], [0, 0, 1920, 1040]],
   [[0, 0, 32768, 32768], [-1920, 0, 0, 1040]],
+  // #90, on a made-up 1920 x 1032 work area: a left edge, a right edge, a bottom edge, a corner, past the border, the top,
+  // larger, and off every monitor, with a border of 7 px, and one uneven border.
+  [[-7, 100, 494, 523], [0, 0, 1920, 1032], [7, 7, 7]],
+  [[1433, 100, 494, 523], [0, 0, 1920, 1032], [7, 7, 7]],
+  [[500, 516, 494, 523], [0, 0, 1920, 1032], [7, 7, 7]],
+  [[-7, 516, 494, 523], [0, 0, 1920, 1032], [7, 7, 7]],
+  [[-20, 100, 800, 600], [0, 0, 1920, 1032], [7, 7, 7]],
+  [[100, -7, 800, 600], [0, 0, 1920, 1032], [7, 7, 7]],
+  [[100, 100, 4000, 3000], [0, 0, 1920, 1032], [7, 7, 7]],
+  [[30000, 30000, 800, 600], [0, 0, 1920, 1032], [7, 3, 11]],
+]
+
+/** Each row: a window's rectangle and its drawn frame ([left, top, right, bottom]): what PLACE_CS's Overhang and overhangOf must agree on (#90). */
+const OVERHANG_PAIRS = [
+  [[-7, 0, 967, 1039], [0, 0, 960, 1032]],
+  [[0, 0, 960, 1032], [0, 0, 960, 1032]],
+  [[-1, 0, 961, 1033], [0, 0, 960, 1032]],
+  [[-2, 0, 1024, 1096], [0, 0, 960, 1032]],
+  // The top is never read: 5 px above the frame, and the three sides still 7.
+  [[-7, -5, 967, 1039], [0, 0, 960, 1032]],
+  [[-65, 0, 960, 1032], [0, 0, 960, 1032]],
+  [[10, 0, 950, 1022], [0, 0, 960, 1032]],
 ]
 
 describe('the window\'s own C#, compiled, its Clamp held to clampToWork (no window)', { skip: !isWindows && 'Windows only: Add-Type compiles the C# of a Windows window' }, () => {
   for (const [name, shell] of [['Windows PowerShell 5.1', WINDOWS_POWERSHELL], ['PowerShell 7', PWSH]]) {
-    test(`${name}: PLACE_CS compiles, every row of Clamp is clampToWork's; Hosted is read for this hidden shell's console, which, started with no console window, it is expected to have none of, so nothing is counted`, t => {
+    test(`${name}: PLACE_CS compiles, every row of Clamp is clampToWork's and every row of Overhang overhangOf's (#90); Hosted is read for this hidden shell's console, which, started with no console window, it is expected to have none of, so nothing is counted`, t => {
       if (!existsSync(shell)) return t.skip(`${name} is not installed here`)
-      const calls = CLAMP_PAIRS.map(([[x, y, w, h], [l, tp, r, b]]) => `@([ClaudeSelfToolsPlace]::Clamp([int]${x}, [int]${y}, [int]${w}, [int]${h}, [int]${l}, [int]${tp}, [int]${r}, [int]${b}))`)
+      const calls = CLAMP_PAIRS.map(([[x, y, w, h], [l, tp, r, b], [bl, br, bb] = [0, 0, 0]]) => `@([ClaudeSelfToolsPlace]::Clamp([int]${x}, [int]${y}, [int]${w}, [int]${h}, [int]${l}, [int]${tp}, [int]${r}, [int]${b}, [int]${bl}, [int]${br}, [int]${bb}))`)
+      const overhangs = OVERHANG_PAIRS.map(([rect, frame]) => `@([ClaudeSelfToolsPlace]::Overhang(${[...rect, ...frame].map(n => `[int]${n}`).join(', ')}))`)
       const script = [
         `Add-Type -ErrorAction Stop -TypeDefinition ${psq(machine.PLACE_CS)}`,
         `Add-Type -ErrorAction Stop -TypeDefinition ${psq(TEST_CS)}`,
@@ -116,7 +144,7 @@ describe('the window\'s own C#, compiled, its Clamp held to clampToWork (no wind
         '$owner = [long][ClaudeSelfToolsPlaceTest]::OwnLow()',
         '$hosted = $null',
         'if ($owner -ne 0) { $hosted = [ClaudeSelfToolsPlace]::Hosted([IntPtr]::new($owner), [IntPtr]::new([long][ClaudeSelfToolsPlaceTest]::ConsoleLow())) }',
-        `[Console]::Out.WriteLine((ConvertTo-Json -Compress -Depth 4 -InputObject ([ordered]@{ clamp = @(${calls.join(', ')}); kind = $kind; hosted = $hosted })))`,
+        `[Console]::Out.WriteLine((ConvertTo-Json -Compress -Depth 4 -InputObject ([ordered]@{ clamp = @(${calls.join(', ')}); overhang = @(${overhangs.join(', ')}); kind = $kind; hosted = $hosted })))`,
       ].join('\r\n')
       const ran = hidden(script, shell)
       assert.equal(ran.code, 0, `${ran.out}${ran.err}`)
@@ -124,8 +152,15 @@ describe('the window\'s own C#, compiled, its Clamp held to clampToWork (no wind
       t.diagnostic(answer.kind === 'no console window' ? 'this hidden shell has no console window, so nothing is counted here' : `this hidden shell's console: ${answer.kind}; Hosted: ${answer.hosted ?? 'not counted (no Windows Terminal window owns it)'}`)
       assert.ok(answer.hosted === null || (Number.isInteger(answer.hosted) && answer.hosted >= -1), `Hosted answers a count or -1: ${JSON.stringify(answer)}`)
       const got = answer.clamp
-      const wrong = CLAMP_PAIRS.map(([rect, work], i) => [rect, work, got[i], machine.clampToWork(rect, work)]).filter(([, , cs, ts]) => JSON.stringify(cs) !== JSON.stringify(ts))
-      assert.deepEqual(wrong.map(([rect, work, cs, ts]) => `${JSON.stringify(rect)} in ${JSON.stringify(work)}: C# ${JSON.stringify(cs)}, TypeScript ${JSON.stringify(ts)}`), [])
+      const wrong = CLAMP_PAIRS.map(([rect, work, border = [0, 0, 0]], i) => [rect, work, border, got[i], machine.clampToWork(rect, work, border)]).filter(([, , , cs, ts]) => JSON.stringify(cs) !== JSON.stringify(ts))
+      const misread = OVERHANG_PAIRS.map(([rect, frame], i) => [rect, frame, answer.overhang[i], machine.overhangOf(rect, frame)]).filter(([, , cs, ts]) => JSON.stringify(cs) !== JSON.stringify(ts))
+      assert.deepEqual(
+        [
+          ...wrong.map(([rect, work, border, cs, ts]) => `Clamp ${JSON.stringify(rect)} in ${JSON.stringify(work)} by ${JSON.stringify(border)}: C# ${JSON.stringify(cs)}, TypeScript ${JSON.stringify(ts)}`),
+          ...misread.map(([rect, frame, cs, ts]) => `Overhang ${JSON.stringify(rect)} framed ${JSON.stringify(frame)}: C# ${JSON.stringify(cs)}, TypeScript ${JSON.stringify(ts)}`),
+        ],
+        [],
+      )
     })
   }
 })
@@ -163,6 +198,7 @@ const TEST_CS = [
   '[DllImport("kernel32.dll")] static extern bool GetExitCodeProcess(IntPtr process, out uint code);',
   '[DllImport("kernel32.dll", SetLastError = true)] static extern bool TerminateProcess(IntPtr process, uint code);',
   '[DllImport("kernel32.dll")] static extern bool CloseHandle(IntPtr handle);',
+  '[DllImport("dwmapi.dll")] static extern int DwmGetWindowAttribute(IntPtr window, uint attribute, out Box value, int size);',
   'static long Low(IntPtr window) { return window.ToInt64() & 0xffffffffL; }',
   'static string ClassOf(IntPtr window) { StringBuilder name = new StringBuilder(256); return GetClassNameW(window, name, name.Capacity) > 0 ? name.ToString() : ""; }',
   'static IntPtr Own() { IntPtr console = GetConsoleWindow(); if (console == IntPtr.Zero) return IntPtr.Zero; string kind = ClassOf(console); if (kind == "ConsoleWindowClass") return console; if (kind == "PseudoConsoleWindow") { IntPtr owner = GetWindow(console, 4); if (owner != IntPtr.Zero && ClassOf(owner) == "CASCADIA_HOSTING_WINDOW_CLASS") return owner; } return IntPtr.Zero; }',
@@ -172,6 +208,8 @@ const TEST_CS = [
   'public static long OwnerLow() { IntPtr console = GetConsoleWindow(); return console == IntPtr.Zero ? 0 : Low(GetWindow(console, 4)); }',
   'public static int[] OwnRect() { IntPtr before = SetThreadDpiAwarenessContext(new IntPtr(-4)); try { Box box; if (!GetWindowRect(Own(), out box)) return new int[0]; return new int[] { box.Left, box.Top, box.Right - box.Left, box.Bottom - box.Top }; } finally { if (before != IntPtr.Zero) SetThreadDpiAwarenessContext(before); } }',
   'public static int[] OwnNormal() { IntPtr before = SetThreadDpiAwarenessContext(new IntPtr(-4)); try { Placement place = new Placement(); place.Length = Marshal.SizeOf(typeof(Placement)); if (!GetWindowPlacement(Own(), ref place)) return new int[0]; return new int[] { place.Normal.Left, place.Normal.Top, place.Normal.Right - place.Normal.Left, place.Normal.Bottom - place.Normal.Top }; } finally { if (before != IntPtr.Zero) SetThreadDpiAwarenessContext(before); } }',
+  // #90: its drawn frame (DWMWA_EXTENDED_FRAME_BOUNDS, 9), [left, top, right, bottom], read per-monitor aware as the shipped BorderOf reads it.
+  'public static int[] OwnFrame() { IntPtr before = SetThreadDpiAwarenessContext(new IntPtr(-4)); try { Box box; if (DwmGetWindowAttribute(Own(), 9, out box, Marshal.SizeOf(typeof(Box))) != 0) return new int[0]; return new int[] { box.Left, box.Top, box.Right, box.Bottom }; } finally { if (before != IntPtr.Zero) SetThreadDpiAwarenessContext(before); } }',
   'public static bool OwnZoomed() { return IsZoomed(Own()); }',
   'public static int[] OwnWork() { IntPtr before = SetThreadDpiAwarenessContext(new IntPtr(-4)); try { MonitorInfo info = new MonitorInfo(); info.Size = (uint)Marshal.SizeOf(typeof(MonitorInfo)); if (!GetMonitorInfoW(MonitorFromWindow(Own(), 2), ref info)) return new int[0]; return new int[] { info.Work.Left, info.Work.Top, info.Work.Right, info.Work.Bottom }; } finally { if (before != IntPtr.Zero) SetThreadDpiAwarenessContext(before); } }',
   'public static long Foreground() { return Low(GetForegroundWindow()); }',
@@ -295,6 +333,7 @@ function openWindow(plan) {
     `    if (-not ("ClaudeSelfToolsPlace" -as [type])) { Add-Type -ErrorAction Stop -TypeDefinition ${psq(machine.PLACE_CS)} }`,
     '    if ($result.kind -like "PseudoConsoleWindow*") { $result.hosted = [ClaudeSelfToolsPlace]::Hosted([IntPtr]::new([long]$result.own), [IntPtr]::new([long]$result.console)) }',
     `    $result.rectAfter = @(${T}::OwnRect())`,
+    `    $result.frameAfter = @(${T}::OwnFrame())`,
     `    $result.zoomed = ${T}::OwnZoomed()`,
     `    $result.work = @(${T}::OwnWork())`,
     // The restore rectangle, a read: GetWindowPlacement's normal rectangle, in its own coordinates (workspace ones, from memory).
@@ -422,16 +461,21 @@ describe('the plain window places itself, live (#5)', { skip: liveSkip, concurre
     const rect = [30000, 30000, 640, 400]
     const [x, y, w, h] = rect
     if (screens.some(({ monitor: [l, top, r, b] }) => x < r && x + w > l && y < b && y + h > top)) return t.skip('a monitor reaches 30000,30000 here, so the rectangle is not off every monitor')
-    // The target once Windows has picked the monitor: Clamp onto the work area the window is on, as PLACE_CS computes it.
-    const prelude = [`function Get-Target { $w = @(${T}::OwnWork()); if ($w.Count -ne 4) { return @() }; return @([ClaudeSelfToolsPlace]::Clamp([int]${x}, [int]${y}, [int]${w}, [int]${h}, $w[0], $w[1], $w[2], $w[3])) }`]
+    // The target once Windows has picked the monitor: Clamp onto the work area the window is on, passed by the window's own
+    // border (#90: its rectangle and its drawn frame, read now, Overhang's arithmetic), as PLACE_CS computes it.
+    const prelude = [`function Get-Target { $w = @(${T}::OwnWork()); $r = @(${T}::OwnRect()); $f = @(${T}::OwnFrame()); if ($w.Count -ne 4 -or $r.Count -ne 4 -or $f.Count -ne 4) { return @() }; $b = @([ClaudeSelfToolsPlace]::Overhang($r[0], $r[1], $r[0] + $r[2], $r[1] + $r[3], $f[0], $f[1], $f[2], $f[3])); return @([ClaudeSelfToolsPlace]::Clamp([int]${x}, [int]${y}, [int]${w}, [int]${h}, $w[0], $w[1], $w[2], $w[3], $b[0], $b[1], $b[2])) }`]
     const opened = openWindow({ place: { rect }, prelude, until: `((@(${T}::OwnRect()) -join ",") -ne ($result.rectBefore -join ",")) -and (Test-Near @(${T}::OwnRect()) @(Get-Target))` })
     if (!settled(t, opened)) return
     const { result } = opened
     assert.equal(result.placeSaid, 'placed', seen(opened))
     assert.notEqual(result.settledMs, null, `moved onto its work area within ${SETTLE_LIMIT_MS} ms: ${seen(opened)}`)
     assert.notDeepEqual(result.rectAfter, result.rectBefore, `it moved: ${seen(opened)}`)
-    assert.ok(rectNear(result.rectAfter, machine.clampToWork(rect, result.work)), `at clampToWork(${JSON.stringify(rect)}, ${JSON.stringify(result.work)}): ${seen(opened)}`)
-    t.diagnostic(`Windows put it on the work area ${JSON.stringify(result.work)}; the model's choice (clampToMonitors) is ${JSON.stringify(machine.clampToMonitors(rect, screens))}`)
+    // #90: the border its frame was read with, after the move: the rectangle as [left, top, right, bottom] against its frame.
+    const [ax, ay, aw, ah] = result.rectAfter
+    const border = Array.isArray(result.frameAfter) && result.frameAfter.length === 4 ? machine.overhangOf([ax, ay, ax + aw, ay + ah], result.frameAfter) : machine.NO_OVERHANG
+    t.diagnostic(`its border, read after the move: ${JSON.stringify(border)} (frame ${JSON.stringify(result.frameAfter)})`)
+    assert.ok(rectNear(result.rectAfter, machine.clampToWork(rect, result.work, border)), `at clampToWork(${JSON.stringify(rect)}, ${JSON.stringify(result.work)}, ${JSON.stringify(border)}): ${seen(opened)}`)
+    t.diagnostic(`Windows put it on the work area ${JSON.stringify(result.work)}; the model's choice (clampToMonitors) is ${JSON.stringify(machine.clampToMonitors(rect, screens, border))}`)
   })
 
   test(`an unplaced window is not moved (watched for ${WATCH_MS / 1000} s)`, t => {
@@ -440,5 +484,146 @@ describe('the plain window places itself, live (#5)', { skip: liveSkip, concurre
     const { result } = opened
     assert.equal(result.placeSaid, undefined, `no placing line ran: ${seen(opened)}`)
     assert.deepEqual(result.rectAfter, result.rectBefore, `where it opened, ${WATCH_MS / 1000} s later: ${seen(opened)}`)
+  })
+})
+
+// #90 and #91, live: at most two windows of the test's own, one at a time, each running only the test's own script,
+// which ends by itself (every wait in it is bounded), so its tab and its window close. Only with SELF_PLACE_LIVE=1.
+// 1. A plain window flush against its work area's left edge (#90): the shipped placing lines are asked for a rect 64 px
+//    past that edge; the clamp brings it back to the window's own border, so its drawn frame starts at the edge.
+// 2. A named window placed by its first tab (#91), only with SELF_PLACE_WT=1 as well: it runs wt.exe, so it runs only in
+//    a guarded run. wt.exe -w <a name made for this run alone> nt, its tab running the test's script,
+//    which holds the slot runner's own place lines byte for byte ($PlaceCs, Set-OwnPlace and the lines they read, cut from
+//    claude-slot.ps1), with the test's own -Place and -Claim. The starter makes the launch's two events first, as launch()
+//    does, then starts wt, and waits on them for PLACE_WAIT_MS, as launch() does.
+// Focus: the plain window opens with SW_SHOWNOACTIVATE (as above). wt.exe has no option that opens a window without
+// focus (its command-line page lists none), so the named window takes it. Each records the window in front before it
+// and after its place, as a fact, never a failure. Never the person's own windows: the plain window keeps the guard
+// above; the named window's name is new for this run, and the shipped lines move it only while it holds one console.
+const FLUSH_WINDOWS = 2
+/** The longest the named window may take: wt's start, the place's compile, its wait, and the starter's look for its result (an estimate's bound). */
+const NAMED_LIMIT_MS = machine.PLACE_WAIT_MS + WINDOW_LIMIT_MS
+const wtWanted = process.env.SELF_PLACE_WT === '1'
+
+describe('flush against an edge, and a first tab placing its named window, live (#90, #91)', { skip: liveSkip, concurrency: 1 }, () => {
+  let screens
+  /** The test's C# built by Windows PowerShell 5.1, for the named window's tab, which runs in 5.1. */
+  let dll51
+  before(() => {
+    assert.ok(LIVE?.shell !== undefined, LIVE?.why ?? 'the shipped shell rule was not read')
+    process.stdout.write(`window-place-live (#90, #91): opens at most ${FLUSH_WINDOWS} windows, one at a time: a plain window (at most ${STARTER_LIMIT_MS / 1000} s)${wtWanted ? `, then a named Windows Terminal window through wt.exe (at most ${NAMED_LIMIT_MS / 1000} s)` : '; the named window is skipped without SELF_PLACE_WT=1'}. Each runs only this test's script, which ends by itself.\n`)
+    work = mkdtempSync(join(tmpdir(), 'window-flush-'))
+    dll = join(work, 'place-test.dll')
+    const compiled = hidden(`Add-Type -ErrorAction Stop -TypeDefinition ${psq(TEST_CS)} -OutputAssembly ${psq(dll)}`, LIVE.shell)
+    assert.ok(compiled.code === 0 && existsSync(dll), `the test's C# compiled: ${compiled.out}${compiled.err}`)
+    // The named window's tab runs Windows PowerShell 5.1, as the shipped slot runner does, so it loads a DLL 5.1 built.
+    // What that rests on, from memory, not a run: an assembly Add-Type builds under PowerShell 7 references .NET's newer
+    // System.Runtime, which .NET Framework 4.8 under 5.1 cannot bind, so 5.1 could not load the DLL built in LIVE.shell.
+    dll51 = join(work, 'place-test-51.dll')
+    const compiled51 = hidden(`Add-Type -ErrorAction Stop -TypeDefinition ${psq(TEST_CS)} -OutputAssembly ${psq(dll51)}`, WINDOWS_POWERSHELL)
+    assert.ok(compiled51.code === 0 && existsSync(dll51), `the test's C# compiled in Windows PowerShell 5.1: ${compiled51.out}${compiled51.err}`)
+    const read = hidden([`Add-Type -ErrorAction Stop -Path ${psq(dll)}`, `[Console]::Out.WriteLine(${T}::Monitors())`].join('\r\n'), LIVE.shell)
+    assert.equal(read.code, 0, `${read.out}${read.err}`)
+    screens = read.out.trim().split(/\r?\n/).at(-1).split(';').map(row => row.split(',').map(Number)).map(n => ({ monitor: n.slice(0, 4), work: n.slice(4, 8), primary: n[8] === 1 }))
+  })
+  after(() => {
+    if (work !== undefined) rmSync(work, { recursive: true, force: true })
+  })
+
+  test('#90: a plain window flush against its work area\'s left edge: its drawn frame at the edge, its rectangle past it by its own border', t => {
+    const primary = screens.find(s => s.primary)
+    const rect = [primary.work[0] - 64, primary.work[1] + 60, 640, 400]
+    const opened = openWindow({ place: { rect }, until: `((@(${T}::OwnRect()) -join ",") -ne ($result.rectBefore -join ","))` })
+    if (!settled(t, opened)) return
+    const { result } = opened
+    const [ax, ay, aw, ah] = result.rectAfter
+    const border = Array.isArray(result.frameAfter) && result.frameAfter.length === 4 ? machine.overhangOf([ax, ay, ax + aw, ay + ah], result.frameAfter) : machine.NO_OVERHANG
+    t.diagnostic(`its border, read after the move: ${JSON.stringify(border)}; its frame ${JSON.stringify(result.frameAfter)} on the work area ${JSON.stringify(result.work)}`)
+    assert.equal(result.placeSaid, 'placed', seen(opened))
+    assert.ok(rectNear(result.rectAfter, machine.clampToWork(rect, result.work, border)), `at clampToWork(${JSON.stringify(rect)}, ${JSON.stringify(result.work)}, ${JSON.stringify(border)}): ${seen(opened)}`)
+    if (border[0] === 0) return t.skip(`its border read as none (${JSON.stringify(result.frameAfter)}), so flush is the work area's own edge`)
+    assert.ok(near(result.frameAfter[0], result.work[0], POS_TOLERANCE), `its drawn frame starts at the work area's left edge: ${seen(opened)}`)
+  })
+
+  test('#91: a named window placed by its first tab, through the slot runner\'s own lines (wt.exe; only with SELF_PLACE_WT=1)', { skip: !wtWanted && 'runs wt.exe: only in the guarded run, with SELF_PLACE_WT=1' }, t => {
+    const wtExe = join(process.env.LOCALAPPDATA ?? '', 'Microsoft', 'WindowsApps', 'wt.exe')
+    if (!existsSync(wtExe)) return t.skip(`no wt.exe at ${wtExe}`)
+    const primary = screens.find(s => s.primary)
+    const rect = [primary.work[0] + 150, primary.work[1] + 110, 700, 450]
+    const uuid = randomUUID()
+    const name = `self-place-test-${uuid.slice(0, 8)}`
+    // The slot runner's own lines, byte for byte: what it reads, $PlaceCs, Set-OwnPlace and Send-PlaceWord, called as it calls them.
+    const runner = readFileSync(join(ROOT, 'plugins', 'self-switch', 'slot', 'claude-slot.ps1'), 'utf8')
+    const lineOf = start => runner.split('\n').find(line => line.startsWith(start))
+    const functionOf = name => {
+      const at = runner.indexOf(`function ${name}`)
+      return at < 0 ? undefined : runner.slice(at, runner.indexOf('\n}\n', at) + 2)
+    }
+    const placing = [functionOf('Set-OwnPlace {'), functionOf('Send-PlaceWord(')]
+    const call = lineOf('    if ($Place) { ')?.trim().replace(/^if \(\$Place\) \{ (.*) \}$/, '$1')
+    const shipped = ['$LaunchClaim = ', '$PlaceArg = ', '$PlacedSignal = ', '$UnplacedSignal = ', '$PlaceCs = '].map(lineOf)
+    assert.ok(placing.every(f => f !== undefined) && call === 'Send-PlaceWord (Set-OwnPlace)' && shipped.every(line => line !== undefined), 'the slot runner holds its place lines')
+    const dir = mkdtempSync(join(work, 'named-'))
+    const files = { script: join(dir, 'tab.ps1'), result: join(dir, 'result.json') }
+    for (const path of Object.values(files)) assert.ok(!/['";%]/.test(path), 'no quote, semicolon or % in a path wt or the scripts take')
+    const target = `@(${T}::OwnRect())`
+    const lines = [
+      '$ErrorActionPreference = "Stop"',
+      '$result = [ordered]@{}',
+      'try {',
+      `  Add-Type -ErrorAction Stop -Path ${psq(dll51)}`,
+      `  $result.frontAtStart = ${T}::Foreground()`,
+      `  $result.own = ${T}::OwnLow()`,
+      `  $result.kind = ${T}::OwnKind()`,
+      `  $result.rectBefore = ${target}`,
+      ...shipped,
+      `$Place = '${machine.placeArgument(rect)}'`,
+      `$Claim = 'launch:${uuid}'`,
+      ...placing,
+      '  $clock = [Diagnostics.Stopwatch]::StartNew()',
+      `  ${call}`,
+      '  $result.placeMs = $clock.ElapsedMilliseconds',
+      `  $settle = [Diagnostics.Stopwatch]::StartNew(); while ($settle.ElapsedMilliseconds -lt ${SETTLE_LIMIT_MS} -and ((${target} -join ",") -eq ($result.rectBefore -join ","))) { Start-Sleep -Milliseconds ${POLL_MS} }`,
+      `  $result.rectAfter = ${target}`,
+      `  $result.frameAfter = @(${T}::OwnFrame())`,
+      `  $result.work = @(${T}::OwnWork())`,
+      '  if ($result.kind -like "PseudoConsoleWindow*") { $result.hosted = [ClaudeSelfToolsPlace]::Hosted([IntPtr]::new([long]$result.own), [IntPtr]::new([long][ClaudeSelfToolsPlaceTest]::ConsoleLow())) }',
+      `  $result.frontAfter = ${T}::Foreground()`,
+      '} catch { $result.error = $_.Exception.Message }',
+      `[IO.File]::WriteAllText(${psq(files.result)}, (ConvertTo-Json -Compress -Depth 4 -InputObject $result))`,
+      'exit 0',
+    ]
+    writeFileSync(files.script, `\ufeff${lines.join('\r\n')}`)
+    const wtLine = ['-w', name, 'nt', '--title', 'place-test', '--suppressApplicationTitle', '--', WINDOWS_POWERSHELL, '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', files.script].map(machine.wtArgument).join(' ')
+    // The starter: the launch's two events first, as launch() makes them, then wt, then the wait on them, then a bounded look for the result.
+    const starter = [
+      `Add-Type -ErrorAction Stop -Path ${psq(dll)}`,
+      '$placedNew = $false',
+      '$unplacedNew = $false',
+      `$placedSignal = [Threading.EventWaitHandle]::new($false, [Threading.EventResetMode]::ManualReset, ${psq(machine.placeSignalName(uuid, 'placed'))}, [ref]$placedNew)`,
+      `$unplacedSignal = [Threading.EventWaitHandle]::new($false, [Threading.EventResetMode]::ManualReset, ${psq(machine.placeSignalName(uuid, 'unplaced'))}, [ref]$unplacedNew)`,
+      `$frontBefore = ${T}::Foreground()`,
+      '$clock = [Diagnostics.Stopwatch]::StartNew()',
+      `[void](Start-Process ${psq(wtExe)} -ArgumentList ${psq(wtLine)} -PassThru)`,
+      `$seen = [Threading.WaitHandle]::WaitAny([Threading.WaitHandle[]]@($placedSignal, $unplacedSignal), ${machine.PLACE_WAIT_MS})`,
+      '$signalMs = $clock.ElapsedMilliseconds',
+      `$look = [Diagnostics.Stopwatch]::StartNew(); while ($look.ElapsedMilliseconds -lt ${WINDOW_LIMIT_MS} -and -not (Test-Path -LiteralPath ${psq(files.result)})) { Start-Sleep -Milliseconds 100 }`,
+      '[Console]::Out.WriteLine((ConvertTo-Json -Compress -InputObject ([ordered]@{ frontBefore = $frontBefore; seen = $seen; signalMs = $signalMs; fresh = ($placedNew -and $unplacedNew) })))',
+    ].join('\r\n')
+    const ran = hidden(starter, LIVE.shell, NAMED_LIMIT_MS + 10_000)
+    assert.equal(ran.code, 0, `${ran.out}${ran.err}`)
+    const record = JSON.parse(ran.out.trim().split(/\r?\n/).at(-1))
+    assert.ok(existsSync(files.result), `the tab wrote nothing (its window may still be open, named ${name}: close it by hand): ${JSON.stringify(record)}`)
+    const result = JSON.parse(readFileSync(files.result, 'utf8').replace(/^\ufeff/, ''))
+    const opened = { result, record }
+    t.diagnostic(`the place's event: ${record.seen === 0 ? 'placed' : record.seen === 1 ? 'unplaced' : 'none'} ${record.signalMs} ms after wt started; the place took ${result.placeMs} ms in the tab`)
+    t.diagnostic(`the window in front: before ${record.frontBefore}; as the tab began ${result.frontAtStart}; after its place ${result.frontAfter} (${result.frontAfter === result.own ? 'the new window' : 'another'})`)
+    assert.equal(result.error, undefined, seen(opened))
+    assert.equal(record.fresh, true, 'both events were this run\'s own')
+    assert.equal(result.hosted, 1, `a new named window holds its first tab's console alone: ${seen(opened)}`)
+    assert.equal(record.seen, 0, `its first tab said placed, within ${machine.PLACE_WAIT_MS / 1000} s: ${seen(opened)}`)
+    const [ax, ay, aw, ah] = result.rectAfter
+    const border = Array.isArray(result.frameAfter) && result.frameAfter.length === 4 ? machine.overhangOf([ax, ay, ax + aw, ay + ah], result.frameAfter) : machine.NO_OVERHANG
+    assert.ok(rectNear(result.rectAfter, machine.clampToWork(rect, result.work, border)), `at its rect, exactly in pixels (wt alone sizes in cells): ${seen(opened)}`)
   })
 })

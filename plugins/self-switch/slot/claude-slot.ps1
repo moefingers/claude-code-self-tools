@@ -39,6 +39,17 @@
 #   a left record's stat (-LeftSize and -LeftMtime, or -LeftExitAt), its transcript is unchanged since; its
 #   floor and cap; then claude --resume <uuid> here. -WaitFor <pid>-<created> first waits for that process to
 #   exit, as long as this tab's claim holds (read at every look). -ConfigDirs "<folder>|<folder>" names other config folders the look reads.
+# - With -Place r<x>,<y>,<width>,<height> as well (#91: the first tab of a new window of placement.json's grid), it
+#   first places its own window there, before anything else that waits: PLACE_CS in the plugins' machine code, byte
+#   for byte ($PlaceCs), which finds its window from this process's own console and moves it only when that Windows
+#   Terminal window holds this console alone (a tab joining a window with other tabs places nothing). Its only inputs
+#   are those four whole numbers, checked here as a rect is (x and y within 32768, 320 to 32768 wide, 200 to 32768
+#   tall). Then it sets one of the two events its launch alone made for its -Claim (placed, or not: it says why here),
+#   so the launch's next tab for that window comes after the place. A failure is said here, and the tab goes on.
+# - With -Prompt as well (#91): its launch wrote a first prompt to prompts\<the uuid of -Claim>.txt beside this
+#   script; it hands that file to claude-launch.ps1 -PromptFile, which reads and checks it, and deletes it once claude
+#   has ended, or when this tab refuses (its checks, or a launcher of another hash). The path is built from -Claim,
+#   never read off the command line.
 # - When Claude Code exits, it looks for the record a switch, a restart or a launch left for this pane:
 #   slots\<pid>-<created>.next.json, where <pid> is this script's process id and <created> its creation
 #   time (a FILETIME), so a record names one run of one pane. It deletes the record before anything else,
@@ -66,7 +77,7 @@
 # It passes claude no other argument: no permission flag of any kind. A resumed session starts in the
 # mode a new session would.
 
-param([switch]$Idle, [string]$Start, [string]$Name, [string]$Resume, [string]$WaitFor, [string]$ConfigDirs, [string]$LeftSize, [string]$LeftMtime, [string]$LeftExitAt, [string]$Launcher, [string]$Claim)
+param([switch]$Idle, [string]$Start, [string]$Name, [string]$Resume, [string]$WaitFor, [string]$ConfigDirs, [string]$LeftSize, [string]$LeftMtime, [string]$LeftExitAt, [string]$Launcher, [string]$Claim, [string]$Place, [switch]$Prompt)
 
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
@@ -82,6 +93,12 @@ $MaxAgeMs = 120000
 $WaitSeconds = 600
 $DefaultMinFreeGb = 5
 $DefaultMaxSessions = 12
+# A tab's own window's place (#91): -Place's shape, the events its launch made (PLACE_SIGNAL_PREFIX in the plugins'
+# machine code), and the C# that places it (PLACE_CS, written here by scripts/embed-launch.mjs, never by hand).
+$PlaceArg = '^r(-?[0-9]{1,5}),(-?[0-9]{1,5}),([0-9]{1,5}),([0-9]{1,5})\z'
+$PlacedSignal = 'Local\claude-self-tools-placed-'
+$UnplacedSignal = 'Local\claude-self-tools-unplaced-'
+$PlaceCs = 'using System; using System.Runtime.InteropServices; using System.Text; public static class ClaudeSelfToolsPlace { [StructLayout(LayoutKind.Sequential)] public struct Box { public int Left; public int Top; public int Right; public int Bottom; } [StructLayout(LayoutKind.Sequential)] public struct MonitorInfo { public uint Size; public Box Whole; public Box Work; public uint Flags; } [DllImport("kernel32.dll")] static extern IntPtr GetConsoleWindow(); [DllImport("user32.dll")] static extern IntPtr GetWindow(IntPtr window, uint relation); [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern int GetClassNameW(IntPtr window, StringBuilder name, int size); [DllImport("user32.dll")] static extern bool IsIconic(IntPtr window); [DllImport("user32.dll")] static extern bool IsZoomed(IntPtr window); [DllImport("user32.dll")] static extern IntPtr SetThreadDpiAwarenessContext(IntPtr context); [DllImport("user32.dll")] static extern IntPtr MonitorFromRect(ref Box rect, uint fallback); [DllImport("user32.dll")] static extern bool GetMonitorInfoW(IntPtr monitor, ref MonitorInfo info); [DllImport("user32.dll", SetLastError = true)] static extern bool SetWindowPos(IntPtr window, IntPtr after, int x, int y, int width, int height, uint flags); [DllImport("user32.dll")] static extern bool ShowWindowAsync(IntPtr window, int show); public delegate bool EachWindow(IntPtr found, IntPtr data); [DllImport("user32.dll")] static extern bool EnumWindows(EachWindow each, IntPtr data); [DllImport("user32.dll")] static extern bool GetWindowRect(IntPtr window, out Box box); [DllImport("dwmapi.dll")] static extern int DwmGetWindowAttribute(IntPtr window, uint attribute, out Box value, int size); static string ClassOf(IntPtr window) { StringBuilder name = new StringBuilder(256); return GetClassNameW(window, name, name.Capacity) > 0 ? name.ToString() : ""; } static bool Same(IntPtr a, IntPtr b) { return (a.ToInt64() & 0xffffffffL) == (b.ToInt64() & 0xffffffffL); } public static int Hosted(IntPtr window, IntPtr console) { int count = 0; bool seen = false; EachWindow each = delegate(IntPtr found, IntPtr data) { if (ClassOf(found) == "PseudoConsoleWindow" && Same(GetWindow(found, 4), window)) { count++; if (Same(found, console)) seen = true; } return true; }; bool listed = EnumWindows(each, IntPtr.Zero); GC.KeepAlive(each); if (!listed) return -1; return seen ? count : -1; } static int Side(int d) { return d >= 2 && d <= 64 ? d : 0; } public static int[] Overhang(int left, int top, int right, int bottom, int frameLeft, int frameTop, int frameRight, int frameBottom) { return new int[] { Side(frameLeft - left), Side(right - frameRight), Side(bottom - frameBottom) }; } public static int[] BorderOf(IntPtr window) { Box rect; Box frame; if (!GetWindowRect(window, out rect) || DwmGetWindowAttribute(window, 9, out frame, Marshal.SizeOf(typeof(Box))) != 0) return new int[] { 0, 0, 0 }; return Overhang(rect.Left, rect.Top, rect.Right, rect.Bottom, frame.Left, frame.Top, frame.Right, frame.Bottom); } public static int[] Clamp(int x, int y, int width, int height, int left, int top, int right, int bottom, int borderLeft, int borderRight, int borderBottom) { left = left - borderLeft; right = right + borderRight; bottom = bottom + borderBottom; int w = Math.Min(width, right - left); int h = Math.Min(height, bottom - top); return new int[] { Math.Max(left, Math.Min(x, right - w)), Math.Max(top, Math.Min(y, bottom - h)), w, h }; } public static string Place(int x, int y, int width, int height, bool hasRect, bool maximized) { IntPtr console = GetConsoleWindow(); if (console == IntPtr.Zero) return "it has no console window"; string kind = ClassOf(console); IntPtr own = IntPtr.Zero; if (kind == "ConsoleWindowClass") own = console; else if (kind == "PseudoConsoleWindow") { own = GetWindow(console, 4); if (own == IntPtr.Zero || ClassOf(own) != "CASCADIA_HOSTING_WINDOW_CLASS") return "its console is a pseudoconsole that no Windows Terminal window owns"; int hosted = Hosted(own, console); if (hosted != 1) return "its Windows Terminal window holds other tabs or panes, or its own console could not be counted among them (" + hosted + "), so it is left where it is"; } else return "its console window is of class " + kind + ", neither the classic console nor Windows Terminal"; if (!hasRect && maximized && IsZoomed(own) && !IsIconic(own)) return "placed"; if (IsIconic(own) || IsZoomed(own)) return "it opened minimized or maximized, so it is left as it is"; IntPtr before = SetThreadDpiAwarenessContext(new IntPtr(-4)); if (before == IntPtr.Zero) return "per-monitor DPI awareness could not be set for its thread"; try { if (hasRect) { Box asked = new Box(); asked.Left = x; asked.Top = y; asked.Right = x + width; asked.Bottom = y + height; MonitorInfo info = new MonitorInfo(); info.Size = (uint)Marshal.SizeOf(typeof(MonitorInfo)); IntPtr monitor = MonitorFromRect(ref asked, 2); if (monitor == IntPtr.Zero || !GetMonitorInfoW(monitor, ref info)) return "the monitor for its rectangle could not be read"; int[] border = BorderOf(own); int[] at = Clamp(x, y, width, height, info.Work.Left, info.Work.Top, info.Work.Right, info.Work.Bottom, border[0], border[1], border[2]); if (!SetWindowPos(own, IntPtr.Zero, at[0], at[1], at[2], at[3], 0x4214)) return "SetWindowPos failed with error " + Marshal.GetLastWin32Error(); } if (maximized && !ShowWindowAsync(own, 3)) return "it could not be maximized"; return "placed"; } finally { SetThreadDpiAwarenessContext(before); } } }'
 
 # This slot's id: its process id and creation time, as the probe reads them.
 $me = Get-CimInstance -ClassName Win32_Process -Filter "ProcessId = $PID" -Property ProcessId, CreationDate
@@ -483,6 +500,40 @@ function Get-Next($keyed) {
   return $run
 }
 
+# This tab's own window, placed at -Place (#91): 'placed', or why not, said here too. PLACE_CS finds the window from this
+# process's console, and moves it only when that Windows Terminal window holds this console alone; it takes no handle,
+# name, title or process id from anywhere. Its inputs are -Place's four whole numbers, each checked here. Never throws.
+function Set-OwnPlace {
+  $said = 'not tried'
+  try {
+    if ($Claim -cnotmatch $LaunchClaim) { $said = '-Place goes with a launch''s own -Claim' }
+    elseif (-not ($Place -cmatch $PlaceArg)) { $said = '-Place takes r<x>,<y>,<width>,<height> in whole pixels' }
+    else {
+      $x = [int]$Matches[1]; $y = [int]$Matches[2]; $w = [int]$Matches[3]; $h = [int]$Matches[4]
+      if ([math]::Abs($x) -gt 32768 -or [math]::Abs($y) -gt 32768 -or $w -lt 320 -or $w -gt 32768 -or $h -lt 200 -or $h -gt 32768) { $said = '-Place is not a rect: x and y within 32768, a width of 320 to 32768 and a height of 200 to 32768' }
+      else {
+        Add-Type -ErrorAction Stop -TypeDefinition $PlaceCs
+        $said = [ClaudeSelfToolsPlace]::Place([int]$x, [int]$y, [int]$w, [int]$h, $true, $false)
+      }
+    }
+  } catch { $said = 'it could not be placed (' + $_.Exception.Message + ')' }
+  if ($said -cne 'placed') { Write-Host ('This window is not where placement.json''s grid puts it: ' + $said + '. The session goes on here.') }
+  return $said
+}
+
+# Tells the launch that opened this tab that its place was tried, by the event that launch made for its own -Claim:
+# placed, or not. Named from the checked -Claim alone; an event that is gone (the launch stopped waiting) is passed over.
+function Send-PlaceWord($said) {
+  if ($Claim -cnotmatch $LaunchClaim) { return }
+  $signalName = $(if ($said -ceq 'placed') { $PlacedSignal } else { $UnplacedSignal }) + $Claim.Substring(7)
+  try { $signal = [Threading.EventWaitHandle]::OpenExisting($signalName); try { [void]$signal.Set() } finally { $signal.Dispose() } } catch { }
+}
+
+# Deletes a first prompt's file (#91), its launch's own, by the path built from -Claim. Never throws.
+function Remove-Prompt($path) {
+  if ($null -ne $path) { try { [IO.File]::Delete($path) } catch { } }
+}
+
 # What this tab was opened to run (-Start or -Resume): $null, or what to run. Each checked; a refusal is
 # printed here, and the tab goes on as an idle slot.
 function Get-Asked {
@@ -495,6 +546,11 @@ function Get-Asked {
   if ($null -eq $why -and $Start -and $Name -cnotmatch $AreaName) { $why = '-Start takes -Name: lowercase letters, digits and hyphens' }
   if ($null -eq $why -and $Launcher -cnotmatch $Sha256) { $why = 'it names no launcher by its SHA-256 (-Launcher), so a plugin older than this slot runner opened it: update the plugins, then launch it again' }
   if ($null -eq $why -and $Claim -cnotmatch $LaunchClaim) { $why = 'it names no claim of its own (-Claim), so a plugin older than this slot runner opened it: update the plugins, then launch it again' }
+  # A first prompt (#91): its launch's own file, by this tab's -Claim, never a path off the command line; claude-launch.ps1
+  # reads and checks it. Built whenever -Claim is a launch's, so a refusal below deletes it too.
+  $promptPath = $null
+  if ($Prompt -and $Claim -cmatch $LaunchClaim) { $promptPath = Join-Path $state ('prompts\' + $Claim.Substring(7) + '.txt') }
+  if ($null -eq $why -and $Prompt -and ($null -eq $promptPath -or -not (Test-Path -LiteralPath $promptPath -PathType Leaf))) { $why = 'its launch''s first prompt is not there (prompts\<the uuid of -Claim>.txt beside this script)' }
   $named = @()
   if ($null -eq $why -and $ConfigDirs) {
     $named = @($ConfigDirs.Split('|'))
@@ -554,6 +610,7 @@ function Get-Asked {
     # Its claim back first: once this is said, the lock is free.
     if ($id -cmatch $SessionId -and $Claim -cmatch $LaunchClaim) { Give-Back $id $Claim }
     if ($id -cmatch $SessionId) { Write-Refused $id $Claim $(if ($Start) { 'start' } else { 'resume' }) $here ('This tab did not run what it was opened for: ' + $why + '.') }
+    Remove-Prompt $promptPath
     Write-Host ('This tab did not run what it was opened for: ' + $why + '.')
     if ($id -cmatch $SessionId) { Say-ByHand $id $(if ($Start) { $Name } else { $null }) $here }
     return $null
@@ -561,6 +618,7 @@ function Get-Asked {
   $run = @{ Launcher = $Launcher; Claim = $Claim; Dir = $here }
   if ($dirs.Count -gt 1) { $run.ConfigDir = @($dirs[1..($dirs.Count - 1)]) }
   if ($Start) { $run.Start = $id; $run.Name = $Name } else { $run.Resume = $id; foreach ($k in $leftArgs.Keys) { $run[$k] = $leftArgs[$k] } }
+  if ($null -ne $promptPath) { $run.PromptFile = $promptPath }
   return $run
 }
 
@@ -604,7 +662,7 @@ function Start-Claude($run) {
     if ($run.ContainsKey('Resume')) { Give-Back $run.Resume $held } elseif ($run.ContainsKey('Start')) { Give-Back $run.Start $held }; if ($run.ContainsKey('Resume') -or $run.ContainsKey('Start')) { Write-Refused $(if ($run.ContainsKey('Start')) { $run.Start } else { $run.Resume }) $held $(if ($run.ContainsKey('Start')) { 'start' } else { 'resume' }) $run.Dir ('claude-launch.ps1 is missing at ' + $launcherPath + ', or does not have the SHA-256 ' + $sha) }
     Write-Host ('Nothing started: ' + $launcherPath + ' does not have the SHA-256 ' + $sha + '. It is missing, or it changed after a launch put it there. Launch it again: a launch puts it back.')
     if ($run.ContainsKey('Resume')) { Say-ByHand $run.Resume $null $run.Dir } elseif ($run.ContainsKey('Start')) { Say-ByHand $run.Start $run.Name $run.Dir }
-    return
+    if ($run.ContainsKey('PromptFile')) { Remove-Prompt $run.PromptFile }; return
   }
   Write-Beacon 'running'
   $policy = [Environment]::GetEnvironmentVariable('PSExecutionPolicyPreference', [EnvironmentVariableTarget]::Process)
@@ -614,6 +672,8 @@ function Start-Claude($run) {
   catch { $threw = $_.Exception.Message }
   finally { [Environment]::SetEnvironmentVariable('PSExecutionPolicyPreference', $policy, [EnvironmentVariableTarget]::Process) }
   $code = $LASTEXITCODE
+  # A first prompt goes once (#91): its file goes once claude has ended, whatever the end.
+  if ($run.ContainsKey('PromptFile')) { Remove-Prompt $run.PromptFile }
   # Its claim back first: once this is said, the lock is free. A tab's is this launch's own, so it can be no one
   # else's. A record's, slot:<id>, only on a throw: see the top of this file. Then the line to run it by hand.
   $heldId = if ($run.ContainsKey('Resume')) { $run.Resume } elseif ($run.ContainsKey('Start')) { $run.Start } else { $null }
@@ -626,7 +686,9 @@ function Start-Claude($run) {
 }
 
 try {
-  if ($Start -or $Resume -or $Name -or $WaitFor -or $Launcher -or $Claim) {
+  if ($Start -or $Resume -or $Name -or $WaitFor -or $Launcher -or $Claim -or $Place -or $Prompt) {
+    # Its own window first, when its launch asked (#91): before anything that waits, so that launch's next tab comes after it.
+    if ($Place) { Send-PlaceWord (Set-OwnPlace) }
     # A tab that waits to run what it was opened for is no idle slot: a launch's record would lie unread until
     # that claude has gone, by when it is too old.
     Write-Beacon 'running'

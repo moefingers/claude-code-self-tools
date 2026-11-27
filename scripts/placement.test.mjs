@@ -233,6 +233,8 @@ function layoutProblems(text) {
   need(!code.includes('Get-FileHash'), 'no Get-FileHash')
   need(code.includes('Start-Sleep -Seconds 2'), '2 seconds between calls')
   need(code.includes("'-Idle')"), 'every tab -Idle')
+  // #91: the grid is checked, and nothing is opened from it: the one loop that builds commands reads layout[] alone.
+  need(code.includes("Test-Has $doc 'grid'") && !/foreach \(\$\w+ in \$doc\.grid/.test(code) && (code.match(/\$commands\.Add\(/g) ?? []).length === 1, 'the grid checked, never opened')
   need(!/\bclaude\.exe\b/.test(code.replace(/\$p\.Name/g, '')), 'it never starts claude')
   need(!/\bbash\b|\bmsys\b/i.test(code), 'no bash')
   return problems
@@ -289,6 +291,20 @@ describe('planted faults in the layout script and the validators, each caught', 
     const rectCase = fixture.bad.find(c => c.name === 'a rect on a named window')
     assert.equal(psTakes(rectCase.file, path, 'fault').code, 0, 'the copy takes it')
     assert.ok('errors' in machine.readPlacement(shapedOf(rectCase.file)), 'readPlacement still refuses it')
+  })
+
+  test('#91: a session named in two grid windows accepted by the PowerShell validator alone: the two then disagree on the shared list', () => {
+    const { path } = copyWith('grid-twice', 'elseif ($gridSessions.ContainsKey($t)) { Add-Fault', 'elseif ($false) { Add-Fault')
+    const twice = fixture.bad.find(c => c.name === 'a session named in two grid windows')
+    assert.equal(psTakes(twice.file, path, 'fault').code, 0, 'the copy takes it')
+    assert.ok('errors' in machine.readPlacement(shapedOf(twice.file)), 'readPlacement still refuses it')
+  })
+
+  test('#91: a grid window with both a rect and maximized accepted by the PowerShell validator alone: the two then disagree', () => {
+    const { path } = copyWith('grid-both', "if ((Test-Has $w 'rect') -and (Test-Has $w 'maximized')) { Add-Fault", "if ($false) { Add-Fault")
+    const both = fixture.bad.find(c => c.name === 'a grid window with both a rect and maximized')
+    assert.equal(psTakes(both.file, path, 'fault').code, 0, 'the copy takes it')
+    assert.ok('errors' in machine.readPlacement(shapedOf(both.file)), 'readPlacement still refuses it')
   })
 
   test('#5: a key given as null read as absent again by the PowerShell validator: the two then disagree', () => {

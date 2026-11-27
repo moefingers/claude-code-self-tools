@@ -64,7 +64,7 @@
     {
       "name": "self-switch",
       "source": "./plugins/self-switch",
-      "description": "Switches the terminal to another conversation on Windows once the turn ends, for your own use: only when that conversation is open nowhere on this machine and nothing runs under this session; in place, in the pane's slot, or in a new window. It refuses where the coordinator runs switches."
+      "description": "Switches the terminal to another conversation on Windows once the turn ends, for your own use: only when that conversation is open nowhere on this machine and nothing runs under this session; in place, in the pane's slot, or in a new window. It refuses where the coordinator runs switches. Its launch_sessions tool opens a list of sessions where placement.json's grid puts them."
     },
     {
       "name": "self-secret",

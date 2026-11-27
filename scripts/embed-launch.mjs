@@ -4,7 +4,8 @@
 // LAUNCH_SCRIPT_VERSION. First it pins the claude wrapper (tools/claude-wrapper/claude-wrapper.ps1): its
 // SHA-256 into claude-launch.ps1's `$WrapperSha256` and into WRAPPER_SCRIPT_SHA256, and its text into
 // WRAPPER_SCRIPT_TEXT (right after wrapperScriptPath), so a change to the wrapper is a change to the
-// launcher too. It pins the slot runner too: its SHA-256 into claude-layout.ps1's `$SlotSha`, and
+// launcher too. It writes PLACE_CS into the slot runner's `$PlaceCs` line (#91), imported from the machine code. It
+// pins the slot runner too: its SHA-256 into claude-layout.ps1's `$SlotSha`, and
 // into SLOT_SCRIPT_SHA256; then the layout script's own into LAYOUT_SCRIPT_SHA256. Run after any edit to
 // one of the four, with claude-launch's version line one higher if it changed (an edit to the wrapper
 // changes it), then `node scripts/sync-shared.mjs`; scripts/claude-launch.test.mjs and
@@ -12,6 +13,7 @@
 import { createHash } from 'node:crypto'
 import { readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
+import { pathToFileURL } from 'node:url'
 import { ROOT } from './sync-shared.mjs'
 
 const SLOT_FOLDER = join(ROOT, 'plugins', 'self-switch', 'slot')
@@ -76,7 +78,17 @@ const lines = {
 }
 for (const [name, line] of Object.entries(lines)) if (!line.test(text)) throw new Error(`${name} is not where this script expects it`)
 
-const slotSha = sha256(plain('claude-slot.ps1', readFileSync(join(SLOT_FOLDER, 'claude-slot.ps1'), 'utf8')))
+// The slot runner carries PLACE_CS byte for byte (#91: a tab places its own window), as one single-quoted line, written
+// here from the machine code before the runner's hash is taken: never by hand.
+const { PLACE_CS } = await import(pathToFileURL(file).href)
+if (typeof PLACE_CS !== 'string' || /['\u2018-\u201b\r\n]/.test(PLACE_CS)) throw new Error('PLACE_CS holds a quote or a line break, which one single-quoted line cannot carry')
+const slotFile = join(SLOT_FOLDER, 'claude-slot.ps1')
+const placeLine = /^\$PlaceCs = '[^'\n]*'$/m
+const oldSlot = plain('claude-slot.ps1', readFileSync(slotFile, 'utf8'))
+if (!placeLine.test(oldSlot)) throw new Error('claude-slot.ps1 has no $PlaceCs line')
+const slot = plain('PLACE_CS', oldSlot.replace(placeLine, () => `$PlaceCs = '${PLACE_CS}'`))
+if (slot !== oldSlot) writeFileSync(slotFile, slot)
+const slotSha = sha256(slot)
 const layoutFile = join(SLOT_FOLDER, 'claude-layout.ps1')
 const layoutLine = /^\$SlotSha = '[^']*'$/m
 const oldLayout = plain('claude-layout.ps1', readFileSync(layoutFile, 'utf8'))

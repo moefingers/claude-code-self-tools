@@ -112,8 +112,11 @@ function outerOf(script) {
  * rest read (and SetThreadDpiAwarenessContext sets the thread's own DPI awareness, put back as it was).
  * EnumWindows is the one listing of windows: it lists the top-level windows once, reads each one's class name, reads
  * the owner of those that are pseudoconsole windows, acts on none, and is there to refuse, never to choose a target
- * (no title is read); held below to its one declaration, its one call and its callback's exact text. An edit that
- * adds, drops or changes one fails here until it is reviewed and this list changed with it.
+ * (no title is read); held below to its one declaration, its one call and its callback's exact text. #90 added two
+ * reads, GetWindowRect and DwmGetWindowAttribute (DWMWA_EXTENDED_FRAME_BOUNDS, 9), each called once, by BorderOf, on
+ * its own window alone: the rectangle and the drawn frame, whose difference is the overhang the clamp may take. No
+ * acting call was added. An edit that adds, drops or changes one fails here until it is reviewed and this list changed
+ * with it.
  */
 const REVIEWED_IMPORTS = [
   '[DllImport("kernel32.dll")] static extern IntPtr GetConsoleWindow();',
@@ -127,6 +130,8 @@ const REVIEWED_IMPORTS = [
   '[DllImport("user32.dll", SetLastError = true)] static extern bool SetWindowPos(IntPtr window, IntPtr after, int x, int y, int width, int height, uint flags);',
   '[DllImport("user32.dll")] static extern bool ShowWindowAsync(IntPtr window, int show);',
   '[DllImport("user32.dll")] static extern bool EnumWindows(EachWindow each, IntPtr data);',
+  '[DllImport("user32.dll")] static extern bool GetWindowRect(IntPtr window, out Box box);',
+  '[DllImport("dwmapi.dll")] static extern int DwmGetWindowAttribute(IntPtr window, uint attribute, out Box value, int size);',
 ]
 
 /**
@@ -140,7 +145,9 @@ const FORBIDDEN_IN_PLACE = ['FindWindow', 'EnumChildWindows', 'EnumDesktopWindow
 const LEFT = { monitor: [-1920, 0, 0, 1080], work: [-1920, 0, 0, 1040] }
 const PRIMARY = { monitor: [0, 0, 2560, 1440], work: [0, 0, 2560, 1400] }
 const TOP_BAR = { monitor: [2560, 0, 4480, 1080], work: [2560, 48, 4480, 1080] }
-/** Each row: what it shows, the rect asked for, and where clampToMonitors puts it among LEFT, PRIMARY and TOP_BAR. */
+/** A window's invisible border, as one machine read it at 100% scale (#90): 7 px on the left, the right and the bottom. */
+const BORDER = [7, 7, 7]
+/** Each row: what it shows, the rect asked for, where clampToMonitors puts it among LEFT, PRIMARY and TOP_BAR, and the window's border (none when left out). */
 const CLAMP_ROWS = [
   ['inside the primary monitor: as asked', [100, 100, 1280, 800], [100, 100, 1280, 800]],
   ['wholly off every monitor, far right and down: onto the nearest, inside its work area', [30000, 30000, 800, 600], [3680, 480, 800, 600]],
@@ -152,6 +159,36 @@ const CLAMP_ROWS = [
   ["past the left-hand monitor's left edge: moved onto it", [-2100, 50, 800, 600], [-1920, 50, 800, 600]],
   ['under a taskbar along the top: just below it', [3000, 0, 800, 600], [3000, 48, 800, 600]],
   ["past the primary's work area at the bottom: up into it", [500, 1300, 800, 600], [500, 800, 800, 600]],
+]
+
+/** #90's made-up screen: one monitor of 1920 x 1080 whose work area stops at 1032, its taskbar below. */
+const SCREEN = { monitor: [0, 0, 1920, 1080], work: [0, 0, 1920, 1032] }
+/**
+ * #90's rows, on SCREEN alone, with a border of 7 px on the left, the right and the bottom (BORDER), which the
+ * rectangle may pass the work area by, and no more. The cells are made up: 4 x 2 of 480 x 516 drawn, so a cell's
+ * rectangle is 494 x 523 at x -7, 473, 953 or 1433 and y 0 or 516.
+ */
+const OVERHANG_CLAMP_ROWS = [
+  ['a left edge: the frame flush with it, the border past it', [-7, 100, 494, 523], [-7, 100, 494, 523], BORDER],
+  ['a right edge: the frame flush with it', [1433, 100, 494, 523], [1433, 100, 494, 523], BORDER],
+  ['a bottom edge: the frame flush with it', [500, 516, 494, 523], [500, 516, 494, 523], BORDER],
+  ['the bottom-left corner: flush with both edges', [-7, 516, 494, 523], [-7, 516, 494, 523], BORDER],
+  ['a border read of 0: wholly inside, as #89 placed it', [-7, 100, 494, 523], [0, 100, 494, 523], [0, 0, 0]],
+  ['past the left edge by more than its border: by its border alone', [-20, 100, 800, 600], [-7, 100, 800, 600], BORDER],
+  ['never past the top: the top has no border', [100, -7, 800, 600], [100, 0, 800, 600], BORDER],
+  ['larger than the work area: the work area and the border', [100, 100, 4000, 3000], [-7, 0, 1934, 1039], BORDER],
+  ['wholly off every monitor: onto the one there is, past its work area by its border alone', [30000, 30000, 800, 600], [1127, 439, 800, 600], BORDER],
+]
+
+/** Each row: a window's rectangle and its drawn frame ([left, top, right, bottom]), and the overhang read from them (overhangOf, PLACE_CS's Overhang). Made up. */
+const OVERHANG_ROWS = [
+  ['a border of 7 px on three sides, none at the top', [-7, 0, 967, 1039], [0, 0, 960, 1032], [7, 7, 7]],
+  ['no border: the frame is the rectangle', [0, 0, 960, 1032], [0, 0, 960, 1032], [0, 0, 0]],
+  ['1 px reads as none', [-1, 0, 961, 1033], [0, 0, 960, 1032], [0, 0, 0]],
+  ['2 px and 64 px read as they are', [-2, 0, 1024, 1096], [0, 0, 960, 1032], [2, 64, 64]],
+  ['the top is never read: a rectangle 5 px above its frame reads as the 7 px of the other three sides', [-7, -5, 967, 1039], [0, 0, 960, 1032], [7, 7, 7]],
+  ['65 px is no border read', [-65, 0, 960, 1032], [0, 0, 960, 1032], [0, 0, 0]],
+  ['a frame outside the rectangle is no border', [10, 0, 950, 1022], [0, 0, 960, 1032], [0, 0, 0]],
 ]
 
 /** Each check takes a machine module: the real one, or a copy with a fault in it. */
@@ -225,6 +262,8 @@ const CHECKS = {
     }
     assert.equal(m.probeScript({ ids: [T], configDirs: [CONFIG], stateDir: STATE, slots: true, heavySlotRoot: null }).split('\r\n').indexOf(m.PSMODULEPATH_RESET), 2)
     assert.equal(m.relockScript({ stateDir: STATE, id: T, by: `launch:${T}`, holder: { pid: 1, created: '1' } }).split('\r\n').indexOf(m.PSMODULEPATH_RESET), 2)
+    // #91: launch_sessions' two Windows Terminal reads, each reset first too.
+    for (const [name, script] of [['wtVersionScript', m.wtVersionScript()], ['wtExeScript', m.wtExeScript(STATE)]]) assert.equal(script.split('\r\n').indexOf(m.PSMODULEPATH_RESET), 2, name)
   },
   inputIdle(m) {
     assert.equal(m.inputIdle(probeOf(m)), true)
@@ -871,6 +910,84 @@ const CHECKS = {
     for (const good of [[-32768, 32768, 320, 200], [32768, -32768, 32768, 32768]]) assert.equal(m.isRect(good), true, JSON.stringify(good))
     for (const bad of [[0, 0, 319, 200], [0, 0, 320, 199], [32769, 0, 320, 200], [0, -32769, 320, 200], [0, 0, 32769, 200], [0, 0, 320, 32769], [0, 0, 320.5, 200], [0, 0, 320], [0, 0, 320, 200, 1], '0,0,320,200', null]) assert.equal(m.isRect(bad), false, JSON.stringify(bad))
   },
+  gridFile(m) {
+    // #91: the grid, read; each refusal says what is wrong.
+    const read = file => m.readPlacement(JSON.stringify(file))
+    const windows = [{ window: 'a-1', rect: [-7, 0, 494, 523], tabs: ['alpha', 'beta'] }, { window: 'a-2', rect: [473, 0, 494, 523] }, { window: 'b-1', maximized: true }]
+    assert.deepEqual(read({ v: 1, layout: [], grid: { windows } }).placement.grid, { windows }, 'a fixed slot, a free cell and a maximized free cell, as written')
+    assert.equal(read({ v: 1, layout: [] }).placement.grid, undefined, 'no grid: none')
+    assert.deepEqual(m.GRID_LIMITS, { windows: 16, tabs: 16 })
+    const said = grid => (read({ v: 1, layout: [], grid }).errors ?? []).join('; ')
+    const rows = [
+      [{ windows: [{ window: 'a', rect: [0, 0, 800, 600], maximized: true }] }, 'grid.windows[0] has both a rect and maximized: a grid window takes one of them'],
+      [{ windows: [{ window: 'a' }] }, 'grid.windows[0] has neither a rect nor maximized: a grid window takes one of them'],
+      [{ windows: [{ window: 'a', maximized: true, tabs: ['x'] }, { window: 'b', maximized: true, tabs: ['x'] }] }, 'grid.windows[1].tabs names a session that a grid window names already'],
+      [{ windows: [{ window: 'a', maximized: true, tabs: ['x', 'x'] }] }, 'grid.windows[0].tabs names a session that a grid window names already'],
+      [{ windows: [{ window: 'a', maximized: true, tabs: ['X'] }] }, 'grid.windows[0].tabs holds something that is not a session name (lowercase letters, digits and hyphens, as --name takes)'],
+      [{ windows: [{ window: 'a', maximized: true }, { window: 'A', maximized: true }] }, 'grid.windows[1].window names a window twice'],
+      [{ windows: [] }, 'grid.windows is not a list of 1 to 16 windows'],
+      [{ windows: [{ window: 'a', maximized: true, tabs: [] }] }, 'grid.windows[0].tabs is not a list of 1 to 16 session names'],
+      [{ windows: [{ window: 'a', maximized: true, colour: 'red' }] }, 'grid.windows[0] has an unknown key colour'],
+      [{ windows: [{ window: 'a', maximized: true }], rows: 2 }, 'grid has an unknown key rows'],
+      [{ windows: [{ window: 'a', rect: [0, 0, 319, 600] }] }, 'grid.windows[0] has a rect that is not four whole numbers [x, y, width, height]: x and y within 32768, a width of 320 to 32768 and a height of 200 to 32768'],
+    ]
+    const wrong = rows.map(([grid, want]) => [grid, want, said(grid)]).filter(([, want, got]) => got !== want)
+    assert.deepEqual(wrong.map(([grid, want, got]) => `${JSON.stringify(grid)}: ${JSON.stringify(got)}, not ${JSON.stringify(want)}`), [])
+    // The rule for a session's name in a grid window's tabs is --name's own (AREA_NAME), and lanes.json's.
+    for (const name of ['alpha', 'a', '0-cell', 'x'.repeat(40), 'Alpha', '-a', 'a b', 'a.b', 'x'.repeat(41)]) assert.equal(said({ windows: [{ window: 'a', maximized: true, tabs: [name] }] }) === '', m.AREA_NAME.test(name), name)
+    // A named window of layout[], launch and restart still refuses a rect (not built there): only a grid window takes one.
+    assert.match((read({ v: 1, layout: [], launch: { prefer: ['window'], window: { name: 'w1', rect: [0, 0, 800, 600] } } }).errors ?? []).join(), /a named window does not take \(not built\)/)
+  },
+  gridPlan(m) {
+    // #91: planGrid, a pure function of the list, the grid and the windows open now, every row compared in one run.
+    const grid = { windows: [{ window: 'c1', rect: [-7, 0, 494, 523], tabs: ['alpha', 'beta'] }, { window: 'c2', rect: [473, 0, 494, 523] }, { window: 'c3', rect: [953, 0, 494, 523] }, { window: 'm1', maximized: true, tabs: ['gamma'] }] }
+    const freeOnly = { windows: [{ window: 'c-1', maximized: true }] }
+    const idOf = n => `00000000-0000-4000-a000-${String(n).padStart(12, '0')}`
+    const listOf = names => names.map((name, i) => ({ name, folder: 'C:\\path\\to\\work', ...(i % 2 === 0 ? { id: idOf(i + 1) } : {}) }))
+    /** A step as `<name>><window>:<new|join>:<by>[:rect|:max]`. */
+    const short = s => `${s.session.name}>${s.window}:${s.opens}:${s.by}${s.place === undefined ? '' : 'rect' in s.place ? ':rect' : ':max'}`
+    const rows = [
+      ['fixed first, in the tabs order, whatever the list order', grid, ['beta', 'alpha'], new Set(), ['alpha>c1:new:fixed:rect', 'beta>c1:join:fixed'], [], 0],
+      ['free cells in file order, one session each, in the list order', grid, ['delta', 'epsilon'], new Set(), ['delta>c2:new:free:rect', 'epsilon>c3:new:free:rect'], [], 0],
+      ['fixed, then free, then overflow in turn into the free cells', grid, ['delta', 'alpha', 'epsilon', 'zeta', 'eta', 'gamma', 'theta'], new Set(), ['alpha>c1:new:fixed:rect', 'gamma>m1:new:fixed:max', 'delta>c2:new:free:rect', 'epsilon>c3:new:free:rect', 'zeta>c2:join:overflow', 'eta>c3:join:overflow', 'theta>c2:join:overflow'], [], 0],
+      ['a free cell whose window holds a live slot is taken; a fixed window open already gets a tab, unplaced', grid, ['alpha', 'delta', 'epsilon'], new Set(['c1', 'c2']), ['alpha>c1:join:fixed', 'delta>c3:new:free:rect', 'epsilon>c3:join:overflow'], [], 0],
+      ['no free cell: overflow in turn into the fixed windows, and a note says so', grid, ['delta', 'epsilon', 'zeta'], new Set(['c2', 'c3']), ['delta>c1:new:overflow:rect', 'epsilon>m1:new:overflow:max', 'zeta>c1:join:overflow'], [], 1],
+      ['no free cell and no fixed window: refused, never an unplaced window', freeOnly, ['delta', 'epsilon'], new Set(['c-1']), [], ['delta', 'epsilon'], 1],
+      ['an empty list: nothing', grid, [], new Set(), [], [], 0],
+      ['a window name open only in another case is not taken: the grid window opens new', grid, ['delta'], new Set(['C2']), ['delta>c2:new:free:rect'], [], 0],
+    ]
+    const wrong = rows.flatMap(([name, g, names, open, steps, refused, notes]) => {
+      const plan = m.planGrid(listOf(names), g, open)
+      const got = [plan.steps.map(short), plan.refused.map(r => r.session.name), plan.notes.length]
+      return JSON.stringify(got) === JSON.stringify([steps, refused, notes]) ? [] : [`${name}: ${JSON.stringify(got)}, not ${JSON.stringify([steps, refused, notes])}`]
+    })
+    assert.deepEqual(wrong, [])
+    // The notes, in words; and a plan's lines.
+    assert.match(m.planGrid(listOf(['delta', 'epsilon', 'zeta']), grid, new Set(['c2', 'c3'])).notes[0], /^no free cell is left, so 3 sessions go as further tabs into the fixed windows, in turn$/)
+    assert.match(m.planGrid(listOf(['delta']), freeOnly, new Set(['c-1'])).refused[0].why, /never goes into a window the grid does not name/)
+    const lines = m.planGrid([{ name: 'alpha', id: idOf(1), folder: 'C:\\path\\to\\work', prompt: 'Resume the next piece.' }, { name: 'zeta', folder: 'C:\\path\\to\\work' }, { name: 'gamma', folder: 'C:\\path\\to\\work' }], grid, new Set(['c2'])).steps.map(m.gridPlanLine)
+    assert.deepEqual(lines, [`alpha: opens window c1 at [-7, 0, 494, 523] (its fixed slot), tab alpha, resumes ${idOf(1)}, with a first prompt`, 'gamma: opens window m1 maximized (its fixed slot), tab gamma, starts a new session', 'zeta: opens window c3 at [953, 0, 494, 523] (a free cell), tab zeta, starts a new session'])
+    // Of another shape: thrown, never planned.
+    assert.throws(() => m.planGrid(listOf(['alpha', 'alpha']), grid, new Set()), /names alpha twice/)
+    assert.throws(() => m.planGrid([{ name: 'a', id: idOf(1), folder: 'C:\\w' }, { name: 'b', id: idOf(1), folder: 'C:\\w' }], grid, new Set()), /conversation .+ twice/)
+    assert.throws(() => m.planGrid(listOf(['x']), { windows: [{ window: 'a', maximized: true, tabs: ['x'] }, { window: 'b', maximized: true, tabs: ['x'] }] }, new Set()), /two fixed slots/)
+    assert.throws(() => m.planGrid(listOf(Array.from({ length: 17 }, (_, i) => `s${i}`)), grid, new Set()), /at most 16/)
+    // The windows open now come from the live slot runners' beacons, by their window stamp; unread runners: none known.
+    const runners = [idleRunner(m, {}, { window: 'c2' }), idleRunner(m, { pid: 22, id: '22-134062345678901240' }, {}), idleRunner(m, { pid: 23, id: '23-134062345678901240', beacon: null })]
+    assert.deepEqual([...m.openWindows(probeOf(m, { slots: runners }))], ['c2'])
+    // A probe whose answer holds no slot runners at all (JSON drops the undefined key): none could be read.
+    assert.equal(m.openWindows(probeOf(m, { slots: undefined })), undefined)
+    // Windows Terminal, read as a tab's launch reads it, two reads of one thing each: 1.19 or later; and wt.exe there.
+    assert.deepEqual(['wt 1.24.10921.0', 'wt 1.19.1', 'wt 1.18.3', 'wt none', 'garbled'].map(m.wtVersionFault), [undefined, undefined, 'Windows Terminal is 1.18.3, older than the 1.19 a tab needs', 'Windows Terminal 1.19 or later is not installed (no version could be read)', "Windows Terminal's version could not be read"])
+    assert.deepEqual(['wtexe yes', 'wtexe no', 'garbled'].map(m.wtExeFault), [undefined, 'wt.exe is not at %LOCALAPPDATA%\\Microsoft\\WindowsApps, where a launch runs it from', 'whether wt.exe is there could not be read'])
+    // Neither runs wt: no start of a process, no call operator on its path, nothing that invokes a file. wtExeScript names
+    // wt.exe as a path alone: built by Join-Path, then only asked whether it is there (Test-Path).
+    for (const script of [m.wtVersionScript(), m.wtExeScript(STATE)]) assert.ok(!/Start-Process|Invoke-Item|Invoke-Expression|&\s*\$wtExe|&\s*['"][^'"]*wt\.exe|\.\s+\$wtExe|cmd(\.exe)?\s+\/c/i.test(script), 'neither read runs wt')
+    const exeScript = m.wtExeScript(STATE)
+    assert.equal(exeScript.split('$wtExe').length - 1, 2, '$wtExe set once, used once')
+    assert.ok(exeScript.includes("$wtExe = Join-Path (Split-Path -Parent $state) 'Microsoft\\WindowsApps\\wt.exe'") && exeScript.includes('(Test-Path -LiteralPath $wtExe -PathType Leaf)'), 'wt.exe named as a path, then only tested for')
+    assert.ok(!m.wtVersionScript().includes('wt.exe') && !m.wtExeScript(STATE).includes('Get-AppxPackage'), 'each reads one thing')
+  },
   plainLegs(m) {
     // The plain window at its place, as a leg: for a launch of another process, and for a restart.
     const placed = placementOf(m, { launch: { prefer: ['slot', 'window'], window: { rect: [0, 0, 1280, 800] } }, restart: { prefer: ['window'], window: { maximized: true } } })
@@ -927,6 +1044,60 @@ const CHECKS = {
       assert.ok(!/SetWindowPos|ShowWindow|ClaudeSelfToolsPlace|MoveWindow|SetForegroundWindow|SetWindowPlacement|FindWindow|EnumWindows/.test(outer), `${JSON.stringify(where)}: the caller's lines act on no window, and list none`)
     }
   },
+  tabPlace(m) {
+    // #91: the first tab of a new grid window places its own window (-Place); a tab joining one places nothing.
+    const first = launchInput({ kind: 'start', id: FRESH, name: 'alpha', claim: `launch:${FRESH}`, where: { tab: { window: 'a-1', title: 'alpha', rect: [-7, 0, 494, 523] } }, waitForExit: undefined, checks: { ...FLOOR_CHECKS, fresh: true }, deadline: NOW + 20_000 })
+    const s = m.launchScriptText(first)
+    assert.equal(wtLineOf(s), `-w a-1 nt --title alpha --suppressApplicationTitle -d "C:\\work\\my repo" -- ${POWERSHELL} -NoExit -NoProfile -ExecutionPolicy RemoteSigned -File "${STATE}\\claude-slot.ps1" -Start ${FRESH} -Name alpha -ConfigDirs "${CONFIG}|D:\\other cfg" -Claim launch:${FRESH} -Launcher ${m.LAUNCH_SCRIPT_SHA256} -Place r-7,0,494,523`, 'its place for its runner alone: no --pos, --size or -M for wt')
+    const join = m.launchScriptText(launchInput({ claim: `launch:${OTHER}`, where: { tab: { window: 'a-1', title: 'beta' } }, waitForExit: undefined, checks: { ...FLOOR_CHECKS, live: true } }))
+    assert.equal(wtLineOf(join), `-w a-1 nt --title beta --suppressApplicationTitle -d "C:\\work\\my repo" -- ${POWERSHELL} -NoExit -NoProfile -ExecutionPolicy RemoteSigned -File "${STATE}\\claude-slot.ps1" -Resume ${T} -ConfigDirs "${CONFIG}|D:\\other cfg" -Claim launch:${OTHER} -Launcher ${m.LAUNCH_SCRIPT_SHA256}`, 'a tab joining a window: no place')
+    assert.ok(!join.includes('$placedSignal') && !join.includes('"place " + $placeSaid'), 'a joining tab waits for nothing')
+    assert.equal(m.placeArgument([-7, 0, 494, 523]), 'r-7,0,494,523')
+    assert.throws(() => m.placeArgument([0, 0, 100, 100]), /not a rect/)
+    // The two events, made before wt starts the tab (the slot runner's hash still right before it), then the wait, bounded by the deadline.
+    const made = s.indexOf(`$placedSignal = [Threading.EventWaitHandle]::new($false, [Threading.EventResetMode]::ManualReset, '${m.placeSignalName(FRESH, 'placed')}', [ref]$placedNew)`)
+    const madeToo = s.indexOf(`$unplacedSignal = [Threading.EventWaitHandle]::new($false, [Threading.EventResetMode]::ManualReset, '${m.placeSignalName(FRESH, 'unplaced')}', [ref]$unplacedNew)`)
+    const refuseOld = s.indexOf('if (-not $placedNew -or -not $unplacedNew) { throw (')
+    const started = s.indexOf('$window = Start-Process $wtExe -ArgumentList $wtLine -PassThru')
+    const waited = s.indexOf('$placeSeen = [Threading.WaitHandle]::WaitAny([Threading.WaitHandle[]]@($placedSignal, $unplacedSignal), [int]$placeLimit)')
+    assert.ok(made > 0 && made < madeToo && madeToo < refuseOld && refuseOld < started && started < waited, 'made, checked as its own, then wt, then the wait')
+    assert.ok(s.includes(`$placeLimit = [math]::Min($placeLimit, [math]::Max(0, ${NOW + 20_000} - ${m.PLACE_DEADLINE_MARGIN_MS} - [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()))`), 'never nearer the deadline than its margin')
+    assert.ok(s.includes(`$placeLimit = ${m.PLACE_WAIT_MS}`) && m.PLACE_WAIT_MS === 10_000)
+    assert.ok(s.indexOf('[Console]::Out.WriteLine("place " + $placeSaid)') < s.indexOf('[Console]::Out.WriteLine("launched " + $placed)'), 'it says which, before launched')
+    assert.deepEqual(m.PLACE_SIGNAL_PREFIX, { placed: 'Local\\claude-self-tools-placed-', unplaced: 'Local\\claude-self-tools-unplaced-' })
+    assert.deepEqual(m.parseLaunch('claim x\r\nplace unconfirmed its first tab did not say within 7 s that it had tried\r\nlaunched tab a-1\r\n').place, { said: 'unconfirmed', why: 'its first tab did not say within 7 s that it had tried' })
+    assert.deepEqual(m.parseLaunch('place placed\r\nlaunched tab a-1\r\n').place, { said: 'placed' })
+    assert.equal(m.parseLaunch('launched tab a-1\r\n').place, undefined)
+    // Nothing on the caller's side acts on a window: the launch makes two events and waits; it calls no window function.
+    assert.ok(!/SetWindowPos|ShowWindow|ClaudeSelfToolsPlace|MoveWindow|SetForegroundWindow|SetWindowPlacement|FindWindow|EnumWindows/.test(s), 'the launch acts on no window, and lists none (its one Add-Type is the input idle read, ClaudeSelfToolsInput)')
+    // One place, set one way; a named window's rect is still not built.
+    assert.throws(() => m.launchScriptText({ ...first, where: { tab: { window: 'a-1', title: 'alpha', rect: [-7, 0, 494, 523], maximized: true } } }), /takes no pos, size or maximized/)
+    assert.throws(() => m.launchScriptText({ ...first, where: { tab: { window: 'a-1', title: 'alpha', rect: [0, 0, 100, 100] } } }), /rect is not four whole numbers/)
+    assert.throws(() => m.launchScriptText(launchInput({ where: { window: { name: 'a-1', rect: [0, 0, 800, 600] } } })), /a named window takes no rect \(not built\)/)
+    // A first prompt as text: a tab alone; written by the launch to its own file, checked there as Windows PowerShell hands it on; never on a line.
+    const PROMPT = "Pick up the next piece: it's in notes\\next.md, then say \"done\"."
+    const p = m.launchScriptText({ ...first, prompt: PROMPT })
+    assert.ok(wtLineOf(p).endsWith(' -Place r-7,0,494,523 -Prompt') && !wtLineOf(p).includes('next piece'), "the tab is told -Prompt; the text is on no line")
+    assert.ok(p.includes(`$promptFile = '${m.promptPath(STATE, FRESH)}'`) && m.promptPath(STATE, FRESH) === `${STATE}\\prompts\\${FRESH}.txt`)
+    assert.ok(p.includes(`$promptText = '${PROMPT.split("'").join("''")}'`), 'the text as a single-quoted literal on standard input')
+    // Created new (CreateNew), as the window's file is: never over a file already there, which is no file of this run's.
+    const wrote = p.indexOf('$promptStream = [IO.File]::Open($promptFile, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None); $promptMade = $promptFile')
+    const checked = p.indexOf('$promptRead = Read-Prompt $promptFile $true')
+    assert.ok(wrote > 0 && wrote < checked && checked < p.indexOf('function New-Claim('), 'written, then read back as Windows PowerShell hands it on, before the claim')
+    assert.ok(p.includes('  if ($null -ne $promptMade) { try { [IO.File]::Delete($promptMade) } catch { } }'), 'a refusal deletes the file it wrote')
+    assert.ok(p.includes("[IO.Path]::GetFileName($staleFile) -cmatch '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\\.txt\\z'"), 'old prompt files swept, by their shape')
+    assert.ok(!s.includes('$promptText') && !s.includes('$promptMade'), 'no prompt: none of it')
+    // Every tab's launch sweeps the prompt files no tab read, a prompt of its own or not (Low 5).
+    for (const tab of [s, join, p]) assert.ok(tab.includes("[IO.Path]::GetFileName($staleFile) -cmatch '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\\.txt\\z'"), 'swept in every tab launch')
+    assert.ok(!scriptsOf(m).plain.includes('.txt\\z'), "a plain window's launch has no prompt folder to sweep")
+    assert.throws(() => m.launchScriptText(launchInput({ claim: `launch:${FRESH}`, prompt: PROMPT })), /goes to a tab alone/)
+    assert.throws(() => m.launchScriptText({ ...first, prompt: PROMPT, promptFile: 'C:\\x\\p.md' }), /a plain window|not both/)
+    const faults = [['', 'empty'], ['  \n ', 'empty'], ['/compact now', 'starts with /'], ['!rm x', 'starts with !'], ['update', 'one bare word'], ['a\u0007b c', 'control character'], ['\ufeffhello there', 'byte order mark'], ['x '.repeat(7501), 'over the 15000'], [3, 'not text']]
+    const misjudged = faults.map(([text, want]) => [want, m.promptTextFault(text)]).filter(([want, got]) => got === undefined || !got.includes(want))
+    assert.deepEqual(misjudged, [])
+    for (const good of ['Resume the billing piece.', 'two words', 'tabs\tand\r\nline breaks are fine']) assert.equal(m.promptTextFault(good), undefined, good)
+    assert.throws(() => m.launchScriptText({ ...first, prompt: '/exit' }), /the first prompt starts with \//)
+  },
   actingCalls(m) {
     // #5's limits, held as text: the window's C# imports the reviewed list and no more; the two acting calls are
     // each made once, with the reviewed arguments, on the window of its own console; its inputs are checked numbers.
@@ -940,7 +1111,19 @@ const CHECKS = {
     assert.deepEqual(cs.match(/\bShowWindowAsync\([^)]*\)/g), ['ShowWindowAsync(IntPtr window, int show)', 'ShowWindowAsync(own, 3)'], 'SW_MAXIMIZE alone')
     assert.deepEqual(cs.match(/\bown = [^;]+;/g), ['own = IntPtr.Zero;', 'own = console;', 'own = GetWindow(console, 4);'], 'its own window: its console window, or that window\'s owner (GW_OWNER)')
     assert.deepEqual(cs.match(/\bconsole = [^;]+;/g), ['console = GetConsoleWindow();'])
-    assert.deepEqual(cs.match(/\bat = [^;]+;/g), ['at = Clamp(x, y, width, height, info.Work.Left, info.Work.Top, info.Work.Right, info.Work.Bottom);'])
+    assert.deepEqual(cs.match(/\bat = [^;]+;/g), ['at = Clamp(x, y, width, height, info.Work.Left, info.Work.Top, info.Work.Right, info.Work.Bottom, border[0], border[1], border[2]);'])
+    // #90: the border is its own window's, read by two reads of that window alone, after the thread is per-monitor aware and
+    // before the clamp; a read that fails is no overhang; the clamp passes the work area by it on the left, the right and the bottom.
+    assert.deepEqual(cs.match(/\bborder = [^;]+;/g), ['border = BorderOf(own);'])
+    assert.deepEqual(cs.match(/\bBorderOf\([^)]*\)/g), ['BorderOf(IntPtr window)', 'BorderOf(own)'], 'declared once, called once, on its own window')
+    assert.deepEqual(cs.match(/\bGetWindowRect\([^)]*\)/g), ['GetWindowRect(IntPtr window, out Box box)', 'GetWindowRect(window, out rect)'])
+    assert.deepEqual(cs.match(/\bDwmGetWindowAttribute\([^)]*\)/g), ['DwmGetWindowAttribute(IntPtr window, uint attribute, out Box value, int size)', 'DwmGetWindowAttribute(window, 9, out frame, Marshal.SizeOf(typeof(Box)'], 'DWMWA_EXTENDED_FRAME_BOUNDS (9) alone')
+    assert.ok(cs.includes('if (!GetWindowRect(window, out rect) || DwmGetWindowAttribute(window, 9, out frame, Marshal.SizeOf(typeof(Box))) != 0) return new int[] { 0, 0, 0 };'), 'a read that fails is no overhang')
+    assert.ok(cs.includes(`static int Side(int d) { return d >= ${m.BORDER_LIMITS.min} && d <= ${m.BORDER_LIMITS.max} ? d : 0; }`), 'a side outside 2 to 64 px reads as none')
+    assert.ok(cs.includes('return new int[] { Side(frameLeft - left), Side(right - frameRight), Side(bottom - frameBottom) };'), 'the left, the right and the bottom; never the top')
+    assert.ok(cs.includes('left = left - borderLeft; right = right + borderRight; bottom = bottom + borderBottom; int w = Math.Min(width, right - left);'), 'the clamp passes the work area by the border alone, never at the top')
+    const bordered = cs.indexOf('int[] border = BorderOf(own);')
+    assert.ok(bordered > cs.indexOf('IntPtr before = SetThreadDpiAwarenessContext(new IntPtr(-4));') && bordered < cs.indexOf('int[] at = Clamp(') && bordered > cs.indexOf('int hosted = Hosted(own, console);'), 'read per-monitor aware, after the count, before the clamp')
     assert.ok(cs.includes('if (kind == "ConsoleWindowClass") own = console; else if (kind == "PseudoConsoleWindow") { own = GetWindow(console, 4); if (own == IntPtr.Zero || ClassOf(own) != "CASCADIA_HOSTING_WINDOW_CLASS") return '), 'the classic console\'s window, or the Windows Terminal window that owns the pseudoconsole; else nothing')
     // Asked only to be maximized, a window maximized already is where it is asked: "placed", nothing done, nothing said;
     // with a rect too, it is left as it is (the rect was not applied), as before.
@@ -983,15 +1166,25 @@ const CHECKS = {
   clampRule(m) {
     // The clamp as a pure function, every row in one run, each that differs listed.
     const monitors = [LEFT, PRIMARY, TOP_BAR]
-    const wrong = CLAMP_ROWS.map(([name, rect, want]) => [name, rect, want, m.clampToMonitors(rect, monitors)]).filter(([, , want, got]) => JSON.stringify(got) !== JSON.stringify(want))
+    // #89's rows among three monitors, with no border; #90's on a screen of their own, with one: every row of both in one run.
+    const tables = [...CLAMP_ROWS.map(row => [monitors, ...row]), ...OVERHANG_CLAMP_ROWS.map(([name, ...row]) => [[SCREEN], `#90, ${name}`, ...row])]
+    const wrong = tables.map(([screens, name, rect, want, border]) => [name, rect, want, border === undefined ? m.clampToMonitors(rect, screens) : m.clampToMonitors(rect, screens, border)]).filter(([, , want, got]) => JSON.stringify(got) !== JSON.stringify(want))
     assert.deepEqual(wrong.map(([name, rect, want, got]) => `${name}: ${JSON.stringify(rect)} gave ${JSON.stringify(got)}, not ${JSON.stringify(want)}`), [])
-    // Wherever it was asked for, the window ends wholly inside one monitor's work area.
-    for (const [name, rect] of CLAMP_ROWS) {
-      const [x, y, w, h] = m.clampToMonitors(rect, monitors)
-      assert.ok(monitors.some(({ work: [l, t, r, b] }) => x >= l && y >= t && x + w <= r && y + h <= b), name)
+    // Wherever it was asked for, the window ends wholly inside one monitor's work area, passed by its border alone (#90).
+    for (const [screens, name, rect, , border = [0, 0, 0]] of tables) {
+      const [x, y, w, h] = m.clampToMonitors(rect, screens, border)
+      assert.ok(screens.some(({ work: [l, t, r, b] }) => x >= l - border[0] && y >= t && x + w <= r + border[1] && y + h <= b + border[2]), name)
     }
     assert.throws(() => m.clampToMonitors([0, 0, 800, 600], []), /no monitor/)
     assert.deepEqual(m.clampToWork([5000, -5000, 800, 600], [0, 0, 1920, 1040]), [1120, 0, 800, 600])
+    // #90's own example: a window snapped to the left half of a 1920 x 1032 work area is drawn at 0, its rectangle at -7.
+    assert.deepEqual(m.clampToWork([-7, 0, 974, 1039], [0, 0, 1920, 1032], BORDER), [-7, 0, 974, 1039], 'flush: as asked')
+    assert.deepEqual(m.clampToWork([-7, 0, 974, 1039], [0, 0, 1920, 1032]), [0, 0, 974, 1032], 'with no border, as #89 placed it')
+    assert.deepEqual(m.NO_OVERHANG, [0, 0, 0])
+    assert.deepEqual(m.BORDER_LIMITS, { min: 2, max: 64 })
+    // The border read: every row in one run, each that differs listed.
+    const misread = OVERHANG_ROWS.map(([name, rect, frame, want]) => [name, want, m.overhangOf(rect, frame)]).filter(([, want, got]) => JSON.stringify(got) !== JSON.stringify(want))
+    assert.deepEqual(misread.map(([name, want, got]) => `${name}: ${JSON.stringify(got)}, not ${JSON.stringify(want)}`), [])
   },
 }
 
@@ -1067,9 +1260,9 @@ const FAULTS = [
   ['readExit dropping the wake-up', 'exitInputs', '...(wake === undefined ? {} : { wake }) }', '}'],
   ['a start record naming no launcher', 'slotRecord', "configDirs = [object[]]$configDirs; launcher = '${LAUNCH_SCRIPT_SHA256}' } | ConvertTo-Json -Compress`", 'configDirs = [object[]]$configDirs } | ConvertTo-Json -Compress`'],
   ['a resume record naming no launcher', 'slotRecord', "configDirs = [object[]]$configDirs; launcher = '${LAUNCH_SCRIPT_SHA256}'${leftField} } | ConvertTo-Json -Compress -Depth 3`", 'configDirs = [object[]]$configDirs${leftField} } | ConvertTo-Json -Compress -Depth 3`'],
-  ['a tab starting with no -Launcher', 'launchArguments', "'-Name', run.name, ...named, ...claim(run.claim), '-Launcher', LAUNCH_SCRIPT_SHA256]", "'-Name', run.name, ...named, ...claim(run.claim)]"],
-  ['a tab resuming with no -Launcher', 'launchArguments', "...named, ...left, ...claim(run.claim), '-Launcher', LAUNCH_SCRIPT_SHA256]", '...named, ...left, ...claim(run.claim)]'],
-  ['F1: a tab line with no -Claim', 'launchArguments', "...named, ...left, ...claim(run.claim), '-Launcher', LAUNCH_SCRIPT_SHA256]", "...named, ...left, '-Launcher', LAUNCH_SCRIPT_SHA256]"],
+  ['a tab starting with no -Launcher', 'launchArguments', "'-Name', run.name, ...named, ...claim(run.claim), '-Launcher', LAUNCH_SCRIPT_SHA256, ...extra(run)]", "'-Name', run.name, ...named, ...claim(run.claim), ...extra(run)]"],
+  ['a tab resuming with no -Launcher', 'launchArguments', "...named, ...left, ...claim(run.claim), '-Launcher', LAUNCH_SCRIPT_SHA256, ...extra(run)]", '...named, ...left, ...claim(run.claim), ...extra(run)]'],
+  ['F1: a tab line with no -Claim', 'launchArguments', "...named, ...left, ...claim(run.claim), '-Launcher', LAUNCH_SCRIPT_SHA256, ...extra(run)]", "...named, ...left, '-Launcher', LAUNCH_SCRIPT_SHA256, ...extra(run)]"],
   ['F1: any claim let through to a tab', 'perLaunchClaim', 'if (!LAUNCH_CLAIM.test(by)) throw', 'if (false) throw'],
   ['F1: claimOf back to one per conversation', 'pickRules', "return where !== 'auto' && 'slot' in where ? `slot:${where.slot}` : undefined", "return where !== 'auto' && 'slot' in where ? `slot:${where.slot}` : where !== 'auto' && 'tab' in where ? 'launch:x' : undefined"],
   ['F3: the workspace tag ignored on tabs and named windows', 'workspaceTabs', 'return opts.workspace !== undefined && tag !== undefined && tag !== opts.workspace', 'return false'],
@@ -1105,7 +1298,7 @@ const FAULTS = [
   ['D4: Release-Claim that can throw', 'windowRefusal', "'  } catch { } finally { $stream.Dispose() }',", "'  } finally { $stream.Dispose() }',"],
   ['N2: wt by its bare name', 'wtByItsPath', '$window = Start-Process $wtExe -ArgumentList', '$window = Start-Process wt.exe -ArgumentList'],
   ["N12: a live holder's lock taken", 'relockHolder', "if ($held) { $answer = 'held' } else {", "if ($false) { $answer = 'held' } else {"],
-  ['the left stat left off a tab', 'leftAtLastLook', "...(input.left === undefined ? {} : { left: input.left }) }\n  const tabOf", "}\n  const tabOf"],
+  ['the left stat left off a tab', 'leftAtLastLook', "...(input.left === undefined ? {} : { left: input.left }), ...tabExtra(place) }\n  const tabOf", "...tabExtra(place) }\n  const tabOf"],
   ['the window back on -EncodedCommand', 'windowFile', `'-File', ('"' + $windowFile + '"')`, "'-EncodedCommand', $encoded"],
   ['the window script written without its byte order mark', 'windowFile', '[Text.UTF8Encoding]::new($true).GetPreamble() + ', ''],
   ['the window script written in place', 'windowFile', "  '  [IO.File]::Move($windowTemp, $windowPath)',\n", ''],
@@ -1197,6 +1390,41 @@ const FAULTS = [
     "  '[DllImport(\"user32.dll\")] static extern bool EnumWindows(EachWindow each, IntPtr data);',\n",
     "  '[DllImport(\"user32.dll\")] static extern bool EnumWindows(EachWindow each, IntPtr data);',\n  '[DllImportAttribute(\"user32.dll\")] static extern bool OpenIcon(IntPtr w);',\n",
   ],
+  ['#91: fixed slots after the free cells', 'gridPlan', '  // 1. Fixed slots.\n', '  if (false) // 1. Fixed slots.\n'],
+  ['#91: a free cell taken though its window is open', 'gridPlan', 'const free = grid.windows.filter(w => w.tabs === undefined && !open.has(w.window))', 'const free = grid.windows.filter(w => w.tabs === undefined)'],
+  ['#91: overflow all into the first free cell', 'gridPlan', "step(session, ring[k % ring.length] as GridWindow, 'overflow')", "step(session, ring[0] as GridWindow, 'overflow')"],
+  ['#91: overflow into an unplaced window when no cell is left', 'gridPlan', "if (ring.length === 0) refused.push({ session, why:", "if (ring.length === 0) steps.push({ session, window: 'overflow', opens: 'new', by: 'overflow' }); else if (false) refused.push({ session, why:"],
+  ['#91: a joining tab placing its window again', 'gridPlan', 'const place = !isNew ? undefined : w.rect', 'const place = false ? undefined : w.rect'],
+  ['#91: window names open compared by case', 'gridPlan', 'slot.beacon?.window === undefined ? [] : [slot.beacon.window]', 'slot.beacon?.window === undefined ? [] : [slot.beacon.window, slot.beacon.window.toUpperCase()]'],
+  ['#91: an old Windows Terminal taken', 'gridPlan', 'if (major < needMajor || (major === needMajor && minor < needMinor)) return', 'if (false) return'],
+  ['#91 round 2: prompt files swept only by a launch that carries one', 'tabPlace', '...(launchUuid === undefined ? [] : [`$promptDir = [IO.Path]::GetDirectoryName(', '...(v.prompt === undefined || launchUuid === undefined ? [] : [`$promptDir = [IO.Path]::GetDirectoryName('],
+  ['#91 round 2: the prompt file written over one already there', 'tabPlace', '[IO.File]::Open($promptFile, [IO.FileMode]::CreateNew,', '[IO.File]::Open($promptFile, [IO.FileMode]::Create,'],
+  ['#91 round 2: the version read checking wt.exe too', 'gridPlan', "    ...READ_WT_VERSION,\n    \"[Console]::Out.WriteLine('wt ' + ", "    ...READ_WT_VERSION,\n    \"$wtExe = 'wt.exe'\",\n    \"[Console]::Out.WriteLine('wt ' + "],
+  ['#91: a tab told to place its window with --pos as well', 'tabPlace', "  if (!('idle' in run) && run.place !== undefined && (input.pos !== undefined || input.size !== undefined || input.maximized !== undefined)) throw", '  if (false) throw'],
+  ['#91: the place events made after wt starts the tab', 'tabPlace', '          ...makePlaceEvents,\n', '', [["          '$window = Start-Process $wtExe -ArgumentList $wtLine -PassThru',\n          ...waitPlace,", "          '$window = Start-Process $wtExe -ArgumentList $wtLine -PassThru',\n          ...makePlaceEvents,\n          ...waitPlace,"]]],
+  ['#91: an event already there taken as this launch\'s own', 'tabPlace', "'if (-not $placedNew -or -not $unplacedNew) { throw (", "'if ($false) { throw ("],
+  ['#91: the wait for the place past the deadline', 'tabPlace', '[math]::Max(0, ${v.deadline} - ${PLACE_DEADLINE_MARGIN_MS} - [DateTimeOffset]', '[math]::Max(0, ${v.deadline} - [DateTimeOffset]'],
+  ['#91: a joining tab told to place its window', 'tabPlace', 'run: tabRun(tab.rect) })', 'run: tabRun(tab.rect ?? [0, 0, 800, 600]) })'],
+  ['#91: a prompt on the tab\'s line', 'tabPlace', "...(r.prompt === true ? ['-Prompt'] : [])", "...(r.prompt === true ? ['-Prompt', 'x'] : [])"],
+  ['#91: a prompt read as 7 reads it, not 5.1', 'tabPlace', "'$promptRead = Read-Prompt $promptFile $true',", "'$promptRead = Read-Prompt $promptFile $false',"],
+  ['#91: a refusal leaving the prompt file', 'tabPlace', "['  if ($null -ne $promptMade) { try { [IO.File]::Delete($promptMade) } catch { } }']", '[]'],
+  ['#91: a prompt to a plain window as text', 'tabPlace', "if (typeof where !== 'object' || !('tab' in where)) throw new Error(\"a first prompt's text", "if (false) throw new Error(\"a first prompt's text"],
+  ['#91: a slash command let through as a prompt', 'tabPlace', "if (lead.startsWith('/') || lead.startsWith('!')) return", "if (lead.startsWith('!')) return"],
+  ['#91: a named window taking a rect after all', 'tabPlace', "      if ('rect' in named) throw new Error(", "      if (false) throw new Error("],
+  ['#91: a grid window taking both a rect and maximized', 'gridFile', 'if (value.rect !== undefined && value.maximized !== undefined) errors.push(`${here} has both', 'if (false) errors.push(`${here} has both'],
+  ['#91: a grid window taking neither', 'gridFile', 'else if (value.rect === undefined && value.maximized === undefined) errors.push(`${here} has neither', 'else if (false) errors.push(`${here} has neither'],
+  ['#91: a session named in two grid windows taken', 'gridFile', 'else if (sessions.has(tab)) errors.push(', 'else if (false) errors.push('],
+  ['#91: a grid tab held to the tab-label rule, not the session-name rule', 'gridFile', "typeof tab !== 'string' || !AREA_NAME.test(tab)", "typeof tab !== 'string' || !TAB_LABEL.test(tab)"],
+  ['#91: grid window names compared by case', 'gridFile', 'names.has(value.window.toLowerCase())', 'names.has(value.window)'],
+  ['#91: an unknown key in a grid window taken', 'gridFile', "keys(value, ['window', 'rect', 'maximized', 'tabs'], here)", "keys(value, ['window', 'rect', 'maximized', 'tabs', 'colour'], here)"],
+  ['#90: the overhang dropped from the clamp', 'clampRule', '[work[0] - border[0], work[1], work[2] + border[1], work[3] + border[2]]', 'work'],
+  ['#90: the top overhanging too', 'clampRule', '[work[0] - border[0], work[1], work[2] + border[1]', '[work[0] - border[0], work[1] - border[0], work[2] + border[1]'],
+  ['#90: a 1 px border taken as one', 'clampRule', 'd >= BORDER_LIMITS.min && d <= BORDER_LIMITS.max ? d : 0', 'd > 0 ? d : 0'],
+  ['#90: no limit on a border read', 'clampRule', 'd >= BORDER_LIMITS.min && d <= BORDER_LIMITS.max ? d : 0', 'd >= BORDER_LIMITS.min ? d : 0'],
+  ["#90: the console window's border read, not its own window's", 'actingCalls', "'int[] border = BorderOf(own);',", "'int[] border = BorderOf(console);',"],
+  ['#90: a failed border read taken as a border', 'actingCalls', ' return new int[] { 0, 0, 0 }; return Overhang(', ' return Overhang('],
+  ['#90: the C# clamp not passing the work area on the left', 'actingCalls', 'left = left - borderLeft; ', ''],
+  ['#90: the border read before the thread is per-monitor aware', 'actingCalls', "  'int[] border = BorderOf(own);',\n", '', [["'IntPtr console = GetConsoleWindow();',", "'IntPtr console = GetConsoleWindow(); int[] border = BorderOf(console);',"]]],
   ['#5 review WP-L-4: a maximized-only ask of a maximized window said as not placed again', 'actingCalls', "  'if (!hasRect && maximized && IsZoomed(own) && !IsIconic(own)) return \"placed\";',\n", ''],
   ['#5 review WP-L-4: a maximized window taken as placed when a rect is asked too', 'actingCalls', 'if (!hasRect && maximized && IsZoomed(own)', 'if (maximized && IsZoomed(own)'],
   [
