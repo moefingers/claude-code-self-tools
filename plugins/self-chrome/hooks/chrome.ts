@@ -10,8 +10,9 @@
 //   has the flag and --no-startup-window, its --profile-directory and its --user-data-dir, and never prints it.
 // - When a call or the setting names a profile folder: whether that folder, with its Preferences file, is in Chrome's
 //   user data folder; and, when it isn't, the names of the folders there that are (directory names only).
-// - When neither names one, for the account match: of Claude Code's .claude.json, `oauthAccount`'s `emailAddress` (its
-//   `accountUuid` only checked to be a plain id, never kept); of Chrome's Local State, each profile folder's
+// - When neither names one, for the account match: of this session's own sign-in ($.session.identity()), its `kind` and
+//   its `accountId`; of Claude Code's .claude.json, `oauthAccount`'s `emailAddress` (its `accountUuid` checked to be a
+//   plain id, and compared with that `accountId`; neither id is kept); of Chrome's Local State, each profile folder's
 //   `profile.info_cache.<folder>.user_name`, and no other key; and whether each folder that matches is a profile folder,
 //   as a named one is checked. Each file only once its stat shows a plain file, no link, of at most 4 MiB.
 // It prints profile folder names only, never a path, an account, an email or a command line.
@@ -152,13 +153,19 @@ function foldersSaid(folders: readonly string[] | undefined): string {
 }
 
 // ---------------------------------------------------------------------------------------------
-// The account match: the email of Claude Code's account, from its .claude.json; each profile folder's Google account,
-// from Chrome's Local State; and the one folder where they agree.
+// The account match: the email of Claude Code's account, from its .claude.json, held against this session's own
+// sign-in; each profile folder's Google account, from Chrome's Local State; and the one folder where they agree.
 //
 // It matches a profile's Google account (Local State's `user_name`) against the email of Claude Code's Claude account.
 // That stands in for "the profile whose Claude in Chrome is signed in to Claude Code's account", which no file says. It
 // holds where the person signs in to Claude with the same address as the profile's Google account; where they don't,
 // the person pins the profile (the call's `profile`, or the profile setting).
+//
+// .claude.json's `oauthAccount` is the last login's, which may not be this session's (a token its host handed it, an
+// API key with an older login's record, credentials swapped). So the session's own sign-in is asked
+// ($.session.identity()): a kind that runs on no Claude account counts as none, and the file's email stands only when
+// the session's account id is the file's `accountUuid`. Where the plugin can't ask (privacy and sec-default refuse a
+// plugin in the `user` tier), the file stands alone, and the answer says so.
 
 /** A mebibyte, in bytes. */
 const MIB = 1024 * 1024
@@ -204,17 +211,47 @@ export function claimPathOf(platform: Platform, env: ClaimEnv): string | undefin
 const ACCOUNT_ID = /^[A-Za-z0-9-]{8,64}$/
 
 /**
- * What a .claude.json says of Claude Code's account: the email of its Claude account; none (an API key, a cloud
- * provider, logged out); or unknown, when the text isn't a JSON object (caught mid-write, say).
+ * This session's own sign-in, as $.session.identity() answered it: its kind, and its account's id when it has one; or
+ * not asked, when the call was refused (privacy and sec-default refuse a plugin in the `user` tier) or failed.
  */
-export type ClaudeAccount = { readonly kind: 'email'; readonly email: string } | { readonly kind: 'none' } | { readonly kind: 'unknown' }
+export type SessionSignIn = { readonly asked: true; readonly kind: string; readonly accountId: string | undefined } | { readonly asked: false }
 
 /**
- * Claude Code's account in a .claude.json's text: `oauthAccount`'s `emailAddress`, when `oauthAccount` is an object whose
- * `accountUuid` is a plain id (ACCOUNT_ID) and the email is a string holding @. The text may start with a BOM. Nothing
+ * The sign-in kinds that run on a Claude account: a login stored on this machine (`claude.ai`), or a token the host
+ * handed over (`oauth-token`), as the engine's types name them. Every other kind runs on none: `console` (a Console
+ * login, which from memory runs on an API key it made), `api-key`, `none`, a cloud provider's name (`bedrock`,
+ * `vertex`), and any kind a later build adds, which the types say to read as a session with no identity.
+ */
+const CLAUDE_KINDS: ReadonlySet<string> = new Set(['claude.ai', 'oauth-token'])
+
+/** Whether the session's sign-in may run on a Claude account: a kind of CLAUDE_KINDS, or not asked. */
+export const mayHoldClaudeAccount = (session: SessionSignIn): boolean => !session.asked || CLAUDE_KINDS.has(session.kind)
+
+/**
+ * What a .claude.json says of Claude Code's account, held against the session's own sign-in: the email of its Claude
+ * account (`sessionAsked`: whether the session's account was asked and is the file's); none in the file (an older
+ * Claude Code, a cloud provider, logged out); unknown, when the text isn't a JSON object (caught mid-write, say); or,
+ * from the session: a sign-in on no Claude account (`session-none`), on another account than the file's
+ * (`session-other`), or one whose account isn't known yet (`session-unconfirmed`: a host's token before the server
+ * answered).
+ */
+export type ClaudeAccount =
+  | { readonly kind: 'email'; readonly email: string; readonly sessionAsked: boolean }
+  | { readonly kind: 'none' }
+  | { readonly kind: 'unknown' }
+  | { readonly kind: 'session-none' }
+  | { readonly kind: 'session-other' }
+  | { readonly kind: 'session-unconfirmed' }
+
+/**
+ * Claude Code's account in a .claude.json's text, held against `session`: `oauthAccount`'s `emailAddress`, when
+ * `oauthAccount` is an object whose `accountUuid` is a plain id (ACCOUNT_ID) and the email is a string holding @; and,
+ * when the session was asked, only when its kind runs on a Claude account and its account id is that `accountUuid`,
+ * compared whole. The two ids are compared, and nothing else is done with them. The text may start with a BOM. Nothing
  * else of the file leaves this function: the parsed object goes when it returns.
  */
-export function claudeAccountOf(text: string): ClaudeAccount {
+export function claudeAccountOf(text: string, session: SessionSignIn): ClaudeAccount {
+  if (!mayHoldClaudeAccount(session)) return { kind: 'session-none' }
   let parsed: unknown
   try {
     parsed = JSON.parse(text.startsWith(BOM) ? text.slice(1) : text)
@@ -225,7 +262,10 @@ export function claudeAccountOf(text: string): ClaudeAccount {
   const account = parsed.oauthAccount
   if (!isRecord(account) || typeof account.accountUuid !== 'string' || !ACCOUNT_ID.test(account.accountUuid)) return { kind: 'none' }
   const email = account.emailAddress
-  return typeof email === 'string' && email.includes('@') ? { kind: 'email', email } : { kind: 'none' }
+  if (typeof email !== 'string' || !email.includes('@')) return { kind: 'none' }
+  if (!session.asked) return { kind: 'email', email, sessionAsked: false }
+  if (session.accountId === undefined) return { kind: 'session-unconfirmed' }
+  return session.accountId === account.accountUuid ? { kind: 'email', email, sessionAsked: true } : { kind: 'session-other' }
 }
 
 // Each profile folder's Google account. Chromium keeps its profiles' attributes under `profile.info_cache`, "A map of
@@ -293,16 +333,23 @@ export function fileFault(stat: { readonly kind: string; readonly isLink: boolea
 
 /** What the account match came to: the one folder, or why there is none. */
 export type AccountPick =
-  | { readonly kind: 'one'; readonly folder: string }
+  /** One folder; `sessionAsked`: whether the session's own account was asked, and is the one .claude.json records. */
+  | { readonly kind: 'one'; readonly folder: string; readonly sessionAsked: boolean }
   /** No folder matches; `absent` of the folders that do are listed in Local State without being profile folders. */
   | { readonly kind: 'none'; readonly absent: number }
   | { readonly kind: 'several'; readonly folders: readonly string[] }
   /** Claude Code's .claude.json can't be placed for sure, or read. */
   | { readonly kind: 'no-claim'; readonly fault: FileFault | 'unplaced' }
-  /** It names no Claude account with an email. */
+  /** It records no Claude account with an email. */
   | { readonly kind: 'no-account' }
   /** It isn't a JSON object. */
   | { readonly kind: 'claim-unclear' }
+  /** The session's own sign-in runs on no Claude account. */
+  | { readonly kind: 'session-none' }
+  /** The session runs on another account than .claude.json records. */
+  | { readonly kind: 'session-other' }
+  /** The session's account isn't known yet. */
+  | { readonly kind: 'session-unconfirmed' }
   /** Chrome's user data folder can't be listed, so no folder can be checked. */
   | { readonly kind: 'unlisted' }
   /** Chrome's user data folder isn't known (`unplaced`), or its Local State can't be read. */
@@ -315,14 +362,14 @@ export type NoPick = Exclude<AccountPick, { readonly kind: 'one' }>
 
 /**
  * What the matching folders come to, among those register.ts found to be profile folders (`present`, each checked as a
- * named one is): one, none or several. Decided on principle: a folder Local State lists without its Preferences file (a
- * profile being deleted, say) doesn't count, since Chrome would make it anew, empty; `absent` counts those when none is
- * left.
+ * named one is): one, none or several; one carries `sessionAsked` (ClaudeAccount's). Decided on principle: a folder
+ * Local State lists without its Preferences file (a profile being deleted, say) doesn't count, since Chrome would make it
+ * anew, empty; `absent` counts those when none is left.
  */
-export function accountMatch(matched: readonly string[], present: readonly string[]): AccountPick {
+export function accountMatch(matched: readonly string[], present: readonly string[], sessionAsked: boolean): AccountPick {
   const kept = matched.filter(folder => isProfileName(folder) && present.includes(folder))
   const [only] = kept
-  if (kept.length === 1 && only !== undefined) return { kind: 'one', folder: only }
+  if (kept.length === 1 && only !== undefined) return { kind: 'one', folder: only, sessionAsked }
   return kept.length === 0 ? { kind: 'none', absent: matched.length } : { kind: 'several', folders: kept }
 }
 
@@ -350,9 +397,15 @@ export function pickReason(pick: NoPick): string {
         ? "Claude Code's .claude.json can't be placed for sure (CLAUDE_CONFIG_DIR, or the home folder, isn't an absolute local path)"
         : `Claude Code's .claude.json ${faultSaid(pick.fault, CLAIM_MAX_BYTES)}`
     case 'no-account':
-      return "Claude Code's .claude.json names no Claude account with an email (an API key, a cloud provider, or logged out)"
+      return "Claude Code's .claude.json records no Claude account with an email"
     case 'claim-unclear':
       return "Claude Code's .claude.json doesn't read as a JSON object just now (caught mid-write, say)"
+    case 'session-none':
+      return "this session isn't signed in to a Claude account (an API key, a Console login, a cloud provider, or no login, as Claude Code says of it)"
+    case 'session-other':
+      return 'this session runs on another account than the one .claude.json records'
+    case 'session-unconfirmed':
+      return "this session's account isn't known yet (a token its host handed it, before the server answered), so the one .claude.json records can't be confirmed"
     case 'unlisted':
       return "Chrome's user data folder can't be listed, so no profile folder can be checked"
     case 'no-local-state':
@@ -374,7 +427,7 @@ export function accountRefusal(pick: NoPick, folders: readonly string[] | undefi
   if (pick.kind === 'no-local-state' && pick.fault === 'unplaced') return { why, fix: byHand }
   if (pick.kind === 'unlisted') return { why, fix: `call chrome_ensure again in a moment, or ${byHand}` }
   const pin = `pin the profile: call chrome_ensure again with \`profile\` set to one of Chrome's profile folders${foldersSaid(folders)}, or set the profile setting to one`
-  return { why, fix: pick.kind === 'claim-unclear' ? `call chrome_ensure again in a moment, or ${pin}` : pin }
+  return { why, fix: pick.kind === 'claim-unclear' || pick.kind === 'session-unconfirmed' ? `call chrome_ensure again in a moment, or ${pin}` : pin }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -868,7 +921,13 @@ export function parseWindowsStart(stdout: string): StartAnswer | string {
 export type Look = { readonly kind: 'read'; readonly judged: Judged } | { readonly kind: 'failed'; readonly why: string }
 
 /** The profile folder a start passed, and where it came from: every start passes one. */
-export type StartProfile = { readonly profile: string; readonly source: ProfileSource }
+export type StartProfile =
+  | { readonly profile: string; readonly source: NamedSource }
+  /** The account match's folder; `sessionAsked`: whether the session's own account was asked (AccountPick's). */
+  | { readonly profile: string; readonly source: 'account'; readonly sessionAsked: boolean }
+
+/** Said of a matched folder when the session's own sign-in couldn't be asked: the file stood alone. Fixed words. */
+export const FILE_ONLY = "Claude Code's account is the one .claude.json records: this session's own sign-in couldn't be asked"
 
 /** What the tool did about starting Chrome. */
 export type Start =
@@ -948,16 +1007,17 @@ function runningSaid(browser: Browser, more: number): string {
 export function accountLine(browser: Browser, pick: AccountPick): { readonly line: string; readonly left?: string } {
   if (pick.kind !== 'one') return { line: `Profile: can't tell whether Chrome runs on ${MATCHED}: ${pickReason(pick)}.` }
   const folder = JSON.stringify(pick.folder)
-  if (browser.profile === pick.folder) return { line: `Profile: Chrome was started on ${folder}, ${MATCHED}.` }
+  const note = pick.sessionAsked ? '' : ` ${FILE_ONLY}.`
+  if (browser.profile === pick.folder) return { line: `Profile: Chrome was started on ${folder}, ${MATCHED}.${note}` }
   if (browser.profile !== undefined) {
     return {
-      line: `Profile: Chrome was started on ${JSON.stringify(browser.profile)}, but ${MATCHED} is ${folder}. A window opened from Chrome's profile menu shows on no command line, so that profile may be open already.`,
+      line: `Profile: Chrome was started on ${JSON.stringify(browser.profile)}, but ${MATCHED} is ${folder}. A window opened from Chrome's profile menu shows on no command line, so that profile may be open already.${note}`,
       left: `open the profile ${folder} from Chrome's profile menu, if it isn't open already: this tool never opens a profile in a Chrome that runs.`,
     }
   }
-  if (browser.namesProfile) return { line: `Profile: Chrome's command line names a profile folder whose name isn't plain, so it can't tell whether Chrome was started on ${folder}, ${MATCHED}.` }
+  if (browser.namesProfile) return { line: `Profile: Chrome's command line names a profile folder whose name isn't plain, so it can't tell whether Chrome was started on ${folder}, ${MATCHED}.${note}` }
   const last = browser.background ? '' : ' (Chrome opened the profile it used last)'
-  return { line: `Profile: Chrome's command line names no profile folder${last}, so it can't tell whether that is ${folder}, ${MATCHED}.` }
+  return { line: `Profile: Chrome's command line names no profile folder${last}, so it can't tell whether that is ${folder}, ${MATCHED}.${note}` }
 }
 
 /** The test or isolated Chromes a look passed over, as a sentence; empty for none. */
@@ -983,7 +1043,12 @@ function addFlagByHand(platform: Platform): string {
 
 /** The arguments a start passed, as a phrase. */
 function argsSaid(profile: StartProfile, flag: boolean): string {
-  const from = profile.source === 'call' ? 'asked for in this call' : profile.source === 'setting' ? 'the profile setting' : "its Google account has the email of Claude Code's account"
+  const from =
+    profile.source === 'account'
+      ? `its Google account has the email of Claude Code's account${profile.sessionAsked ? '' : `; ${FILE_ONLY}`}`
+      : profile.source === 'call'
+        ? 'asked for in this call'
+        : 'the profile setting'
   return `the profile folder ${JSON.stringify(profile.profile)} (${from}), --restore-last-session${flag ? ` and ${FLAG}` : `, without ${FLAG}`}`
 }
 
