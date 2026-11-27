@@ -112,8 +112,11 @@ function outerOf(script) {
  * rest read (and SetThreadDpiAwarenessContext sets the thread's own DPI awareness, put back as it was).
  * EnumWindows is the one listing of windows: it lists the top-level windows once, reads each one's class name, reads
  * the owner of those that are pseudoconsole windows, acts on none, and is there to refuse, never to choose a target
- * (no title is read); held below to its one declaration, its one call and its callback's exact text. An edit that
- * adds, drops or changes one fails here until it is reviewed and this list changed with it.
+ * (no title is read); held below to its one declaration, its one call and its callback's exact text. #90 added two
+ * reads, GetWindowRect and DwmGetWindowAttribute (DWMWA_EXTENDED_FRAME_BOUNDS, 9), each called once, by BorderOf, on
+ * its own window alone: the rectangle and the drawn frame, whose difference is the overhang the clamp may take. No
+ * acting call was added. An edit that adds, drops or changes one fails here until it is reviewed and this list changed
+ * with it.
  */
 const REVIEWED_IMPORTS = [
   '[DllImport("kernel32.dll")] static extern IntPtr GetConsoleWindow();',
@@ -127,6 +130,8 @@ const REVIEWED_IMPORTS = [
   '[DllImport("user32.dll", SetLastError = true)] static extern bool SetWindowPos(IntPtr window, IntPtr after, int x, int y, int width, int height, uint flags);',
   '[DllImport("user32.dll")] static extern bool ShowWindowAsync(IntPtr window, int show);',
   '[DllImport("user32.dll")] static extern bool EnumWindows(EachWindow each, IntPtr data);',
+  '[DllImport("user32.dll")] static extern bool GetWindowRect(IntPtr window, out Box box);',
+  '[DllImport("dwmapi.dll")] static extern int DwmGetWindowAttribute(IntPtr window, uint attribute, out Box value, int size);',
 ]
 
 /**
@@ -140,7 +145,9 @@ const FORBIDDEN_IN_PLACE = ['FindWindow', 'EnumChildWindows', 'EnumDesktopWindow
 const LEFT = { monitor: [-1920, 0, 0, 1080], work: [-1920, 0, 0, 1040] }
 const PRIMARY = { monitor: [0, 0, 2560, 1440], work: [0, 0, 2560, 1400] }
 const TOP_BAR = { monitor: [2560, 0, 4480, 1080], work: [2560, 48, 4480, 1080] }
-/** Each row: what it shows, the rect asked for, and where clampToMonitors puts it among LEFT, PRIMARY and TOP_BAR. */
+/** A window's invisible border, as one machine read it at 100% scale (#90): 7 px on the left, the right and the bottom. */
+const BORDER = [7, 7, 7]
+/** Each row: what it shows, the rect asked for, where clampToMonitors puts it among LEFT, PRIMARY and TOP_BAR, and the window's border (none when left out). */
 const CLAMP_ROWS = [
   ['inside the primary monitor: as asked', [100, 100, 1280, 800], [100, 100, 1280, 800]],
   ['wholly off every monitor, far right and down: onto the nearest, inside its work area', [30000, 30000, 800, 600], [3680, 480, 800, 600]],
@@ -152,6 +159,36 @@ const CLAMP_ROWS = [
   ["past the left-hand monitor's left edge: moved onto it", [-2100, 50, 800, 600], [-1920, 50, 800, 600]],
   ['under a taskbar along the top: just below it', [3000, 0, 800, 600], [3000, 48, 800, 600]],
   ["past the primary's work area at the bottom: up into it", [500, 1300, 800, 600], [500, 800, 800, 600]],
+]
+
+/** #90's made-up screen: one monitor of 1920 x 1080 whose work area stops at 1032, its taskbar below. */
+const SCREEN = { monitor: [0, 0, 1920, 1080], work: [0, 0, 1920, 1032] }
+/**
+ * #90's rows, on SCREEN alone, with a border of 7 px on the left, the right and the bottom (BORDER), which the
+ * rectangle may pass the work area by, and no more. The cells are made up: 4 x 2 of 480 x 516 drawn, so a cell's
+ * rectangle is 494 x 523 at x -7, 473, 953 or 1433 and y 0 or 516.
+ */
+const OVERHANG_CLAMP_ROWS = [
+  ['a left edge: the frame flush with it, the border past it', [-7, 100, 494, 523], [-7, 100, 494, 523], BORDER],
+  ['a right edge: the frame flush with it', [1433, 100, 494, 523], [1433, 100, 494, 523], BORDER],
+  ['a bottom edge: the frame flush with it', [500, 516, 494, 523], [500, 516, 494, 523], BORDER],
+  ['the bottom-left corner: flush with both edges', [-7, 516, 494, 523], [-7, 516, 494, 523], BORDER],
+  ['a border read of 0: wholly inside, as #89 placed it', [-7, 100, 494, 523], [0, 100, 494, 523], [0, 0, 0]],
+  ['past the left edge by more than its border: by its border alone', [-20, 100, 800, 600], [-7, 100, 800, 600], BORDER],
+  ['never past the top: the top has no border', [100, -7, 800, 600], [100, 0, 800, 600], BORDER],
+  ['larger than the work area: the work area and the border', [100, 100, 4000, 3000], [-7, 0, 1934, 1039], BORDER],
+  ['wholly off every monitor: onto the one there is, past its work area by its border alone', [30000, 30000, 800, 600], [1127, 439, 800, 600], BORDER],
+]
+
+/** Each row: a window's rectangle and its drawn frame ([left, top, right, bottom]), and the overhang read from them (overhangOf, PLACE_CS's Overhang). Made up. */
+const OVERHANG_ROWS = [
+  ['a border of 7 px on three sides, none at the top', [-7, 0, 967, 1039], [0, 0, 960, 1032], [7, 7, 7]],
+  ['no border: the frame is the rectangle', [0, 0, 960, 1032], [0, 0, 960, 1032], [0, 0, 0]],
+  ['1 px reads as none', [-1, 0, 961, 1033], [0, 0, 960, 1032], [0, 0, 0]],
+  ['2 px and 64 px read as they are', [-2, 0, 1024, 1096], [0, 0, 960, 1032], [2, 64, 64]],
+  ['the top is never read: a rectangle 5 px above its frame reads as the 7 px of the other three sides', [-7, -5, 967, 1039], [0, 0, 960, 1032], [7, 7, 7]],
+  ['65 px is no border read', [-65, 0, 960, 1032], [0, 0, 960, 1032], [0, 0, 0]],
+  ['a frame outside the rectangle is no border', [10, 0, 950, 1022], [0, 0, 960, 1032], [0, 0, 0]],
 ]
 
 /** Each check takes a machine module: the real one, or a copy with a fault in it. */
@@ -940,7 +977,19 @@ const CHECKS = {
     assert.deepEqual(cs.match(/\bShowWindowAsync\([^)]*\)/g), ['ShowWindowAsync(IntPtr window, int show)', 'ShowWindowAsync(own, 3)'], 'SW_MAXIMIZE alone')
     assert.deepEqual(cs.match(/\bown = [^;]+;/g), ['own = IntPtr.Zero;', 'own = console;', 'own = GetWindow(console, 4);'], 'its own window: its console window, or that window\'s owner (GW_OWNER)')
     assert.deepEqual(cs.match(/\bconsole = [^;]+;/g), ['console = GetConsoleWindow();'])
-    assert.deepEqual(cs.match(/\bat = [^;]+;/g), ['at = Clamp(x, y, width, height, info.Work.Left, info.Work.Top, info.Work.Right, info.Work.Bottom);'])
+    assert.deepEqual(cs.match(/\bat = [^;]+;/g), ['at = Clamp(x, y, width, height, info.Work.Left, info.Work.Top, info.Work.Right, info.Work.Bottom, border[0], border[1], border[2]);'])
+    // #90: the border is its own window's, read by two reads of that window alone, after the thread is per-monitor aware and
+    // before the clamp; a read that fails is no overhang; the clamp passes the work area by it on the left, the right and the bottom.
+    assert.deepEqual(cs.match(/\bborder = [^;]+;/g), ['border = BorderOf(own);'])
+    assert.deepEqual(cs.match(/\bBorderOf\([^)]*\)/g), ['BorderOf(IntPtr window)', 'BorderOf(own)'], 'declared once, called once, on its own window')
+    assert.deepEqual(cs.match(/\bGetWindowRect\([^)]*\)/g), ['GetWindowRect(IntPtr window, out Box box)', 'GetWindowRect(window, out rect)'])
+    assert.deepEqual(cs.match(/\bDwmGetWindowAttribute\([^)]*\)/g), ['DwmGetWindowAttribute(IntPtr window, uint attribute, out Box value, int size)', 'DwmGetWindowAttribute(window, 9, out frame, Marshal.SizeOf(typeof(Box)'], 'DWMWA_EXTENDED_FRAME_BOUNDS (9) alone')
+    assert.ok(cs.includes('if (!GetWindowRect(window, out rect) || DwmGetWindowAttribute(window, 9, out frame, Marshal.SizeOf(typeof(Box))) != 0) return new int[] { 0, 0, 0 };'), 'a read that fails is no overhang')
+    assert.ok(cs.includes(`static int Side(int d) { return d >= ${m.BORDER_LIMITS.min} && d <= ${m.BORDER_LIMITS.max} ? d : 0; }`), 'a side outside 2 to 64 px reads as none')
+    assert.ok(cs.includes('return new int[] { Side(frameLeft - left), Side(right - frameRight), Side(bottom - frameBottom) };'), 'the left, the right and the bottom; never the top')
+    assert.ok(cs.includes('left = left - borderLeft; right = right + borderRight; bottom = bottom + borderBottom; int w = Math.Min(width, right - left);'), 'the clamp passes the work area by the border alone, never at the top')
+    const bordered = cs.indexOf('int[] border = BorderOf(own);')
+    assert.ok(bordered > cs.indexOf('IntPtr before = SetThreadDpiAwarenessContext(new IntPtr(-4));') && bordered < cs.indexOf('int[] at = Clamp(') && bordered > cs.indexOf('int hosted = Hosted(own, console);'), 'read per-monitor aware, after the count, before the clamp')
     assert.ok(cs.includes('if (kind == "ConsoleWindowClass") own = console; else if (kind == "PseudoConsoleWindow") { own = GetWindow(console, 4); if (own == IntPtr.Zero || ClassOf(own) != "CASCADIA_HOSTING_WINDOW_CLASS") return '), 'the classic console\'s window, or the Windows Terminal window that owns the pseudoconsole; else nothing')
     // Asked only to be maximized, a window maximized already is where it is asked: "placed", nothing done, nothing said;
     // with a rect too, it is left as it is (the rect was not applied), as before.
@@ -983,15 +1032,25 @@ const CHECKS = {
   clampRule(m) {
     // The clamp as a pure function, every row in one run, each that differs listed.
     const monitors = [LEFT, PRIMARY, TOP_BAR]
-    const wrong = CLAMP_ROWS.map(([name, rect, want]) => [name, rect, want, m.clampToMonitors(rect, monitors)]).filter(([, , want, got]) => JSON.stringify(got) !== JSON.stringify(want))
+    // #89's rows among three monitors, with no border; #90's on a screen of their own, with one: every row of both in one run.
+    const tables = [...CLAMP_ROWS.map(row => [monitors, ...row]), ...OVERHANG_CLAMP_ROWS.map(([name, ...row]) => [[SCREEN], `#90, ${name}`, ...row])]
+    const wrong = tables.map(([screens, name, rect, want, border]) => [name, rect, want, border === undefined ? m.clampToMonitors(rect, screens) : m.clampToMonitors(rect, screens, border)]).filter(([, , want, got]) => JSON.stringify(got) !== JSON.stringify(want))
     assert.deepEqual(wrong.map(([name, rect, want, got]) => `${name}: ${JSON.stringify(rect)} gave ${JSON.stringify(got)}, not ${JSON.stringify(want)}`), [])
-    // Wherever it was asked for, the window ends wholly inside one monitor's work area.
-    for (const [name, rect] of CLAMP_ROWS) {
-      const [x, y, w, h] = m.clampToMonitors(rect, monitors)
-      assert.ok(monitors.some(({ work: [l, t, r, b] }) => x >= l && y >= t && x + w <= r && y + h <= b), name)
+    // Wherever it was asked for, the window ends wholly inside one monitor's work area, passed by its border alone (#90).
+    for (const [screens, name, rect, , border = [0, 0, 0]] of tables) {
+      const [x, y, w, h] = m.clampToMonitors(rect, screens, border)
+      assert.ok(screens.some(({ work: [l, t, r, b] }) => x >= l - border[0] && y >= t && x + w <= r + border[1] && y + h <= b + border[2]), name)
     }
     assert.throws(() => m.clampToMonitors([0, 0, 800, 600], []), /no monitor/)
     assert.deepEqual(m.clampToWork([5000, -5000, 800, 600], [0, 0, 1920, 1040]), [1120, 0, 800, 600])
+    // #90's own example: a window snapped to the left half of a 1920 x 1032 work area is drawn at 0, its rectangle at -7.
+    assert.deepEqual(m.clampToWork([-7, 0, 974, 1039], [0, 0, 1920, 1032], BORDER), [-7, 0, 974, 1039], 'flush: as asked')
+    assert.deepEqual(m.clampToWork([-7, 0, 974, 1039], [0, 0, 1920, 1032]), [0, 0, 974, 1032], 'with no border, as #89 placed it')
+    assert.deepEqual(m.NO_OVERHANG, [0, 0, 0])
+    assert.deepEqual(m.BORDER_LIMITS, { min: 2, max: 64 })
+    // The border read: every row in one run, each that differs listed.
+    const misread = OVERHANG_ROWS.map(([name, rect, frame, want]) => [name, want, m.overhangOf(rect, frame)]).filter(([, want, got]) => JSON.stringify(got) !== JSON.stringify(want))
+    assert.deepEqual(misread.map(([name, want, got]) => `${name}: ${JSON.stringify(got)}, not ${JSON.stringify(want)}`), [])
   },
 }
 
@@ -1197,6 +1256,14 @@ const FAULTS = [
     "  '[DllImport(\"user32.dll\")] static extern bool EnumWindows(EachWindow each, IntPtr data);',\n",
     "  '[DllImport(\"user32.dll\")] static extern bool EnumWindows(EachWindow each, IntPtr data);',\n  '[DllImportAttribute(\"user32.dll\")] static extern bool OpenIcon(IntPtr w);',\n",
   ],
+  ['#90: the overhang dropped from the clamp', 'clampRule', '[work[0] - border[0], work[1], work[2] + border[1], work[3] + border[2]]', 'work'],
+  ['#90: the top overhanging too', 'clampRule', '[work[0] - border[0], work[1], work[2] + border[1]', '[work[0] - border[0], work[1] - border[0], work[2] + border[1]'],
+  ['#90: a 1 px border taken as one', 'clampRule', 'd >= BORDER_LIMITS.min && d <= BORDER_LIMITS.max ? d : 0', 'd > 0 ? d : 0'],
+  ['#90: no limit on a border read', 'clampRule', 'd >= BORDER_LIMITS.min && d <= BORDER_LIMITS.max ? d : 0', 'd >= BORDER_LIMITS.min ? d : 0'],
+  ["#90: the console window's border read, not its own window's", 'actingCalls', "'int[] border = BorderOf(own);',", "'int[] border = BorderOf(console);',"],
+  ['#90: a failed border read taken as a border', 'actingCalls', ' return new int[] { 0, 0, 0 }; return Overhang(', ' return Overhang('],
+  ['#90: the C# clamp not passing the work area on the left', 'actingCalls', 'left = left - borderLeft; ', ''],
+  ['#90: the border read before the thread is per-monitor aware', 'actingCalls', "  'int[] border = BorderOf(own);',\n", '', [["'IntPtr console = GetConsoleWindow();',", "'IntPtr console = GetConsoleWindow(); int[] border = BorderOf(console);',"]]],
   ['#5 review WP-L-4: a maximized-only ask of a maximized window said as not placed again', 'actingCalls', "  'if (!hasRect && maximized && IsZoomed(own) && !IsIconic(own)) return \"placed\";',\n", ''],
   ['#5 review WP-L-4: a maximized window taken as placed when a rect is asked too', 'actingCalls', 'if (!hasRect && maximized && IsZoomed(own)', 'if (maximized && IsZoomed(own)'],
   [

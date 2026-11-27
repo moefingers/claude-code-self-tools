@@ -90,7 +90,7 @@ function hidden(script, shell = WINDOWS_POWERSHELL, timeout = HIDDEN_LIMIT_MS) {
   return { code: run.status, out: `${run.stdout ?? ''}`, err: `${run.stderr ?? ''}` }
 }
 
-/** Each row: a rect and a work area ([left, top, right, bottom]): what PLACE_CS's Clamp and clampToWork must agree on. */
+/** Each row: a rect, a work area ([left, top, right, bottom]) and, from #90, a border ([left, right, bottom]; none when left out): what PLACE_CS's Clamp and clampToWork must agree on. */
 const CLAMP_PAIRS = [
   [[100, 100, 1280, 800], [0, 0, 2560, 1400]],
   [[30000, 30000, 800, 600], [2560, 48, 4480, 1080]],
@@ -101,13 +101,36 @@ const CLAMP_PAIRS = [
   [[3000, 0, 800, 600], [2560, 48, 4480, 1080]],
   [[5000, -5000, 800, 600], [0, 0, 1920, 1040]],
   [[0, 0, 32768, 32768], [-1920, 0, 0, 1040]],
+  // #90, on a made-up 1920 x 1032 work area: a left edge, a right edge, a bottom edge, a corner, past the border, the top,
+  // larger, and off every monitor, with a border of 7 px, and one uneven border.
+  [[-7, 100, 494, 523], [0, 0, 1920, 1032], [7, 7, 7]],
+  [[1433, 100, 494, 523], [0, 0, 1920, 1032], [7, 7, 7]],
+  [[500, 516, 494, 523], [0, 0, 1920, 1032], [7, 7, 7]],
+  [[-7, 516, 494, 523], [0, 0, 1920, 1032], [7, 7, 7]],
+  [[-20, 100, 800, 600], [0, 0, 1920, 1032], [7, 7, 7]],
+  [[100, -7, 800, 600], [0, 0, 1920, 1032], [7, 7, 7]],
+  [[100, 100, 4000, 3000], [0, 0, 1920, 1032], [7, 7, 7]],
+  [[30000, 30000, 800, 600], [0, 0, 1920, 1032], [7, 3, 11]],
+]
+
+/** Each row: a window's rectangle and its drawn frame ([left, top, right, bottom]): what PLACE_CS's Overhang and overhangOf must agree on (#90). */
+const OVERHANG_PAIRS = [
+  [[-7, 0, 967, 1039], [0, 0, 960, 1032]],
+  [[0, 0, 960, 1032], [0, 0, 960, 1032]],
+  [[-1, 0, 961, 1033], [0, 0, 960, 1032]],
+  [[-2, 0, 1024, 1096], [0, 0, 960, 1032]],
+  // The top is never read: 5 px above the frame, and the three sides still 7.
+  [[-7, -5, 967, 1039], [0, 0, 960, 1032]],
+  [[-65, 0, 960, 1032], [0, 0, 960, 1032]],
+  [[10, 0, 950, 1022], [0, 0, 960, 1032]],
 ]
 
 describe('the window\'s own C#, compiled, its Clamp held to clampToWork (no window)', { skip: !isWindows && 'Windows only: Add-Type compiles the C# of a Windows window' }, () => {
   for (const [name, shell] of [['Windows PowerShell 5.1', WINDOWS_POWERSHELL], ['PowerShell 7', PWSH]]) {
-    test(`${name}: PLACE_CS compiles, every row of Clamp is clampToWork's; Hosted is read for this hidden shell's console, which, started with no console window, it is expected to have none of, so nothing is counted`, t => {
+    test(`${name}: PLACE_CS compiles, every row of Clamp is clampToWork's and every row of Overhang overhangOf's (#90); Hosted is read for this hidden shell's console, which, started with no console window, it is expected to have none of, so nothing is counted`, t => {
       if (!existsSync(shell)) return t.skip(`${name} is not installed here`)
-      const calls = CLAMP_PAIRS.map(([[x, y, w, h], [l, tp, r, b]]) => `@([ClaudeSelfToolsPlace]::Clamp([int]${x}, [int]${y}, [int]${w}, [int]${h}, [int]${l}, [int]${tp}, [int]${r}, [int]${b}))`)
+      const calls = CLAMP_PAIRS.map(([[x, y, w, h], [l, tp, r, b], [bl, br, bb] = [0, 0, 0]]) => `@([ClaudeSelfToolsPlace]::Clamp([int]${x}, [int]${y}, [int]${w}, [int]${h}, [int]${l}, [int]${tp}, [int]${r}, [int]${b}, [int]${bl}, [int]${br}, [int]${bb}))`)
+      const overhangs = OVERHANG_PAIRS.map(([rect, frame]) => `@([ClaudeSelfToolsPlace]::Overhang(${[...rect, ...frame].map(n => `[int]${n}`).join(', ')}))`)
       const script = [
         `Add-Type -ErrorAction Stop -TypeDefinition ${psq(machine.PLACE_CS)}`,
         `Add-Type -ErrorAction Stop -TypeDefinition ${psq(TEST_CS)}`,
@@ -116,7 +139,7 @@ describe('the window\'s own C#, compiled, its Clamp held to clampToWork (no wind
         '$owner = [long][ClaudeSelfToolsPlaceTest]::OwnLow()',
         '$hosted = $null',
         'if ($owner -ne 0) { $hosted = [ClaudeSelfToolsPlace]::Hosted([IntPtr]::new($owner), [IntPtr]::new([long][ClaudeSelfToolsPlaceTest]::ConsoleLow())) }',
-        `[Console]::Out.WriteLine((ConvertTo-Json -Compress -Depth 4 -InputObject ([ordered]@{ clamp = @(${calls.join(', ')}); kind = $kind; hosted = $hosted })))`,
+        `[Console]::Out.WriteLine((ConvertTo-Json -Compress -Depth 4 -InputObject ([ordered]@{ clamp = @(${calls.join(', ')}); overhang = @(${overhangs.join(', ')}); kind = $kind; hosted = $hosted })))`,
       ].join('\r\n')
       const ran = hidden(script, shell)
       assert.equal(ran.code, 0, `${ran.out}${ran.err}`)
@@ -124,8 +147,15 @@ describe('the window\'s own C#, compiled, its Clamp held to clampToWork (no wind
       t.diagnostic(answer.kind === 'no console window' ? 'this hidden shell has no console window, so nothing is counted here' : `this hidden shell's console: ${answer.kind}; Hosted: ${answer.hosted ?? 'not counted (no Windows Terminal window owns it)'}`)
       assert.ok(answer.hosted === null || (Number.isInteger(answer.hosted) && answer.hosted >= -1), `Hosted answers a count or -1: ${JSON.stringify(answer)}`)
       const got = answer.clamp
-      const wrong = CLAMP_PAIRS.map(([rect, work], i) => [rect, work, got[i], machine.clampToWork(rect, work)]).filter(([, , cs, ts]) => JSON.stringify(cs) !== JSON.stringify(ts))
-      assert.deepEqual(wrong.map(([rect, work, cs, ts]) => `${JSON.stringify(rect)} in ${JSON.stringify(work)}: C# ${JSON.stringify(cs)}, TypeScript ${JSON.stringify(ts)}`), [])
+      const wrong = CLAMP_PAIRS.map(([rect, work, border = [0, 0, 0]], i) => [rect, work, border, got[i], machine.clampToWork(rect, work, border)]).filter(([, , , cs, ts]) => JSON.stringify(cs) !== JSON.stringify(ts))
+      const misread = OVERHANG_PAIRS.map(([rect, frame], i) => [rect, frame, answer.overhang[i], machine.overhangOf(rect, frame)]).filter(([, , cs, ts]) => JSON.stringify(cs) !== JSON.stringify(ts))
+      assert.deepEqual(
+        [
+          ...wrong.map(([rect, work, border, cs, ts]) => `Clamp ${JSON.stringify(rect)} in ${JSON.stringify(work)} by ${JSON.stringify(border)}: C# ${JSON.stringify(cs)}, TypeScript ${JSON.stringify(ts)}`),
+          ...misread.map(([rect, frame, cs, ts]) => `Overhang ${JSON.stringify(rect)} framed ${JSON.stringify(frame)}: C# ${JSON.stringify(cs)}, TypeScript ${JSON.stringify(ts)}`),
+        ],
+        [],
+      )
     })
   }
 })
@@ -163,6 +193,7 @@ const TEST_CS = [
   '[DllImport("kernel32.dll")] static extern bool GetExitCodeProcess(IntPtr process, out uint code);',
   '[DllImport("kernel32.dll", SetLastError = true)] static extern bool TerminateProcess(IntPtr process, uint code);',
   '[DllImport("kernel32.dll")] static extern bool CloseHandle(IntPtr handle);',
+  '[DllImport("dwmapi.dll")] static extern int DwmGetWindowAttribute(IntPtr window, uint attribute, out Box value, int size);',
   'static long Low(IntPtr window) { return window.ToInt64() & 0xffffffffL; }',
   'static string ClassOf(IntPtr window) { StringBuilder name = new StringBuilder(256); return GetClassNameW(window, name, name.Capacity) > 0 ? name.ToString() : ""; }',
   'static IntPtr Own() { IntPtr console = GetConsoleWindow(); if (console == IntPtr.Zero) return IntPtr.Zero; string kind = ClassOf(console); if (kind == "ConsoleWindowClass") return console; if (kind == "PseudoConsoleWindow") { IntPtr owner = GetWindow(console, 4); if (owner != IntPtr.Zero && ClassOf(owner) == "CASCADIA_HOSTING_WINDOW_CLASS") return owner; } return IntPtr.Zero; }',
@@ -172,6 +203,8 @@ const TEST_CS = [
   'public static long OwnerLow() { IntPtr console = GetConsoleWindow(); return console == IntPtr.Zero ? 0 : Low(GetWindow(console, 4)); }',
   'public static int[] OwnRect() { IntPtr before = SetThreadDpiAwarenessContext(new IntPtr(-4)); try { Box box; if (!GetWindowRect(Own(), out box)) return new int[0]; return new int[] { box.Left, box.Top, box.Right - box.Left, box.Bottom - box.Top }; } finally { if (before != IntPtr.Zero) SetThreadDpiAwarenessContext(before); } }',
   'public static int[] OwnNormal() { IntPtr before = SetThreadDpiAwarenessContext(new IntPtr(-4)); try { Placement place = new Placement(); place.Length = Marshal.SizeOf(typeof(Placement)); if (!GetWindowPlacement(Own(), ref place)) return new int[0]; return new int[] { place.Normal.Left, place.Normal.Top, place.Normal.Right - place.Normal.Left, place.Normal.Bottom - place.Normal.Top }; } finally { if (before != IntPtr.Zero) SetThreadDpiAwarenessContext(before); } }',
+  // #90: its drawn frame (DWMWA_EXTENDED_FRAME_BOUNDS, 9), [left, top, right, bottom], read per-monitor aware as the shipped BorderOf reads it.
+  'public static int[] OwnFrame() { IntPtr before = SetThreadDpiAwarenessContext(new IntPtr(-4)); try { Box box; if (DwmGetWindowAttribute(Own(), 9, out box, Marshal.SizeOf(typeof(Box))) != 0) return new int[0]; return new int[] { box.Left, box.Top, box.Right, box.Bottom }; } finally { if (before != IntPtr.Zero) SetThreadDpiAwarenessContext(before); } }',
   'public static bool OwnZoomed() { return IsZoomed(Own()); }',
   'public static int[] OwnWork() { IntPtr before = SetThreadDpiAwarenessContext(new IntPtr(-4)); try { MonitorInfo info = new MonitorInfo(); info.Size = (uint)Marshal.SizeOf(typeof(MonitorInfo)); if (!GetMonitorInfoW(MonitorFromWindow(Own(), 2), ref info)) return new int[0]; return new int[] { info.Work.Left, info.Work.Top, info.Work.Right, info.Work.Bottom }; } finally { if (before != IntPtr.Zero) SetThreadDpiAwarenessContext(before); } }',
   'public static long Foreground() { return Low(GetForegroundWindow()); }',
@@ -295,6 +328,7 @@ function openWindow(plan) {
     `    if (-not ("ClaudeSelfToolsPlace" -as [type])) { Add-Type -ErrorAction Stop -TypeDefinition ${psq(machine.PLACE_CS)} }`,
     '    if ($result.kind -like "PseudoConsoleWindow*") { $result.hosted = [ClaudeSelfToolsPlace]::Hosted([IntPtr]::new([long]$result.own), [IntPtr]::new([long]$result.console)) }',
     `    $result.rectAfter = @(${T}::OwnRect())`,
+    `    $result.frameAfter = @(${T}::OwnFrame())`,
     `    $result.zoomed = ${T}::OwnZoomed()`,
     `    $result.work = @(${T}::OwnWork())`,
     // The restore rectangle, a read: GetWindowPlacement's normal rectangle, in its own coordinates (workspace ones, from memory).
@@ -422,16 +456,21 @@ describe('the plain window places itself, live (#5)', { skip: liveSkip, concurre
     const rect = [30000, 30000, 640, 400]
     const [x, y, w, h] = rect
     if (screens.some(({ monitor: [l, top, r, b] }) => x < r && x + w > l && y < b && y + h > top)) return t.skip('a monitor reaches 30000,30000 here, so the rectangle is not off every monitor')
-    // The target once Windows has picked the monitor: Clamp onto the work area the window is on, as PLACE_CS computes it.
-    const prelude = [`function Get-Target { $w = @(${T}::OwnWork()); if ($w.Count -ne 4) { return @() }; return @([ClaudeSelfToolsPlace]::Clamp([int]${x}, [int]${y}, [int]${w}, [int]${h}, $w[0], $w[1], $w[2], $w[3])) }`]
+    // The target once Windows has picked the monitor: Clamp onto the work area the window is on, passed by the window's own
+    // border (#90: its rectangle and its drawn frame, read now, Overhang's arithmetic), as PLACE_CS computes it.
+    const prelude = [`function Get-Target { $w = @(${T}::OwnWork()); $r = @(${T}::OwnRect()); $f = @(${T}::OwnFrame()); if ($w.Count -ne 4 -or $r.Count -ne 4 -or $f.Count -ne 4) { return @() }; $b = @([ClaudeSelfToolsPlace]::Overhang($r[0], $r[1], $r[0] + $r[2], $r[1] + $r[3], $f[0], $f[1], $f[2], $f[3])); return @([ClaudeSelfToolsPlace]::Clamp([int]${x}, [int]${y}, [int]${w}, [int]${h}, $w[0], $w[1], $w[2], $w[3], $b[0], $b[1], $b[2])) }`]
     const opened = openWindow({ place: { rect }, prelude, until: `((@(${T}::OwnRect()) -join ",") -ne ($result.rectBefore -join ",")) -and (Test-Near @(${T}::OwnRect()) @(Get-Target))` })
     if (!settled(t, opened)) return
     const { result } = opened
     assert.equal(result.placeSaid, 'placed', seen(opened))
     assert.notEqual(result.settledMs, null, `moved onto its work area within ${SETTLE_LIMIT_MS} ms: ${seen(opened)}`)
     assert.notDeepEqual(result.rectAfter, result.rectBefore, `it moved: ${seen(opened)}`)
-    assert.ok(rectNear(result.rectAfter, machine.clampToWork(rect, result.work)), `at clampToWork(${JSON.stringify(rect)}, ${JSON.stringify(result.work)}): ${seen(opened)}`)
-    t.diagnostic(`Windows put it on the work area ${JSON.stringify(result.work)}; the model's choice (clampToMonitors) is ${JSON.stringify(machine.clampToMonitors(rect, screens))}`)
+    // #90: the border its frame was read with, after the move: the rectangle as [left, top, right, bottom] against its frame.
+    const [ax, ay, aw, ah] = result.rectAfter
+    const border = Array.isArray(result.frameAfter) && result.frameAfter.length === 4 ? machine.overhangOf([ax, ay, ax + aw, ay + ah], result.frameAfter) : machine.NO_OVERHANG
+    t.diagnostic(`its border, read after the move: ${JSON.stringify(border)} (frame ${JSON.stringify(result.frameAfter)})`)
+    assert.ok(rectNear(result.rectAfter, machine.clampToWork(rect, result.work, border)), `at clampToWork(${JSON.stringify(rect)}, ${JSON.stringify(result.work)}, ${JSON.stringify(border)}): ${seen(opened)}`)
+    t.diagnostic(`Windows put it on the work area ${JSON.stringify(result.work)}; the model's choice (clampToMonitors) is ${JSON.stringify(machine.clampToMonitors(rect, screens, border))}`)
   })
 
   test(`an unplaced window is not moved (watched for ${WATCH_MS / 1000} s)`, t => {

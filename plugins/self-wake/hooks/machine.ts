@@ -4460,12 +4460,39 @@ export type ScreenBox = readonly [number, number, number, number]
 export type MonitorBox = { readonly monitor: ScreenBox; readonly work: ScreenBox }
 
 /**
- * `rect` within `work`: no wider or taller than the work area, then moved the least that puts it wholly inside.
- * The arithmetic of PLACE_CS's Clamp, line for line (scripts/window-place-live.test.mjs compares the two on Windows).
+ * How far a window's rectangle may pass its work area, in pixels: on the left, on the right and at the bottom, in
+ * that order. It is the window's own invisible resize border on each side, as PLACE_CS reads it (overhangOf), so a
+ * window can sit flush against a screen edge (#90). Never the top: a window's border there is none on Windows 10
+ * and 11 (from memory), and its frame is what a person drags.
  */
-export function clampToWork(rect: PixelRect, work: ScreenBox): PixelRect {
+export type Overhang = readonly [number, number, number]
+
+/** No overhang: the rectangle wholly inside the work area, as #89 placed it, and what a failed border read gives. */
+export const NO_OVERHANG: Overhang = [0, 0, 0]
+
+/** A border side PLACE_CS reads as one: 2 to 64 pixels. Less is none (a rounding, not a border); more is no border read. */
+export const BORDER_LIMITS = { min: 2, max: 64 } as const
+
+/**
+ * A window's overhang from its rectangle as Windows keeps it (GetWindowRect) and its drawn frame (DWM's extended
+ * frame bounds), both [left, top, right, bottom]: the frame's left minus the rectangle's, the rectangle's right minus
+ * the frame's, the rectangle's bottom minus the frame's; a side outside BORDER_LIMITS reads as 0. PLACE_CS's Overhang,
+ * line for line (scripts/window-place-live.test.mjs compares the two on Windows).
+ */
+export function overhangOf(rect: ScreenBox, frame: ScreenBox): Overhang {
+  const side = (d: number): number => (d >= BORDER_LIMITS.min && d <= BORDER_LIMITS.max ? d : 0)
+  return [side(frame[0] - rect[0]), side(rect[2] - frame[2]), side(rect[3] - frame[3])]
+}
+
+/**
+ * `rect` within `work`, which may be passed by `border` (Overhang) on the left, the right and the bottom: no wider or
+ * taller than that area, then moved the least that puts it wholly inside it. With no border, wholly inside the work
+ * area, as #89 placed it. The arithmetic of PLACE_CS's Clamp, line for line (scripts/window-place-live.test.mjs
+ * compares the two on Windows).
+ */
+export function clampToWork(rect: PixelRect, work: ScreenBox, border: Overhang = NO_OVERHANG): PixelRect {
   const [x, y, width, height] = rect
-  const [left, top, right, bottom] = work
+  const [left, top, right, bottom] = [work[0] - border[0], work[1], work[2] + border[1], work[3] + border[2]]
   const w = Math.min(width, right - left)
   const h = Math.min(height, bottom - top)
   return [Math.max(left, Math.min(x, right - w)), Math.max(top, Math.min(y, bottom - h)), w, h]
@@ -4479,9 +4506,11 @@ export function clampToWork(rect: PixelRect, work: ScreenBox): PixelRect {
  * the monitor with the largest area of intersection with the rectangle. For a rectangle that meets none, the page
  * says only "the display monitor that is nearest to the rectangle": here the smallest gap between the two
  * rectangles (across plus down), ties to the first; a stand-in for Windows' own measure, which no page gives.
- * A rectangle across two monitors goes wholly onto the one that holds more of it. Throws with no monitor.
+ * A rectangle across two monitors goes wholly onto the one that holds more of it, passing its work area by `border`
+ * alone (clampToWork). The monitor is picked by `rect` as asked, before any clamp, as PLACE_CS asks MonitorFromRect.
+ * Throws with no monitor.
  */
-export function clampToMonitors(rect: PixelRect, monitors: readonly MonitorBox[]): PixelRect {
+export function clampToMonitors(rect: PixelRect, monitors: readonly MonitorBox[], border: Overhang = NO_OVERHANG): PixelRect {
   if (monitors.length === 0) throw new Error('no monitor to place a window on')
   const [x, y, width, height] = rect
   const overlap = ([left, top, right, bottom]: ScreenBox): number => Math.max(0, Math.min(right, x + width) - Math.max(left, x)) * Math.max(0, Math.min(bottom, y + height) - Math.max(top, y))
@@ -4489,7 +4518,7 @@ export function clampToMonitors(rect: PixelRect, monitors: readonly MonitorBox[]
   let best = monitors[0] as MonitorBox
   for (const m of monitors) if (overlap(m.monitor) > overlap(best.monitor)) best = m
   if (overlap(best.monitor) === 0) for (const m of monitors) if (gap(m.monitor) < gap(best.monitor)) best = m
-  return clampToWork(rect, best.work)
+  return clampToWork(rect, best.work, border)
 }
 
 /** SetWindowPos's flags for the place: SWP_NOZORDER (0x0004) | SWP_NOACTIVATE (0x0010) | SWP_NOOWNERZORDER (0x0200) | SWP_ASYNCWINDOWPOS (0x4000). */
@@ -4514,7 +4543,11 @@ export const PLACE_SWP_FLAGS = 0x4214
  * the window's. Then per-monitor DPI awareness for its thread alone
  * (SetThreadDpiAwarenessContext(-4), DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2; Windows PowerShell 5.1 is DPI-unaware,
  * #5), put back as it was before it returns. With a rect: the monitor MonitorFromRect picks (MONITOR_DEFAULTTONEAREST,
- * 2), its work area (GetMonitorInfoW's rcWork), Clamp (clampToWork's arithmetic), then SetWindowPos with
+ * 2), its work area (GetMonitorInfoW's rcWork), its own window's invisible border (BorderOf, #90: two reads of that one
+ * window, GetWindowRect and DwmGetWindowAttribute(DWMWA_EXTENDED_FRAME_BOUNDS); the rectangle minus the drawn frame on
+ * the left, the right and the bottom, Overhang's arithmetic, overhangOf's; a side under 2 px or over 64 px reads as none,
+ * and a read that fails is no overhang at all), Clamp (clampToWork's arithmetic, passing the work area by that border
+ * alone, so the drawn frame can sit flush against an edge and never past it), then SetWindowPos with
  * PLACE_SWP_FLAGS: no Z-order change, no activation, posted to the window's own thread rather than waited on. With
  * maximized: ShowWindowAsync(SW_MAXIMIZE = 3), after the rect when both are given, so it maximizes on that rect's
  * monitor and restores to the rect: so intended, and not seen until the guarded live run shows it. ShowWindow has no
@@ -4549,9 +4582,21 @@ export const PLACE_SWP_FLAGS = 0x4214
  * and MONITORINFO https://learn.microsoft.com/en-us/windows/win32/api/winuser/ns-winuser-monitorinfo; SetWindowPos
  * https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-setwindowpos; ShowWindowAsync
  * https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-showwindowasync and ShowWindow's values
- * https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-showwindow. From memory alone, no page read:
+ * https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-showwindow. GetWindowRect
+ * https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-getwindowrect ("the Window Rect now may include
+ * invisible resize borders. To get the visible window bounds, not including the invisible resize borders, use
+ * DwmGetWindowAttribute, specifying DWMWA_EXTENDED_FRAME_BOUNDS. Note that unlike the Window Rect, the DWM Extended
+ * Frame Bounds are not adjusted for DPI": so both are read after the thread is made per-monitor aware, where neither is
+ * virtualized; that they then agree is from memory, and the guarded live run is what shows it); DwmGetWindowAttribute
+ * https://learn.microsoft.com/en-us/windows/win32/api/dwmapi/nf-dwmapi-dwmgetwindowattribute (dwmapi.dll; S_OK, 0, on
+ * success, an HRESULT error otherwise) and DWMWINDOWATTRIBUTE
+ * https://learn.microsoft.com/en-us/windows/win32/api/dwmapi/ne-dwmapi-dwmwindowattribute (DWMWA_EXTENDED_FRAME_BOUNDS
+ * "Retrieves the extended frame bounds rectangle in screen space", a RECT; its value 9 counted from the page's list,
+ * which gives DWMWA_NCRENDERING_ENABLED as 1 and the next eight in order). From memory alone, no page read:
  * the class names ConsoleWindowClass and PseudoConsoleWindow, MONITOR_DEFAULTTONEAREST's value 2 (its page names it
- * without a number), and that a top-level window's "client coordinates" in SetWindowPos are the virtual screen's.
+ * without a number), that a top-level window's "client coordinates" in SetWindowPos are the virtual screen's, and that
+ * a window's border at the top is none (so the top never overhangs). The border is read where the window is before it
+ * moves: on a monitor of another scale it may differ by a few pixels there (not measured).
  */
 export const PLACE_CS = [
   'using System; using System.Runtime.InteropServices; using System.Text;',
@@ -4570,10 +4615,15 @@ export const PLACE_CS = [
   '[DllImport("user32.dll")] static extern bool ShowWindowAsync(IntPtr window, int show);',
   'public delegate bool EachWindow(IntPtr found, IntPtr data);',
   '[DllImport("user32.dll")] static extern bool EnumWindows(EachWindow each, IntPtr data);',
+  '[DllImport("user32.dll")] static extern bool GetWindowRect(IntPtr window, out Box box);',
+  '[DllImport("dwmapi.dll")] static extern int DwmGetWindowAttribute(IntPtr window, uint attribute, out Box value, int size);',
   'static string ClassOf(IntPtr window) { StringBuilder name = new StringBuilder(256); return GetClassNameW(window, name, name.Capacity) > 0 ? name.ToString() : ""; }',
   'static bool Same(IntPtr a, IntPtr b) { return (a.ToInt64() & 0xffffffffL) == (b.ToInt64() & 0xffffffffL); }',
   'public static int Hosted(IntPtr window, IntPtr console) { int count = 0; bool seen = false; EachWindow each = delegate(IntPtr found, IntPtr data) { if (ClassOf(found) == "PseudoConsoleWindow" && Same(GetWindow(found, 4), window)) { count++; if (Same(found, console)) seen = true; } return true; }; bool listed = EnumWindows(each, IntPtr.Zero); GC.KeepAlive(each); if (!listed) return -1; return seen ? count : -1; }',
-  'public static int[] Clamp(int x, int y, int width, int height, int left, int top, int right, int bottom) { int w = Math.Min(width, right - left); int h = Math.Min(height, bottom - top); return new int[] { Math.Max(left, Math.Min(x, right - w)), Math.Max(top, Math.Min(y, bottom - h)), w, h }; }',
+  `static int Side(int d) { return d >= ${BORDER_LIMITS.min} && d <= ${BORDER_LIMITS.max} ? d : 0; }`,
+  'public static int[] Overhang(int left, int top, int right, int bottom, int frameLeft, int frameTop, int frameRight, int frameBottom) { return new int[] { Side(frameLeft - left), Side(right - frameRight), Side(bottom - frameBottom) }; }',
+  'public static int[] BorderOf(IntPtr window) { Box rect; Box frame; if (!GetWindowRect(window, out rect) || DwmGetWindowAttribute(window, 9, out frame, Marshal.SizeOf(typeof(Box))) != 0) return new int[] { 0, 0, 0 }; return Overhang(rect.Left, rect.Top, rect.Right, rect.Bottom, frame.Left, frame.Top, frame.Right, frame.Bottom); }',
+  'public static int[] Clamp(int x, int y, int width, int height, int left, int top, int right, int bottom, int borderLeft, int borderRight, int borderBottom) { left = left - borderLeft; right = right + borderRight; bottom = bottom + borderBottom; int w = Math.Min(width, right - left); int h = Math.Min(height, bottom - top); return new int[] { Math.Max(left, Math.Min(x, right - w)), Math.Max(top, Math.Min(y, bottom - h)), w, h }; }',
   'public static string Place(int x, int y, int width, int height, bool hasRect, bool maximized) {',
   'IntPtr console = GetConsoleWindow();',
   'if (console == IntPtr.Zero) return "it has no console window";',
@@ -4592,7 +4642,8 @@ export const PLACE_CS = [
   'MonitorInfo info = new MonitorInfo(); info.Size = (uint)Marshal.SizeOf(typeof(MonitorInfo));',
   'IntPtr monitor = MonitorFromRect(ref asked, 2);',
   'if (monitor == IntPtr.Zero || !GetMonitorInfoW(monitor, ref info)) return "the monitor for its rectangle could not be read";',
-  'int[] at = Clamp(x, y, width, height, info.Work.Left, info.Work.Top, info.Work.Right, info.Work.Bottom);',
+  'int[] border = BorderOf(own);',
+  'int[] at = Clamp(x, y, width, height, info.Work.Left, info.Work.Top, info.Work.Right, info.Work.Bottom, border[0], border[1], border[2]);',
   `if (!SetWindowPos(own, IntPtr.Zero, at[0], at[1], at[2], at[3], 0x${PLACE_SWP_FLAGS.toString(16)})) return "SetWindowPos failed with error " + Marshal.GetLastWin32Error();`,
   '}',
   'if (maximized && !ShowWindowAsync(own, 3)) return "it could not be maximized";',
