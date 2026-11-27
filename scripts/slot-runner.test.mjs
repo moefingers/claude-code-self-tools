@@ -57,8 +57,8 @@ function runnerProblems(text) {
   need(placeAt > 0 && placeAt < text.indexOf("Write-Beacon 'running'\n    $asked = Get-Asked") && text.indexOf('if ($Start -or $Resume -or $Name -or $WaitFor -or $Launcher -or $Claim -or $Place -or $Prompt) {') < placeAt, 'its own window placed first, before anything waits')
   // -Prompt: the file by its own claim, handed to the launcher, deleted once claude has ended, and on each refusal of its own.
   need(has("  if ($Prompt -and $Claim -cmatch $LaunchClaim) { $promptPath = Join-Path $state ('prompts\\' + $Claim.Substring(7) + '.txt') }") && has('  if ($null -ne $promptPath) { $run.PromptFile = $promptPath }') && !/PromptFile\s*=\s*\$Prompt\b/.test(code), "a first prompt's file built from -Claim, never off the command line")
-  const deleted = text.indexOf("\n  if ($run.ContainsKey('PromptFile')) { Remove-Prompt $run.PromptFile }\n")
-  need(deleted > text.indexOf('try { & $launcherPath @run }') && deleted < text.indexOf('$gaveBack = $null -ne $heldId'), 'the prompt file deleted once claude has ended')
+  const promptGone = text.indexOf("\n  if ($run.ContainsKey('PromptFile')) { Remove-Prompt $run.PromptFile }\n")
+  need(promptGone > text.indexOf('try { & $launcherPath @run }') && promptGone < text.indexOf('$gaveBack = $null -ne $heldId'), 'the prompt file deleted once claude has ended')
   const refusedAt = text.indexOf("    Remove-Prompt $promptPath\n    Write-Host ('This tab did not run what it was opened for: ' + $why + '.')")
   need(refusedAt > text.indexOf('function Get-Asked {') && refusedAt < text.indexOf('function Get-NewestLauncher'), 'the prompt file deleted when the tab refuses')
   const hashAt = text.indexOf("    if ($run.ContainsKey('PromptFile')) { Remove-Prompt $run.PromptFile }; return\n")
