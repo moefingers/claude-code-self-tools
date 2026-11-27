@@ -37,6 +37,8 @@ const QUEUES_NOTHING = new Map([
   ['desktop_windows', 'answers at once, and only reads'],
   ['desktop_read', 'answers at once, and only reads'],
   ['desktop_capture', 'answers at once with a file it wrote, and acts on no window'],
+  ['settings_read', 'answers at once, and only reads'],
+  ['settings_set', "answers at once with the option changed, or why not: it queues nothing for the turn's end"],
   ['launch_sessions', 'answers in the call itself, once every launch has run (or, with plan, at once): it queues nothing for the turn\'s end'],
 ])
 
@@ -65,6 +67,8 @@ const TOOLS = [
   'remote_control',
   'restart_after_turn',
   'secret_run_command',
+  'settings_read',
+  'settings_set',
   'switch_after_turn',
   'tools_check',
   'update_status',
