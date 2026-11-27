@@ -6,14 +6,16 @@
 //    its own; and whether it started with --silent-debugger-extension-api. On Windows through a fixed Windows
 //    PowerShell script, as the shared machine code reads processes (machine.ts: powershellCall); on macOS with pgrep
 //    and ps.
-// 2. Starts Chrome when it isn't running, detached: the profile folder when the call or the setting names one (and it
-//    is one of Chrome's), else none, so Chrome opens the profile it used last; --restore-last-session; and the flag
+// 2. Starts Chrome when it isn't running, detached: on the profile folder the call or the setting names, else on the
+//    one profile folder whose Google account has the email of Claude Code's account (the account match; with none or
+//    several, it starts nothing), each one of Chrome's profile folders; --restore-last-session; and the flag
 //    when the person opted in (the silentDebugger setting, or CLAUDE_CHROME_SILENT_DEBUGGER while it is auto). The
 //    launch is short and returns at once; looks of their own then wait up to 20 s for the browser process. A lock
 //    made with an exclusive create, one per user whatever the config folder, keeps two sessions from starting Chrome
 //    at once (chrome.ts: windowsStartScript; macLockPath).
 // 3. Never quits, kills or restarts Chrome: that closes every session's tabs and tab groups. A Chrome running without
-//    the flag the person opted in to is said, with how the person fixes it.
+//    the flag the person opted in to is said, with how the person fixes it. With nothing naming a profile, a Chrome
+//    running is said to run on the account match's folder, or another, as far as its command line shows.
 // 4. Queues `/mcp reconnect claude-in-chrome` for when the turn ends, as self-mcp does, whenever Chrome runs, at most
 //    RECONNECT_CAP times in RECONNECT_WINDOW_MS a session; then resumes with `resume`, or tells the model.
 // The rules are in chrome.ts, pure; this file runs them. It hooks no event Claude Code's built-in guard passes over.
@@ -21,24 +23,38 @@ import type { EngineInterface, Register } from 'claude-code'
 import type { Queued } from '../types'
 import { idleWords } from './at-idle'
 import {
+  accountFolders,
+  accountMatch,
+  type AccountPick,
+  accountRefusal,
   answer,
   type Browser,
   type ChromeProcess,
   chooseProfile,
+  CLAIM_MAX_BYTES,
+  claimPathOf,
+  type ClaudeAccount,
+  claudeAccountOf,
+  type FileFault,
+  fileFault,
   type FlagChoice,
   flagChoice,
   isStaleLock,
   isProfileName,
   isRunning,
   judge,
+  LOCAL_STATE,
+  LOCAL_STATE_MAX_BYTES,
   type Look,
   macChromeFault,
   macLockPath,
   macOpenArgv,
   macStandard,
   macUserData,
+  mayHoldClaudeAccount,
   missingProfile,
   MKDIR,
+  type NamedSource,
   parsePids,
   parsePs,
   parseWindowsLook,
@@ -46,12 +62,15 @@ import {
   pgrepArgv,
   ID,
   type Platform,
+  type ProfileAccount,
+  profileAccountsOf,
   profileCandidates,
   psArgv,
   type Reconnect,
   reconnectsWithin,
   RMDIR,
   SERVER,
+  type SessionSignIn,
   type SilentSetting,
   silentSetting,
   SLEEP,
@@ -161,9 +180,11 @@ function closeArm(arm: Arm): void {
 
 const DESCRIPTION = [
   'Makes sure Chrome runs for Claude in Chrome, and reconnects Claude in Chrome: for when its tools say the browser is not connected, before asking the person.',
-  "It looks for the person's Chrome (its browser process on the default user data folder; never a test or isolated Chrome), starts it when it isn't running (the profile folder when one is named, else the profile Chrome used last; the last session restored; and --silent-debugger-extension-api when the person opted in), and queues /mcp reconnect claude-in-chrome for when this turn ends whenever Chrome runs, at most 3 times in 10 minutes.",
+  "It looks for the person's Chrome (its browser process on the default user data folder; never a test or isolated Chrome), starts it when it isn't running (on the profile folder named, else on the profile folder whose Google account has the email of Claude Code's account; the last session restored; and --silent-debugger-extension-api when the person opted in), and queues /mcp reconnect claude-in-chrome for when this turn ends whenever Chrome runs, at most 3 times in 10 minutes.",
   "It never quits, kills or restarts Chrome, which would close every session's tabs and tab groups: when Chrome runs without the flag the person opted in to, it says how the person can fix it. It never opens a profile in a Chrome that runs, signs in, or types anything into Chrome.",
-  "`profile` (optional) is the profile folder a start opens, by its folder's name (Default, Profile 2), never an account, and only one that is in Chrome's user data folder; left out, the plugin's setting, else none, so Chrome opens the profile it used last. `reconnect` (default true) queues the reconnect. `resume` is the message that starts your next turn once the reconnect has run: what to try again.",
+  "`profile` (optional) is the profile folder a start opens, by its folder's name (Default, Profile 2), never an account, and only one that is in Chrome's user data folder; left out, the plugin's profile setting, else the account match: the one profile folder whose Google account (in Chrome's Local State) has the email of Claude Code's Claude account (in its .claude.json). That email counts only when this session's own sign-in (as Claude Code answers it) runs on a Claude account whose id is the one .claude.json records; where Claude Code won't say, the file stands alone, and the answer says so.",
+  "The match stands in for the profile whose Claude in Chrome is signed in to Claude Code's account, and fails where the two emails differ. When no folder or several match, or either account can't be read or confirmed, it starts nothing and says why: then name the profile, which is also how to start the profile Chrome used last. With Chrome running and no profile named, it says whether Chrome's command line names the matched folder. It names profile folders only, never an account.",
+  '`reconnect` (default true) queues the reconnect. `resume` is the message that starts your next turn once the reconnect has run: what to try again.',
   "The reconnect runs when the session is idle: Claude Code queues a plugin's command behind anything already waiting (a message typed during this turn, a background task's notification), so under a nonstop stream of work and notifications it may run in the distant future. Nothing waiting is lost.",
   "Windows and macOS. When it says to ask the person, ask them; don't call it again.",
   idleWords('When it says the reconnect is queued'),
@@ -265,8 +286,8 @@ type Machine = {
   readonly first: readonly ChromeProcess[]
   /** Another look, after a short pause when `pause`; a string says why it failed. */
   look(pause: boolean): Promise<ChromeProcess[] | string>
-  /** The start, under the lock, named by `claim`: a fresh UUID. */
-  start(profile: string | undefined, flag: boolean, claim: string): Promise<StartRun>
+  /** The start on `profile`, a profile folder checked by isProfileFolder, under the lock, named by `claim`: a fresh UUID. */
+  start(profile: string, flag: boolean, claim: string): Promise<StartRun>
   /** Lets the start's lock go, when it is still `claim`'s own. Never throws. */
   release(claim: string): Promise<void>
 }
@@ -467,32 +488,151 @@ async function takeMacLock($: EngineInterface, lock: string): Promise<number | u
 // ---------------------------------------------------------------------------------------------
 // The profile, the start and its wait.
 
+/** Chrome's user data folder's entries, each a name and a kind. */
+type Entries = readonly { readonly name: string; readonly kind: string }[]
+
+/** Chrome's user data folder's entries; undefined when the folder isn't known or can't be listed. */
+async function listUserData($: EngineInterface, m: Machine): Promise<Entries | undefined> {
+  if (m.userData === undefined) return undefined
+  try {
+    return await $.fs.list(m.userData)
+  } catch {
+    return undefined
+  }
+}
+
 /**
- * Why a named profile isn't one to start: Chrome's user data folder unknown, or no folder of that exact name with its
- * Preferences file there, which Chrome would make as a new, empty profile. Undefined when it is one.
+ * Whether `name` is one of Chrome's profile folders: a profile folder's name (PROFILE_NAME), a folder of exactly that
+ * name in Chrome's user data folder (as Chrome keys its profiles, never one that differs only in case), with its
+ * Preferences file. Every folder a start opens, named or matched, is held to it: given any other, Chrome would make a
+ * new, empty profile of that name, without Claude in Chrome.
  */
-async function profileMissing($: EngineInterface, m: Machine, name: string, source: 'call' | 'setting'): Promise<{ readonly why: string; readonly fix: string } | undefined> {
+async function isProfileFolder($: EngineInterface, m: Machine, entries: Entries | undefined, name: string): Promise<boolean> {
+  if (m.userData === undefined || entries === undefined || !isProfileName(name)) return false
+  if (!entries.some(e => e.kind === 'dir' && e.name === name)) return false
+  return isThere($, `${m.userData}${m.sep}${name}${m.sep}Preferences`)
+}
+
+/** The profile folders in Chrome's user data folder, by isProfileFolder's rule, sorted, at most 40; undefined when not listed. */
+async function profileFolders($: EngineInterface, m: Machine, entries: Entries | undefined): Promise<string[] | undefined> {
+  if (entries === undefined) return undefined
+  const folders: string[] = []
+  for (const candidate of profileCandidates(entries)) if (await isProfileFolder($, m, entries, candidate)) folders.push(candidate)
+  return folders
+}
+
+/**
+ * Why a named profile isn't one to start: Chrome's user data folder unknown, or not listed, so nothing can be checked;
+ * or not one of Chrome's profile folders (isProfileFolder). Undefined when it is one.
+ */
+async function profileMissing($: EngineInterface, m: Machine, entries: Entries | undefined, name: string, source: NamedSource): Promise<{ readonly why: string; readonly fix: string } | undefined> {
   if (m.userData === undefined) {
     return {
       why: "Chrome's user data folder isn't known here, so the profile named can't be checked against Chrome's profile folders",
-      fix: 'leave the profile out, so Chrome opens the profile it used last',
+      fix: 'start Chrome by hand on that profile',
     }
   }
-  const folder = (child: string) => `${m.userData}${m.sep}${child}${m.sep}Preferences`
-  let entries: readonly { readonly name: string; readonly kind: string }[] | undefined
+  if (entries === undefined) {
+    return {
+      why: "Chrome's user data folder can't be listed, so the profile named can't be checked against Chrome's profile folders",
+      fix: 'call chrome_ensure again in a moment, or start Chrome by hand on that profile',
+    }
+  }
+  if (await isProfileFolder($, m, entries, name)) return undefined
+  return missingProfile(source, await profileFolders($, m, entries))
+}
+
+// ---------------------------------------------------------------------------------------------
+// The account match's reads. Each file is read whole, once its stat shows a plain file, no link, within its cap; only
+// the one field chrome.ts takes leaves the function that read it, and its text goes when that function returns. No
+// error's own text is kept: it may hold the path, and the path the person's name.
+
+/** A file's text, read only once its stat shows a plain file, no link, of at most `max` bytes; else why not (fileFault). */
+async function readSmall($: EngineInterface, path: string, max: number): Promise<{ readonly text: string } | { readonly fault: FileFault }> {
+  let fault: FileFault | undefined
   try {
-    entries = await $.fs.list(m.userData)
+    fault = fileFault(await $.fs.stat(path), max)
   } catch {
-    entries = undefined
+    return { fault: 'missing' }
   }
-  // The exact name, as Chrome keys its profiles, never one that differs only in case.
-  if (entries?.some(e => e.kind === 'dir' && e.name === name) && (await isThere($, folder(name)))) return undefined
-  let folders: string[] | undefined
-  if (entries !== undefined) {
-    folders = []
-    for (const candidate of profileCandidates(entries)) if (await isThere($, folder(candidate))) folders.push(candidate)
+  if (fault !== undefined) return { fault }
+  try {
+    return { text: await $.fs.read(path) }
+  } catch {
+    return { fault: 'unreadable' }
   }
-  return missingProfile(source, folders)
+}
+
+/**
+ * This session's own sign-in (chrome.ts: SessionSignIn): $.session.identity()'s `kind` and `accountId`, and no other
+ * field; not asked when the call is refused (privacy and sec-default answer a plugin in the `user` tier with a deny) or
+ * fails. The id is only compared with .claude.json's (claudeAccountOf), never kept, returned past it, logged or shown.
+ *
+ * Its `email` isn't used: it is there only where a managed `forceLoginOrgUUID` lists the account's organization
+ * (SessionIdentity, in the engine's types), so on most machines it has none.
+ */
+async function sessionSignIn($: EngineInterface): Promise<SessionSignIn> {
+  try {
+    const identity = await $.session.identity()
+    if (identity.deny !== undefined) return { asked: false }
+    return { asked: true, kind: typeof identity.kind === 'string' ? identity.kind : '', accountId: typeof identity.accountId === 'string' ? identity.accountId : undefined }
+  } catch {
+    return { asked: false }
+  }
+}
+
+/**
+ * Claude Code's account, from its .claude.json (chrome.ts: claimPathOf, claudeAccountOf): `oauthAccount`'s email, and
+ * nothing else of the file, held against the session's own sign-in; or why it can't be read. A session that runs on no
+ * Claude account reads no file.
+ */
+async function readClaudeAccount($: EngineInterface, platform: Platform, session: SessionSignIn): Promise<ClaudeAccount | { readonly kind: 'unread'; readonly fault: FileFault | 'unplaced' }> {
+  if (!mayHoldClaudeAccount(session)) return { kind: 'session-none' }
+  const path = claimPathOf(platform, {
+    configDir: await env(() => $.env.get('CLAUDE_CONFIG_DIR')),
+    userProfile: platform === 'windows' ? await env(() => $.env.get('USERPROFILE')) : undefined,
+    home: await env(() => $.env.get('HOME')),
+  })
+  if (path === undefined) return { kind: 'unread', fault: 'unplaced' }
+  const read = await readSmall($, path, CLAIM_MAX_BYTES)
+  return 'fault' in read ? { kind: 'unread', fault: read.fault } : claudeAccountOf(read.text, session)
+}
+
+/** What Chrome's Local State says of its profiles: each folder's Google account; why it can't be read; or that it holds no profile list. */
+type LocalStateRead = { readonly pairs: readonly ProfileAccount[] } | { readonly fault: FileFault | 'unplaced' } | { readonly unclear: true }
+
+/** Each profile folder's Google account, from Chrome's Local State in its user data folder (chrome.ts: profileAccountsOf): `user_name` alone. */
+async function readProfileAccounts($: EngineInterface, m: Machine): Promise<LocalStateRead> {
+  if (m.userData === undefined) return { fault: 'unplaced' }
+  const read = await readSmall($, `${m.userData}${m.sep}${LOCAL_STATE}`, LOCAL_STATE_MAX_BYTES)
+  if ('fault' in read) return { fault: read.fault }
+  const pairs = profileAccountsOf(read.text)
+  return pairs === undefined ? { unclear: true } : { pairs }
+}
+
+/**
+ * The account match: the one profile folder whose Google account has the email of Claude Code's account, or why there is
+ * none. Nothing is asked or read when no folder could be checked (Chrome's user data folder unknown, or not listed).
+ * Each folder that matches is checked as a named one is (isProfileFolder). Neither email nor either account id leaves
+ * this function: it answers folder names only. Every read is caught, so it never throws.
+ */
+async function matchAccount($: EngineInterface, m: Machine, entries: Entries | undefined): Promise<AccountPick> {
+  if (m.userData === undefined) return { kind: 'no-local-state', fault: 'unplaced' }
+  if (entries === undefined) return { kind: 'unlisted' }
+  const account = await readClaudeAccount($, m.platform, await sessionSignIn($))
+  if (account.kind === 'unread') return { kind: 'no-claim', fault: account.fault }
+  if (account.kind === 'none') return { kind: 'no-account' }
+  if (account.kind === 'unknown') return { kind: 'claim-unclear' }
+  if (account.kind === 'session-none') return { kind: 'session-none' }
+  if (account.kind === 'session-other') return { kind: 'session-other' }
+  if (account.kind === 'session-unconfirmed') return { kind: 'session-unconfirmed' }
+  const local = await readProfileAccounts($, m)
+  if ('fault' in local) return { kind: 'no-local-state', fault: local.fault }
+  if ('unclear' in local) return { kind: 'local-state-unclear' }
+  const matched = accountFolders(local.pairs, account.email)
+  const present: string[] = []
+  for (const folder of matched) if (await isProfileFolder($, m, entries, folder)) present.push(folder)
+  return accountMatch(matched, present, account.sessionAsked)
 }
 
 /** Looks, each in a run of its own after a short pause, until the person's Chrome shows, START_WAIT_S pass, or `looks` are made. */
@@ -509,8 +649,8 @@ async function waitForBrowser($: EngineInterface, m: Machine, looks: number): Pr
   return undefined
 }
 
-/** What the look and the start came to. */
-type Found = { readonly look: Look; readonly start: Start }
+/** What the look and the start came to; `account`, the account match while Chrome runs and nothing names a profile. */
+type Found = { readonly look: Look; readonly start: Start; readonly account?: AccountPick }
 
 const none: Start = { kind: 'none' }
 const lookFailed = (whyNot: string): Found => ({ look: { kind: 'failed', why: whyNot }, start: none })
@@ -524,20 +664,30 @@ async function ensureChrome($: EngineInterface, platform: Platform, flag: FlagCh
     return lookFailed(`${n} Chrome process${n === 1 ? '' : 'es'} of this login ${n === 1 ? 'has' : 'have'} a command line that can't be read, as an elevated Chrome's can't`)
   }
   const found: Look = { kind: 'read', judged }
-  if (judged.browsers.length > 0) return { look: found, start: none }
+  const choice = chooseProfile(asked, profileSetting)
+  if (judged.browsers.length > 0) {
+    // Chrome runs, and opens no profile. With nothing naming one, the answer says whether it runs on the match's folder.
+    if ('refusal' in choice || choice.source !== 'account') return { look: found, start: none }
+    return { look: found, start: none, account: await matchAccount($, m, await listUserData($, m)) }
+  }
   if (m.binary === undefined) {
     const configured = chromePathSetting !== ''
     const standard = platform === 'windows' ? "Chrome isn't at its standard install paths (under Program Files, or the per-user install)" : "Chrome isn't at its standard install path (/Applications/Google Chrome.app)"
     const fix = platform === 'windows' ? "set the chromePath setting to chrome.exe's absolute path" : 'set the chromePath setting to the Google Chrome binary inside its .app'
     return { look: found, start: { kind: 'refused', why: configured ? 'the chromePath setting names no file' : standard, fix } }
   }
-  const choice = chooseProfile(asked, profileSetting)
   if ('refusal' in choice) return { look: found, start: { kind: 'refused', why: choice.refusal, fix: choice.fix } }
-  if (choice.profile !== undefined) {
-    const missing = await profileMissing($, m, choice.profile, choice.source)
+  const entries = await listUserData($, m)
+  let profile: StartProfile
+  if (choice.source === 'account') {
+    const pick = await matchAccount($, m, entries)
+    if (pick.kind !== 'one') return { look: found, start: { kind: 'refused', ...accountRefusal(pick, await profileFolders($, m, entries)) } }
+    profile = { profile: pick.folder, source: 'account', sessionAsked: pick.sessionAsked }
+  } else {
+    const missing = await profileMissing($, m, entries, choice.profile, choice.source)
     if (missing !== undefined) return { look: found, start: { kind: 'refused', ...missing } }
+    profile = { profile: choice.profile, source: choice.source }
   }
-  const profile: StartProfile = choice.profile === undefined ? { profile: undefined } : { profile: choice.profile, source: choice.source }
   const claim = crypto.randomUUID()
   const run = await m.start(profile.profile, flag.on, claim)
   // Held by another start: this call launched nothing, and looks for what that start makes.
@@ -681,7 +831,7 @@ export const register: Register = (on, options) => {
           profile: {
             type: 'string',
             description:
-              "The profile folder a start opens, by its folder's name (Default, Profile 2), never an account; one that isn't in Chrome's user data folder is refused, with the folders that are. Used only when Chrome isn't running. Left out: the plugin's profile setting, else none, so Chrome opens the profile it used last.",
+              "The profile folder a start opens, by its folder's name (Default, Profile 2), never an account; one that isn't in Chrome's user data folder is refused, with the folders that are. Used only when Chrome isn't running. Left out: the plugin's profile setting, else the one profile folder whose Google account has the email of Claude Code's account (none or several: nothing starts). To start the profile Chrome used last, name it.",
           },
           reconnect: {
             type: 'boolean',
@@ -714,9 +864,9 @@ export const register: Register = (on, options) => {
       return { result: `Chrome: not looked for. self-chrome looks after Chrome on Windows and macOS, on the machine Chrome runs on, and this session runs on ${platform}. Nothing was started or queued.` }
     }
     const flag = flagChoice(silent, await env(() => $.env.get('CLAUDE_CHROME_SILENT_DEBUGGER')))
-    const { look, start } = await ensureChrome($, platform, flag, asked)
+    const { look, start, account } = await ensureChrome($, platform, flag, asked)
     const reconnect = await queueReconnect($, input.reconnect !== false, isRunning(look, start), resume)
-    return { result: answer({ platform, flag, look, start, reconnect }) }
+    return { result: answer({ platform, flag, look, start, reconnect, ...(account === undefined ? {} : { account }) }) }
   }).catch(($, e, next) => (next.called ? next(e) : { deny: 'self-chrome: chrome_ensure failed before it could answer. Call it again to see where Chrome stands.' }))
 
   on('turn.complete', async ($, e, next) => {

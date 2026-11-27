@@ -3,12 +3,23 @@ import type { Engine } from 'claude-code/testing'
 import type { On } from 'claude-code'
 import { GO_IDLE, idleWords, WHY_IDLE } from '../hooks/at-idle'
 import {
+  accountFolders,
+  accountMatch,
+  type AccountPick,
   answer,
   chooseProfile,
+  CLAIM_MAX_BYTES,
+  type ClaimEnv,
+  claimPathOf,
+  type ClaudeAccount,
+  claudeAccountOf,
+  type FileFault,
+  fileFault,
   flagChoice,
   hasSwitch,
   isStaleLock,
   judge,
+  LOCAL_STATE_MAX_BYTES,
   LOGIN_ENV_CS,
   MAC_CHROME,
   macBundle,
@@ -16,13 +27,19 @@ import {
   macLockPath,
   macOpenArgv,
   macStandard,
+  MATCHED,
+  mayHoldClaudeAccount,
   missingProfile,
   parsePs,
   parseWindowsStart,
   pgrepArgv,
+  type Platform,
+  type ProfileAccount,
+  profileAccountsOf,
   profileCandidates,
   psArgv,
   reconnectsWithin,
+  type SessionSignIn,
   silentSetting,
   START_LOCK_MS,
   switchValue,
@@ -39,8 +56,39 @@ const CHROME = 'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe'
 const LOCAL = 'C:\\Users\\u\\AppData\\Local'
 const USER_DATA = `${LOCAL}\\Google\\Chrome\\User Data`
 const HOME = '/Users/u'
-const WINDOWS = { OS: 'Windows_NT', SystemRoot: 'C:\\Windows' }
+const USERPROFILE = 'C:\\Users\\u'
+const WINDOWS = { OS: 'Windows_NT', SystemRoot: 'C:\\Windows', USERPROFILE }
 const MAC = { HOME }
+/** Claude Code's .claude.json and Chrome's Local State, where the plugin should look for them. */
+const CLAIM_WINDOWS = `${USERPROFILE}\\.claude.json`
+const CLAIM_MAC = `${HOME}/.claude.json`
+const LOCAL_STATE_WINDOWS = `${USER_DATA}\\Local State`
+const LOCAL_STATE_MAC = `${HOME}/Library/Application Support/Google/Chrome/Local State`
+/** The phrase the answers name the account match's folder by. */
+const MATCH = "the profile folder whose Google account has the email of Claude Code's account"
+
+// Made-up accounts, built at run time: no address is written out whole, and none is a real one.
+const mail = (name: string) => [name, 'example.test'].join('@')
+/** The email of Claude Code's account, in the fakes. */
+const OWNER = mail('owner')
+/** Another account's. */
+const SOMEONE = mail('someone')
+/** An account id as Claude Code writes one, made up. */
+const accountId = (n: number) => `${'0'.repeat(8)}-${'0'.repeat(4)}-${String(n).padStart(4, '0')}`
+/** A made-up account id with letters in it, to show the ids are compared whole, case and all. */
+const ID_WITH_LETTERS = ['abcdef01', 'beef', 'cafe', '0001'].join('-')
+/** A value planted where the plugin must not look: no answer or read's result may hold one. */
+const plant = (n: number) => ['planted', 'never', 'out', String(n)].join('_')
+/** An `oauthAccount` with `email` and `id`, among the other fields Claude Code writes there. */
+const accountRecord = (email: unknown, id: unknown = accountId(1)) => ({ accountUuid: id, emailAddress: email, organizationUuid: accountId(2), displayName: plant(1) })
+/** A .claude.json's text: `oauthAccount` (left out when undefined) among the rest of Claude Code's state. */
+const claimText = (account: unknown) => JSON.stringify({ numStartups: 3, oauthAccount: account, projects: { [plant(2)]: { allowedTools: [] } }, userID: plant(3) })
+/** A Local State's text: `profile.info_cache` among other keys, `os_crypt` planted. */
+const localStateText = (cache: unknown) => JSON.stringify({ os_crypt: { planted: plant(4) }, profile: { info_cache: cache, last_used: 'Default' }, browser: { planted: plant(5) } })
+/** A profile's attributes in info_cache, signed in to `email`, its other keys planted. */
+const signedIn = (email: unknown) => ({ user_name: email, name: plant(6), gaia_name: plant(7), gaia_id: plant(8) })
+/** The fakes' profiles: Default signed in to another account, Profile 3 to Claude Code's. */
+const CACHE = { Default: signedIn(SOMEONE), 'Profile 3': signedIn(OWNER) }
 const NOW = 1_000_000
 const MINUTE = 60_000
 /** A tool of Claude in Chrome's. */
@@ -51,6 +99,20 @@ const KILLS = /Stop-Process|taskkill|\.Kill\(|CloseMainWindow|Restart-|killall|p
 
 /** A browser process as the look reads it. */
 type Proc = { pid: number; exe?: string; cmd: string }
+
+/**
+ * The path the plugin asked for, from the path a fake file hook is given. On Linux a Windows path (C:\...) is a relative
+ * one, so the test kit resolves it against the plugin's folder before any hook sees it, as `<that folder>/C:\...`: that
+ * prefix is taken off, and the drive and what follows it are what the plugin asked for. On Windows, and for a POSIX
+ * path, the path is as given. Nothing is resolved with Node's path.
+ */
+const asked = (path: string): string => /^\/.*\/([A-Za-z]:\\[^/]*)$/.exec(path)?.[1] ?? path
+
+/**
+ * A file the fakes hold: its text; or what its stat or read shows instead: not there, a link, over 4 MiB, a folder, or a
+ * plain file whose read fails.
+ */
+type FakeFile = { readonly text: string } | { readonly fault: 'missing' | 'link' | 'huge' | 'dir' | 'fails' }
 
 type World = {
   platform?: 'windows' | 'macos' | 'linux' | 'wsl'
@@ -76,6 +138,17 @@ type World = {
   open?: 'opens' | 'fails' | 'hangs'
   /** The profile folders in Chrome's user data folder, each with its Preferences file. */
   profiles?: string[]
+  /** Claude Code's .claude.json; left out, one whose account has OWNER's email. */
+  claim?: FakeFile
+  /** Chrome's Local State; left out, one with CACHE. */
+  localState?: FakeFile
+  /**
+   * This session's sign-in as $.session.identity() answers it: a kind and an account id (left out: claude.ai, on the id
+   * .claude.json records); or refused, as privacy refuses a plugin in the `user` tier; or a call that throws.
+   */
+  identity?: { readonly kind: string; readonly accountId?: string } | 'denied' | 'throws'
+  /** Chrome's user data folder can't be listed. */
+  listFails?: boolean
   /** The session's tools. */
   tools?: string[]
   /** What the look's script does. */
@@ -101,10 +174,15 @@ function engine(on: On, world: World = {}) {
   const isMac = platform === 'macos'
   let running: Proc[] = world.running ?? []
   let looks = 0
+  /** How many times the plugin asked for the session's sign-in. */
+  let asks = 0
   const scripts: string[] = []
   const starts: string[] = []
   const argvs: string[][] = []
+  /** The paths the plugin read, stat'd, asked to exist and listed, each as it asked for it (asked). */
   const reads: string[] = []
+  const stats: string[] = []
+  const existed: string[] = []
   const lists: string[] = []
   const commands: string[] = []
   const prompts: string[] = []
@@ -117,7 +195,10 @@ function engine(on: On, world: World = {}) {
   const profiles = world.profiles ?? ['Default', 'Profile 3']
   const clock = mock.clock(on, { now: NOW })
   const session = mock.session(on)
-  mock.env(on, { ...(isMac ? MAC : platform === 'windows' ? WINDOWS : {}), ...world.env })
+  // The update check off, by its own switch (update-check.ts: trafficOff, before its read of the plugin's own
+  // plugin.json): every file the records hold is then one chrome_ensure asked for. tests/update-check.test.ts runs the
+  // check against this plugin's tool.
+  mock.env(on, { ...(isMac ? MAC : platform === 'windows' ? WINDOWS : {}), CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1', ...world.env })
   on('store.get', (_, e) => ({ value: store.get(e.key) }))
   on('store.set', (_, e) => {
     store.set(e.key, JSON.parse(JSON.stringify(e.value)))
@@ -144,21 +225,50 @@ function engine(on: On, world: World = {}) {
     toasts.push(String(e.text))
     return { value: undefined }
   })
+  /** The fake file at `path`, by its name: a host on Windows may spell a POSIX path its own way. */
+  const fileAt = (path: string): FakeFile | undefined => {
+    const spelt = path.replace(/\\/g, '/')
+    if (spelt.endsWith('/.claude.json')) return world.claim ?? { text: claimText(accountRecord(OWNER)) }
+    if (spelt.endsWith('/Local State')) return world.localState ?? { text: localStateText(CACHE) }
+    return undefined
+  }
+  // This session's sign-in: its kind and account id, as the engine answers them; refused, or a call that throws.
+  // Each call is counted, so a case can show that nothing was asked.
+  on('session.identity', () => {
+    asks += 1
+    const identity = world.identity ?? { kind: 'claude.ai', accountId: accountId(1) }
+    if (identity === 'denied') return { deny: 'privacy: a plugin in the user tier is not told who the session is' }
+    if (identity === 'throws') throw new Error('the identity could not be read')
+    return { value: { kind: identity.kind, isVerified: false, ...(identity.accountId === undefined ? {} : { accountId: identity.accountId }) } }
+  })
+  // A refusal names the path, as an OS error does: no answer may repeat it.
   on('fs.read', (_, e) => {
-    reads.push(e.path)
-    return { deny: `ENOENT: ${e.path}` }
+    reads.push(asked(e.path))
+    const file = fileAt(e.path)
+    return file !== undefined && 'text' in file ? { value: file.text } : { deny: `EACCES: ${e.path}` }
   })
   // Chrome's user data folder: its profile folders, and other folders and files that are no profile.
   on('fs.list', (_, e) => {
-    lists.push(e.path ?? '')
+    lists.push(asked(e.path ?? ''))
+    if (world.listFails === true) return { deny: `EACCES: ${e.path ?? ''}` }
     const dirs = [...profiles, 'Crashpad', 'ShaderCache', 'Stale', 'bad.name']
     return { value: [...dirs.map(name => ({ name, kind: 'dir' as const, size: 0, mtimeMs: 0, isLink: false })), { name: 'Local State', kind: 'file' as const, size: 9, mtimeMs: 0, isLink: false }] }
   })
+  // The fake files' stats; and the macOS lock folder's age: just made by another start, or long ago.
+  on('fs.stat', (_, e) => {
+    stats.push(asked(e.path))
+    const file = fileAt(e.path)
+    if (file === undefined) return { value: { kind: 'dir' as const, size: 0, mtimeMs: world.macLock === 'stale' ? NOW - START_LOCK_MS - 1 : NOW, isLink: false } }
+    const fault = 'fault' in file ? file.fault : undefined
+    if (fault === 'missing') return { deny: `ENOENT: ${e.path}` }
+    const size = 'text' in file ? file.text.length : fault === 'huge' ? 4 * 1024 * 1024 + 1 : 10
+    const kind: 'file' | 'dir' = fault === 'dir' ? 'dir' : 'file'
+    return { value: { kind, size, mtimeMs: NOW, isLink: fault === 'link' } }
+  })
   // The standard install is there, and each profile folder's Preferences. Matched by the tail: a host on Windows may
   // spell a POSIX path its own way.
-  // The macOS lock folder's age: just made by another start, or long ago.
-  on('fs.stat', () => ({ value: { kind: 'dir' as const, size: 0, mtimeMs: world.macLock === 'stale' ? NOW - START_LOCK_MS - 1 : NOW, isLink: false } }))
   on('fs.exists', (_, e) => {
+    existed.push(asked(e.path))
     const path = e.path.replace(/\\/g, '/')
     if (/\/Google Chrome\.app\/Contents\/MacOS\/Google Chrome$/.test(path)) return { value: true }
     return { value: profiles.some(p => path.endsWith(`/${p}/Preferences`)) }
@@ -206,8 +316,8 @@ function engine(on: On, world: World = {}) {
       return pids.length === 0 ? ok('', 1) : ok(`${pids.join('\n')}\n`)
     }
     if (argv[0] === '/bin/ps') {
-      const asked = (argv.at(-1) ?? '').split(',').map(Number)
-      return ok(running.filter(p => asked.includes(p.pid)).map(p => `${String(p.pid).padStart(5)} ${p.cmd}`).join('\n'))
+      const pidsAsked = (argv.at(-1) ?? '').split(',').map(Number)
+      return ok(running.filter(p => pidsAsked.includes(p.pid)).map(p => `${String(p.pid).padStart(5)} ${p.cmd}`).join('\n'))
     }
     if (argv[0] === '/bin/mkdir') {
       if (argv[1] === '-p') return ok('')
@@ -238,7 +348,40 @@ function engine(on: On, world: World = {}) {
     commands.push(`${e.command} ${e.args}`)
     return {}
   })
-  return { scripts, starts, releases, argvs, reads, lists, commands, prompts, toasts, described, store, clock, session, macLock: () => macLockThere }
+  return { scripts, starts, releases, argvs, reads, stats, existed, lists, commands, prompts, toasts, described, store, clock, session, macLock: () => macLockThere, identityAsks: () => asks }
+}
+
+/**
+ * What every answer is held to: no email, no @, nothing planted, no path of the person's; and the plugin's file calls:
+ * reads and stats of .claude.json and Local State alone (and the macOS lock's age), existence checks of Preferences
+ * files and Chrome's binary alone, and nothing of .credentials.json.
+ */
+function heldToFolders(said: string, fakes: ReturnType<typeof engine>): void {
+  expect(said).not.toContain(OWNER)
+  expect(said).not.toContain(SOMEONE)
+  expect(said).not.toContain('@')
+  expect(said).not.toContain('example.test')
+  expect(said).not.toContain('planted')
+  // No account id, the file's or the session's: accountId() makes them, and ID_WITH_LETTERS is the other the tests use.
+  expect(said).not.toContain('0000-')
+  expect(said.toLowerCase()).not.toContain(ID_WITH_LETTERS.toLowerCase())
+  expect(said).not.toContain(USERPROFILE)
+  expect(said).not.toContain(HOME)
+  const named = /[\\/](?:\.claude\.json|Local State)$/
+  expect(fakes.reads.filter(path => !named.test(path))).toEqual([])
+  expect(fakes.stats.filter(path => !named.test(path) && !/[\\/]chrome-start\.lock$/.test(path))).toEqual([])
+  expect(fakes.existed.filter(path => !/[\\/]Preferences$/.test(path) && !/[\\/]Contents[\\/]MacOS[\\/]Google Chrome$/.test(path))).toEqual([])
+  expect([...fakes.reads, ...fakes.stats, ...fakes.existed, ...fakes.lists].filter(path => /credentials/i.test(path))).toEqual([])
+}
+
+/** Every row whose answer isn't the one it wants, each as a line: all of them, never only the first. */
+function differing<I, O>(rows: readonly (readonly [string, I, O])[], rule: (input: I) => O): string[] {
+  const wrong: string[] = []
+  for (const [name, input, want] of rows) {
+    const got = rule(input)
+    if (JSON.stringify(got) !== JSON.stringify(want)) wrong.push(`${name}: got ${JSON.stringify(got)}, want ${JSON.stringify(want)}`)
+  }
+  return wrong
 }
 
 /** The call's result, as text; it must not be refused. */
@@ -271,24 +414,27 @@ test('the flag: auto follows CLAUDE_CHROME_SILENT_DEBUGGER (1, true or on), and 
   expect(silentSetting('off')).toBe('off')
 })
 
-test('not running, opted in by the variable, no profile named: Chrome starts with the flag and no --profile-directory, and the reconnect runs once the turn ends', async ($, on) => {
-  const { starts, releases, argvs, scripts, reads, commands, clock } = engine(on, { env: { CLAUDE_CHROME_SILENT_DEBUGGER: '1' } })
+test("not running, opted in by the variable, no profile named: Chrome starts with the flag on the account match's folder, and the reconnect runs once the turn ends", async ($, on) => {
+  const fakes = engine(on, { env: { CLAUDE_CHROME_SILENT_DEBUGGER: '1' } })
+  const { starts, releases, argvs, scripts, reads, commands, clock } = fakes
   await $.session.start(START)
   const said = await ensure($)
   expect(said).toMatch(/^Chrome: not running\.$/m)
   expect(said).toMatch(/^Flag: on: the silentDebugger setting is auto, and CLAUDE_CHROME_SILENT_DEBUGGER turns it on\.$/m)
-  expect(said).toContain(`Did: started Chrome, with no profile folder named (Chrome opens the profile it used last), --restore-last-session and ${FLAG}. It runs as PID 4321, and the flag took.`)
+  expect(said).toContain(`Did: started Chrome, with the profile folder "Profile 3" (its Google account has the email of Claude Code's account), --restore-last-session and ${FLAG}. It runs as PID 4321, and the flag took.`)
   expect(said).toMatch(/^Reconnect: \/mcp reconnect claude-in-chrome runs once this turn ends/m)
   // #67: the answer that says the reconnect is queued says what to do now in the shared words.
   expect(said).toContain(`Reconnect: /mcp reconnect claude-in-chrome runs once this turn ends, so ${GO_IDLE} ${WHY_IDLE} Then the session `)
   expect(said).toMatch(/^Left for the person: nothing\.$/m)
-  // The start: one short launch, then a look of its own; no --profile-directory, so Chrome picks its own last profile.
+  // The start: one short launch, then a look of its own, on the folder whose Google account has Claude Code's email.
   expect(starts).toHaveLength(1)
-  expect(argumentsOf(starts[0] ?? '')).toBe(`--restore-last-session ${FLAG}`)
+  expect(argumentsOf(starts[0] ?? '')).toBe(`--profile-directory="Profile 3" --restore-last-session ${FLAG}`)
   expect(scripts.at(-2)).toContain('Start-Sleep -Milliseconds 700')
-  // Windows PowerShell by its known path, the script on standard input; nothing of Local State read.
+  // Windows PowerShell by its known path, the script on standard input; .claude.json beside the home folder's .claude,
+  // and Local State in Chrome's user data folder, each read once.
   expect(argvs[0]?.[0]).toBe('C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe')
-  expect(reads.filter(path => /Local State/.test(path))).toEqual([])
+  expect(reads).toEqual([CLAIM_WINDOWS, LOCAL_STATE_WINDOWS])
+  heldToFolders(said, fakes)
   expect(killsAnything(scripts, argvs)).toBe(false)
   // The start's lock is let go after the wait, under the start's own claim.
   const claim = /^\$claim = '([0-9a-f-]{36})'\r?$/m.exec(starts[0] ?? '')?.[1]
@@ -304,33 +450,39 @@ test('not running, opted in by the variable, no profile named: Chrome starts wit
 })
 
 test('not running, auto and the variable unset: Chrome starts without the flag', async ($, on) => {
-  const { starts } = engine(on)
+  const fakes = engine(on)
   await $.session.start(START)
   const said = await ensure($)
-  expect(said).toContain(`Did: started Chrome, with no profile folder named (Chrome opens the profile it used last), --restore-last-session, without ${FLAG}. It runs as PID 4321.`)
+  expect(said).toContain(`Did: started Chrome, with the profile folder "Profile 3" (its Google account has the email of Claude Code's account), --restore-last-session, without ${FLAG}. It runs as PID 4321.`)
   expect(said).toMatch(/^Flag: off: the silentDebugger setting is auto, and CLAUDE_CHROME_SILENT_DEBUGGER doesn't turn it on/m)
-  expect(argumentsOf(starts[0] ?? '')).toBe('--restore-last-session')
+  expect(argumentsOf(fakes.starts[0] ?? '')).toBe('--profile-directory="Profile 3" --restore-last-session')
+  heldToFolders(said, fakes)
 })
 
 test('the setting on overrides an unset variable: Chrome starts with the flag', { options: { silentDebugger: 'on' } }, async ($, on) => {
-  const { starts } = engine(on)
+  const fakes = engine(on)
   await $.session.start(START)
-  expect(await ensure($)).toMatch(/^Flag: on: the silentDebugger setting is on\.$/m)
-  expect(argumentsOf(starts[0] ?? '')).toContain(FLAG)
+  const said = await ensure($)
+  expect(said).toMatch(/^Flag: on: the silentDebugger setting is on\.$/m)
+  expect(argumentsOf(fakes.starts[0] ?? '')).toContain(FLAG)
+  heldToFolders(said, fakes)
 })
 
 test('the setting off overrides the variable: Chrome starts without the flag', { options: { silentDebugger: 'off' } }, async ($, on) => {
-  const { starts } = engine(on, { env: { CLAUDE_CHROME_SILENT_DEBUGGER: 'true' } })
+  const fakes = engine(on, { env: { CLAUDE_CHROME_SILENT_DEBUGGER: 'true' } })
   await $.session.start(START)
-  expect(await ensure($)).toMatch(/^Flag: off: the silentDebugger setting is off\.$/m)
-  expect(argumentsOf(starts[0] ?? '')).not.toContain(FLAG)
+  const said = await ensure($)
+  expect(said).toMatch(/^Flag: off: the silentDebugger setting is off\.$/m)
+  expect(argumentsOf(fakes.starts[0] ?? '')).not.toContain(FLAG)
+  heldToFolders(said, fakes)
 })
 
 // ---------------------------------------------------------------------------------------------
 // Chrome running.
 
 test('running with the flag: nothing to do, nothing started', async ($, on) => {
-  const { scripts, starts, argvs } = engine(on, { env: { CLAUDE_CHROME_SILENT_DEBUGGER: 'on' }, running: [{ pid: 777, cmd: `"${CHROME}" --profile-directory="Profile 3" ${FLAG}` }] })
+  const fakes = engine(on, { env: { CLAUDE_CHROME_SILENT_DEBUGGER: 'on' }, running: [{ pid: 777, cmd: `"${CHROME}" --profile-directory="Profile 3" ${FLAG}` }] })
+  const { scripts, starts, argvs } = fakes
   await $.session.start(START)
   const said = await ensure($)
   expect(said).toMatch(/^Chrome: running \(PID 777\); with --silent-debugger-extension-api; its command line names the profile folder "Profile 3"\.$/m)
@@ -339,12 +491,15 @@ test('running with the flag: nothing to do, nothing started', async ($, on) => {
   expect(scripts).toHaveLength(1)
   expect(starts).toEqual([])
   expect(killsAnything(scripts, argvs)).toBe(false)
+  heldToFolders(said, fakes)
 })
 
 test('running without the flag while opted in: it says so and how the person fixes it, and never quits, kills or restarts Chrome', async ($, on) => {
-  const { scripts, starts, argvs, commands, clock } = engine(on, { env: { CLAUDE_CHROME_SILENT_DEBUGGER: '1' }, running: [{ pid: 777, cmd: `"${CHROME}" --restore-last-session` }] })
+  const fakes = engine(on, { env: { CLAUDE_CHROME_SILENT_DEBUGGER: '1' }, running: [{ pid: 777, cmd: `"${CHROME}" --restore-last-session` }] })
+  const { scripts, starts, argvs, commands, clock } = fakes
   await $.session.start(START)
   const said = await ensure($)
+  heldToFolders(said, fakes)
   expect(said).toMatch(/^Chrome: running \(PID 777\); without --silent-debugger-extension-api; its command line names no profile folder/m)
   expect(said).toContain("Did: nothing to Chrome. Chrome takes flags only when it starts, and this tool never quits, kills or restarts Chrome: that would close every session's tabs and tab groups.")
   expect(said).toMatch(/Left for the person: for the flag, quit Chrome fully .*then call chrome_ensure again; or add --silent-debugger-extension-api to the Target of the shortcut/)
@@ -360,31 +515,36 @@ test('running without the flag while opted in: it says so and how the person fix
 })
 
 test('running without the flag and the flag off: nothing to do', async ($, on) => {
-  const { starts } = engine(on, { running: [{ pid: 777, cmd: `"${CHROME}"` }] })
+  const fakes = engine(on, { running: [{ pid: 777, cmd: `"${CHROME}"` }] })
   await $.session.start(START)
   const said = await ensure($)
   expect(said).toMatch(/^Did: nothing: Chrome runs, and the flag is off\.$/m)
   expect(said).toMatch(/^Left for the person: nothing\.$/m)
-  expect(starts).toEqual([])
+  expect(fakes.starts).toEqual([])
+  heldToFolders(said, fakes)
 })
 
 test('a Chrome in the background with no window counts as running, and is said plainly', async ($, on) => {
-  const { starts } = engine(on, { running: [{ pid: 640, cmd: `"${CHROME}" --no-startup-window --win-session-start` }] })
+  const fakes = engine(on, { running: [{ pid: 640, cmd: `"${CHROME}" --no-startup-window --win-session-start` }] })
   await $.session.start(START)
   const said = await ensure($)
   expect(said).toMatch(/^Chrome: running \(PID 640\), in the background with no window\. That counts as running: a start now would only hand off to it, and Chrome took its flags when it started; without --silent-debugger-extension-api; its command line names no profile folder\.$/m)
-  expect(starts).toEqual([])
+  // A Chrome in the background names no "profile it used last": it opened no window.
+  expect(said).toMatch(/^Profile: Chrome's command line names no profile folder, so it can't tell whether that is "Profile 3", /m)
+  expect(fakes.starts).toEqual([])
+  heldToFolders(said, fakes)
 })
 
 test("a test or isolated Chrome with its own --user-data-dir isn't the person's: Chrome starts beside it", async ($, on) => {
-  const { starts } = engine(on, { running: [{ pid: 55, cmd: `"${CHROME}" --user-data-dir="C:\\Temp\\playwright-1" --remote-debugging-port=0` }] })
+  const fakes = engine(on, { running: [{ pid: 55, cmd: `"${CHROME}" --user-data-dir="C:\\Temp\\playwright-1" --remote-debugging-port=0` }] })
   await $.session.start(START)
   const said = await ensure($)
   expect(said).toMatch(/^Chrome: not running\. 1 other Chrome, with its own --user-data-dir \(a test or isolated Chrome\), isn't counted\.$/m)
   expect(said).toMatch(/Did: started Chrome/)
   // The isolated one's path never reaches the answer.
   expect(said).not.toContain('playwright')
-  expect(starts).toHaveLength(1)
+  expect(fakes.starts).toHaveLength(1)
+  heldToFolders(said, fakes)
 })
 
 test("a chrome.exe whose command line can't be read (an elevated Chrome) leaves the look unable to tell: nothing started", async ($, on) => {
@@ -432,16 +592,23 @@ test("a command line's switches, on Windows and on macOS", () => {
 // ---------------------------------------------------------------------------------------------
 // The profile.
 
-test('which profile a start opens: the call, then the setting, else none; a bad setting is refused by its length, never echoed', () => {
-  expect(chooseProfile('Work', 'Profile 9')).toEqual({ profile: 'Work', source: 'call' })
-  expect(chooseProfile(undefined, 'Profile 9')).toEqual({ profile: 'Profile 9', source: 'setting' })
-  expect(chooseProfile(undefined, '')).toEqual({ profile: undefined })
-  const bad = chooseProfile(undefined, 'person@example.com')
-  expect(bad).toEqual({
-    refusal: "the profile setting isn't a profile folder's name (it is 18 characters long)",
-    fix: "set the profile setting to one of Chrome's profile folders, by its folder's name (Default, Profile 2), or empty it, so Chrome opens the profile it used last",
-  })
-  expect(JSON.stringify(bad)).not.toContain('example')
+test('which profile a start opens: the call, then the setting, then the account match, and nothing after it; a bad setting is refused by its length, never echoed', () => {
+  const badSetting = mail('person')
+  const refused = {
+    refusal: `the profile setting isn't a profile folder's name (it is ${badSetting.length} characters long)`,
+    fix: `set the profile setting to one of Chrome's profile folders, by its folder's name (Default, Profile 2), or empty it, so a start takes ${MATCH}`,
+  }
+  const rows: [string, [string | undefined, string], ReturnType<typeof chooseProfile>][] = [
+    ['the call first, over the setting', ['Work', 'Profile 9'], { profile: 'Work', source: 'call' }],
+    ['the call, with no setting', ['Default', ''], { profile: 'Default', source: 'call' }],
+    ['the setting, with no call', [undefined, 'Profile 9'], { profile: 'Profile 9', source: 'setting' }],
+    ['neither: the account match', [undefined, ''], { source: 'account' }],
+    ['a setting that is no folder name, with no call', [undefined, badSetting], refused],
+    ['a call over a bad setting', ['Default', badSetting], { profile: 'Default', source: 'call' }],
+  ]
+  expect(differing(rows, ([asked, setting]) => chooseProfile(asked, setting))).toEqual([])
+  expect(JSON.stringify(chooseProfile(undefined, badSetting))).not.toContain('example')
+  expect(MATCHED).toBe(MATCH)
 })
 
 test("the profile folders listed: plain directory names only, files and other names left out; a missing profile's refusal never names it", () => {
@@ -455,17 +622,18 @@ test("the profile folders listed: plain directory names only, files and other na
   expect(profileCandidates(entries)).toEqual(['Default', 'Profile 3'])
   const call = missingProfile('call', ['Default', 'Profile 3'])
   expect(call.why).toBe("the profile asked for in this call names no profile folder in Chrome's user data folder, and Chrome would make a new, empty profile of that name")
-  expect(call.fix).toBe('call chrome_ensure again with `profile` set to one of Chrome\'s profile folders ("Default", "Profile 3"), or leave it out, so Chrome opens the profile it used last')
+  expect(call.fix).toBe(`call chrome_ensure again with \`profile\` set to one of Chrome's profile folders ("Default", "Profile 3"), or leave it out, so a start takes the profile setting, else ${MATCH}`)
   expect(missingProfile('setting', []).fix).toContain('(none was found)')
-  expect(missingProfile('setting', undefined).fix).toBe("set the profile setting to one of Chrome's profile folders, by its folder's name, or leave it out, so Chrome opens the profile it used last")
+  expect(missingProfile('setting', undefined).fix).toBe(`set the profile setting to one of Chrome's profile folders, by its folder's name, or empty it, so a start takes ${MATCH}`)
 })
 
-test("a call's profile that is one of Chrome's folders is started with, quoted", { options: { profile: 'Profile 9' } }, async ($, on) => {
-  const { starts } = engine(on)
+test("a call's profile that is one of Chrome's folders is started with, quoted, and neither .claude.json nor Local State is read", { options: { profile: 'Profile 9' } }, async ($, on) => {
+  const { starts, reads, stats } = engine(on)
   await $.session.start(START)
   const said = await ensure($, { profile: ' Profile 3 ' })
   expect(said).toContain('with the profile folder "Profile 3" (asked for in this call), --restore-last-session')
   expect(argumentsOf(starts[0] ?? '')).toBe('--profile-directory="Profile 3" --restore-last-session')
+  expect([...reads, ...stats]).toEqual([])
 })
 
 test("a call's profile that isn't one of Chrome's folders starts nothing (Chrome would make a new, empty profile), and lists the folders that are, never the name asked", async ($, on) => {
@@ -487,11 +655,12 @@ test("a profile that differs only in case is no profile folder of Chrome's", asy
   expect(starts).toEqual([])
 })
 
-test('the profile setting is started with when it names one of Chrome\'s folders', { options: { profile: 'Default' } }, async ($, on) => {
-  const { starts } = engine(on)
+test("the profile setting is started with when it names one of Chrome's folders, a pin over the account match", { options: { profile: 'Default' } }, async ($, on) => {
+  const { starts, reads, stats } = engine(on)
   await $.session.start(START)
   expect(await ensure($)).toContain('with the profile folder "Default" (the profile setting)')
   expect(argumentsOf(starts[0] ?? '')).toBe('--profile-directory="Default" --restore-last-session')
+  expect([...reads, ...stats]).toEqual([])
 })
 
 test("a profile setting that names no folder of Chrome's starts nothing, and says how to set it", { options: { profile: 'Profile 9' } }, async ($, on) => {
@@ -524,32 +693,494 @@ test("a call's profile that isn't a folder's name is refused, and nothing runs",
 })
 
 // ---------------------------------------------------------------------------------------------
+// The account match: its pure rules, each a table compared whole.
+
+test("Claude Code's account from a .claude.json's text: oauthAccount's email, with a plain account id; none, or can't tell", () => {
+  // The session asked, on the id the file records: the file's own rules decide.
+  const same: SessionSignIn = { asked: true, kind: 'claude.ai', accountId: accountId(1) }
+  const email = (value: string): ClaudeAccount => ({ kind: 'email', email: value, sessionAsked: true })
+  const none: ClaudeAccount = { kind: 'none' }
+  const unknown: ClaudeAccount = { kind: 'unknown' }
+  const spaced = ` ${OWNER.toUpperCase()} `
+  const rows: [string, string, ClaudeAccount][] = [
+    ['an account', claimText(accountRecord(OWNER)), email(OWNER)],
+    ['a BOM first', `${String.fromCharCode(0xfeff)}${claimText(accountRecord(OWNER))}`, email(OWNER)],
+    ['the email as written: the match folds case and spaces', claimText(accountRecord(spaced)), email(spaced)],
+    ['no oauthAccount (no login recorded)', claimText(undefined), none],
+    ['oauthAccount null (logged out)', claimText(null), none],
+    ['oauthAccount an array', claimText([accountRecord(OWNER)]), none],
+    ['no accountUuid', claimText({ emailAddress: OWNER }), none],
+    ['an accountUuid too short', claimText(accountRecord(OWNER, 'abc')), none],
+    ['an accountUuid with a space', claimText(accountRecord(OWNER, 'abcd efgh')), none],
+    ['an accountUuid too long', claimText(accountRecord(OWNER, 'a'.repeat(65))), none],
+    ['an accountUuid not a string', claimText(accountRecord(OWNER, 12_345_678)), none],
+    ['an email not a string', claimText(accountRecord(7)), none],
+    ['an email that is an object', claimText(accountRecord({ address: OWNER })), none],
+    ['an email with no @', claimText(accountRecord('owner')), none],
+    ['an empty email', claimText(accountRecord('')), none],
+    ['no email', claimText({ accountUuid: accountId(1) }), none],
+    ['not JSON: caught mid-write', '{"oauthAccount": {"accountUuid"', unknown],
+    ['empty', '', unknown],
+    ['an array', JSON.stringify([accountRecord(OWNER)]), unknown],
+    ['a string', JSON.stringify(OWNER), unknown],
+    ['null', 'null', unknown],
+  ]
+  expect(differing(rows, text => claudeAccountOf(text, same))).toEqual([])
+  // Nothing else of the file comes out: not the account id, the organization, the name or the rest of the state.
+  expect(rows.filter(([, text]) => /planted|0000-/.test(JSON.stringify(claudeAccountOf(text, same)))).map(([name]) => name)).toEqual([])
+})
+
+test(".claude.json held against this session's own sign-in: only the same account id lets its email stand; the ids are only compared", () => {
+  const file = claimText(accountRecord(OWNER))
+  const signIn = (kind: string, id?: string): SessionSignIn => ({ asked: true, kind, accountId: id })
+  const rows: [string, [string, SessionSignIn], ClaudeAccount][] = [
+    ['claude.ai, the same id', [file, signIn('claude.ai', accountId(1))], { kind: 'email', email: OWNER, sessionAsked: true }],
+    ["a host's token, the same id", [file, signIn('oauth-token', accountId(1))], { kind: 'email', email: OWNER, sessionAsked: true }],
+    ['claude.ai, another id: the session runs on another account', [file, signIn('claude.ai', accountId(9))], { kind: 'session-other' }],
+    ["a host's token, another id", [file, signIn('oauth-token', accountId(9))], { kind: 'session-other' }],
+    ['the ids compared whole, case and all', [claimText(accountRecord(OWNER, ID_WITH_LETTERS)), signIn('claude.ai', ID_WITH_LETTERS.toUpperCase())], { kind: 'session-other' }],
+    ['the same id with letters', [claimText(accountRecord(OWNER, ID_WITH_LETTERS)), signIn('claude.ai', ID_WITH_LETTERS)], { kind: 'email', email: OWNER, sessionAsked: true }],
+    ["a host's token with no id yet: can't be confirmed", [file, signIn('oauth-token')], { kind: 'session-unconfirmed' }],
+    ["claude.ai with no id: can't be confirmed", [file, signIn('claude.ai')], { kind: 'session-unconfirmed' }],
+    ['an API key: no Claude account', [file, signIn('api-key', accountId(1))], { kind: 'session-none' }],
+    ['a Console login: no Claude account', [file, signIn('console', accountId(1))], { kind: 'session-none' }],
+    ['no login', [file, signIn('none')], { kind: 'session-none' }],
+    ['a cloud provider (bedrock)', [file, signIn('bedrock')], { kind: 'session-none' }],
+    ['a cloud provider (vertex)', [file, signIn('vertex')], { kind: 'session-none' }],
+    ['a kind this plugin does not know, read as no identity', [file, signIn('some-later-kind', accountId(1))], { kind: 'session-none' }],
+    ['an empty kind', [file, signIn('', accountId(1))], { kind: 'session-none' }],
+    ['the kind decides before the file is read: no account, whatever the text', ['not json', signIn('api-key')], { kind: 'session-none' }],
+    ['the file decides before the ids: no account in it', [claimText(undefined), signIn('claude.ai', accountId(9))], { kind: 'none' }],
+    ["not asked (refused, or it failed): the file stands alone, and says so", [file, { asked: false }], { kind: 'email', email: OWNER, sessionAsked: false }],
+    ['not asked, no account in the file', [claimText(null), { asked: false }], { kind: 'none' }],
+  ]
+  expect(differing(rows, ([text, session]) => claudeAccountOf(text, session))).toEqual([])
+  // Neither id comes out, whatever the answer.
+  expect(rows.filter(([, [text, session]]) => /0000-|abcdef01/i.test(JSON.stringify(claudeAccountOf(text, session)))).map(([name]) => name)).toEqual([])
+  // Whether the session may run on a Claude account at all: claude.ai and oauth-token, or not asked.
+  const kinds: [string, SessionSignIn, boolean][] = [
+    ['claude.ai', signIn('claude.ai'), true],
+    ['oauth-token', signIn('oauth-token'), true],
+    ['not asked', { asked: false }, true],
+    ['console', signIn('console'), false],
+    ['api-key', signIn('api-key'), false],
+    ['an unknown kind', signIn('Claude.AI'), false],
+  ]
+  expect(differing(kinds, mayHoldClaudeAccount)).toEqual([])
+})
+
+test(".claude.json's place: in CLAUDE_CONFIG_DIR when set and not blank, else the home folder; only a folder placed for sure", () => {
+  const rows: [string, [Platform, ClaimEnv], string | undefined][] = [
+    ['Windows, CLAUDE_CONFIG_DIR set', ['windows', { configDir: 'C:\\path\\to\\config', userProfile: USERPROFILE }], 'C:\\path\\to\\config\\.claude.json'],
+    ['Windows, CLAUDE_CONFIG_DIR with trailing separators', ['windows', { configDir: 'C:\\path\\to\\config\\\\' }], 'C:\\path\\to\\config\\.claude.json'],
+    ['Windows, CLAUDE_CONFIG_DIR with forward slashes', ['windows', { configDir: 'C:/path/to/config/' }], 'C:/path/to/config\\.claude.json'],
+    ['Windows, a drive root', ['windows', { configDir: 'C:\\' }], 'C:\\.claude.json'],
+    ['Windows, CLAUDE_CONFIG_DIR empty: the home folder', ['windows', { configDir: '', userProfile: USERPROFILE }], CLAIM_WINDOWS],
+    ['Windows, CLAUDE_CONFIG_DIR blank: the home folder', ['windows', { configDir: '   ', userProfile: USERPROFILE }], CLAIM_WINDOWS],
+    ['Windows, USERPROFILE before HOME', ['windows', { userProfile: USERPROFILE, home: 'C:\\path\\to\\home' }], CLAIM_WINDOWS],
+    ['Windows, no USERPROFILE: HOME', ['windows', { home: 'C:\\path\\to\\home' }], 'C:\\path\\to\\home\\.claude.json'],
+    ['Windows, USERPROFILE empty: HOME', ['windows', { userProfile: '', home: 'C:\\path\\to\\home' }], 'C:\\path\\to\\home\\.claude.json'],
+    ['Windows, no folder at all', ['windows', {}], undefined],
+    ['Windows, CLAUDE_CONFIG_DIR relative', ['windows', { configDir: 'config', userProfile: USERPROFILE }], undefined],
+    ['Windows, drive-relative', ['windows', { configDir: 'C:config' }], undefined],
+    ['Windows, rooted with no drive', ['windows', { configDir: '\\path\\to\\config' }], undefined],
+    ['Windows, a network path', ['windows', { configDir: '\\\\host\\share\\config' }], undefined],
+    ['Windows, a network path with forward slashes', ['windows', { configDir: '//host/share/config' }], undefined],
+    ['Windows, a \\\\?\\ path', ['windows', { configDir: '\\\\?\\C:\\path\\to\\config' }], undefined],
+    ['Windows, a \\\\.\\ device path', ['windows', { configDir: '\\\\.\\pipe\\config' }], undefined],
+    ['Windows, a \\??\\ path', ['windows', { configDir: '\\??\\C:\\path\\to\\config' }], undefined],
+    ['Windows, spaces around it', ['windows', { configDir: ' C:\\path\\to\\config' }], undefined],
+    ['Windows, a NUL in it', ['windows', { configDir: `C:\\path${String.fromCharCode(0)}\\config` }], undefined],
+    ['Windows, a home folder with a space after it', ['windows', { userProfile: `${USERPROFILE} ` }], undefined],
+    ['macOS, the home folder', ['macos', { home: HOME }], CLAIM_MAC],
+    ['macOS, USERPROFILE is no home folder there', ['macos', { userProfile: HOME }], undefined],
+    ['macOS, CLAUDE_CONFIG_DIR with a trailing slash', ['macos', { configDir: '/path/to/config/', home: HOME }], '/path/to/config/.claude.json'],
+    ['macOS, the root', ['macos', { home: '/' }], '/.claude.json'],
+    ['macOS, CLAUDE_CONFIG_DIR relative', ['macos', { configDir: 'config', home: HOME }], undefined],
+    ['macOS, a network path', ['macos', { configDir: '//host/config', home: HOME }], undefined],
+    ['macOS, a Windows path', ['macos', { configDir: 'C:\\path\\to\\config', home: HOME }], undefined],
+  ]
+  expect(differing(rows, ([platform, env]) => claimPathOf(platform, env))).toEqual([])
+})
+
+test("each profile folder's Google account from Local State's text: info_cache's user_name alone, never os_crypt or any other key", () => {
+  const pair = (folder: string, email: string): ProfileAccount => ({ folder, email })
+  const rows: [string, string, ProfileAccount[] | undefined][] = [
+    ['two profiles', localStateText(CACHE), [pair('Default', SOMEONE), pair('Profile 3', OWNER)]],
+    ['a BOM first', `${String.fromCharCode(0xfeff)}${localStateText(CACHE)}`, [pair('Default', SOMEONE), pair('Profile 3', OWNER)]],
+    ['a user_name as written: the match folds case and spaces', localStateText({ Default: signedIn(` ${OWNER} `) }), [pair('Default', ` ${OWNER} `)]],
+    ['a folder name PROFILE_NAME refuses', localStateText({ 'bad.name': signedIn(OWNER), '..': signedIn(OWNER), ' Default': signedIn(OWNER), 'Profile 3': signedIn(OWNER) }), [pair('Profile 3', OWNER)]],
+    ['no user_name (signed out)', localStateText({ Default: { name: plant(9) }, 'Profile 3': signedIn(OWNER) }), [pair('Profile 3', OWNER)]],
+    ['a user_name not a string', localStateText({ Default: signedIn(7), 'Profile 3': signedIn([OWNER]) }), []],
+    ['a user_name with no @', localStateText({ Default: signedIn('owner'), 'Profile 3': signedIn('') }), []],
+    ['an entry not an object', localStateText({ Default: OWNER, 'Profile 3': [OWNER] }), []],
+    ['an empty info_cache', localStateText({}), []],
+    ['info_cache an array', localStateText([signedIn(OWNER)]), undefined],
+    ['no info_cache', JSON.stringify({ os_crypt: { planted: plant(4) }, profile: { last_used: 'Default' } }), undefined],
+    ['no profile', JSON.stringify({ os_crypt: { planted: plant(4) } }), undefined],
+    ['not JSON: caught mid-write', '{"profile": {"info_cache"', undefined],
+    ['an array', JSON.stringify([localStateText(CACHE)]), undefined],
+  ]
+  expect(differing(rows, profileAccountsOf)).toEqual([])
+  // The planted os_crypt, the other top-level keys, and each profile's other attributes never come out.
+  expect(rows.filter(([, text]) => /planted/.test(JSON.stringify(profileAccountsOf(text)) ?? '')).map(([name]) => name)).toEqual([])
+})
+
+test('the match: both emails trimmed and lower-cased, compared whole; one, none or several, among profile folders with their Preferences', () => {
+  const pair = (folder: string, email: string): ProfileAccount => ({ folder, email })
+  const both = ['Default', 'Profile 3']
+  const rows: [string, { pairs: ProfileAccount[]; email: string; present: string[] }, AccountPick][] = [
+    ['one', { pairs: [pair('Default', SOMEONE), pair('Profile 3', OWNER)], email: OWNER, present: both }, { kind: 'one', folder: 'Profile 3', sessionAsked: true }],
+    ['none', { pairs: [pair('Default', SOMEONE), pair('Profile 3', OWNER)], email: mail('nobody'), present: both }, { kind: 'none', absent: 0 }],
+    ['several', { pairs: [pair('Profile 3', OWNER), pair('Default', OWNER)], email: OWNER, present: both }, { kind: 'several', folders: both }],
+    ['case and spaces aside', { pairs: [pair('Profile 3', ` ${OWNER.toUpperCase()}\t`)], email: ` ${OWNER} `, present: both }, { kind: 'one', folder: 'Profile 3', sessionAsked: true }],
+    ['compared whole, never a part', { pairs: [pair('Default', `x${OWNER}`), pair('Profile 3', `${OWNER}.org`)], email: OWNER, present: both }, { kind: 'none', absent: 0 }],
+    ['a folder without its Preferences file does not count', { pairs: [pair('Profile 7', OWNER)], email: OWNER, present: both }, { kind: 'none', absent: 1 }],
+    ['one of two left once a folder without Preferences is out', { pairs: [pair('Profile 3', OWNER), pair('Profile 7', OWNER)], email: OWNER, present: both }, { kind: 'one', folder: 'Profile 3', sessionAsked: true }],
+    ['a folder name PROFILE_NAME refuses, held again', { pairs: [pair('../x', OWNER)], email: OWNER, present: ['../x'] }, { kind: 'none', absent: 1 }],
+  ]
+  // `present`: the profile folders that pass register.ts's check (a folder of that name, with its Preferences file).
+  expect(differing(rows, ({ pairs, email, present }) => accountMatch(accountFolders(pairs, email), present, true))).toEqual([])
+  // One carries whether the session was asked, as it was given.
+  expect(accountMatch(['Profile 3'], ['Profile 3'], false)).toEqual({ kind: 'one', folder: 'Profile 3', sessionAsked: false })
+})
+
+test("a file is read only when its stat shows a plain file, no link, within its cap", () => {
+  const stat = (kind: string, size: number, isLink = false) => ({ kind, size, isLink })
+  const rows: [string, [ReturnType<typeof stat>, number], FileFault | undefined][] = [
+    ['a plain file within the cap', [stat('file', 10), CLAIM_MAX_BYTES], undefined],
+    ['a plain file at the cap', [stat('file', CLAIM_MAX_BYTES), CLAIM_MAX_BYTES], undefined],
+    ['a plain file over the cap', [stat('file', CLAIM_MAX_BYTES + 1), CLAIM_MAX_BYTES], 'too-big'],
+    ["a size that isn't a number", [stat('file', Number.NaN), LOCAL_STATE_MAX_BYTES], 'too-big'],
+    ['a link to a plain file', [stat('file', 10, true), CLAIM_MAX_BYTES], 'link'],
+    ['a folder', [stat('dir', 0), CLAIM_MAX_BYTES], 'not-file'],
+    ['another kind', [stat('other', 0), CLAIM_MAX_BYTES], 'not-file'],
+  ]
+  expect(differing(rows, ([s, max]) => fileFault(s, max))).toEqual([])
+  expect([CLAIM_MAX_BYTES, LOCAL_STATE_MAX_BYTES]).toEqual([4 * 1024 * 1024, 4 * 1024 * 1024])
+})
+
+// ---------------------------------------------------------------------------------------------
+// The account match through the plugin: each answer for a start, and for a Chrome that runs. Every answer holds no
+// email, no @ and no path, and the plugin reads .claude.json and Local State alone.
+
+/** A start's case: its world, the answer's lines it must hold, and the files it reads (left out: both). */
+type StartCase = {
+  readonly name: string
+  readonly world?: World
+  readonly lines: readonly string[]
+  readonly started: boolean
+  readonly reads?: readonly string[]
+  /** How many times the session's sign-in is asked (left out: once). */
+  readonly asks?: number
+}
+
+const PIN = "Left for the person: pin the profile: call chrome_ensure again with `profile` set to one of Chrome's profile folders (\"Default\", \"Profile 3\"), or set the profile setting to one."
+const NOT_PICKED = `Did: nothing: ${MATCH} can't be picked:`
+const STARTED_ON_3 = `Did: started Chrome, with the profile folder "Profile 3" (its Google account has the email of Claude Code's account), --restore-last-session, without ${FLAG}. It runs as PID 4321.`
+/** The fixed words said when Claude Code didn't answer for the session's own sign-in, so .claude.json stood alone. */
+const FILE_ONLY_WORDS = "Claude Code's account was taken from .claude.json alone: Claude Code didn't answer for this session's own sign-in"
+const STARTED_ON_3_BY_FILE = `Did: started Chrome, with the profile folder "Profile 3" (its Google account has the email of Claude Code's account; ${FILE_ONLY_WORDS}), --restore-last-session, without ${FLAG}. It runs as PID 4321.`
+const NO_ACCOUNT_IN_FILE = `${NOT_PICKED} Claude Code's .claude.json records no Claude account with an email.`
+const SESSION_NONE = `${NOT_PICKED} this session isn't signed in to a Claude account (Claude Code calls its sign-in an API key, a Console login, a cloud provider or no login, or a kind this plugin reads as none).`
+const AGAIN_OR_PIN = `Left for the person: call chrome_ensure again in a moment, or ${PIN.slice('Left for the person: '.length)}`
+
+const START_CASES: readonly StartCase[] = [
+  { name: 'exactly one folder matches: the start opens it', lines: [STARTED_ON_3], started: true },
+  { name: 'case and spaces aside, one folder matches', world: { localState: { text: localStateText({ Default: signedIn(SOMEONE), 'Profile 3': signedIn(` ${OWNER.toUpperCase()} `) }) } }, lines: [STARTED_ON_3], started: true },
+  {
+    name: 'no folder matches: nothing starts, and the profile folders there are listed',
+    world: { localState: { text: localStateText({ Default: signedIn(SOMEONE), 'Profile 3': signedIn(mail('another')) }) } },
+    lines: [`${NOT_PICKED} no profile folder's Google account has it.`, PIN],
+    started: false,
+  },
+  {
+    name: 'several folders match: nothing starts, and the matching ones are listed',
+    world: { localState: { text: localStateText({ Default: signedIn(OWNER), 'Profile 3': signedIn(OWNER) }) } },
+    lines: [`${NOT_PICKED} 2 profile folders' Google accounts have it ("Default", "Profile 3"), and it doesn't guess.`, PIN],
+    started: false,
+  },
+  {
+    name: 'the one folder that matches has no Preferences file: it does not count',
+    world: { localState: { text: localStateText({ Default: signedIn(SOMEONE), 'Profile 7': signedIn(OWNER) }) } },
+    lines: [`${NOT_PICKED} no profile folder's Google account has it (1 folder Local State lists with it has no Preferences file, so it doesn't count).`, PIN],
+    started: false,
+  },
+  {
+    name: 'of two that match, the one without Preferences is out: the other starts',
+    world: { localState: { text: localStateText({ 'Profile 3': signedIn(OWNER), 'Profile 7': signedIn(OWNER) }) } },
+    lines: [STARTED_ON_3],
+    started: true,
+  },
+  {
+    name: 'no account in .claude.json: nothing starts, and Local State is not read',
+    world: { claim: { text: claimText(undefined) } },
+    lines: [NO_ACCOUNT_IN_FILE, PIN],
+    started: false,
+    reads: [CLAIM_WINDOWS],
+  },
+  {
+    name: 'an account id that is no plain id is no account',
+    world: { claim: { text: claimText(accountRecord(OWNER, 'not an id')) } },
+    lines: [NO_ACCOUNT_IN_FILE, PIN],
+    started: false,
+    reads: [CLAIM_WINDOWS],
+  },
+  {
+    name: ".claude.json caught mid-write: can't tell, and it says to call again",
+    world: { claim: { text: '{"oauthAccount": {"accountUuid"' } },
+    lines: [`${NOT_PICKED} Claude Code's .claude.json doesn't read as a JSON object just now (caught mid-write, say).`, AGAIN_OR_PIN],
+    started: false,
+    reads: [CLAIM_WINDOWS],
+  },
+  { name: "a host's token on the account .claude.json records: the start opens the match", world: { identity: { kind: 'oauth-token', accountId: accountId(1) } }, lines: [STARTED_ON_3], started: true },
+  {
+    name: 'the session on another account than .claude.json records: nothing starts, and Local State is not read',
+    world: { identity: { kind: 'claude.ai', accountId: accountId(9) } },
+    lines: [`${NOT_PICKED} this session runs on another account than the one .claude.json records.`, PIN],
+    started: false,
+    reads: [CLAIM_WINDOWS],
+  },
+  {
+    name: "a host's token that names no account id: can't be confirmed, and the fix is a pin",
+    world: { identity: { kind: 'oauth-token' } },
+    lines: [`${NOT_PICKED} this session's own sign-in names no account id (a token its host handed it, before the server answered, say), so the one .claude.json records can't be confirmed.`, PIN],
+    started: false,
+    reads: [CLAIM_WINDOWS],
+  },
+  { name: 'the session on an API key: no Claude account, and neither file is read', world: { identity: { kind: 'api-key' } }, lines: [SESSION_NONE, PIN], started: false, reads: [] },
+  { name: 'the session on a Console login: no Claude account', world: { identity: { kind: 'console', accountId: accountId(1) } }, lines: [SESSION_NONE, PIN], started: false, reads: [] },
+  { name: 'the session with no login: no Claude account', world: { identity: { kind: 'none' } }, lines: [SESSION_NONE, PIN], started: false, reads: [] },
+  { name: 'the session on a cloud provider: no Claude account', world: { identity: { kind: 'bedrock' } }, lines: [SESSION_NONE, PIN], started: false, reads: [] },
+  { name: 'the session on a kind this plugin does not know: read as no identity', world: { identity: { kind: 'some-later-kind', accountId: accountId(1) } }, lines: [SESSION_NONE, PIN], started: false, reads: [] },
+  { name: "the session's sign-in refused (privacy): .claude.json stands alone, and the answer says so", world: { identity: 'denied' }, lines: [STARTED_ON_3_BY_FILE], started: true },
+  { name: "the session's sign-in call throws: .claude.json stands alone, and the answer says so", world: { identity: 'throws' }, lines: [STARTED_ON_3_BY_FILE], started: true },
+  {
+    name: "Chrome's user data folder can't be listed: nothing is asked or read, and no false reason is given",
+    world: { listFails: true },
+    lines: [`${NOT_PICKED} Chrome's user data folder can't be listed, so no profile folder can be checked.`, "Left for the person: call chrome_ensure again in a moment, or start Chrome by hand, on the profile whose Claude in Chrome is signed in to Claude Code's account."],
+    started: false,
+    reads: [],
+    asks: 0,
+  },
+  { name: '.claude.json not there', world: { claim: { fault: 'missing' } }, lines: [`${NOT_PICKED} Claude Code's .claude.json isn't there, or can't be looked at.`, PIN], started: false, reads: [] },
+  { name: '.claude.json over the cap: not read', world: { claim: { fault: 'huge' } }, lines: [`${NOT_PICKED} Claude Code's .claude.json is over 4 MiB, which isn't read.`, PIN], started: false, reads: [] },
+  { name: '.claude.json a link: not read', world: { claim: { fault: 'link' } }, lines: [`${NOT_PICKED} Claude Code's .claude.json is a link, which isn't followed.`, PIN], started: false, reads: [] },
+  { name: '.claude.json a folder: not read', world: { claim: { fault: 'dir' } }, lines: [`${NOT_PICKED} Claude Code's .claude.json isn't a plain file.`, PIN], started: false, reads: [] },
+  { name: ".claude.json whose read fails: the error's path never shown", world: { claim: { fault: 'fails' } }, lines: [`${NOT_PICKED} Claude Code's .claude.json couldn't be read.`, PIN], started: false, reads: [CLAIM_WINDOWS] },
+  { name: 'Local State not there', world: { localState: { fault: 'missing' } }, lines: [`${NOT_PICKED} Chrome's Local State isn't there, or can't be looked at.`, PIN], started: false, reads: [CLAIM_WINDOWS] },
+  { name: 'Local State over the cap: not read', world: { localState: { fault: 'huge' } }, lines: [`${NOT_PICKED} Chrome's Local State is over 4 MiB, which isn't read.`, PIN], started: false, reads: [CLAIM_WINDOWS] },
+  { name: 'Local State a link: not read', world: { localState: { fault: 'link' } }, lines: [`${NOT_PICKED} Chrome's Local State is a link, which isn't followed.`, PIN], started: false, reads: [CLAIM_WINDOWS] },
+  { name: 'Local State a folder: not read', world: { localState: { fault: 'dir' } }, lines: [`${NOT_PICKED} Chrome's Local State isn't a plain file.`, PIN], started: false, reads: [CLAIM_WINDOWS] },
+  { name: 'Local State whose read fails', world: { localState: { fault: 'fails' } }, lines: [`${NOT_PICKED} Chrome's Local State couldn't be read.`, PIN], started: false, reads: [CLAIM_WINDOWS, LOCAL_STATE_WINDOWS] },
+  {
+    name: 'Local State with no profile list',
+    world: { localState: { text: JSON.stringify({ os_crypt: { planted: plant(4) }, profile: { info_cache: [] } }) } },
+    lines: [`${NOT_PICKED} Chrome's Local State doesn't read as its list of profiles.`, PIN],
+    started: false,
+  },
+  {
+    name: 'CLAUDE_CONFIG_DIR set: .claude.json is read there',
+    world: { env: { CLAUDE_CONFIG_DIR: 'C:\\path\\to\\config\\' } },
+    lines: [STARTED_ON_3],
+    started: true,
+    reads: ['C:\\path\\to\\config\\.claude.json', LOCAL_STATE_WINDOWS],
+  },
+  {
+    name: 'CLAUDE_CONFIG_DIR relative: nothing is read',
+    world: { env: { CLAUDE_CONFIG_DIR: 'config' } },
+    lines: [`${NOT_PICKED} Claude Code's .claude.json can't be placed for sure (CLAUDE_CONFIG_DIR, or the home folder, isn't an absolute local path).`, PIN],
+    started: false,
+    reads: [],
+  },
+  {
+    name: 'CLAUDE_CONFIG_DIR a network path: nothing is read',
+    world: { env: { CLAUDE_CONFIG_DIR: '\\\\host\\share\\config' } },
+    lines: [`${NOT_PICKED} Claude Code's .claude.json can't be placed for sure (CLAUDE_CONFIG_DIR, or the home folder, isn't an absolute local path).`, PIN],
+    started: false,
+    reads: [],
+  },
+]
+
+for (const c of START_CASES) {
+  test(`not running, no profile named: ${c.name}`, async ($, on) => {
+    const fakes = engine(on, c.world ?? {})
+    await $.session.start(START)
+    const said = await ensure($)
+    const lines = said.split('\n')
+    expect(c.lines.filter(line => !lines.includes(line))).toEqual([])
+    expect(fakes.starts).toHaveLength(c.started ? 1 : 0)
+    if (c.started) expect(argumentsOf(fakes.starts[0] ?? '')).toBe('--profile-directory="Profile 3" --restore-last-session')
+    else expect(said).toMatch(/^Reconnect: not queued: Chrome isn't known to run\./m)
+    expect(fakes.reads).toEqual([...(c.reads ?? [CLAIM_WINDOWS, LOCAL_STATE_WINDOWS])])
+    expect(fakes.identityAsks()).toBe(c.asks ?? 1)
+    heldToFolders(said, fakes)
+  })
+}
+
+/** A running Chrome's case: its command line's switches, its world, and the Profile line (and what is left) it must say. */
+type RunningCase = { readonly name: string; readonly args: string; readonly world?: World; readonly line: string; readonly left: string }
+
+const RUNNING_CASES: readonly RunningCase[] = [
+  { name: 'started on the matched folder', args: '--profile-directory="Profile 3"', line: `Profile: Chrome was started on "Profile 3", ${MATCH}.`, left: 'Left for the person: nothing.' },
+  {
+    name: 'started on another folder: both named, and opening the matched one is the person\'s',
+    args: '--profile-directory=Default',
+    line: `Profile: Chrome was started on "Default", but ${MATCH} is "Profile 3". A window opened from Chrome's profile menu shows on no command line, so that profile may be open already.`,
+    left: 'Left for the person: open the profile "Profile 3" from Chrome\'s profile menu, if it isn\'t open already: this tool never opens a profile in a Chrome that runs.',
+  },
+  {
+    name: "started with no --profile-directory: the command line can't tell",
+    args: '--restore-last-session',
+    line: `Profile: Chrome's command line names no profile folder (Chrome opened the profile it used last), so it can't tell whether that is "Profile 3", ${MATCH}.`,
+    left: 'Left for the person: nothing.',
+  },
+  {
+    name: "a read that fails: it can't tell, and why, and the tool answers",
+    args: '--profile-directory="Profile 3"',
+    world: { claim: { fault: 'missing' } },
+    line: `Profile: can't tell whether Chrome runs on ${MATCH}: Claude Code's .claude.json isn't there, or can't be looked at.`,
+    left: 'Left for the person: nothing.',
+  },
+  {
+    name: "the session's sign-in refused: .claude.json stands alone, and the line says so",
+    args: '--profile-directory="Profile 3"',
+    world: { identity: 'denied' },
+    line: `Profile: Chrome was started on "Profile 3", ${MATCH}. ${FILE_ONLY_WORDS}.`,
+    left: 'Left for the person: nothing.',
+  },
+  {
+    name: "the session on another account than .claude.json records: it can't tell",
+    args: '--profile-directory="Profile 3"',
+    world: { identity: { kind: 'claude.ai', accountId: accountId(9) } },
+    line: `Profile: can't tell whether Chrome runs on ${MATCH}: this session runs on another account than the one .claude.json records.`,
+    left: 'Left for the person: nothing.',
+  },
+  {
+    name: "several folders match: it can't tell",
+    args: '--profile-directory="Profile 3"',
+    world: { localState: { text: localStateText({ Default: signedIn(OWNER), 'Profile 3': signedIn(OWNER) }) } },
+    line: `Profile: can't tell whether Chrome runs on ${MATCH}: 2 profile folders' Google accounts have it ("Default", "Profile 3"), and it doesn't guess.`,
+    left: 'Left for the person: nothing.',
+  },
+]
+
+for (const c of RUNNING_CASES) {
+  test(`running, no profile named: ${c.name}`, async ($, on) => {
+    const fakes = engine(on, { ...c.world, running: [{ pid: 777, cmd: `"${CHROME}" ${c.args}` }] })
+    await $.session.start(START)
+    const said = await ensure($)
+    const lines = said.split('\n')
+    expect([c.line, c.left].filter(line => !lines.includes(line))).toEqual([])
+    // The Profile line follows the Chrome line; nothing is started, and the reconnect is queued as ever.
+    expect(lines[1]).toBe(c.line)
+    expect(fakes.starts).toEqual([])
+    expect(fakes.scripts).toHaveLength(1)
+    expect(said).toMatch(/^Reconnect: \/mcp reconnect claude-in-chrome runs once this turn ends/m)
+    heldToFolders(said, fakes)
+  })
+}
+
+test('running, the profile setting names one: no Profile line, and neither file is read', { options: { profile: 'Default' } }, async ($, on) => {
+  const fakes = engine(on, { running: [{ pid: 777, cmd: `"${CHROME}" --profile-directory=Default` }] })
+  await $.session.start(START)
+  const said = await ensure($)
+  expect(said).not.toMatch(/^Profile:/m)
+  expect([...fakes.reads, ...fakes.stats]).toEqual([])
+})
+
+test("running, the call names one: no Profile line, and neither file is read", async ($, on) => {
+  const fakes = engine(on, { running: [{ pid: 777, cmd: `"${CHROME}"` }] })
+  await $.session.start(START)
+  const said = await ensure($, { profile: 'Default' })
+  expect(said).not.toMatch(/^Profile:/m)
+  expect([...fakes.reads, ...fakes.stats]).toEqual([])
+})
+
+test("a named profile when Chrome's user data folder can't be listed: nothing starts, and no false reason is given", async ($, on) => {
+  const fakes = engine(on, { listFails: true })
+  await $.session.start(START)
+  const said = await ensure($, { profile: 'Profile 3' })
+  const lines = said.split('\n')
+  const want = [
+    "Did: nothing: Chrome's user data folder can't be listed, so the profile named can't be checked against Chrome's profile folders.",
+    'Left for the person: call chrome_ensure again in a moment, or start Chrome by hand on that profile.',
+  ]
+  expect(want.filter(line => !lines.includes(line))).toEqual([])
+  expect(fakes.starts).toEqual([])
+  expect([...fakes.reads, ...fakes.stats]).toEqual([])
+  expect(fakes.identityAsks()).toBe(0)
+  heldToFolders(said, fakes)
+})
+
+test("macOS with no home folder, a named profile: Chrome's user data folder isn't known, so nothing starts, and nothing is read", async ($, on) => {
+  const fakes = engine(on, { platform: 'macos', env: { HOME: '' } })
+  await $.session.start(START)
+  const said = await ensure($, { profile: 'Profile 3' })
+  const lines = said.split('\n')
+  const want = [
+    "Did: nothing: Chrome's user data folder isn't known here, so the profile named can't be checked against Chrome's profile folders.",
+    'Left for the person: start Chrome by hand on that profile.',
+  ]
+  expect(want.filter(line => !lines.includes(line))).toEqual([])
+  expect(fakes.argvs.some(a => a[0] === '/usr/bin/open')).toBe(false)
+  expect(fakes.reads).toEqual([])
+  expect(fakes.lists).toEqual([])
+  expect(fakes.identityAsks()).toBe(0)
+  heldToFolders(said, fakes)
+})
+
+test("macOS with no home folder, nothing named: the match can't check a folder, so nothing starts, and nothing is read", async ($, on) => {
+  const fakes = engine(on, { platform: 'macos', env: { HOME: '' } })
+  await $.session.start(START)
+  const said = await ensure($)
+  const lines = said.split('\n')
+  const want = [
+    `${NOT_PICKED} Chrome's user data folder isn't known here, so its Local State can't be read.`,
+    "Left for the person: start Chrome by hand, on the profile whose Claude in Chrome is signed in to Claude Code's account.",
+  ]
+  expect(want.filter(line => !lines.includes(line))).toEqual([])
+  expect(fakes.argvs.some(a => a[0] === '/usr/bin/open')).toBe(false)
+  expect(fakes.reads).toEqual([])
+  expect(fakes.lists).toEqual([])
+  expect(fakes.identityAsks()).toBe(0)
+  heldToFolders(said, fakes)
+})
+
+// ---------------------------------------------------------------------------------------------
 // Starts that don't go as planned.
 
 test('the flag asked for but not taken: it says so, and how the person adds it', async ($, on) => {
-  engine(on, { env: { CLAUDE_CHROME_SILENT_DEBUGGER: '1' }, after: [{ pid: 4321, cmd: `"${CHROME}"` }] })
+  const fakes = engine(on, { env: { CLAUDE_CHROME_SILENT_DEBUGGER: '1' }, after: [{ pid: 4321, cmd: `"${CHROME}"` }] })
   await $.session.start(START)
   const said = await ensure($)
   expect(said).toMatch(/It runs as PID 4321, but without the flag: a Chrome already starting may have taken the launch\./)
   expect(said).toMatch(/^Left for the person: for the flag, quit Chrome fully/m)
+  heldToFolders(said, fakes)
 })
 
 test('a launch that handed off to a Chrome already starting is said: the PID found is not the one launched', async ($, on) => {
-  engine(on, { launchedPid: 9999 })
+  const fakes = engine(on, { launchedPid: 9999 })
   await $.session.start(START)
-  expect(await ensure($)).toMatch(/^Did: launched Chrome, with .+, but the launch handed off to a Chrome that was starting already: it runs as PID 4321\.$/m)
+  const said = await ensure($)
+  expect(said).toMatch(/^Did: launched Chrome, with .+, but the launch handed off to a Chrome that was starting already: it runs as PID 4321\.$/m)
+  heldToFolders(said, fakes)
 })
 
 test('a launch Windows names no process for is still looked for', async ($, on) => {
-  engine(on, { startRun: 'no-pid' })
+  const fakes = engine(on, { startRun: 'no-pid' })
   await $.session.start(START)
-  expect(await ensure($)).toMatch(/^Did: started Chrome, with .+\. It runs as PID 4321\.$/m)
+  const said = await ensure($)
+  expect(said).toMatch(/^Did: started Chrome, with .+\. It runs as PID 4321\.$/m)
+  heldToFolders(said, fakes)
 })
 
 test('started, but no browser process within 20 s: it says so after its looks, and the reconnect still goes', async ($, on) => {
-  const { scripts, commands, clock } = engine(on, { after: [] })
+  const fakes = engine(on, { after: [] })
+  const { scripts, commands, clock } = fakes
   await $.session.start(START)
   const said = await ensure($)
+  heldToFolders(said, fakes)
   expect(said).toMatch(/Did: asked Chrome to start, with .+, but no browser process of it showed within 20 s\./)
   // The first look, the start, then 20 looks of its own, each after a pause: never one long run; then the release.
   expect(scripts).toHaveLength(23)
@@ -561,9 +1192,11 @@ test('started, but no browser process within 20 s: it says so after its looks, a
 })
 
 test("a start whose answer never came isn't a failed start: the looks find Chrome, and the answer says so", async ($, on) => {
-  const { commands, clock } = engine(on, { startRun: 'hangs' })
+  const fakes = engine(on, { startRun: 'hangs' })
+  const { commands, clock } = fakes
   await $.session.start(START)
   const said = await ensure($)
+  heldToFolders(said, fakes)
   expect(said).toMatch(/^Did: started Chrome, with .+; the start's own answer didn't come \(the start didn't answer \(.*still running after 30000 ms.*\)\)\. It runs as PID 4321\.$/m)
   await $.turn.complete(ANSWERED)
   await clock.advance(1000)
@@ -571,9 +1204,11 @@ test("a start whose answer never came isn't a failed start: the looks find Chrom
 })
 
 test('a start whose answer never came, and no browser after: nothing is said to run, and no reconnect is queued', async ($, on) => {
-  const { commands, clock } = engine(on, { startRun: 'hangs', after: [] })
+  const fakes = engine(on, { startRun: 'hangs', after: [] })
+  const { commands, clock } = fakes
   await $.session.start(START)
   const said = await ensure($)
+  heldToFolders(said, fakes)
   expect(said).toMatch(/^Did: asked Chrome to start, with .+; the start's own answer didn't come \(.+\), but no browser process of it showed within 20 s\.$/m)
   expect(said).toMatch(/^Reconnect: not queued: Chrome isn't known to run\./m)
   await $.turn.complete(ANSWERED)
@@ -582,9 +1217,11 @@ test('a start whose answer never came, and no browser after: nothing is said to 
 })
 
 test('a start that fails says why, after one look, and queues no reconnect', async ($, on) => {
-  const { scripts } = engine(on, { startRun: 'fails', after: [] })
+  const fakes = engine(on, { startRun: 'fails', after: [] })
+  const { scripts } = fakes
   await $.session.start(START)
   const said = await ensure($)
+  heldToFolders(said, fakes)
   expect(said).toMatch(/^Did: tried to start Chrome, but the start exited 1: Exception calling "Start" with "1" argument\(s\): "The system cannot find the file specified"\.$/m)
   expect(said).toMatch(/^Left for the person: start Chrome by hand\.$/m)
   expect(said).toMatch(/^Reconnect: not queued/m)
@@ -894,12 +1531,19 @@ test("macOS argument building: open -a with the .app, the arguments after --args
   ])
 })
 
-test('macOS, not running: a last look, then open with the flag and no profile named, and the wait finds it', async ($, on) => {
-  const { argvs, commands, clock, macLock } = engine(on, { platform: 'macos', env: { CLAUDE_CHROME_SILENT_DEBUGGER: '1' } })
+test("macOS, not running: a last look, then open with the flag on the account match's folder, and the wait finds it", async ($, on) => {
+  const fakes = engine(on, { platform: 'macos', env: { CLAUDE_CHROME_SILENT_DEBUGGER: '1' } })
+  const { argvs, reads, commands, clock, macLock } = fakes
   await $.session.start(START)
   const said = await ensure($)
-  expect(said).toContain(`Did: started Chrome, with no profile folder named (Chrome opens the profile it used last), --restore-last-session and ${FLAG}. It runs as PID 4321, and the flag took.`)
-  expect(argvs.find(a => a[0] === '/usr/bin/open')).toEqual(['/usr/bin/open', '-a', '/Applications/Google Chrome.app', '--args', '--restore-last-session', FLAG])
+  expect(said).toContain(`Did: started Chrome, with the profile folder "Profile 3" (its Google account has the email of Claude Code's account), --restore-last-session and ${FLAG}. It runs as PID 4321, and the flag took.`)
+  expect(argvs.find(a => a[0] === '/usr/bin/open')).toEqual(['/usr/bin/open', '-a', '/Applications/Google Chrome.app', '--args', '--profile-directory=Profile 3', '--restore-last-session', FLAG])
+  // .claude.json in the home folder, and Local State in Chrome's own folder under it, each read once; by the tail, as
+  // a host on Windows may spell a POSIX path its own way.
+  const macReads = reads.map(path => path.replace(/\\/g, '/'))
+  expect(macReads).toHaveLength(2)
+  expect([macReads[0]?.endsWith(CLAIM_MAC), macReads[1]?.endsWith(LOCAL_STATE_MAC)]).toEqual([true, true])
+  heldToFolders(said, fakes)
   // This user's uid; the first look; the lock (its folder's parent, then the folder); the last look right before
   // open; open; then a sleep and a look until it shows; then the lock let go.
   expect(argvs.map(a => a[0])).toEqual(['/usr/bin/id', '/usr/bin/pgrep', '/bin/mkdir', '/bin/mkdir', '/usr/bin/pgrep', '/usr/bin/open', '/bin/sleep', '/usr/bin/pgrep', '/bin/ps', '/bin/rmdir'])
@@ -923,49 +1567,62 @@ test("macOS, a named profile is checked against Chrome's own folder under the ho
 })
 
 test('macOS, open fails: the start says why, and no reconnect is queued', async ($, on) => {
-  engine(on, { platform: 'macos', open: 'fails', after: [] })
+  const fakes = engine(on, { platform: 'macos', open: 'fails', after: [] })
   await $.session.start(START)
   const said = await ensure($)
   expect(said).toMatch(/^Did: tried to start Chrome, but open exited 1: LSOpenURLsWithRole\(\) failed with error -10810\.$/m)
   expect(said).toMatch(/^Reconnect: not queued/m)
+  heldToFolders(said, fakes)
 })
 
 test("macOS, open that never answers isn't a failed start: the looks find Chrome", async ($, on) => {
-  engine(on, { platform: 'macos', open: 'hangs' })
+  const fakes = engine(on, { platform: 'macos', open: 'hangs' })
   await $.session.start(START)
-  expect(await ensure($)).toMatch(/^Did: started Chrome, with .+; the start's own answer didn't come \(open didn't answer \(.+\)\)\. It runs as PID 4321\.$/m)
+  const said = await ensure($)
+  expect(said).toMatch(/^Did: started Chrome, with .+; the start's own answer didn't come \(open didn't answer \(.+\)\)\. It runs as PID 4321\.$/m)
+  heldToFolders(said, fakes)
 })
 
 test('macOS, no browser within 20 s: it says so after its looks', async ($, on) => {
-  const { argvs } = engine(on, { platform: 'macos', after: [] })
+  const fakes = engine(on, { platform: 'macos', after: [] })
   await $.session.start(START)
-  expect(await ensure($)).toMatch(/Did: asked Chrome to start, with .+, but no browser process of it showed within 20 s\./)
-  expect(argvs.filter(a => a[0] === '/bin/sleep')).toHaveLength(20)
+  const said = await ensure($)
+  expect(said).toMatch(/Did: asked Chrome to start, with .+, but no browser process of it showed within 20 s\./)
+  expect(fakes.argvs.filter(a => a[0] === '/bin/sleep')).toHaveLength(20)
+  heldToFolders(said, fakes)
 })
 
 test('macOS, running without the flag while opted in: it says so, and never quits Chrome', async ($, on) => {
-  const { argvs } = engine(on, { platform: 'macos', env: { CLAUDE_CHROME_SILENT_DEBUGGER: '1' }, running: [{ pid: 412, cmd: `${MAC_CHROME} --profile-directory=Profile 3` }] })
+  const fakes = engine(on, { platform: 'macos', env: { CLAUDE_CHROME_SILENT_DEBUGGER: '1' }, running: [{ pid: 412, cmd: `${MAC_CHROME} --profile-directory=Profile 3` }] })
+  const { argvs } = fakes
   await $.session.start(START)
   const said = await ensure($)
   expect(said).toMatch(/^Chrome: running \(PID 412\); without --silent-debugger-extension-api; its command line names the profile folder "Profile 3"\.$/m)
   expect(said).toMatch(/quit Chrome fully \(Cmd\+Q, every window\), then call chrome_ensure again; or start Chrome with it by hand: open -a "Google Chrome" --args --silent-debugger-extension-api/)
   expect(argvs.map(a => a[0])).toEqual(['/usr/bin/id', '/usr/bin/pgrep', '/bin/ps'])
   expect(killsAnything([], argvs)).toBe(false)
+  heldToFolders(said, fakes)
 })
 
 test("macOS, another start holding the lock: open never runs, and this call waits for what that start makes", async ($, on) => {
-  const { argvs, macLock } = engine(on, { platform: 'macos', macLock: 'held', after: [], appear: { after: 2, procs: [{ pid: 515, cmd: `${MAC_CHROME} --restore-last-session` }] } })
+  const fakes = engine(on, { platform: 'macos', macLock: 'held', after: [], appear: { after: 2, procs: [{ pid: 515, cmd: `${MAC_CHROME} --restore-last-session` }] } })
+  const { argvs, macLock } = fakes
   await $.session.start(START)
-  expect(await ensure($)).toMatch(/^Did: nothing: another session was starting Chrome, which runs as PID 515, without the flag\.$/m)
+  const said = await ensure($)
+  expect(said).toMatch(/^Did: nothing: another session was starting Chrome, which runs as PID 515, without the flag\.$/m)
   expect(argvs.some(a => a[0] === '/usr/bin/open')).toBe(false)
   expect(argvs.some(a => a[0] === '/bin/rmdir')).toBe(false)
   expect(macLock()).toBe(true)
+  heldToFolders(said, fakes)
 })
 
 test('macOS, a lock older than a start can take is taken over', async ($, on) => {
-  const { argvs } = engine(on, { platform: 'macos', macLock: 'stale' })
+  const fakes = engine(on, { platform: 'macos', macLock: 'stale' })
+  const { argvs } = fakes
   await $.session.start(START)
-  expect(await ensure($)).toMatch(/^Did: started Chrome/m)
+  const said = await ensure($)
+  expect(said).toMatch(/^Did: started Chrome/m)
+  heldToFolders(said, fakes)
   // mkdir fails on the old lock; it is removed and made again; open runs; the lock is let go after the wait.
   expect(argvs.map(a => a[0]).filter(c => c === '/bin/mkdir' || c === '/bin/rmdir' || c === '/usr/bin/open')).toEqual(['/bin/mkdir', '/bin/mkdir', '/bin/rmdir', '/bin/mkdir', '/usr/bin/open', '/bin/rmdir'])
 })
