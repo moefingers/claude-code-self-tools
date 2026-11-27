@@ -35,8 +35,10 @@ export async function runGridSteps(run: GridRun): Promise<string[]> {
   const opened = new Set(run.open)
   const lines: string[] = []
   const rest = (from: number, why: string): string[] => run.steps.slice(from).map(s => `${s.session.name}: not opened: ${why}.`)
+  // Read afresh at each look, through a call: the Stop can come while a pause or a launch is awaited.
+  const stopped = (): boolean => run.signal?.aborted === true
   for (const [n, step] of run.steps.entries()) {
-    if (run.signal?.aborted === true) {
+    if (stopped()) {
       lines.push(...rest(n, 'interrupted'))
       break
     }
@@ -44,7 +46,7 @@ export async function runGridSteps(run: GridRun): Promise<string[]> {
       try {
         await run.pause(run.signal)
       } catch {
-        lines.push(...rest(n, run.signal?.aborted === true ? 'interrupted' : 'the plugin stopped before its turn'))
+        lines.push(...rest(n, stopped() ? 'interrupted' : 'the plugin stopped before its turn'))
         break
       }
     }

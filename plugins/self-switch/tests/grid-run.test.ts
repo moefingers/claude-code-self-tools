@@ -7,7 +7,8 @@ import { planGrid, type Grid } from '../hooks/machine'
 /** A made-up grid: a fixed slot at a rect, a free cell maximized. */
 const GRID: Grid = { windows: [{ window: 'one', rect: [-7, 0, 494, 523], tabs: ['alpha', 'beta'] }, { window: 'two', maximized: true }] }
 const FOLDER = 'C:\\path\\to\\work'
-const steps = planGrid(['alpha', 'beta', 'gamma', 'delta'].map(name => ({ name, folder: FOLDER })), GRID, new Set())
+/** The plan's steps, which the run takes (its `steps`), never the plan itself. */
+const steps = planGrid(['alpha', 'beta', 'gamma', 'delta'].map(name => ({ name, folder: FOLDER })), GRID, new Set()).steps
 
 /** What each launch was given, and a launch that answers `launched` unless its session is in `refuse`, or throws for `throws`. */
 function launcher(refuse: readonly string[] = [], throws: readonly string[] = []) {
