@@ -312,8 +312,9 @@ export const MARKETPLACE = 'claude-code-self-tools'
 /**
  * Whether the plugin named `plugin` is enabled from this marketplace alone, as the `enabledPlugins` setting says. A row
  * names its plugin by name only, so a plugin of another marketplace that took a listed plugin's name would otherwise
- * match a key on MAY_SET. Fails closed: false when the marketplaces couldn't be read, when the setting enables the name
- * from no marketplace (a plugin loaded with --plugin-dir), and when it enables it from another one as well.
+ * match a key on MAY_SET. Fails closed: false when the marketplaces couldn't be read, when the setting holds an entry
+ * marketplacesOf can't read, when it enables the name from no marketplace (a plugin loaded with --plugin-dir), and when
+ * it enables it from another one as well.
  */
 export function isOursAlone(marketplaces: Marketplaces, plugin: string): boolean {
   const from = marketplaces?.get(plugin) ?? []
@@ -440,8 +441,11 @@ export type Marketplaces = ReadonlyMap<string, readonly string[]> | undefined
 
 /**
  * The marketplaces each plugin is enabled from, read from the `enabledPlugins` setting's value (`<plugin>@<marketplace>`
- * keys, true for enabled): by plugin, sorted. A setting the sources hold none of is no plugin; anything not of its shape
- * is unread.
+ * keys, true for enabled, false for not): by plugin, sorted. A setting the sources hold none of is no plugin. Anything
+ * else leaves the whole setting unread: a value that isn't a map; an entry whose value isn't true or false (a list, which
+ * the settings schema allows too, among them: what it means isn't guessed); and a key that doesn't parse as
+ * `<plugin>@<marketplace>`, whatever its value, since it can't be tied to a plugin. Skipped, such an entry could be a
+ * same-name plugin of another marketplace, left out of isOursAlone's count.
  */
 export function marketplacesOf(enabled: unknown): Marketplaces {
   if (enabled === undefined) return new Map()
@@ -451,7 +455,8 @@ export function marketplacesOf(enabled: unknown): Marketplaces {
     const parts = /^([^@\s]+)@([^@\s]+)$/.exec(id)
     const plugin = parts?.[1]
     const marketplace = parts?.[2]
-    if (on !== true || plugin === undefined || marketplace === undefined) continue
+    if (typeof on !== 'boolean' || plugin === undefined || marketplace === undefined) return undefined
+    if (!on) continue
     found.set(plugin, [...(found.get(plugin) ?? []), marketplace].sort())
   }
   return found

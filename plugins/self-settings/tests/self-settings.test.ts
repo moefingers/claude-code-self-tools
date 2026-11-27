@@ -52,8 +52,11 @@ const updateCheck = (plugin: string, value = 'on', more: { plugin?: string; isLo
   row(`${plugin}.updateCheck`, 'Update check', 'choice', value, { options: ['on', 'off'], ...more })
 const reminder = (value: string): ConfigRow => row('self-compact.compactReminder', 'Compact reminder', 'text', value)
 
-/** The enabledPlugins setting's value, or one that isn't of its shape: settings_set fails closed on that as on a read that fails. */
-type Enabled = Readonly<Record<string, boolean>> | 'unreadable'
+/**
+ * The enabledPlugins setting's value, its entries' values of any type (one that isn't true or false leaves it unread),
+ * or one that isn't of its shape at all: settings_set fails closed on either as on a read that fails.
+ */
+type Enabled = Readonly<Record<string, unknown>> | 'unreadable'
 
 /** Every plugin on the list, enabled from this marketplace alone: what settings_set needs to change any option on it. */
 const ALL_OURS: Readonly<Record<string, boolean>> = Object.fromEntries(MAY_SET.map(key => [`${key.slice(0, key.indexOf('.'))}@${MARKET}`, true]))
@@ -278,18 +281,54 @@ test('read: the plugin and marketplace filters match exactly, and a filter of th
   expect(got).toEqual(asks)
 })
 
-test('the marketplaces of each plugin, from the enabledPlugins setting: enabled ones only, by name, sorted; anything else unread', () => {
+test('the marketplaces of each plugin, from the enabledPlugins setting: enabled ones only, by name, sorted; one entry it can\'t read leaves the whole setting unread', () => {
   const parsed = (value: unknown): unknown => {
     const found = marketplacesOf(value)
     return found === undefined ? 'unread' : [...found]
   }
-  expect([undefined, { 'a@m2': true, 'a@m1': true, 'b@m1': false, c: true, 'd@m@x': true, ' e@m1': true, 'f@m1': 'yes' }, 'a@m1', ['a@m1'], null].map(parsed)).toEqual([
-    [],
-    [['a', ['m1', 'm2']]],
-    'unread',
-    'unread',
-    'unread',
-  ])
+  const good = { 'a@m1': true }
+  const cases: [unknown, unknown][] = [
+    // A setting the sources hold none of: no plugin.
+    [undefined, []],
+    // True and false only, every key `<plugin>@<marketplace>`: the enabled ones by name, each one's marketplaces sorted, false left out.
+    [{ 'a@m2': true, 'a@m1': true, 'b@m1': false, 'c@m1': true, 'c@m2': false }, [['a', ['m1', 'm2']], ['c', ['m1']]]],
+    // A key that doesn't parse, beside a good entry, whatever its value: no `@`, two, a space.
+    [{ ...good, c: true }, 'unread'],
+    [{ ...good, c: false }, 'unread'],
+    [{ ...good, 'd@m@x': true }, 'unread'],
+    [{ ...good, ' e@m1': true }, 'unread'],
+    // A value that isn't true or false, beside a good entry: a list among them, which the settings schema allows.
+    [{ ...good, 'f@m1': 'yes' }, 'unread'],
+    [{ ...good, 'f@m1': 'true' }, 'unread'],
+    [{ ...good, 'f@m1': 1 }, 'unread'],
+    [{ ...good, 'f@m1': null }, 'unread'],
+    [{ ...good, 'f@m1': [] }, 'unread'],
+    [{ ...good, 'f@m1': {} }, 'unread'],
+    // A value that isn't a map.
+    ['a@m1', 'unread'],
+    [['a@m1'], 'unread'],
+    [null, 'unread'],
+  ]
+  expect(cases.map(([value]) => [value, parsed(value)])).toEqual(cases)
+})
+
+test("an entry of the enabledPlugins setting it can't read refuses the set, at the serving, and the read says the marketplaces weren't read", async ($, on) => {
+  // self-compact from this marketplace alone, and an entry for a plugin of that name elsewhere whose value is no boolean:
+  // skipped, that plugin would be left out of the count.
+  const { sets, toasts } = engine(on, { rows: [reminder('')], enabled: { ...ALL_OURS, 'self-compact@other': 'true' } })
+  await $.session.start(START)
+  const refused = await set($, { key: 'self-compact.compactReminder', value: '40%' })
+  const listed = await read($)
+  expect({ refused, listed, sets, toasts }).toEqual({
+    refused: atServing(OWNER_ONLY),
+    listed: `result: ${[
+      HEAD('1 plugin', '1 row'),
+      ['self-compact (marketplace not read)', '- self-compact.compactReminder, "Compact reminder", text: ""; default; owner only'].join('\n'),
+      SENSITIVE_NOTE,
+    ].join('\n\n')}`,
+    sets: [],
+    toasts: [],
+  })
 })
 
 test('a value that looks like a secret: the rule, as a table', () => {

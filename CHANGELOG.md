@@ -2,6 +2,14 @@
 
 Each entry names a plugin and its version, as `version` in `plugins/<name>/.claude-plugin/plugin.json` has it.
 
+## 2026-11-27: self-settings 0.1.1: an `enabledPlugins` entry it can't read leaves the setting unread, so every set is refused (#102)
+
+- **The problem.** `marketplacesOf` skipped an entry of the `enabledPlugins` setting whose value wasn't literally `true`, or whose key didn't parse as `<plugin>@<marketplace>`. Had the engine ever counted another value as enabled (a string `"true"`, say), a same-name plugin of another marketplace would have been left out of `isOursAlone`'s count, and the set could have passed. It was bounded: only the 18 listed keys can be changed at all, and the row must still have the kind its manifest declares (#102, from #101's review).
+- **The fix: one odd entry, the whole setting unread.** A value that isn't true or false, or a key that doesn't parse, whatever its value, makes `marketplacesOf` answer unread, as a value that isn't a map already did: `settings_set` refuses every option with the owner-only line, and `settings_read` heads every plugin `marketplace not read`, each row `owner only`. `false` is still "not enabled", and a setting the sources hold none of still enables no plugin.
+- **The settings schema allows a list.** https://json.schemastore.org/claude-code-settings.json lets an entry's value be a list of texts as well as a boolean. What a list means isn't guessed: one leaves the setting unread, and the README's Known limits says so.
+- **Tests.** `marketplacesOf`'s table, rewritten whole: no setting; true and false only; each odd entry alone beside a good one (a key with no `@`, one with two, one with a space, one that doesn't parse valued false; the values `'yes'`, `'true'`, `1`, `null`, `[]` and `{}`); and values that aren't a map. One set and one read under this marketplace's own entries plus `'self-compact@other': 'true'`: the set refused at the serving, nothing reaching `$.config.set`, nothing toasted, and the read's heading `marketplace not read`, its row `owner only`.
+- **What ran.** Nothing while it was built: the tests were written to be read, for the cloud gate.
+
 ## 2026-11-27: self-settings 0.1.0, new: a session reads this machine's plugin settings, and changes the few on a fixed list (#88, PR 1)
 
 - **What ran.** The cloud gate on the first round's head (`b2ef37b`): `claude plugin validate plugins/self-settings --strict` passed, and the steps that fail on `main` failed there the same way; two of the plugin's tests failed, expecting `deny` where a refusal made at the serving comes back as the call's error result, which the review's round fixes. The plugin's tests on the review's round: the cloud gate. No session has called a tool yet; what each part rests on is said below.
