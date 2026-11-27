@@ -74,7 +74,7 @@
     {
       "name": "self-chrome",
       "source": "./plugins/self-chrome",
-      "description": "Makes sure Chrome runs for Claude in Chrome: looks for your Chrome, starts it when it isn't running (the profile you name, or the one Chrome used last; the last session restored; and --silent-debugger-extension-api only when you opt in), and reconnects Claude in Chrome once the turn ends. It never quits or restarts Chrome."
+      "description": "Makes sure Chrome runs for Claude in Chrome: looks for your Chrome, starts it when it isn't running (on the profile you name, else on the one profile whose Google account has the email of Claude Code's account; the last session restored; and --silent-debugger-extension-api only when you opt in), and reconnects Claude in Chrome once the turn ends. It never quits or restarts Chrome."
     },
     {
       "name": "self-update",

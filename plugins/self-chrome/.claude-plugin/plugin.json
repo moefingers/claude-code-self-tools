@@ -1,7 +1,7 @@
 {
   "name": "self-chrome",
-  "version": "0.1.7",
-  "description": "Lets a session make sure Chrome runs for Claude in Chrome: it looks for your Chrome, starts it when it isn't running (the profile you name, or the one Chrome used last; the last session restored; and --silent-debugger-extension-api when you opt in), and reconnects Claude in Chrome once the turn ends. It never quits or restarts Chrome.",
+  "version": "0.2.0",
+  "description": "Lets a session make sure Chrome runs for Claude in Chrome: it looks for your Chrome, starts it when it isn't running (on the profile you name, else on the one profile whose Google account has the email of Claude Code's account; the last session restored; and --silent-debugger-extension-api when you opt in), and reconnects Claude in Chrome once the turn ends. It never quits or restarts Chrome.",
   "author": { "name": "moefingers", "url": "https://github.com/moefingers" },
   "homepage": "https://github.com/moefingers/claude-code-self-tools/tree/main/plugins/self-chrome#readme",
   "repository": "https://github.com/moefingers/claude-code-self-tools",
@@ -26,7 +26,7 @@
     "profile": {
       "type": "string",
       "title": "Chrome profile",
-      "description": "The profile folder a Chrome this plugin starts opens, by its folder's name (Default, Profile 2); it must be one of Chrome's profile folders. Empty: none, and Chrome opens the profile it used last.",
+      "description": "A pin: the profile folder a Chrome this plugin starts opens, by its folder's name (Default, Profile 2); it must be one of Chrome's profile folders. Empty: the one profile folder whose Google account (in Chrome's Local State) has the email of Claude Code's Claude account (in its .claude.json); with none or several, nothing starts. Set it where the two emails differ, or to start the profile Chrome used last.",
       "default": ""
     },
     "chromePath": {

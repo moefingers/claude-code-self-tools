@@ -16,16 +16,16 @@ So the flag is opt-in, and off unless you turn it on. Some people want the banne
 
 `chrome_ensure` (Claude sees `mcp__self-chrome__chrome_ensure`):
 
-- `profile` (optional): the profile folder a start opens, by its folder's name (`Default`, `Profile 2`), never an account. It must be one of Chrome's profile folders ([below](#the-profile)). Used only when Chrome isn't running. Left out: the `profile` setting, else none, and Chrome opens the profile it used last.
+- `profile` (optional): the profile folder a start opens, by its folder's name (`Default`, `Profile 2`), never an account. It must be one of Chrome's profile folders ([below](#the-profile)). Used only when Chrome isn't running. Left out: the `profile` setting, else the account match: the one profile folder whose Google account has the email of Claude Code's account ([below](#the-account-match)).
 - `reconnect` (optional, default `true`): queue `/mcp reconnect claude-in-chrome` for when the turn ends.
 - `resume` (optional): the message that starts the session's next turn once the reconnect has run, as [self-mcp](../self-mcp)'s `resume`.
 
 ## What it does
 
-1. **It looks for your Chrome**: the browser process of the configured Chrome (the one that is no child of another, with no `--type=`), of your own login, on Chrome's default user data folder. A test or isolated Chrome, started with a `--user-data-dir` of its own (Playwright's, say), isn't yours: it is counted apart, and never touched. It says whether Chrome runs, whether it started with the flag, and the profile folder its command line names, if any.
+1. **It looks for your Chrome**: the browser process of the configured Chrome (the one that is no child of another, with no `--type=`), of your own login, on Chrome's default user data folder. A test or isolated Chrome, started with a `--user-data-dir` of its own (Playwright's, say), isn't yours: it is counted apart, and never touched. It says whether Chrome runs, whether it started with the flag, and the profile folder its command line names, if any. With nothing naming a profile, it says whether that is the account match's folder ([below](#when-chrome-runs)).
    - **Chrome in the background counts as running.** A Chrome with no window (`--no-startup-window`, as Chrome starts at login when it keeps running in the background) is said plainly to run in the background with no window. A start would only hand off to it, and it took its flags when it started.
    - **A Chrome whose command line can't be read** (an elevated Chrome, run as administrator) leaves the look unable to say that Chrome isn't running. So it says it can't tell, and starts nothing.
-2. **If Chrome isn't running, it starts it**, detached, with `--restore-last-session`, the flag when you opted in, and `--profile-directory=<profile>` only when the call or the `profile` setting names one. The launch is short: it returns at once, and looks of their own then wait up to 20 seconds for the browser process. It says the PID, and whether the flag took.
+2. **If Chrome isn't running, it starts it**, detached, with `--profile-directory=<profile>` (the folder the call or the `profile` setting names, else the account match's: [the profile](#the-profile)), `--restore-last-session`, and the flag when you opted in. When no folder can be picked, it starts nothing, and says why. The launch is short: it returns at once, and looks of their own then wait up to 20 seconds for the browser process. It says the PID, and whether the flag took.
    - **Windows:** `chrome.exe` through ShellExecute (what `Start-Process -PassThru` calls), in Chrome's own folder, never the session's, which Chrome would hold open for its whole life. Chrome gets your login environment, as Windows builds it for a program you start (`CreateEnvironmentBlock`): the machine's and your own Environment keys in the registry, and the system's own variables. The swap to it is Windows' own calls, made in a small C# helper, so it is the same under any PowerShell. Then, right before the launch, the start checks that its environment is the login environment exactly; when it isn't, it launches nothing, and says so without naming any variable. None of the Claude Code session's environment reaches Chrome, or anything Chrome starts while it runs.
    - **macOS:** `open -a "<Google Chrome.app>" --args …`, so Chrome starts as it would from the Dock, with launchd's environment.
    - **A last look comes right before the launch.** A Chrome that came up meanwhile is never started again, and the answer says so.
@@ -42,11 +42,43 @@ So the flag is opt-in, and off unless you turn it on. Some people want the banne
 
 ## The profile
 
-**Decided on principle: when nothing names a profile, the plugin names none.** With no `profile` in the call and no `profile` setting, a start passes no `--profile-directory`, and Chrome opens the profile it used last, restoring the profiles it had open. Chrome knows its last profile better than any guess the plugin could make. So the plugin reads nothing of Chrome's Local State.
+A start opens one profile folder, the first of:
 
-A profile that is named must be one of Chrome's profile folders: a folder of exactly that name in Chrome's user data folder, with its `Preferences` file. Given any other name, Chrome would make a new, empty profile of that name, without Claude in Chrome, and leave it in your profile picker. So the plugin starts nothing, and lists the profile folders that are there, by folder name only (`"Default", "Profile 3"`), never their display names or accounts. It never repeats the name it was given, which may be an account's.
+1. **The call's `profile`.**
+2. **The `profile` setting**: a pin, for a machine where the account match below doesn't hold.
+3. **The account match**: the one profile folder whose Google account has the email of Claude Code's account ([below](#the-account-match)).
+
+Nothing comes after the account match. When it picks no folder, the start starts nothing, and says why.
+
+**Decided on principle: the profile Chrome used last is started by naming it.** Before 0.2.0, with nothing named, a start passed no `--profile-directory`, and Chrome opened the profile it used last. That never followed Claude Code's account, so it is gone. To start the profile Chrome used last, name its folder, in the call or in the setting. From memory, not tested: a start on a named folder opens that profile alone, where a start with no `--profile-directory` reopened every profile Chrome had open.
+
+A profile that is named, or matched, must be one of Chrome's profile folders: a folder of exactly that name in Chrome's user data folder, with its `Preferences` file. Given any other name, Chrome would make a new, empty profile of that name, without Claude in Chrome, and leave it in your profile picker. So the plugin starts nothing, and lists the profile folders that are there, by folder name only (`"Default", "Profile 3"`), never their display names or accounts. It never repeats the name it was given, which may be an account's.
 
 `--restore-last-session` reopens the last session of each profile Chrome opens, whatever that profile's own "On startup" setting says.
+
+### The account match
+
+Claude in Chrome pairs with Claude Code only from a Chrome profile whose Claude in Chrome is signed in to Claude Code's own account, and that account can change (a weekly limit, a `/login`). No file says which profile's Claude in Chrome is signed in to which account. So the plugin matches what it can read, at the moment of the call: each profile's **Google account** (`user_name` in Chrome's Local State) against the email of Claude Code's **Claude account** (`oauthAccount` in Claude Code's `.claude.json`). The match stands in for "the profile whose Claude in Chrome is signed in to Claude Code's account". It holds where you sign in to Claude with the same address as that profile's Google account. Where you don't, pin the profile with the setting.
+
+- Both emails are trimmed and lower-cased, then compared whole.
+- **Exactly one folder matches:** the start opens it.
+- **No folder matches:** it starts nothing. It says so, lists the profile folders there by folder name, and says how to pin one (the call's `profile`, or the `profile` setting).
+- **Several match:** it starts nothing. It says how many, lists the matching folders by folder name, and says how to pin one.
+- **Claude Code's account unknown** (no Claude account in `.claude.json`: an API key, a cloud provider, logged out; or a `.claude.json` that doesn't read as JSON, caught mid-write) **or Local State unreadable:** it starts nothing, says which, and says how to pin one.
+- **Decided on principle: a folder Local State lists without its `Preferences` file doesn't count** (a profile being deleted, say). Chrome would make it anew, empty, as with a named folder that isn't there.
+- `.claude.json` is read at `<CLAUDE_CONFIG_DIR>/.claude.json` when `CLAUDE_CONFIG_DIR` is set and not blank, else at `.claude.json` in your home folder, beside the `.claude` folder, not in it (Claude Code's own layout, [the .claude directory](https://code.claude.com/docs/en/claude-directory.md)). The home folder is `USERPROFILE` on Windows (else `HOME`), and `HOME` on macOS. A folder that can't be placed for sure is not read: a relative path, a network or device path, a path on Windows with no drive, spaces around it.
+- Local State is read in Chrome's user data folder, the one the plugin already knows. That `profile.info_cache` is Chromium's map of profile folders to their attributes, and `user_name` a profile's signed-in account, is from Chromium's source (`chrome/common/pref_names.h`, `chrome/browser/profiles/profile_attributes_entry.cc`). That the map is in Local State, and that `user_name` is the Google account's email, is from memory.
+
+### When Chrome runs
+
+It opens no profile in a Chrome that runs ([below](#what-it-doesnt-do)). With nothing naming a profile, the answer adds a `Profile:` line, as far as the browser process's command line shows:
+
+- Chrome was started on the account match's folder.
+- Chrome was started on another folder: it names both, and says that opening the matched profile is yours, from Chrome's profile menu. A window opened from the profile menu shows on no command line, so that profile may be open already.
+- Chrome was started with no `--profile-directory` (the profile it used last), so the command line can't tell.
+- The account match picked no folder, or a read failed: it says it can't tell, and why. The tool answers as ever, and the reconnect is queued as ever.
+
+With a profile named in the call or the setting, it says nothing of this.
 
 ## What it doesn't do
 
@@ -54,7 +86,7 @@ A profile that is named must be one of Chrome's profile folders: a folder of exa
 - **It never signs in, and never types anything into Chrome.** Starting Chrome and reconnecting are all it does.
 - **Decided on principle: it never opens a profile in a Chrome that is running.** A launch of `chrome.exe --profile-directory=<profile>` at a running Chrome would hand off to it and open that profile's window, as the profile menu does. But when the running Chrome doesn't answer a handed-off launch in time, Chrome ends the browser it takes for hung, and every session's tabs and tab groups with it. So the profile applies only to a start, and opening another profile in a running Chrome stays yours.
 - **It acts only on Windows and macOS**, on the machine Chrome runs on. On Linux, WSL or a hosted server it says so, and does nothing.
-- **Known limits.** It doesn't see a Chrome whose install path holds a quote, such as a per-user install under a Windows profile folder with an apostrophe: it says Chrome isn't running, and a start then hands off to the running one. The macOS path is tested on fixtures only, not yet on a real Mac.
+- **Known limits.** It doesn't see a Chrome whose install path holds a quote, such as a per-user install under a Windows profile folder with an apostrophe: it says Chrome isn't running, and a start then hands off to the running one. The macOS path is tested on fixtures only, not yet on a real Mac. The account match is tested on fixtures only: it has not yet been seen to pick a profile on a real machine. With Chrome's user data folder unknown (a home folder that can't be placed), no folder can be checked, so it starts nothing: start Chrome by hand.
 
 ## Flags apply only when Chrome starts
 
@@ -93,7 +125,7 @@ Either applies to the next Chrome the plugin starts, not to one running now.
 | Setting | Default | What |
 | :- | :- | :- |
 | `silentDebugger` | `auto` | Whether a Chrome the plugin starts gets the flag: `auto`, `on` or `off` (above). |
-| `profile` | empty | The profile folder a start opens, by its folder's name; it must be one of Chrome's profile folders ([above](#the-profile)). Empty: none, and Chrome opens the profile it used last. A value that isn't a folder's name (letters, digits, spaces, `_` and `-`) starts nothing; the answer says how long it is, never what it says. |
+| `profile` | empty | A pin: the profile folder a start opens, by its folder's name; it must be one of Chrome's profile folders ([above](#the-profile)). Empty: the account match ([above](#the-account-match)). Set it where your Claude account's email isn't the profile's Google account, or to start the profile Chrome used last. A value that isn't a folder's name (letters, digits, spaces, `_` and `-`) starts nothing; the answer says how long it is, never what it says. |
 | `chromePath` | empty | Chrome's executable, as an absolute path, with no `[`, `]` or backtick. Empty: the standard installs. On Windows, `chrome.exe` under Program Files, then Program Files (x86), then the per-user install under your local application data folder, each as Windows names that folder, never from an environment variable. On macOS, `/Applications/Google Chrome.app/Contents/MacOS/Google Chrome`, then the same under your home folder's Applications; a binary whose name has no `Chrome` in it is refused. |
 | `updateCheck` | `on` | See [Update check](#update-check). |
 
@@ -102,8 +134,9 @@ Set them in `/config`, or with `claude plugin configure self-chrome@claude-code-
 ## Privacy
 
 - **It reads process command lines, Chrome's alone, of your own login.** On Windows, a fixed Windows PowerShell script, run by its known path as the shared machine code runs its scripts, reads the `chrome.exe` processes of its own Windows session with `Get-CimInstance`. It passes on only those that are no child of another (no `--type=`): a child's command line never leaves the script. On macOS, `pgrep -U <your uid>` finds your processes whose command starts with Chrome's executable, and `ps` reads those alone. Of each command line the plugin keeps whether it has the flag and `--no-startup-window`, its `--profile-directory` and its `--user-data-dir`, and nothing else.
-- **It reads nothing of Chrome's Local State.** When a profile is named, it checks that folder in Chrome's user data folder. When it isn't there, it lists the folder names there that have a `Preferences` file: directory names only.
-- **It prints folder names only**: a profile folder's name (`Profile 3`), never a path, an account or a command line. A profile folder whose name isn't plain (letters, digits, spaces, `_`, `-`) is said to be there, and not shown. A `profile` setting that isn't a folder's name is said to be invalid, with its length, and never repeated.
+- **For the account match, it reads one field of each of two files**, and only when nothing names a profile. Of Claude Code's `.claude.json`: `oauthAccount.emailAddress`, once it has checked that `oauthAccount.accountUuid` is a plain id (letters, digits and `-`, 8 to 64), which it doesn't keep. Of Chrome's Local State: each profile folder's `profile.info_cache.<folder>.user_name`, and no other key (never `os_crypt`). Each file is read only when its stat shows a plain file, no link, of at most 4 MiB (`$.fs.read`'s own limit). Its text is dropped once the field is taken. The two emails are compared, and never kept, logged or shown: not masked, not hashed, not their length or their domain. It never opens `.credentials.json`.
+- **It checks profile folders by name.** For a named or a matched folder, it checks that folder in Chrome's user data folder. When none can be started, it lists the folder names there that have a `Preferences` file: directory names only.
+- **It prints folder names only**: a profile folder's name (`Profile 3`), never a path, an account, an email or a command line. A profile folder whose name isn't plain (letters, digits, spaces, `_`, `-`) is said to be there, and not shown. A `profile` setting that isn't a folder's name is said to be invalid, with its length, and never repeated.
 - **Chrome never gets the session's environment.** On Windows it starts with your login environment, which Windows rebuilds from the registry; on macOS, LaunchServices starts it with its own.
 - **It writes nothing** but its own session state (the queued reconnect, and the times of its recent reconnects) and the start's lock, which names a random id and the time, and goes once the start is over. It sends nothing anywhere but the update check below.
 
