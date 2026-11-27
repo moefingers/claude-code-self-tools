@@ -303,6 +303,8 @@ export type AccountPick =
   | { readonly kind: 'no-account' }
   /** It isn't a JSON object. */
   | { readonly kind: 'claim-unclear' }
+  /** Chrome's user data folder can't be listed, so no folder can be checked. */
+  | { readonly kind: 'unlisted' }
   /** Chrome's user data folder isn't known (`unplaced`), or its Local State can't be read. */
   | { readonly kind: 'no-local-state'; readonly fault: FileFault | 'unplaced' }
   /** It holds no `profile.info_cache` object. */
@@ -351,6 +353,8 @@ export function pickReason(pick: NoPick): string {
       return "Claude Code's .claude.json names no Claude account with an email (an API key, a cloud provider, or logged out)"
     case 'claim-unclear':
       return "Claude Code's .claude.json doesn't read as a JSON object just now (caught mid-write, say)"
+    case 'unlisted':
+      return "Chrome's user data folder can't be listed, so no profile folder can be checked"
     case 'no-local-state':
       return pick.fault === 'unplaced' ? "Chrome's user data folder isn't known here, so its Local State can't be read" : `Chrome's Local State ${faultSaid(pick.fault, LOCAL_STATE_MAX_BYTES)}`
     case 'local-state-unclear':
@@ -361,11 +365,14 @@ export function pickReason(pick: NoPick): string {
 /**
  * The refusal for a start the account match picked no folder for, with how the person pins one among `folders` (the
  * profile folders there, as missingProfile lists them; undefined: not listed). With Chrome's user data folder unknown,
- * no folder can be checked, named or matched, so the fix is a start by hand.
+ * or not listed, no folder can be checked, named or matched, so the fix is a start by hand (or, for a listing, another
+ * call in a moment).
  */
 export function accountRefusal(pick: NoPick, folders: readonly string[] | undefined): { readonly why: string; readonly fix: string } {
   const why = `${MATCHED} can't be picked: ${pickReason(pick)}`
-  if (pick.kind === 'no-local-state' && pick.fault === 'unplaced') return { why, fix: "start Chrome by hand, on the profile whose Claude in Chrome is signed in to Claude Code's account" }
+  const byHand = "start Chrome by hand, on the profile whose Claude in Chrome is signed in to Claude Code's account"
+  if (pick.kind === 'no-local-state' && pick.fault === 'unplaced') return { why, fix: byHand }
+  if (pick.kind === 'unlisted') return { why, fix: `call chrome_ensure again in a moment, or ${byHand}` }
   const pin = `pin the profile: call chrome_ensure again with \`profile\` set to one of Chrome's profile folders${foldersSaid(folders)}, or set the profile setting to one`
   return { why, fix: pick.kind === 'claim-unclear' ? `call chrome_ensure again in a moment, or ${pin}` : pin }
 }

@@ -519,14 +519,20 @@ async function profileFolders($: EngineInterface, m: Machine, entries: Entries |
 }
 
 /**
- * Why a named profile isn't one to start: Chrome's user data folder unknown, or not one of Chrome's profile folders
- * (isProfileFolder). Undefined when it is one.
+ * Why a named profile isn't one to start: Chrome's user data folder unknown, or not listed, so nothing can be checked;
+ * or not one of Chrome's profile folders (isProfileFolder). Undefined when it is one.
  */
 async function profileMissing($: EngineInterface, m: Machine, entries: Entries | undefined, name: string, source: NamedSource): Promise<{ readonly why: string; readonly fix: string } | undefined> {
   if (m.userData === undefined) {
     return {
       why: "Chrome's user data folder isn't known here, so the profile named can't be checked against Chrome's profile folders",
       fix: 'start Chrome by hand on that profile',
+    }
+  }
+  if (entries === undefined) {
+    return {
+      why: "Chrome's user data folder can't be listed, so the profile named can't be checked against Chrome's profile folders",
+      fix: 'call chrome_ensure again in a moment, or start Chrome by hand on that profile',
     }
   }
   if (await isProfileFolder($, m, entries, name)) return undefined
@@ -586,11 +592,13 @@ async function readProfileAccounts($: EngineInterface, m: Machine): Promise<Loca
 
 /**
  * The account match: the one profile folder whose Google account has the email of Claude Code's account, or why there is
- * none. Each folder that matches is checked as a named one is (isProfileFolder). Neither email leaves this function: it
- * answers folder names only. Every read is caught, so it never throws.
+ * none. Nothing is read when no folder could be checked (Chrome's user data folder unknown, or not listed). Each folder
+ * that matches is checked as a named one is (isProfileFolder). Neither email leaves this function: it answers folder
+ * names only. Every read is caught, so it never throws.
  */
 async function matchAccount($: EngineInterface, m: Machine, entries: Entries | undefined): Promise<AccountPick> {
   if (m.userData === undefined) return { kind: 'no-local-state', fault: 'unplaced' }
+  if (entries === undefined) return { kind: 'unlisted' }
   const account = await readClaudeAccount($, m.platform)
   if (account.kind === 'unread') return { kind: 'no-claim', fault: account.fault }
   if (account.kind === 'none') return { kind: 'no-account' }
