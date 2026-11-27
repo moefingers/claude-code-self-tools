@@ -555,14 +555,15 @@ test('a near miss of a key on the list is another key: refused with the owner-on
   // A row under each spelling, its plugin the part before the first dot, unlocked and shown: only the list refuses it.
   const { sets } = engine(on, { rows: [reminder(''), ...misses.map(key => row(key, 'A near miss', 'text', ''))] })
   await $.session.start(START)
-  const atCall: [string, string][] = []
-  const atServing: [string, string][] = []
+  const byCall: [string, string][] = []
+  const byServing: [string, string][] = []
   for (const key of misses) {
-    atCall.push([key, await set($, { key, value: '40%' })])
-    atServing.push([key, said(await $.tool.run({ tool: SET, tool_use_id: 't1', key, value: '40%' }))])
+    byCall.push([key, await set($, { key, value: '40%' })])
+    byServing.push([key, said(await $.tool.run({ tool: SET, tool_use_id: 't1', key, value: '40%' }))])
   }
-  const refused = misses.map(key => [key, `deny: ${OWNER_ONLY}`])
-  expect({ atCall, atServing, sets }).toEqual({ atCall: refused, atServing: refused, sets: [] })
+  // Refused at tool.call through $.tool.call, and by the serving's own { deny } through $.tool.run.
+  const refused = misses.map(key => [key, atCall(OWNER_ONLY)])
+  expect({ byCall, byServing, sets }).toEqual({ byCall: refused, byServing: refused, sets: [] })
 })
 
 test('a subagent is refused both tools, at the call and again at the serving, and nothing is read or changed; a key off the list is the owner-only line even for it', async ($, on) => {
