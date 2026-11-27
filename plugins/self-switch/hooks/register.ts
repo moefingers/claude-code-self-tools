@@ -1781,7 +1781,7 @@ function lookForMove($: EngineInterface): Promise<void> {
 // launch_sessions (#91): a list of sessions, each opened where placement.json's grid puts it. The caller passes the
 // list; this plugin reads no other plugin's store and names no session of this machine. planGrid (machine.ts) decides
 // where each goes, from the list, the grid and the probe's slot runners; each launch is one run of the shared launcher,
-// a tab in a named window running the slot runner, with launch()'s own checks and environment, one at a time.
+// a tab in a named window running the slot runner, with the shared launcher's own checks and environment, one at a time.
 
 const LAUNCH_TOOL = 'mcp__self-switch__launch_sessions'
 
@@ -1799,7 +1799,7 @@ const LAUNCH_DESCRIPTION = [
 
 const SUBAGENT_LAUNCH = "A subagent can't open sessions on the person's screen. Return the list to the main session, which can call launch_sessions."
 
-/** The sessions asked for, each checked as launch() checks its own (a name, an id, a folder, a prompt); or why not. */
+/** The sessions asked for, each checked as the shared launcher checks its own (a name, an id, a folder, a prompt); or why not. */
 function sessionsOf(raw: unknown): { readonly sessions: GridSession[] } | { readonly why: string } {
   if (!Array.isArray(raw) || raw.length < 1 || raw.length > GRID_SESSIONS_MAX) return { why: `\`sessions\` is a list of 1 to ${GRID_SESSIONS_MAX} sessions, each { name, id?, folder, prompt? }` }
   const out: GridSession[] = []
