@@ -10,7 +10,11 @@
 //   has the flag and --no-startup-window, its --profile-directory and its --user-data-dir, and never prints it.
 // - When a call or the setting names a profile folder: whether that folder, with its Preferences file, is in Chrome's
 //   user data folder; and, when it isn't, the names of the folders there that are (directory names only).
-// It reads nothing of Local State, and prints profile folder names only, never a path, an account or a command line.
+// - When neither names one, for the account match: of Claude Code's .claude.json, `oauthAccount`'s `emailAddress` (its
+//   `accountUuid` only checked to be a plain id, never kept); of Chrome's Local State, each profile folder's
+//   `profile.info_cache.<folder>.user_name`, and no other key; and whether each folder that matches is a profile folder,
+//   as a named one is checked. Each file only once its stat shows a plain file, no link, of at most 4 MiB.
+// It prints profile folder names only, never a path, an account, an email or a command line.
 // It writes only the start's lock, which names a fresh UUID and when, and lets it go after the start's wait.
 //
 // What it never does: quit, kill or restart Chrome (that closes every session's tabs and tab groups), open a profile in
@@ -50,6 +54,8 @@ export type Platform = 'windows' | 'macos'
 
 const BOM = String.fromCharCode(0xfeff)
 
+const isRecord = (value: unknown): value is Record<string, unknown> => typeof value === 'object' && value !== null && !Array.isArray(value)
+
 // ---------------------------------------------------------------------------------------------
 // The flag: the setting, and the environment variable while the setting is auto.
 
@@ -78,7 +84,7 @@ export function flagChoice(setting: SilentSetting, env: string | undefined): Fla
 }
 
 // ---------------------------------------------------------------------------------------------
-// The profile: the call's, else the setting's, else none, so Chrome opens the profile it used last.
+// The profile: the call's, else the setting's, else the account match's, and nothing after it.
 
 /** A profile folder's name as --profile-directory takes it (Default, Profile 2, Guest Profile): letters, digits, spaces, _ and -, no space at either end, at most 64. */
 export const PROFILE_NAME = /^[A-Za-z0-9_-](?:[A-Za-z0-9 _-]{0,62}[A-Za-z0-9_-])?$/
@@ -86,26 +92,32 @@ export const PROFILE_NAME = /^[A-Za-z0-9_-](?:[A-Za-z0-9 _-]{0,62}[A-Za-z0-9_-])
 /** Whether `value` is a profile folder's name the plugin passes to Chrome and prints. */
 export const isProfileName = (value: unknown): value is string => typeof value === 'string' && PROFILE_NAME.test(value)
 
-/** Where a named profile came from. */
-export type ProfileSource = 'call' | 'setting'
+/** The folder the account match picks, as every answer names it. */
+export const MATCHED = "the profile folder whose Google account has the email of Claude Code's account"
+
+/** Where a named profile came from: the call, or the profile setting. */
+export type NamedSource = 'call' | 'setting'
+
+/** Where a start's profile came from: named (the call, the setting), or the account match. */
+export type ProfileSource = NamedSource | 'account'
 
 /**
- * The profile a start opens: the call's `profile` (checked at the call), else the profile setting, else none, and
- * Chrome opens the profile it used last, which it knows better than any guess. A setting that isn't a profile folder's
- * name refuses, saying how long it is, never what it says: a person may have typed an account there.
+ * The profile a start opens: the call's `profile` (checked at the call), else the profile setting (a pin), else the
+ * account match (`source: 'account'`), and nothing after it: with no folder picked, nothing starts. A setting that isn't
+ * a profile folder's name refuses, saying how long it is, never what it says: a person may have typed an account there.
  */
 export type ProfileChoice =
-  | { readonly profile: string; readonly source: ProfileSource }
-  | { readonly profile: undefined }
+  | { readonly profile: string; readonly source: NamedSource }
+  | { readonly source: 'account' }
   | { readonly refusal: string; readonly fix: string }
 
 export function chooseProfile(asked: string | undefined, setting: string): ProfileChoice {
   if (asked !== undefined) return { profile: asked, source: 'call' }
-  if (setting === '') return { profile: undefined }
+  if (setting === '') return { source: 'account' }
   if (PROFILE_NAME.test(setting)) return { profile: setting, source: 'setting' }
   return {
     refusal: `the profile setting isn't a profile folder's name (it is ${setting.length} character${setting.length === 1 ? '' : 's'} long)`,
-    fix: "set the profile setting to one of Chrome's profile folders, by its folder's name (Default, Profile 2), or empty it, so Chrome opens the profile it used last",
+    fix: `set the profile setting to one of Chrome's profile folders, by its folder's name (Default, Profile 2), or empty it, so a start takes ${MATCHED}`,
   }
 }
 
@@ -123,17 +135,239 @@ export function profileCandidates(entries: readonly { readonly name: string; rea
  * that name, without Claude in Chrome. It names the profile folders that are there, by folder name only (a folder
  * with a Preferences file); never the name asked for, which may be an account's.
  */
-export function missingProfile(source: ProfileSource, folders: readonly string[] | undefined): { readonly why: string; readonly fix: string } {
+export function missingProfile(source: NamedSource, folders: readonly string[] | undefined): { readonly why: string; readonly fix: string } {
   const named = source === 'call' ? 'the profile asked for in this call' : 'the profile setting'
-  const list = folders === undefined ? undefined : folders.length === 0 ? 'none was found' : folders.map(f => JSON.stringify(f)).join(', ')
   const how = source === 'call' ? 'call chrome_ensure again with `profile` set to' : 'set the profile setting to'
+  const without = source === 'call' ? `leave it out, so a start takes the profile setting, else ${MATCHED}` : `empty it, so a start takes ${MATCHED}`
   return {
     why: `${named} names no profile folder in Chrome's user data folder, and Chrome would make a new, empty profile of that name`,
-    fix:
-      list === undefined
-        ? `${how} one of Chrome's profile folders, by its folder's name, or leave it out, so Chrome opens the profile it used last`
-        : `${how} one of Chrome's profile folders (${list}), or leave it out, so Chrome opens the profile it used last`,
+    fix: `${how} one of Chrome's profile folders${foldersSaid(folders)}, or ${without}`,
   }
+}
+
+/** Profile folders as a fix lists them: ` (<names>)`, ` (none was found)`, or, when not listed, `, by its folder's name`. */
+function foldersSaid(folders: readonly string[] | undefined): string {
+  if (folders === undefined) return ", by its folder's name"
+  return ` (${folders.length === 0 ? 'none was found' : folders.map(f => JSON.stringify(f)).join(', ')})`
+}
+
+// ---------------------------------------------------------------------------------------------
+// The account match: the email of Claude Code's account, from its .claude.json; each profile folder's Google account,
+// from Chrome's Local State; and the one folder where they agree.
+//
+// It matches a profile's Google account (Local State's `user_name`) against the email of Claude Code's Claude account.
+// That stands in for "the profile whose Claude in Chrome is signed in to Claude Code's account", which no file says. It
+// holds where the person signs in to Claude with the same address as the profile's Google account; where they don't,
+// the person pins the profile (the call's `profile`, or the profile setting).
+
+/** A mebibyte, in bytes. */
+const MIB = 1024 * 1024
+
+/**
+ * Claude Code's config file, which "Holds account details" (Claude Code's own layout,
+ * code.claude.com/docs/en/claude-directory.md). Its place, from the same page: "If you set CLAUDE_CONFIG_DIR, every
+ * ~/.claude path on this page lives under that directory instead. The same applies to .claude.json, which otherwise sits
+ * at ~/.claude.json": beside the .claude folder, not in it. The page names no field of it: `oauthAccount`, its
+ * `accountUuid` and its `emailAddress` are from memory, and from another reader of the same file.
+ */
+export const CLAIM_NAME = '.claude.json'
+
+/**
+ * The most of .claude.json read: 4 MiB, $.fs.read's own limit (its answer is refused past it). The file holds Claude
+ * Code's whole state, and grows; one past this is not read at all.
+ */
+export const CLAIM_MAX_BYTES = 4 * MIB
+
+/** The variables .claude.json's place is taken from, as the environment holds them (unset: undefined). */
+export type ClaimEnv = { readonly configDir?: string | undefined; readonly userProfile?: string | undefined; readonly home?: string | undefined }
+
+/** A variable's value when it is set and not blank; undefined otherwise. */
+const setValue = (value: string | undefined): string | undefined => (value === undefined || value.trim() === '' ? undefined : value)
+
+/**
+ * Where Claude Code's .claude.json is: in CLAUDE_CONFIG_DIR when it is set and not blank, else in the home folder
+ * (USERPROFILE on Windows, else HOME; HOME on macOS). Undefined when that folder can't be placed for sure: not an
+ * absolute local path (on Windows one with a drive, C:\), spaces around it, a network or device path (\\host, //host,
+ * \\?\, \\.\, \??\), or a control character. A relative one is Claude Code's to resolve, against a folder this process
+ * can't know. The folder's trailing separators are dropped.
+ */
+export function claimPathOf(platform: Platform, env: ClaimEnv): string | undefined {
+  const home = platform === 'windows' ? (setValue(env.userProfile) ?? setValue(env.home)) : setValue(env.home)
+  const folder = setValue(env.configDir) ?? home
+  if (folder === undefined || folder !== folder.trim() || /[\x00-\x1f\x7f]/.test(folder)) return undefined
+  if (/^[\\/]{2}/.test(folder) || /^[\\/]\?\?[\\/]/.test(folder)) return undefined
+  if (platform === 'windows') return /^[A-Za-z]:[\\/]/.test(folder) ? `${folder.replace(/[\\/]+$/, '')}\\${CLAIM_NAME}` : undefined
+  return folder.startsWith('/') ? `${folder.replace(/\/+$/, '')}/${CLAIM_NAME}` : undefined
+}
+
+/** An account id as Claude Code writes one: letters, digits and -, 8 to 64 (from memory, and another reader of the file). */
+const ACCOUNT_ID = /^[A-Za-z0-9-]{8,64}$/
+
+/**
+ * What a .claude.json says of Claude Code's account: the email of its Claude account; none (an API key, a cloud
+ * provider, logged out); or unknown, when the text isn't a JSON object (caught mid-write, say).
+ */
+export type ClaudeAccount = { readonly kind: 'email'; readonly email: string } | { readonly kind: 'none' } | { readonly kind: 'unknown' }
+
+/**
+ * Claude Code's account in a .claude.json's text: `oauthAccount`'s `emailAddress`, when `oauthAccount` is an object whose
+ * `accountUuid` is a plain id (ACCOUNT_ID) and the email is a string holding @. The text may start with a BOM. Nothing
+ * else of the file leaves this function: the parsed object goes when it returns.
+ */
+export function claudeAccountOf(text: string): ClaudeAccount {
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(text.startsWith(BOM) ? text.slice(1) : text)
+  } catch {
+    return { kind: 'unknown' }
+  }
+  if (!isRecord(parsed)) return { kind: 'unknown' }
+  const account = parsed.oauthAccount
+  if (!isRecord(account) || typeof account.accountUuid !== 'string' || !ACCOUNT_ID.test(account.accountUuid)) return { kind: 'none' }
+  const email = account.emailAddress
+  return typeof email === 'string' && email.includes('@') ? { kind: 'email', email } : { kind: 'none' }
+}
+
+// Each profile folder's Google account. Chromium keeps its profiles' attributes under `profile.info_cache`, "A map of
+// profile data directory to profile attributes" (chrome/common/pref_names.h, kProfileAttributes), and a profile's
+// signed-in account as `user_name` (chrome/browser/profiles/profile_attributes_entry.cc: kUserNameKey, which SetAuthInfo
+// writes). From memory, not those pages: that the map is in Local State, in the user data folder, and that `user_name`
+// is the Google account's email.
+
+/** Chrome's file in its user data folder that holds `profile.info_cache`. */
+export const LOCAL_STATE = 'Local State'
+
+/**
+ * The most of Local State read: 4 MiB, $.fs.read's own limit (its answer is refused past it). Local State is tens of KB
+ * (from memory); one past this is not read at all.
+ */
+export const LOCAL_STATE_MAX_BYTES = 4 * MIB
+
+/** A profile folder and the email of its Google account, as Local State pairs them. */
+export type ProfileAccount = { readonly folder: string; readonly email: string }
+
+/**
+ * The profile folders and their Google accounts in Local State's text: `profile.info_cache.<folder>.user_name`, and no
+ * other key of the file. A folder counts only when its name is a profile folder's (PROFILE_NAME); a `user_name` only when
+ * it is a string holding @. Undefined when the text has no `profile.info_cache` object: not Local State, or caught
+ * mid-write. The text may start with a BOM. The parsed object goes when this returns.
+ */
+export function profileAccountsOf(text: string): ProfileAccount[] | undefined {
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(text.startsWith(BOM) ? text.slice(1) : text)
+  } catch {
+    return undefined
+  }
+  const profile = isRecord(parsed) ? parsed.profile : undefined
+  const cache = isRecord(profile) ? profile.info_cache : undefined
+  if (!isRecord(cache)) return undefined
+  const pairs: ProfileAccount[] = []
+  for (const [folder, info] of Object.entries(cache)) {
+    if (!isProfileName(folder) || !isRecord(info)) continue
+    const email = info.user_name
+    if (typeof email === 'string' && email.includes('@')) pairs.push({ folder, email })
+  }
+  return pairs
+}
+
+/** An email as the match compares it: trimmed and lower-cased. */
+const foldEmail = (email: string): string => email.trim().toLowerCase()
+
+/** The profile folders whose Google account has `email`: both trimmed and lower-cased, compared whole; sorted, each once. */
+export function accountFolders(pairs: readonly ProfileAccount[], email: string): string[] {
+  const want = foldEmail(email)
+  const folders = new Set(pairs.filter(pair => foldEmail(pair.email) === want).map(pair => pair.folder))
+  return [...folders].sort((a, b) => a.localeCompare(b, 'en'))
+}
+
+/** Why a file wasn't read: not there (or not to be looked at), a link, not a plain file, over its cap, or its read failed. */
+export type FileFault = 'missing' | 'link' | 'not-file' | 'too-big' | 'unreadable'
+
+/** Why a file of this stat isn't read: a link, not a plain file, or over `max` bytes; undefined when it is read. */
+export function fileFault(stat: { readonly kind: string; readonly isLink: boolean; readonly size: number }, max: number): FileFault | undefined {
+  if (stat.isLink) return 'link'
+  if (stat.kind !== 'file') return 'not-file'
+  return stat.size >= 0 && stat.size <= max ? undefined : 'too-big'
+}
+
+/** What the account match came to: the one folder, or why there is none. */
+export type AccountPick =
+  | { readonly kind: 'one'; readonly folder: string }
+  /** No folder matches; `absent` of the folders that do are listed in Local State without being profile folders. */
+  | { readonly kind: 'none'; readonly absent: number }
+  | { readonly kind: 'several'; readonly folders: readonly string[] }
+  /** Claude Code's .claude.json can't be placed for sure, or read. */
+  | { readonly kind: 'no-claim'; readonly fault: FileFault | 'unplaced' }
+  /** It names no Claude account with an email. */
+  | { readonly kind: 'no-account' }
+  /** It isn't a JSON object. */
+  | { readonly kind: 'claim-unclear' }
+  /** Chrome's user data folder isn't known (`unplaced`), or its Local State can't be read. */
+  | { readonly kind: 'no-local-state'; readonly fault: FileFault | 'unplaced' }
+  /** It holds no `profile.info_cache` object. */
+  | { readonly kind: 'local-state-unclear' }
+
+/** An account match that picked no folder. */
+export type NoPick = Exclude<AccountPick, { readonly kind: 'one' }>
+
+/**
+ * What the matching folders come to, among those register.ts found to be profile folders (`present`, each checked as a
+ * named one is): one, none or several. Decided on principle: a folder Local State lists without its Preferences file (a
+ * profile being deleted, say) doesn't count, since Chrome would make it anew, empty; `absent` counts those when none is
+ * left.
+ */
+export function accountMatch(matched: readonly string[], present: readonly string[]): AccountPick {
+  const kept = matched.filter(folder => isProfileName(folder) && present.includes(folder))
+  const [only] = kept
+  if (kept.length === 1 && only !== undefined) return { kind: 'one', folder: only }
+  return kept.length === 0 ? { kind: 'none', absent: matched.length } : { kind: 'several', folders: kept }
+}
+
+/** A file's fault, as the end of a sentence about it. */
+function faultSaid(fault: FileFault, max: number): string {
+  if (fault === 'missing') return "isn't there, or can't be looked at"
+  if (fault === 'link') return "is a link, which isn't followed"
+  if (fault === 'not-file') return "isn't a plain file"
+  if (fault === 'too-big') return `is over ${max / MIB} MiB, which isn't read`
+  return "couldn't be read"
+}
+
+/** Why the account match picked no folder, as a phrase: folder names only, never an email. */
+export function pickReason(pick: NoPick): string {
+  switch (pick.kind) {
+    case 'none': {
+      const n = pick.absent
+      const absent = n === 0 ? '' : ` (${n} folder${n === 1 ? '' : 's'} Local State lists with it ${n === 1 ? 'has' : 'have'} no Preferences file, so ${n === 1 ? "it doesn't" : "they don't"} count)`
+      return `no profile folder's Google account has it${absent}`
+    }
+    case 'several':
+      return `${pick.folders.length} profile folders' Google accounts have it (${pick.folders.map(f => JSON.stringify(f)).join(', ')}), and it doesn't guess`
+    case 'no-claim':
+      return pick.fault === 'unplaced'
+        ? "Claude Code's .claude.json can't be placed for sure (CLAUDE_CONFIG_DIR, or the home folder, isn't an absolute local path)"
+        : `Claude Code's .claude.json ${faultSaid(pick.fault, CLAIM_MAX_BYTES)}`
+    case 'no-account':
+      return "Claude Code's .claude.json names no Claude account with an email (an API key, a cloud provider, or logged out)"
+    case 'claim-unclear':
+      return "Claude Code's .claude.json doesn't read as a JSON object just now (caught mid-write, say)"
+    case 'no-local-state':
+      return pick.fault === 'unplaced' ? "Chrome's user data folder isn't known here, so its Local State can't be read" : `Chrome's Local State ${faultSaid(pick.fault, LOCAL_STATE_MAX_BYTES)}`
+    case 'local-state-unclear':
+      return "Chrome's Local State doesn't read as its list of profiles"
+  }
+}
+
+/**
+ * The refusal for a start the account match picked no folder for, with how the person pins one among `folders` (the
+ * profile folders there, as missingProfile lists them; undefined: not listed). With Chrome's user data folder unknown,
+ * no folder can be checked, named or matched, so the fix is a start by hand.
+ */
+export function accountRefusal(pick: NoPick, folders: readonly string[] | undefined): { readonly why: string; readonly fix: string } {
+  const why = `${MATCHED} can't be picked: ${pickReason(pick)}`
+  if (pick.kind === 'no-local-state' && pick.fault === 'unplaced') return { why, fix: "start Chrome by hand, on the profile whose Claude in Chrome is signed in to Claude Code's account" }
+  const pin = `pin the profile: call chrome_ensure again with \`profile\` set to one of Chrome's profile folders${foldersSaid(folders)}, or set the profile setting to one`
+  return { why, fix: pick.kind === 'claim-unclear' ? `call chrome_ensure again in a moment, or ${pin}` : pin }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -571,8 +805,6 @@ function jsonLine(stdout: string): Record<string, unknown> | undefined {
   }
 }
 
-const isRecord = (value: unknown): value is Record<string, unknown> => typeof value === 'object' && value !== null && !Array.isArray(value)
-
 /** A script's `procs`, each checked; undefined when it isn't a list of them. */
 function procsOf(raw: unknown): ChromeProcess[] | undefined {
   const list = Array.isArray(raw) ? raw : isRecord(raw) ? [raw] : raw === null || raw === undefined ? [] : undefined
@@ -628,8 +860,8 @@ export function parseWindowsStart(stdout: string): StartAnswer | string {
 /** What the look found: the person's Chrome, or why it couldn't tell. */
 export type Look = { readonly kind: 'read'; readonly judged: Judged } | { readonly kind: 'failed'; readonly why: string }
 
-/** The profile a start passed: a named folder and where it came from, or none. */
-export type StartProfile = { readonly profile: string; readonly source: ProfileSource } | { readonly profile: undefined }
+/** The profile folder a start passed, and where it came from: every start passes one. */
+export type StartProfile = { readonly profile: string; readonly source: ProfileSource }
 
 /** What the tool did about starting Chrome. */
 export type Start =
@@ -664,8 +896,18 @@ export type Reconnect =
   | { readonly kind: 'capped' }
   | { readonly kind: 'failed' }
 
-/** Everything the answer says. */
-export type Outcome = { readonly platform: Platform; readonly flag: FlagChoice; readonly look: Look; readonly start: Start; readonly reconnect: Reconnect }
+/**
+ * Everything the answer says. `account`: what the account match came to while Chrome runs and nothing names a profile,
+ * for the Profile line (accountLine); absent otherwise.
+ */
+export type Outcome = {
+  readonly platform: Platform
+  readonly flag: FlagChoice
+  readonly look: Look
+  readonly start: Start
+  readonly reconnect: Reconnect
+  readonly account?: AccountPick
+}
 
 /** Whether Chrome runs once the tool is done: found running, started (a start that showed no process yet may still come up), or found after. */
 export function isRunning(look: Look, start: Start): boolean {
@@ -688,6 +930,27 @@ function runningSaid(browser: Browser, more: number): string {
     ? ', in the background with no window. That counts as running: a start now would only hand off to it, and Chrome took its flags when it started'
     : ''
   return `Chrome: running (PID ${browser.pid}${also})${background}; ${browser.flag ? 'with' : 'without'} ${FLAG}; ${profileSaid(browser)}.`
+}
+
+/**
+ * The Profile line, for a Chrome that runs while nothing names a profile: whether its browser process's command line
+ * names the folder the account match picked, as far as it shows; and, when it names another, that opening the picked
+ * profile is the person's (`left`). A window opened from Chrome's profile menu shows on no command line. Folder names
+ * only.
+ */
+export function accountLine(browser: Browser, pick: AccountPick): { readonly line: string; readonly left?: string } {
+  if (pick.kind !== 'one') return { line: `Profile: can't tell whether Chrome runs on ${MATCHED}: ${pickReason(pick)}.` }
+  const folder = JSON.stringify(pick.folder)
+  if (browser.profile === pick.folder) return { line: `Profile: Chrome was started on ${folder}, ${MATCHED}.` }
+  if (browser.profile !== undefined) {
+    return {
+      line: `Profile: Chrome was started on ${JSON.stringify(browser.profile)}, but ${MATCHED} is ${folder}. A window opened from Chrome's profile menu shows on no command line, so that profile may be open already.`,
+      left: `open the profile ${folder} from Chrome's profile menu, if it isn't open already: this tool never opens a profile in a Chrome that runs.`,
+    }
+  }
+  if (browser.namesProfile) return { line: `Profile: Chrome's command line names a profile folder whose name isn't plain, so it can't tell whether Chrome was started on ${folder}, ${MATCHED}.` }
+  const last = browser.background ? '' : ' (Chrome opened the profile it used last)'
+  return { line: `Profile: Chrome's command line names no profile folder${last}, so it can't tell whether that is ${folder}, ${MATCHED}.` }
 }
 
 /** The test or isolated Chromes a look passed over, as a sentence; empty for none. */
@@ -713,11 +976,8 @@ function addFlagByHand(platform: Platform): string {
 
 /** The arguments a start passed, as a phrase. */
 function argsSaid(profile: StartProfile, flag: boolean): string {
-  const named =
-    profile.profile === undefined
-      ? 'no profile folder named (Chrome opens the profile it used last)'
-      : `the profile folder ${JSON.stringify(profile.profile)} (${profile.source === 'call' ? 'asked for in this call' : 'the profile setting'})`
-  return `${named}, --restore-last-session${flag ? ` and ${FLAG}` : `, without ${FLAG}`}`
+  const from = profile.source === 'call' ? 'asked for in this call' : profile.source === 'setting' ? 'the profile setting' : "its Google account has the email of Claude Code's account"
+  return `the profile folder ${JSON.stringify(profile.profile)} (${from}), --restore-last-session${flag ? ` and ${FLAG}` : `, without ${FLAG}`}`
 }
 
 /** Whether a browser has the flag a start asked for, as the end of a sentence. */
@@ -733,6 +993,12 @@ export function answer(o: Outcome): string {
     const [browser, ...more] = o.look.judged.browsers
     const others = isolatedSaid(o.look.judged.isolated)
     lines.push(browser === undefined ? `Chrome: not running.${others}` : `${runningSaid(browser, more.length)}${others}`)
+    // Chrome runs, and nothing names a profile: whether it runs on the folder the account match picked.
+    if (browser !== undefined && o.account !== undefined) {
+      const said = accountLine(browser, o.account)
+      lines.push(said.line)
+      if (said.left !== undefined) left.push(said.left)
+    }
   }
   lines.push(`Flag: ${o.flag.on ? 'on' : 'off'}: ${o.flag.why}.`)
   // What it did.
