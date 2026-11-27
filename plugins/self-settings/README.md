@@ -55,7 +55,7 @@ Nothing else. Every other option, of any plugin, and every option a plugin adds 
 
 - **A row's provider is read as two live runs listed it:** the plugin's ID, `<name>@<source>` ("What ran"). A provider of another shape is no row of this marketplace's, so an engine that wrote one would have every set refused, and its plugins headed `source unknown`.
 - **A list in `enabledPlugins`.** The settings schema lets an entry's value be a list of texts as well as true or false; what a list means isn't guessed, so one leaves the setting unread, and every `settings_set` is refused.
-- **Defaults and sensitive fields** are known for this marketplace's plugins only, as this release's manifests declare them: a default for their rows alone, a sensitive field hidden on any row of its key.
+- **Defaults and sensitive fields** are known for this marketplace's plugins only, as this release's manifests declare them: a default for their rows alone, a sensitive field hidden on any row of a plugin of that name, whatever its source. A row of that key whose provider can't be read, or that another plugin owns, isn't hidden; no field is marked sensitive yet.
 
 ## Not built
 
