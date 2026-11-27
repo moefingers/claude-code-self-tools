@@ -1,6 +1,6 @@
 {
   "name": "claude-code-self-tools",
-  "description": "Small Claude Code plugins that let a session act on itself: compact or clear its conversation, reload its plugins, reconnect an MCP server, read its context window, check its own tools, wake itself later, turn on Remote Control under a title, set its prompt bar color, exit or restart, switch to another conversation, run a command with a secret pasted at the machine that it never sees, make sure Chrome runs for Claude in Chrome, keep the machine's plugins current, and read its own desktop on Windows; and a skill for running several sessions as a hierarchy. Install only the ones you want.",
+  "description": "Small Claude Code plugins that let a session act on itself: compact or clear its conversation, reload its plugins, reconnect an MCP server, read its context window, check its own tools, wake itself later, turn on Remote Control under a title, set its prompt bar color, exit or restart, switch to another conversation, run a command with a secret pasted at the machine that it never sees, make sure Chrome runs for Claude in Chrome, keep the machine's plugins current, read its own desktop on Windows, and read its machine's plugin settings and change the few on a fixed list; and a skill for running several sessions as a hierarchy. Install only the ones you want.",
   "owner": {
     "name": "moefingers",
     "url": "https://github.com/moefingers"
@@ -85,6 +85,11 @@
       "name": "self-desktop",
       "source": "./plugins/self-desktop",
       "description": "Reads the session's own machine's desktop on Windows, read only: lists the windows a person could see (a title only for Windows Terminal windows and the session's own), reads the session's own terminal window and the text showing in its own pane, whoever wrote it (never from a console shared by a program that is not the session's own), and captures a classic console window of the session's own to a local PNG; a picture of a Windows Terminal window isn't built. It never clicks, types, focuses, moves or closes anything. Off until you turn it on."
+    },
+    {
+      "name": "self-settings",
+      "source": "./plugins/self-settings",
+      "description": "Reads this machine's plugin settings as the /config menu shows them (a sensitive field's value never read, a value that looks like a secret never shown), and changes only the options on a fixed list, each plugin's update check and self-compact's compact reminder, through Claude Code's own /config writer. Every other option is the owner's, in /config by hand."
     },
     {
       "name": "self-hierarchy",
