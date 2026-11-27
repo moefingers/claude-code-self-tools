@@ -19,6 +19,7 @@ import { connect } from "node:net";
 import { networkInterfaces } from "node:os";
 import { join } from "node:path";
 import { after, before, test } from "node:test";
+import { runInNewContext } from "node:vm";
 import {
   captureSecret,
   cookiesNamed,
@@ -1026,12 +1027,32 @@ test("the page's one script sends the form by fetch, and closes its window only 
   assert.match(script, /method: "POST",/);
   assert.match(script, /headers: \{ Accept: "application\/json" \},/);
   assert.match(script, /credentials: "same-origin",/);
-  assert.match(script, /e\.preventDefault\(\);\n  if \(busy\) return;/);
   // A browser that can't say which button was pressed gets the plain form: a Cancel is never sent as a paste.
   assert.match(script, /\(e\) => \{\n  if \(!\("submitter" in e\)\) return;\n  e\.preventDefault\(\);/);
   assert.match(
     script,
-    /const cancel = e\.submitter !== null && e\.submitter\.getAttribute\("formaction"\) === "\/cancel";/,
+    /const cancel = e\.submitter !== null && e\.submitter\.getAttribute\("formaction"\) === "\/cancel";\n  if \(busy && !cancel\) return;/,
+    "while a value is out, Submit waits and Cancel still goes",
+  );
+  // Only Submit is ever disabled, and only while a value is out.
+  assert.match(
+    script,
+    /const submitButton = form\.querySelector\("button:not\(\[formaction\]\)"\);/,
+  );
+  assert.deepEqual(
+    [...html.matchAll(/<button [^>]*>/g)].filter((m) => !m[0].includes("formaction")).map((m) => m[0]),
+    ["<button type=submit>"],
+    "that selector finds the Submit button alone",
+  );
+  assert.deepEqual(
+    [...script.matchAll(/(\w+)\.disabled = (\w+);/g)].map((m) => `${m[1]} ${m[2]}`),
+    ["submitButton true", "submitButton false"],
+  );
+  assert.match(script, /if \(!cancel\) \{\n    busy = true;\n    submitButton\.disabled = true;/);
+  // The first end wins, and empties the field.
+  assert.match(
+    script,
+    /const end = \(words, after\) => \{\n  if \(ended\) return;\n  ended = true;\n  field\.value = "";/,
   );
 
   // It closes the window in one place, which only the end calls.
@@ -1040,11 +1061,18 @@ test("the page's one script sends the form by fetch, and closes its window only 
   assert.equal(script.match(/\bshut\b/g)?.length, 2, "shut, and its one call");
   assert.match(script, /setTimeout\(shut, after\);/);
 
-  // The ends, and only these: the deadline, nothing answering, accepted (after 1.5 s), and the
-  // answers that end the form. A refusal is none of them: the window stays open.
+  // The ends, and only these: the deadline, nothing answering, accepted (after 1.5 s), the
+  // answers that end the form, and a refusal that came back after the deadline. A refusal
+  // before it is none of them: the window stays open.
   assert.deepEqual(
     [...script.matchAll(/\bend\(([^()]*)\)/g)].map((m) => m[1]),
-    ["WORDS.expired, 0", "WORDS.closed, 0", "answer.words, 1500", "answer.words, 0"],
+    [
+      "WORDS.expired, 0",
+      "WORDS.closed, 0",
+      "answer.words, 1500",
+      "answer.words, 0",
+      "WORDS.expired, 0",
+    ],
   );
   assert.match(script, /const ENDS = \["cancelled", "closed", "expired"\];/);
   assert.match(script, /if \(state === "accepted"\) return end\(answer\.words, 1500\);/);
@@ -1066,7 +1094,13 @@ test("the page's one script sends the form by fetch, and closes its window only 
   // The deadline: the time left, which the page is given and closes at.
   const left = Number(/<input name=v [^>]*data-left=(\d+)/.exec(html)?.[1]);
   assert.ok(left > 0 && left <= 20_000, `the time left, ${left} ms`);
-  assert.match(script, /deadline = setTimeout\(\(\) => end\(WORDS\.expired, 0\), left\);/);
+  // A deadline while a value is out waits for that answer; a refusal then ends it as expired.
+  assert.match(
+    script,
+    /const expire = \(\) => \{ if \(busy\) due = true; else end\(WORDS\.expired, 0\); \};/,
+  );
+  assert.match(script, /deadline = setTimeout\(expire, left\);/);
+  assert.match(script, /if \(cancel\) return;\n  busy = false;\n  if \(due\) return end\(WORDS\.expired, 0\);/);
 
   // Without script, the form still posts as a form.
   assert.match(html, /<form method=post action="\/">/);
@@ -1331,4 +1365,211 @@ test("a request the form reads once it has ended: the page's script is told clos
   for (const r of [told, asBefore, noCookie])
     assertNoLeak(r.text, FAKE, "an answer after the end");
   form.release();
+});
+
+/** The page's one script as a form serves it, from a form in this process that is then cancelled. */
+async function servedScript() {
+  const form = heldForm(60);
+  const url = await form.address;
+  const { origin } = new URL(url);
+  const { Cookie } = await scriptHeaders(url);
+  const html = (await raw(`${origin}/`, { headers: { Cookie } })).body;
+  await raw(`${origin}/cancel`, { method: "POST", headers: { Cookie }, fields: {} });
+  await form.done;
+  return /<script>([\s\S]*?)<\/script>/.exec(html)[1];
+}
+
+/** The time left that the stand-in page gives its script: when its deadline is due. */
+const LEFT = 60_000;
+
+/**
+ * The page's script run against a stand-in of its page, no browser: the
+ * elements it reads, a window whose close() works when closable, and timers
+ * and fetches the test fires and answers itself. submit(button) is the
+ * browser's submit event for that button; ended() the words the page ended
+ * on, or null; fire(ms) runs the timers set for that many ms.
+ */
+function standIn(script, { closable = true } = {}) {
+  const element = (attrs = {}) => ({
+    textContent: "",
+    hidden: false,
+    disabled: false,
+    value: "",
+    dataset: {},
+    listeners: {},
+    addEventListener(type, fn) {
+      this.listeners[type] = fn;
+    },
+    focus() {},
+    getAttribute: (name) => attrs[name] ?? null,
+  });
+  const field = element();
+  field.dataset = { left: String(LEFT), trim: "1" };
+  const status = element();
+  const error = element();
+  error.hidden = true;
+  const heading = element();
+  const submitButton = element();
+  const cancelButton = element({ formaction: "/cancel" });
+  const form = element();
+  form.querySelector = (selector) =>
+    ({ "input[name=v]": field, "button:not([formaction])": submitButton })[selector] ?? null;
+  const body = {
+    children: null,
+    replaceChildren(...children) {
+      this.children = children;
+    },
+    append(child) {
+      this.children.push(child);
+    },
+  };
+  const window = {
+    closed: false,
+    closes: 0,
+    close() {
+      this.closes += 1;
+      if (closable) this.closed = true;
+    },
+  };
+  const timers = [];
+  const sent = [];
+  runInNewContext(script, {
+    document: {
+      body,
+      querySelector: (selector) => ({ form, h1: heading })[selector] ?? null,
+      getElementById: (id) => ({ status, error })[id] ?? null,
+      createElement: () => element(),
+    },
+    window,
+    URLSearchParams,
+    setTimeout: (fn, ms) => timers.push({ fn, ms, live: true }),
+    clearTimeout: (id) => {
+      if (id) timers[id - 1].live = false;
+    },
+    fetch: (url, init) =>
+      new Promise((resolve, reject) => sent.push({ url, init, resolve, reject })),
+  });
+  return {
+    field,
+    error,
+    submitButton,
+    cancelButton,
+    window,
+    sent,
+    submit: (button) =>
+      form.listeners.submit({ submitter: button, preventDefault() {} }),
+    ended: () => (body.children ? body.children[1].textContent : null),
+    texts: () => (body.children ?? []).slice(1).map((c) => c.textContent),
+    fire(ms) {
+      for (const t of timers.filter((t) => t.live && t.ms === ms)) {
+        t.live = false;
+        t.fn();
+      }
+    },
+  };
+}
+
+/** A fetch's answer: its status, and the JSON it reads as. */
+const answer = (body, status = 200) => ({ status, json: async () => body });
+
+test("the page's script, run on a stand-in page: a deadline waits for a value that is out, Cancel works during a check, and the end empties the field", async () => {
+  const script = await servedScript();
+  const ACCEPTED = { state: "accepted", words: "Received. Running the command." };
+  const REFUSED = { state: "refused", words: "That key didn't work: a made-up reason." };
+  const CANCELLED = { state: "cancelled", words: "Cancelled. Nothing was run." };
+  const EXPIRED = "This form ran out of time. Nothing was run.";
+  const made = `made-up-${WRONG}`;
+
+  // The deadline while a value is out: nothing ends until its answer, which closes the window 1.5 s on.
+  {
+    const p = standIn(script);
+    p.field.value = made;
+    const sending = p.submit(p.submitButton);
+    assert.equal(p.sent.length, 1);
+    assert.equal(p.sent[0].url, "/");
+    assert.equal(p.sent[0].init.body.get("v"), made);
+    p.fire(LEFT);
+    assert.equal(p.ended(), null, "the deadline waits for the answer");
+    p.sent[0].resolve(answer(ACCEPTED));
+    await sending;
+    assert.equal(p.ended(), ACCEPTED.words);
+    assert.equal(p.field.value, "", "the end empties the field");
+    assert.equal(p.window.closes, 0);
+    p.fire(1500);
+    assert.equal(p.window.closes, 1);
+  }
+
+  // The deadline while a value is out that is then refused: it ends as expired once the answer is in.
+  {
+    const p = standIn(script);
+    p.field.value = made;
+    const sending = p.submit(p.submitButton);
+    p.fire(LEFT);
+    p.sent[0].resolve(answer(REFUSED, 422));
+    await sending;
+    assert.equal(p.ended(), EXPIRED);
+    assert.equal(p.field.value, "");
+    p.fire(0);
+    assert.equal(p.window.closes, 1);
+  }
+
+  // Cancel during a check: Submit alone waits, a second Submit sends nothing, Cancel goes out,
+  // and the first end stays when the value's request then fails (secret-run has exited).
+  {
+    const p = standIn(script);
+    p.field.value = made;
+    const sending = p.submit(p.submitButton);
+    assert.equal(p.submitButton.disabled, true);
+    assert.equal(p.cancelButton.disabled, false);
+    await p.submit(p.submitButton);
+    assert.equal(p.sent.length, 1, "a second Submit while one is out sends nothing");
+    const cancelling = p.submit(p.cancelButton);
+    assert.equal(p.sent.length, 2);
+    assert.equal(p.sent[1].url, "/cancel");
+    assert.equal(p.sent[1].init.body.get("v"), null, "a Cancel sends no value");
+    p.sent[1].resolve(answer(CANCELLED));
+    await cancelling;
+    assert.equal(p.ended(), CANCELLED.words);
+    assert.equal(p.field.value, "");
+    p.sent[0].reject(new TypeError("fetch failed"));
+    await sending;
+    assert.equal(p.ended(), CANCELLED.words, "the first end stays");
+    p.fire(0);
+    assert.equal(p.window.closes, 1, "closed once");
+  }
+
+  // A refusal before the deadline: open, the reason shown, the field empty, Submit back; the deadline then closes it.
+  {
+    const p = standIn(script);
+    p.field.value = made;
+    const sending = p.submit(p.submitButton);
+    p.sent[0].resolve(answer(REFUSED, 422));
+    await sending;
+    assert.equal(p.ended(), null, "still open");
+    assert.equal(p.error.textContent, REFUSED.words);
+    assert.equal(p.error.hidden, false);
+    assert.equal(p.field.value, "");
+    assert.equal(p.submitButton.disabled, false);
+    p.fire(LEFT);
+    assert.equal(p.ended(), EXPIRED);
+    p.fire(0);
+    assert.equal(p.window.closes, 1);
+  }
+
+  // The fallback: a window the browser keeps open says so a moment later; one it closed says nothing more.
+  for (const closable of [false, true]) {
+    const p = standIn(script, { closable });
+    const cancelling = p.submit(p.cancelButton);
+    p.sent[0].resolve(answer(CANCELLED));
+    await cancelling;
+    p.fire(0);
+    p.fire(500);
+    assert.deepEqual(
+      p.texts(),
+      closable
+        ? [CANCELLED.words]
+        : [CANCELLED.words, "Done. You can close this window."],
+      closable ? "closed" : "kept open",
+    );
+  }
 });

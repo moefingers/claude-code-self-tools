@@ -61,10 +61,14 @@
 //   cancelled, closed (the form ended, or nothing answers at its address any
 //     more), or expired (its deadline, which the page is given, as the time
 //     left, in the field's data-left): at once.
-// A refused value leaves it open, the reason shown and the field empty, to
-// paste again; its deadline closes it if no one does. Where the browser keeps
-// the window open all the same (it may, for a tab), the page says DONE a
-// moment later.
+// The first end wins, and empties the field, so the value stays in the page
+// no longer. A deadline that comes while a value is out waits for its answer,
+// which ends the page itself, or, if it is a refusal, ends it as expired. A
+// refused value leaves it open, the reason shown and the field empty, to paste
+// again; its deadline closes it if no one does. While a value is being
+// checked, Submit waits and Cancel still works. Where the browser keeps the
+// window open all the same (it may, for a tab), the page says DONE a moment
+// later.
 //
 // A profile can name the page where the key is made. The form links to it
 // under the prompt, in a new tab, with rel="noopener noreferrer": the page it
@@ -151,7 +155,7 @@ const field = form.querySelector("input[name=v]");
 const status = document.getElementById("status");
 const error = document.getElementById("error");
 const heading = document.querySelector("h1");
-const buttons = form.querySelectorAll("button");
+const submitButton = form.querySelector("button:not([formaction])");
 const shape = field.dataset.pattern ? { pattern: field.dataset.pattern, says: field.dataset.says } : null;
 const spacesInside = field.dataset.spaces === "1";
 const say = (state, text) => { status.dataset.state = state; status.textContent = text; };
@@ -188,24 +192,32 @@ const shut = () => {
   }, 500);
 };
 let deadline = null;
+let ended = false;
 const end = (words, after) => {
+  if (ended) return;
+  ended = true;
+  field.value = "";
   clearTimeout(deadline);
   const p = document.createElement("p");
   p.textContent = words;
   document.body.replaceChildren(heading, p);
   setTimeout(shut, after);
 };
-const left = Number(field.dataset.left);
-if (left >= 0 && left <= 2147483647) deadline = setTimeout(() => end(WORDS.expired, 0), left);
 let busy = false;
+let due = false;
+const expire = () => { if (busy) due = true; else end(WORDS.expired, 0); };
+const left = Number(field.dataset.left);
+if (left >= 0 && left <= 2147483647) deadline = setTimeout(expire, left);
 form.addEventListener("submit", async (e) => {
   if (!("submitter" in e)) return;
   e.preventDefault();
-  if (busy) return;
-  busy = true;
-  buttons.forEach((b) => { b.disabled = true; });
   const cancel = e.submitter !== null && e.submitter.getAttribute("formaction") === "/cancel";
-  if (!cancel) say("", "Checking the key.");
+  if (busy && !cancel) return;
+  if (!cancel) {
+    busy = true;
+    submitButton.disabled = true;
+    say("", "Checking the key.");
+  }
   let res;
   try {
     res = await fetch(cancel ? "/cancel" : "/", {
@@ -223,10 +235,12 @@ form.addEventListener("submit", async (e) => {
   const state = answer ? answer.state : null;
   if (state === "accepted") return end(answer.words, 1500);
   if (ENDS.includes(state)) return end(answer.words, 0);
-  busy = false;
-  buttons.forEach((b) => { b.disabled = false; });
   error.textContent = state === "refused" ? answer.words : "The form's answer couldn't be read (HTTP " + res.status + "). Try again.";
   error.hidden = false;
+  if (cancel) return;
+  busy = false;
+  if (due) return end(WORDS.expired, 0);
+  submitButton.disabled = false;
   field.value = "";
   say("", "");
   field.focus();
@@ -314,8 +328,9 @@ const page = (title, inner) =>
 // STARTUPINFO structure"), so a browser that wasn't running could start hidden. A browser has no console
 // to hide; cmd, open and xdg-open keep windowsHide, as before.
 //
-// The address, nonce and all, is an argument of the browser it starts, as it was of cmd's start before:
-// a process of the same user can read it there, and its nonce is spent once the window has opened it.
+// The address, nonce and all, is an argument of the browser it starts, as it was of cmd's start before
+// (and is of open or xdg-open): a process of the same user can read it there, and on Linux another
+// user's can too, through /proc. Its nonce is spent once the window has opened it.
 
 /** The key whose ProgId values name the person's default browser for http, on Windows. */
 export const HTTP_DEFAULT_KEY =
