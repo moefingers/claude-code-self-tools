@@ -8,10 +8,12 @@ import type { ConfigRow, ConfigValue, On } from 'claude-code'
 import {
   type Known,
   looksSecret,
+  MARKETPLACE,
   marketplacesOf,
   MAY_SET,
   NO_VALUE,
   OWNER_ONLY,
+  planSet,
   READ_TAKES,
   readAnswer,
   reloadSaid,
@@ -46,10 +48,16 @@ const updateCheck = (plugin: string, value = 'on', more: { plugin?: string; isLo
   row(`${plugin}.updateCheck`, 'Update check', 'choice', value, { options: ['on', 'off'], ...more })
 const reminder = (value: string): ConfigRow => row('self-compact.compactReminder', 'Compact reminder', 'text', value)
 
+/** The enabledPlugins setting's value, or one that isn't of its shape: settings_set fails closed on that as on a read that fails. */
+type Enabled = Readonly<Record<string, boolean>> | 'unreadable'
+
+/** Every plugin on the list, enabled from this marketplace alone: what settings_set needs to change any option on it. */
+const ALL_OURS: Readonly<Record<string, boolean>> = Object.fromEntries(MAY_SET.map(key => [`${key.slice(0, key.indexOf('.'))}@${MARKET}`, true]))
+
 type World = {
   rows: readonly ConfigRow[]
-  /** The enabledPlugins setting's value. */
-  enabled?: Readonly<Record<string, boolean>>
+  /** The enabledPlugins setting's value; ALL_OURS when left out. */
+  enabled?: Enabled
   /** A config.set hook beneath that refuses every change, with this reason. */
   deny?: string
   /** A config.set hook beneath that writes this value in place of the one asked. */
@@ -59,6 +67,7 @@ type World = {
 /** The engine beneath the plugin, and what the plugin asked of it: each change, each toast, each read. */
 function engine(on: On, world: World) {
   let rows = [...world.rows]
+  let enabled: Enabled = world.enabled ?? ALL_OURS
   const sets: string[] = []
   const toasts: string[] = []
   const asked = { list: 0, settings: 0 }
@@ -75,7 +84,7 @@ function engine(on: On, world: World) {
   })
   on('settings.read', () => {
     asked.settings += 1
-    return { value: { enabledPlugins: world.enabled ?? {} } }
+    return { value: { enabledPlugins: enabled === 'unreadable' ? ['not', 'a', 'map'] : enabled } }
   })
   // A hidden row still answers a change, as the engine's does: only the plugin's own rules keep it out.
   on('config.set', (_, e) => {
@@ -85,7 +94,15 @@ function engine(on: On, world: World) {
     rows = rows.map(r => (r.key === e.key ? { ...r, value } : r))
     return { value }
   })
-  return { sets, toasts, asked }
+  return {
+    sets,
+    toasts,
+    asked,
+    /** The enabledPlugins setting changes from here on. */
+    enable(next: Enabled) {
+      enabled = next
+    },
+  }
 }
 
 /** A call's answer as one line of text: its refusal, or its result. */
@@ -176,6 +193,51 @@ test('read: a sensitive field is named from the known table, never shown, and so
       SENSITIVE_NOTE,
     ].join('\n\n'),
     "No plugin row in /config matches marketplace elsewhere. The plugins' marketplaces couldn't be read.",
+  ])
+})
+
+test('read: "agents may set" says what settings_set does, row by row: a plugin of this marketplace alone, one row, its own, unlocked', () => {
+  expect(MARKETPLACE).toBe(MARKET)
+  const rows = [
+    updateCheck('self-compact'),
+    // From another marketplace only, from both, and from none (a plugin loaded with --plugin-dir).
+    updateCheck('self-check'),
+    updateCheck('self-color'),
+    updateCheck('self-clear'),
+    // Two rows of one key.
+    updateCheck('self-mcp'),
+    updateCheck('self-mcp'),
+    updateCheck('self-desktop', 'on', { isLocked: true }),
+    row('self-desktop.enabled', 'Read the desktop', 'choice', 'on', { options: ['off', 'on'] }),
+    // Another plugin's row under a listed key.
+    updateCheck('self-wake', 'on', { plugin: 'another-plugin' }),
+  ]
+  const marketplaces = marketplacesOf({
+    [`self-compact@${MARKET}`]: true,
+    'self-check@elsewhere': true,
+    [`self-color@${MARKET}`]: true,
+    'self-color@elsewhere': true,
+    [`self-mcp@${MARKET}`]: true,
+    [`self-desktop@${MARKET}`]: true,
+    [`self-wake@${MARKET}`]: true,
+  })
+  const lines = readAnswer(rows, marketplaces, {})
+    .split('\n')
+    .flatMap(line => {
+      const found = /^- (\S+), "[^"]*", .*; (agents may set|owner only)(?:; locked: a trusted source owns it)?$/.exec(line)
+      return found === null ? [] : [[found[1] ?? '', found[2] ?? '']]
+    })
+  const verdict = (key: string): string => ('change' in planSet({ key, value: 'off' }, rows, marketplaces) ? 'agents may set' : 'owner only')
+  expect(lines.map(([key = '', may]) => [key, may, verdict(key)])).toEqual([
+    ['self-compact.updateCheck', 'agents may set', 'agents may set'],
+    ['self-check.updateCheck', 'owner only', 'owner only'],
+    ['self-color.updateCheck', 'owner only', 'owner only'],
+    ['self-clear.updateCheck', 'owner only', 'owner only'],
+    ['self-mcp.updateCheck', 'owner only', 'owner only'],
+    ['self-mcp.updateCheck', 'owner only', 'owner only'],
+    ['self-desktop.updateCheck', 'owner only', 'owner only'],
+    ['self-desktop.enabled', 'owner only', 'owner only'],
+    ['self-wake.updateCheck', 'owner only', 'owner only'],
   ])
 })
 
@@ -280,7 +342,9 @@ test('the words: the owner-only line, who sees a change, and the note on sensiti
 test('every option on the list is changed through $.config.set, read back, said and toasted', async ($, on) => {
   const isReminder = (key: string): boolean => key === 'self-compact.compactReminder'
   const pluginOf = (key: string): string => key.slice(0, key.indexOf('.'))
-  const { sets, toasts } = engine(on, { rows: MAY_SET.map(key => (isReminder(key) ? reminder('') : updateCheck(pluginOf(key)))) })
+  // Every plugin on the list from this marketplace alone; another marketplace's plugin of a name, not enabled, counts for nothing.
+  const enabled = { ...ALL_OURS, 'self-check@elsewhere': false }
+  const { sets, toasts } = engine(on, { rows: MAY_SET.map(key => (isReminder(key) ? reminder('') : updateCheck(pluginOf(key)))), enabled })
   await $.session.start(START)
   const asks = MAY_SET.map(key => ({ key, value: isReminder(key) ? '40%' : 'off' }))
   const answers: [string, string][] = []
@@ -340,34 +404,55 @@ test("refused, and nothing is changed: a locked row, a hidden row, a key that is
     row('self-desktop.enabled', 'Read the desktop', 'choice', 'off', { options: ['off', 'on'] }),
     // self-wake.updateCheck is hidden: the engine lists no row for it, though its config.set would take it.
   ]
-  const { sets, toasts } = engine(on, { rows })
+  const { sets, toasts, enable } = engine(on, { rows })
   await $.session.start(START)
+  /**
+   * The enabledPlugins setting each call is made under: every plugin on the list from this marketplace alone (ours), or,
+   * for self-check, another marketplace's plugin of that name only, both, a value that can't be read, or none at all
+   * (a plugin loaded with --plugin-dir is enabled by no marketplace).
+   */
+  type Setting = 'ours' | 'elsewhere only' | 'both' | 'unreadable' | 'none'
+  const SETTINGS: Readonly<Record<Setting, Enabled>> = {
+    ours: ALL_OURS,
+    'elsewhere only': { 'self-check@elsewhere': true },
+    both: { [`self-check@${MARKET}`]: true, 'self-check@elsewhere': true },
+    unreadable: 'unreadable',
+    none: {},
+  }
   // A key off the list, an argument the tool doesn't take and a missing value are refused at tool.call; what needs the
-  // rows is refused at the serving.
-  const asks: [Record<string, unknown>, string][] = [
-    [{ key: 'self-desktop.updateCheck', value: 'off' }, atServing("self-desktop.updateCheck is locked: a trusted source (managed settings, the organization's policy) owns its value. Nothing was changed.")],
-    [{ key: 'self-wake.updateCheck', value: 'off' }, atServing("self-wake.updateCheck has no row in /config in this session (self-wake isn't enabled here, or a plugin hides the row), so nothing was changed.")],
-    [{ key: 'theme', value: 'light' }, atCall(OWNER_ONLY)],
-    [{ key: 'autoCompact', value: false }, atCall(OWNER_ONLY)],
-    [{ key: 'self-clear.updateCheck', value: 'off' }, atServing(OWNER_ONLY)],
-    [{ key: 'self-color.updateCheck', value: 'off' }, atServing(OWNER_ONLY)],
-    [{ key: 'self-desktop.enabled', value: 'on' }, atCall(OWNER_ONLY)],
-    [{ key: 'self-desktop.enabled', value: 'on', force: true }, atCall(OWNER_ONLY)],
-    [{ value: 'on' }, atCall(OWNER_ONLY)],
-    [{ key: ['self-compact.compactReminder'], value: '40%' }, atCall(OWNER_ONLY)],
-    [{ key: 'self-mcp.updateCheck', value: 'off' }, atServing("/config has more than one row named self-mcp.updateCheck, so which one would change can't be known. Nothing was changed.")],
-    [{ key: 'self-reload.updateCheck', value: 'maybe' }, atServing('self-reload.updateCheck takes one of: on, off. Nothing was changed.')],
-    [{ key: 'self-exit.updateCheck', value: false }, atServing('self-exit.updateCheck takes one of: on, off. Nothing was changed.')],
-    [{ key: 'self-compact.compactReminder', value: 40 }, atServing('self-compact.compactReminder takes a text. Nothing was changed.')],
-    [{ key: 'self-compact.compactReminder', value: ['40%'] }, atServing('self-compact.compactReminder takes a text. Nothing was changed.')],
-    [{ key: 'self-compact.compactReminder' }, atCall(NO_VALUE)],
-    [{ key: 'self-compact.compactReminder', value: null }, atCall(NO_VALUE)],
-    [{ key: 'self-compact.compactReminder', value: { levels: '40%' } }, atCall(NO_VALUE)],
-    [{ key: 'self-compact.compactReminder', value: '40%', plugin: 'self-compact' }, atCall(SET_TAKES)],
-    [{ key: 'self-check.updateCheck', value: 'on' }, 'result: self-check.updateCheck already reads "on", so nothing was changed.'],
+  // rows or the marketplaces is refused at the serving.
+  const asks: [Record<string, unknown>, Setting, string][] = [
+    [{ key: 'self-desktop.updateCheck', value: 'off' }, 'ours', atServing("self-desktop.updateCheck is locked: a trusted source (managed settings, the organization's policy) owns its value. Nothing was changed.")],
+    [{ key: 'self-wake.updateCheck', value: 'off' }, 'ours', atServing("self-wake.updateCheck has no row in /config in this session (self-wake isn't enabled here, or a plugin hides the row), so nothing was changed.")],
+    [{ key: 'theme', value: 'light' }, 'ours', atCall(OWNER_ONLY)],
+    [{ key: 'autoCompact', value: false }, 'ours', atCall(OWNER_ONLY)],
+    [{ key: 'self-clear.updateCheck', value: 'off' }, 'ours', atServing(OWNER_ONLY)],
+    [{ key: 'self-color.updateCheck', value: 'off' }, 'ours', atServing(OWNER_ONLY)],
+    [{ key: 'self-desktop.enabled', value: 'on' }, 'ours', atCall(OWNER_ONLY)],
+    [{ key: 'self-desktop.enabled', value: 'on', force: true }, 'ours', atCall(OWNER_ONLY)],
+    [{ value: 'on' }, 'ours', atCall(OWNER_ONLY)],
+    [{ key: ['self-compact.compactReminder'], value: '40%' }, 'ours', atCall(OWNER_ONLY)],
+    [{ key: 'self-mcp.updateCheck', value: 'off' }, 'ours', atServing("/config has more than one row named self-mcp.updateCheck, so which one would change can't be known. Nothing was changed.")],
+    [{ key: 'self-reload.updateCheck', value: 'maybe' }, 'ours', atServing('self-reload.updateCheck takes one of: on, off. Nothing was changed.')],
+    [{ key: 'self-exit.updateCheck', value: false }, 'ours', atServing('self-exit.updateCheck takes one of: on, off. Nothing was changed.')],
+    [{ key: 'self-compact.compactReminder', value: 40 }, 'ours', atServing('self-compact.compactReminder takes a text. Nothing was changed.')],
+    [{ key: 'self-compact.compactReminder', value: ['40%'] }, 'ours', atServing('self-compact.compactReminder takes a text. Nothing was changed.')],
+    [{ key: 'self-compact.compactReminder' }, 'ours', atCall(NO_VALUE)],
+    [{ key: 'self-compact.compactReminder', value: null }, 'ours', atCall(NO_VALUE)],
+    [{ key: 'self-compact.compactReminder', value: { levels: '40%' } }, 'ours', atCall(NO_VALUE)],
+    [{ key: 'self-compact.compactReminder', value: '40%', plugin: 'self-compact' }, 'ours', atCall(SET_TAKES)],
+    // A row of the listed key, unlocked and shown, but the plugin of that name isn't this marketplace's alone.
+    [{ key: 'self-check.updateCheck', value: 'off' }, 'elsewhere only', atServing(OWNER_ONLY)],
+    [{ key: 'self-check.updateCheck', value: 'off' }, 'both', atServing(OWNER_ONLY)],
+    [{ key: 'self-check.updateCheck', value: 'off' }, 'unreadable', atServing(OWNER_ONLY)],
+    [{ key: 'self-check.updateCheck', value: 'off' }, 'none', atServing(OWNER_ONLY)],
+    [{ key: 'self-check.updateCheck', value: 'on' }, 'ours', 'result: self-check.updateCheck already reads "on", so nothing was changed.'],
   ]
-  const got: [Record<string, unknown>, string][] = []
-  for (const [input] of asks) got.push([input, await set($, input)])
+  const got: [Record<string, unknown>, Setting, string][] = []
+  for (const [input, setting] of asks) {
+    enable(SETTINGS[setting])
+    got.push([input, setting, await set($, input)])
+  }
   expect({ got, sets, toasts }).toEqual({ got: asks, sets: [], toasts: [] })
 })
 

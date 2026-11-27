@@ -37,6 +37,9 @@ function otherValue(row) {
   return Array.isArray(row.value) ? [...row.value, 'x'] : `${row.value}x`
 }
 
+/** Every plugin here, and every plugin LATER names, enabled from this marketplace alone: so only the list refuses a field. */
+const OURS = new Map([...MANIFESTS.map(m => m.name), 'self-new'].map(name => [name, [settings.MARKETPLACE]]))
+
 /** Fields no manifest declares today, as a plugin might add them later: read only, like any field off the list. */
 const LATER = [
   { plugin: 'self-compact', field: 'newOption', key: 'self-compact.newOption', spec: { type: 'string', default: '' } },
@@ -54,12 +57,13 @@ test('the manifests were found, every plugin with a userConfig among them', () =
 
 test('every field off the list is refused with exactly the owner-only line, at the call and at the serving, its row there, shown and unlocked', () => {
   assert.equal(settings.OWNER_ONLY, 'owner only: /config by hand')
-  const off = [...FIELDS.filter(f => !settings.MAY_SET.includes(f.key)), ...LATER]
+  assert.equal(settings.MARKETPLACE, 'claude-code-self-tools')
+  const off =[...FIELDS.filter(f => !settings.MAY_SET.includes(f.key)), ...LATER]
   assert.ok(off.length >= 15 + LATER.length, `fields off the list: ${off.length}`)
   const said = off.map(f => {
     const row = rowOf(f)
     const input = { key: f.key, value: otherValue(row) }
-    return [f.key, settings.setInputOf(input), settings.callRefusal('settings_set', input), settings.planSet(input, [row])]
+    return [f.key, settings.setInputOf(input), settings.callRefusal('settings_set', input), settings.planSet(input, [row], OURS)]
   })
   const refused = { deny: settings.OWNER_ONLY }
   assert.deepEqual(said, off.map(f => [f.key, refused, refused, refused]))
@@ -72,7 +76,7 @@ test("every entry on the list names a field that is there and isn't sensitive, a
     if (f === undefined) return 'no such field'
     if (f.spec.sensitive === true) return 'sensitive'
     const row = rowOf(f)
-    const plan = settings.planSet({ key, value: otherValue(row) }, [row])
+    const plan = settings.planSet({ key, value: otherValue(row) }, [row], OURS)
     return 'change' in plan ? 'a field, changed' : `a field, not changed: ${JSON.stringify(plan)}`
   }
   assert.deepEqual(

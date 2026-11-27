@@ -20,9 +20,11 @@
 // What the engine gives, and what it doesn't. $.config.list gives each row's key, label, kind, choices, value, owner
 // and lock, a hidden row left out (one still answers $.config.set, so settings_set refuses a key with no listed row).
 // It gives no default and no sensitive field (one is kept in secure storage, and has no row), and no other $ call hands
-// a plugin another plugin's userConfig: settings.ts's KNOWN holds this marketplace's manifests instead. The marketplace
-// of a plugin is read from the `enabledPlugins` setting's value alone, through $.settings.read({ key }); no other
-// setting is read, and no file. No config.set hook: self-settings polices only its own tool.
+// a plugin another plugin's userConfig: settings.ts's KNOWN holds this marketplace's manifests instead. A row names its
+// plugin by name, not marketplace, so the marketplaces each plugin is enabled from are read from the `enabledPlugins`
+// setting's value alone, through $.settings.read({ key }); no other setting is read, and no file. settings_read shows
+// them, and settings_set changes an option only for a plugin enabled from claude-code-self-tools alone, refusing when
+// they can't be read. No config.set hook: self-settings polices only its own tool.
 import type { ConfigSetResult, EngineInterface, Register } from 'claude-code'
 import {
   type After,
@@ -114,7 +116,9 @@ async function serveSet($: EngineInterface, e: object & { readonly agentId?: str
   } catch (err) {
     return { deny: `self-settings: the /config rows couldn't be read (${why(err)}), so nothing was changed.` }
   }
-  const plan = planSet(e, listed)
+  // The plugin the key names must be enabled from this marketplace alone (planSet, isOursAlone): a row names its plugin
+  // by name only. Marketplaces that can't be read refuse.
+  const plan = planSet(e, listed, await marketplaces($))
   if ('deny' in plan) return plan
   if ('same' in plan) return { result: plan.same }
   const { change } = plan
