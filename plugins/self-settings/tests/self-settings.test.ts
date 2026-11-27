@@ -204,18 +204,20 @@ test('read: the plugins\' rows by plugin, each heading where its rows came from,
   expect({ sets, toasts, ...asked }).toEqual({ sets: [], toasts: [], list: 1, settings: 1 })
 })
 
-test("read: a sensitive field is named from the known table, never shown, and so is a row of one, for this marketplace's rows alone; a setting not read is said, and the marketplace filter still matches the rows' own source", () => {
+test("read: a sensitive field is named from the known table, never shown, and so is a row of one, whatever its source; the defaults for this marketplace's rows alone; a setting not read is said, and the marketplace filter still matches the rows' own source", () => {
   const known: Known = { 'other-plugin': { apiKey: { default: '', sensitive: true }, pin: { default: '', sensitive: true }, mode: { default: 'b' } } }
   const rows = [
     row('other-plugin.mode', 'Mode', 'choice', 'a', { options: ['a', 'b'] }),
     row('other-plugin.pin', 'PIN', 'text', built('12', '34')),
-    // A plugin of that name from another marketplace: neither the known defaults nor the sensitive names are its.
+    // A plugin of that name from another marketplace: the known defaults aren't its, and the fields with no row aren't
+    // named under it, but a row of a field the table marks sensitive is hidden all the same, leaning toward hiding.
     row('other-plugin.mode', 'Mode', 'choice', 'a', { options: ['a', 'b'], source: 'elsewhere' }),
     row('other-plugin.pin', 'PIN', 'text', built('12', '34'), { source: 'elsewhere' }),
+    row('other-plugin.apiKey', 'API key', 'text', built('k3y', '-', 'value'), { source: 'elsewhere' }),
   ]
   expect([readAnswer(rows, undefined, {}, known), readAnswer(ROWS, undefined, { marketplace: 'elsewhere' })]).toEqual([
     [
-      HEAD('2 plugins', '4 rows'),
+      HEAD('2 plugins', '5 rows'),
       [
         'other-plugin (from claude-code-self-tools)',
         '- other-plugin.mode, "Mode", choice of a, b: "a"; set (default "b"); owner only',
@@ -225,7 +227,8 @@ test("read: a sensitive field is named from the known table, never shown, and so
       [
         'other-plugin (from elsewhere)',
         '- other-plugin.mode, "Mode", choice of a, b: "a"; default unknown; owner only',
-        `- other-plugin.pin, "PIN", text: "${built('12', '34')}"; default unknown; owner only`,
+        '- other-plugin.pin, "PIN", text: sensitive: not shown; owner only',
+        '- other-plugin.apiKey, "API key", text: sensitive: not shown; owner only',
       ].join('\n'),
       UNREAD_NOTE,
       SENSITIVE_NOTE,
@@ -653,7 +656,7 @@ test("refused, and nothing is changed: a locked row, a hidden row, a key that is
   expect({ got, sets, toasts }).toEqual({ got: asks, sets: [], toasts: [] })
 })
 
-test("a listed key is changed only on a row whose own provider is its plugin from this marketplace: from anywhere else, or a provider that doesn't parse, refused at the serving, and nothing changed", async ($, on) => {
+test("a listed key is changed only on a row whose own provider is its plugin from this marketplace: from anywhere else, or a provider that doesn't parse, refused at the serving, and nothing changed; two rows of the key, this marketplace's among them, refused as two", async ($, on) => {
   // The setting enables self-compact from this marketplace alone (ALL_OURS): only the row's provider differs, call to call.
   const { sets, toasts, show } = engine(on, { rows: [] })
   await $.session.start(START)
@@ -678,8 +681,12 @@ test("a listed key is changed only on a row whose own provider is its plugin fro
     show([row('self-compact.compactReminder', 'Compact reminder', 'text', '', { provider })])
     got.push([provider, await set($, { key: 'self-compact.compactReminder', value: '40%' })])
   }
-  expect({ got, sets, toasts }).toEqual({
+  // This marketplace's row and a folder's of the same key: the rows are counted before either's source is asked.
+  show([reminder(''), row('self-compact.compactReminder', 'Compact reminder', 'text', '', { source: 'inline' })])
+  const both = await set($, { key: 'self-compact.compactReminder', value: '40%' })
+  expect({ got, both, sets, toasts }).toEqual({
     got: asks,
+    both: atServing("/config has more than one row named self-compact.compactReminder, so which one would change can't be known. Nothing was changed."),
     sets: ['self-compact.compactReminder="40%"'],
     toasts: ['self-settings set self-compact.compactReminder: it now reads "40%"'],
   })

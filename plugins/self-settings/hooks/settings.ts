@@ -65,8 +65,9 @@ const UPDATE_CHECK: Field = Object.freeze({ default: 'on', options: ON_OFF })
  * Each option of this marketplace's plugins as their manifests declare it in this release: its default, its options,
  * and whether it is sensitive. The engine hands no plugin another plugin's userConfig (a $.config.list row carries no
  * default, and a sensitive field has no row at all), so this is how settings_read tells a value that was set from a
- * default, and names a sensitive field, for these plugins, on a row whose provider says it came from this marketplace;
- * for any other plugin, a same-name one from anywhere else included, it says the default is unknown; and how
+ * default, for these plugins, on a row whose provider says it came from this marketplace (for any other plugin, a
+ * same-name one from anywhere else included, it says the default is unknown); how it names a sensitive field, hiding a
+ * row of one whatever its source, and naming one with no row under this marketplace's heading only; and how
  * settings_set knows the kind a listed option's row must have. A plugin installed at another version may declare
  * otherwise.
  */
@@ -337,7 +338,10 @@ function misfitOf(row: Row, value: ConfigValue): string | undefined {
  */
 export const MARKETPLACE = 'claude-code-self-tools'
 
-/** Whether the row came from this marketplace, by its provider's own ID: only then do KNOWN's defaults and sensitive names apply. */
+/**
+ * Whether the row came from this marketplace, by its provider's own ID: only then do KNOWN's defaults apply, and its
+ * sensitive fields with no row get named. A row of a field KNOWN marks sensitive is hidden whatever its source.
+ */
 const isFromHere = (row: Row): boolean => row.source === MARKETPLACE
 
 /**
@@ -504,18 +508,19 @@ const maySetRow = (row: Row, rows: readonly Row[], marketplaces: Marketplaces, k
 
 /**
  * One row's line, among all the rows listed: key, label, kind: value; set or at its default; who may change it; its
- * lock. What `known` says of the field (its default, whether it is sensitive) applies to a row from this marketplace
- * only: a same-name plugin from anywhere else reads `default unknown`.
+ * lock. A field `known` marks sensitive is never shown, whatever the row's source: a same-name plugin's row of it is
+ * hidden too, leaning toward hiding. Its default applies to a row from this marketplace only: a same-name plugin from
+ * anywhere else reads `default unknown`.
  */
 function rowSaid(row: Row, rows: readonly Row[], marketplaces: Marketplaces, known: Known): string {
-  const field = isFromHere(row) ? fieldOf(row) : undefined
+  const field = fieldOf(row)
   const spec = field === undefined ? undefined : known[row.plugin]?.[field]
   const kind = row.kind === 'choice' ? `choice of ${(row.options ?? []).map(named).join(', ')}` : row.kind
   const head = `- ${named(row.key)}, ${JSON.stringify(row.label)}, ${kind}`
   const locked = row.isLocked ? '; locked: a trusted source owns it' : ''
   if (spec?.sensitive === true) return `${head}: sensitive: not shown; owner only${locked}`
   const may = maySetRow(row, rows, marketplaces, known) ? 'agents may set' : 'owner only'
-  const fallback = spec?.default
+  const fallback = isFromHere(row) ? spec?.default : undefined
   let state: string
   if (valueLooksSecret(row.value)) state = fallback !== undefined && sameValue(row.value, fallback) ? `default ${HIDDEN}` : `set ${HIDDEN}`
   else if (fallback === undefined) state = `${shown(row.value)}; default unknown`
