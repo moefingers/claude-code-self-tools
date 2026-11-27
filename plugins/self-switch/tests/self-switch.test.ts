@@ -58,6 +58,14 @@ const launchOf = (where: LaunchInput['where'], folder: string, claim: string = L
 const TOKEN = '00000000-0000-4000-a000-000000000001'
 const PANE = JSON.stringify({ v: 2, pid: 20, started: ft(1) })
 
+/**
+ * The path the plugin asked for, from the path a fake file hook is given. On Linux a Windows path (C:\...) is a relative
+ * one, so the test kit resolves it against the plugin's folder before any hook sees it, as `<that folder>/C:\...`: that
+ * prefix is taken off, and the drive and what follows it are what the plugin asked for. On Windows, and for a POSIX
+ * path, the path is as given. Nothing is resolved with Node's path. (self-chrome's tests read it the same way, #93.)
+ */
+const asked = (path: string): string => /^\/.*\/([A-Za-z]:\\[^/]*)$/.exec(path)?.[1] ?? path
+
 /** The test's own `$`, through which the engine fake dispatches what the engine would. */
 type TestDollar = Parameters<Extract<Parameters<typeof test>[1], (...args: never[]) => unknown>>[0]
 
@@ -317,23 +325,29 @@ function engine(
   // The conversation's transcript is under whichever project folder the start folder a test gives names, so
   // a session.start's own folder, held provisional, is known at once to be where the session started.
   const TRANSCRIPT = /\\projects\\[^\\]+\\[0-9a-f-]{36}\.jsonl$/
-  on('fs.exists', (_, e) => answer({ value: e.path === GATE ? world.gate !== undefined : e.path === MARKER ? world.wake.marker !== undefined : files.has(e.path) || TRANSCRIPT.test(e.path) }))
-  on('fs.read', (_, e) =>
-    answer(
-      files.has(e.path)
-        ? { value: files.get(e.path) as string }
-        : e.path === GATE && world.gate !== undefined
+  // Each file hook reads the path the plugin asked for (asked): on Linux the kit hands it a C:\... path prefixed with the plugin's folder.
+  on('fs.exists', (_, e) => {
+    const path = asked(e.path)
+    return answer({ value: path === GATE ? world.gate !== undefined : path === MARKER ? world.wake.marker !== undefined : files.has(path) || TRANSCRIPT.test(path) })
+  })
+  on('fs.read', (_, e) => {
+    const path = asked(e.path)
+    return answer(
+      files.has(path)
+        ? { value: files.get(path) as string }
+        : path === GATE && world.gate !== undefined
         ? { value: world.gate }
-        : e.path === panePath(STATE, TOKEN) && pane !== undefined
+        : path === panePath(STATE, TOKEN) && pane !== undefined
           ? { value: pane }
-          : e.path === MARKER && world.wake.marker !== undefined
+          : path === MARKER && world.wake.marker !== undefined
             ? { value: world.wake.marker }
-            : { deny: `ENOENT: ${e.path}` },
-    ),
-  )
+            : { deny: `ENOENT: ${path}` },
+    )
+  })
   on('fs.write', (_, e) => {
-    writes.push({ path: e.path, text: e.text })
-    files.set(e.path, e.text)
+    const path = asked(e.path)
+    writes.push({ path, text: e.text })
+    files.set(path, e.text)
     return answer({ value: undefined })
   })
   // An untracked file's stat is one of a fingerprint's reads: a hash still to come stays to come.
