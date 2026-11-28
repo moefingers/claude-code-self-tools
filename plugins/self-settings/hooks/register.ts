@@ -22,7 +22,7 @@
 // So when a hook hides a same-name plugin's row (one loaded from a folder, say), this marketplace's row is the only one
 // listed, settings_set counts one row, and $.config.set sets the bare key as the engine resolves it: its argument
 // (ConfigSetArgs) is a key and a value, with no plugin ID. That is bounded: only the options on MAY_SET, and a plugin
-// the owner loaded on their own machine. $.config.list gives no default and no sensitive field (one is kept in secure
+// no marketplace enables. $.config.list gives no default and no sensitive field (one is kept in secure
 // storage, and has no row), and no other $ call hands a plugin another plugin's userConfig: settings.ts's KNOWN holds
 // this marketplace's manifests instead. A row's key names its plugin by the bare name, while its provider is the
 // plugin's ID, `<name>@<source>` (a marketplace, `inline` for a folder, `builtin`), so settings_read heads each plugin
