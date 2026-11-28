@@ -22,11 +22,15 @@ const MANIFESTS = plugins().map(folder => {
 /** Every userConfig field of every manifest, as `<plugin>.<field>`, with what the manifest declares of it. */
 const FIELDS = MANIFESTS.flatMap(({ name, userConfig }) => Object.entries(userConfig).map(([field, spec]) => ({ plugin: name, field, key: `${name}.${field}`, spec })))
 
-/** The /config row a field would have: its plugin's own, shown, unlocked, holding its default. */
+/**
+ * The /config row a field would have: its plugin's own, installed from this marketplace (its provider the plugin's ID,
+ * `<plugin>@claude-code-self-tools`, as the engine lists it), shown, unlocked, holding its default.
+ */
 function rowOf({ plugin, key, spec }) {
   const kind = spec.type === 'boolean' ? 'boolean' : spec.type === 'number' ? 'number' : Array.isArray(spec.options) ? 'choice' : 'text'
   const value = spec.default ?? (spec.multiple === true ? [] : kind === 'boolean' ? false : kind === 'number' ? 0 : '')
-  return { key, label: spec.title ?? key, kind, value, ...(Array.isArray(spec.options) ? { options: spec.options } : {}), provider: { plugin, tier: 'user' }, isLocked: false }
+  const provider = { plugin: `${plugin}@${settings.MARKETPLACE}`, tier: 'user' }
+  return { key, label: spec.title ?? key, kind, value, ...(Array.isArray(spec.options) ? { options: spec.options } : {}), provider, isLocked: false }
 }
 
 /** A value of the row's kind other than the one it holds: what a change would ask for. */
