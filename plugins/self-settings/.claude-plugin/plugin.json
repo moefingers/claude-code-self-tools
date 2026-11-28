@@ -1,6 +1,6 @@
 {
   "name": "self-settings",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Lets a session read this machine's plugin settings as the /config menu shows them (key, label, kind, choices, value, lock, set or at its default, and who may change it), and change only the options on a fixed list: each claude-code-self-tools plugin's update check, and self-compact's compact reminder, through Claude Code's own /config writer. Every other option is read only: the owner changes it in /config by hand. A sensitive field's value is never read, and a value that looks like a secret is never shown.",
   "author": { "name": "moefingers", "url": "https://github.com/moefingers" },
   "homepage": "https://github.com/moefingers/claude-code-self-tools/tree/main/plugins/self-settings#readme",
