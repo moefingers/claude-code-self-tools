@@ -19,13 +19,17 @@
 //
 // What the engine gives, and what it doesn't. $.config.list gives each row's key, label, kind, choices, value, owner
 // and lock, a hidden row left out (one still answers $.config.set, so settings_set refuses a key with no listed row).
-// It gives no default and no sensitive field (one is kept in secure storage, and has no row), and no other $ call hands
-// a plugin another plugin's userConfig: settings.ts's KNOWN holds this marketplace's manifests instead. A row's key
-// names its plugin by the bare name, while its provider is the plugin's ID, `<name>@<source>` (a marketplace, `inline`
-// for a folder, `builtin`), so settings_read heads each plugin with where its rows came from, and settings_set changes
-// an option only on a row from claude-code-self-tools. It also needs the plugin enabled from claude-code-self-tools
-// alone, as the `enabledPlugins` setting's value says, read through $.settings.read({ key }), and refuses when that
-// can't be read; no other setting is read, and no file. No config.set hook: self-settings polices only its own tool.
+// So when a hook hides a same-name plugin's row (one loaded from a folder, say), this marketplace's row is the only one
+// listed, settings_set counts one row, and $.config.set sets the bare key as the engine resolves it: its argument
+// (ConfigSetArgs) is a key and a value, with no plugin ID. That is bounded: only the options on MAY_SET, and a plugin
+// no marketplace enables. $.config.list gives no default and no sensitive field (one is kept in secure
+// storage, and has no row), and no other $ call hands a plugin another plugin's userConfig: settings.ts's KNOWN holds
+// this marketplace's manifests instead. A row's key names its plugin by the bare name, while its provider is the
+// plugin's ID, `<name>@<source>` (a marketplace, `inline` for a folder, `builtin`), so settings_read heads each plugin
+// with where its rows came from, and settings_set changes an option only on a row from claude-code-self-tools. It also
+// needs the plugin enabled from claude-code-self-tools alone, as the `enabledPlugins` setting's value says, read
+// through $.settings.read({ key }), and refuses when that can't be read; no other setting is read, and no file. No
+// config.set hook: self-settings polices only its own tool.
 import type { ConfigSetResult, EngineInterface, Register } from 'claude-code'
 import {
   type After,

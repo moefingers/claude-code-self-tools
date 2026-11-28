@@ -246,6 +246,50 @@ test("read: a sensitive field is named from the known table, never shown, and so
   ])
 })
 
+test("read: a sensitive field with no row is named under this marketplace's heading alone, never under a same-name plugin's from another marketplace or a folder", () => {
+  const known: Known = { 'other-plugin': { apiKey: { default: '', sensitive: true }, mode: { default: 'a' } } }
+  // No row of apiKey from any source: only the heading's source decides where it is named.
+  const rows = [
+    row('other-plugin.mode', 'Mode', 'text', 'a'),
+    row('other-plugin.mode', 'Mode', 'text', 'a', { source: 'elsewhere' }),
+    row('other-plugin.mode', 'Mode', 'text', 'a', { source: 'inline' }),
+  ]
+  expect(readAnswer(rows, marketplacesOf({}), {}, known)).toEqual(
+    [
+      HEAD('3 plugins', '3 rows'),
+      ['other-plugin (from claude-code-self-tools)', '- other-plugin.mode, "Mode", text: "a"; default; owner only', '- other-plugin.apiKey: sensitive: not shown'].join('\n'),
+      ['other-plugin (from elsewhere)', '- other-plugin.mode, "Mode", text: "a"; default unknown; owner only'].join('\n'),
+      ['other-plugin (loaded from a folder)', '- other-plugin.mode, "Mode", text: "a"; default unknown; owner only'].join('\n'),
+      SENSITIVE_NOTE,
+    ].join('\n\n'),
+  )
+})
+
+test("read: a row of a field the known table marks sensitive is hidden by its key, whatever its provider: this marketplace, a folder, another marketplace, another plugin's ID, one that doesn't parse; none of its value reaches the answer", () => {
+  const known: Known = { 'other-plugin': { apiKey: { default: '', sensitive: true } } }
+  // A made-up secret, put together here, that the secret rule alone would show: only the sensitive mark hides it.
+  const secret = built('Zq7', 'vKp', '3xW', 'm9t')
+  expect(looksSecret(secret)).toBe(false)
+  const apiKey = (more: From): ConfigRow => row('other-plugin.apiKey', 'API key', 'text', secret, more)
+  // The engine's own row of a plugin's key isn't listed at all (isPluginRow), so it is left out here.
+  const rows = [apiKey({}), apiKey({ source: 'inline' }), apiKey({ source: 'elsewhere' }), apiKey({ plugin: 'another-plugin' }), apiKey({ provider: 'a@b@c' })]
+  const answer = readAnswer(rows, marketplacesOf({}), {}, known)
+  const hidden = '- other-plugin.apiKey, "API key", text: sensitive: not shown; owner only'
+  const runs = Array.from({ length: secret.length - 3 }, (_, i) => secret.slice(i, i + 4))
+  expect({ answer, shown: runs.filter(run => answer.includes(run)) }).toEqual({
+    answer: [
+      HEAD('5 plugins', '5 rows'),
+      ['other-plugin (from claude-code-self-tools)', hidden].join('\n'),
+      ['other-plugin (loaded from a folder)', hidden].join('\n'),
+      ['other-plugin (from elsewhere)', hidden].join('\n'),
+      ['another-plugin (from claude-code-self-tools)', hidden].join('\n'),
+      ['a@b@c (source unknown)', hidden].join('\n'),
+      SENSITIVE_NOTE,
+    ].join('\n\n'),
+    shown: [],
+  })
+})
+
 test('read: "agents may set" says what settings_set does, row by row: a plugin of this marketplace alone, one row, its own, unlocked', () => {
   expect(MARKETPLACE).toBe(MARKET)
   const rows = [
@@ -501,7 +545,7 @@ test('the words: the owner-only line, who sees a change, the note on sensitive f
   expect([OWNER_ONLY, reloadSaid('self-compact'), SENSITIVE_NOTE, UNREAD_NOTE]).toEqual([
     'owner only: /config by hand',
     'This session reloads self-compact on its own. Other open sessions may need /reload-plugins to see it.',
-    'A sensitive field has no row in /config, and self-settings never reads its value; it names one, and knows each default, only for the plugins of its own marketplace, claude-code-self-tools.',
+    'A sensitive field has no row in /config, and self-settings never reads its value. It knows each default, and names a sensitive field with no row, only for the plugins of its own marketplace, claude-code-self-tools; a row of a field it knows as sensitive is never shown, wherever the row came from.',
     "The enabledPlugins setting couldn't be read, so settings_set changes no option until it can be.",
   ])
 })
@@ -656,7 +700,7 @@ test("refused, and nothing is changed: a locked row, a hidden row, a key that is
   expect({ got, sets, toasts }).toEqual({ got: asks, sets: [], toasts: [] })
 })
 
-test("a listed key is changed only on a row whose own provider is its plugin from this marketplace: from anywhere else, or a provider that doesn't parse, refused at the serving, and nothing changed; two rows of the key, this marketplace's among them, refused as two", async ($, on) => {
+test("a listed key is changed only on a row whose own provider is its plugin from this marketplace, exactly: from anywhere else, a near miss of the ID, or a provider that doesn't parse, refused at the serving, and nothing changed; two rows of the key, this marketplace's among them, refused as two", async ($, on) => {
   // The setting enables self-compact from this marketplace alone (ALL_OURS): only the row's provider differs, call to call.
   const { sets, toasts, show } = engine(on, { rows: [] })
   await $.session.start(START)
@@ -675,6 +719,22 @@ test("a listed key is changed only on a row whose own provider is its plugin fro
     [`self-compact @${MARKET}`, atServing(OWNER_ONLY)],
     ['self-compact@', atServing(OWNER_ONLY)],
     [`@${MARKET}`, atServing(OWNER_ONLY)],
+    // Near misses of the ID. These parse, as another source or another plugin's name, and the exact compare refuses
+    // them: a prefix or a suffix on the source, a zero-width space (no whitespace to `\s`) at the end of the source or
+    // the start of the name, and a look-alike letter (the Cyrillic `\u0441` for `c`) in either.
+    [`self-compact@x${MARKET}`, atServing(OWNER_ONLY)],
+    [`self-compact@${MARKET}x`, atServing(OWNER_ONLY)],
+    [`self-compact@${MARKET}-2`, atServing(OWNER_ONLY)],
+    [`self-compact@${MARKET}\u200b`, atServing(OWNER_ONLY)],
+    [`\u200bself-compact@${MARKET}`, atServing(OWNER_ONLY)],
+    ['self-compact@\u0441laude-code-self-tools', atServing(OWNER_ONLY)],
+    [`self-\u0441ompact@${MARKET}`, atServing(OWNER_ONLY)],
+    // These don't parse as an ID at all, since `\s` holds each (a BOM is whitespace to it), so they are kept whole:
+    // a BOM at the end of the source or the start of the name, and a trailing newline or tab on the whole ID.
+    [`self-compact@${MARKET}\ufeff`, atServing(OWNER_ONLY)],
+    [`\ufeffself-compact@${MARKET}`, atServing(OWNER_ONLY)],
+    [`self-compact@${MARKET}\n`, atServing(OWNER_ONLY)],
+    [`self-compact@${MARKET}\t`, atServing(OWNER_ONLY)],
   ]
   const got: [string, string][] = []
   for (const [provider] of asks) {
