@@ -67,9 +67,9 @@ const UPDATE_CHECK: Field = Object.freeze({ default: 'on', options: ON_OFF })
  * default, and a sensitive field has no row at all), so this is how settings_read tells a value that was set from a
  * default, for these plugins, on a row whose provider says it came from this marketplace (for any other plugin, a
  * same-name one from anywhere else included, it says the default is unknown); how it names a sensitive field, hiding a
- * row of one whatever its source, and naming one with no row under this marketplace's heading only; and how
- * settings_set knows the kind a listed option's row must have. A plugin installed at another version may declare
- * otherwise.
+ * row of one by its key, whatever the row's provider says, and naming one with no row under this marketplace's heading
+ * only; and how settings_set knows the kind a listed option's row must have. A plugin installed at another version may
+ * declare otherwise.
  */
 export const KNOWN: Known = Object.freeze({
   'self-check': {
@@ -232,6 +232,15 @@ const pluginOfKey = (key: string): string | undefined => {
 /** The field a plugin's row is for: its key past `<plugin>.`; undefined when the key doesn't start with its plugin's bare name. */
 const fieldOf = (row: Row): string | undefined => (row.key.startsWith(`${row.plugin}.`) ? row.key.slice(row.plugin.length + 1) : undefined)
 
+/**
+ * The field `known` holds for a key, by the key alone: the plugin it names (pluginOfKey) and the rest of it past
+ * `<that plugin>.`, whoever owns a row of it; undefined when `known` holds none.
+ */
+const specOfKey = (key: string, known: Known): Field | undefined => {
+  const plugin = pluginOfKey(key)
+  return plugin === undefined ? undefined : known[plugin]?.[key.slice(plugin.length + 1)]
+}
+
 /** Whether two values are the same: equal, or two lists of the same texts in the same order. */
 export function sameValue(a: ConfigValue, b: ConfigValue): boolean {
   if (typeof a === 'string' || typeof a === 'number' || typeof a === 'boolean' || typeof b === 'string' || typeof b === 'number' || typeof b === 'boolean') return a === b
@@ -339,8 +348,9 @@ function misfitOf(row: Row, value: ConfigValue): string | undefined {
 export const MARKETPLACE = 'claude-code-self-tools'
 
 /**
- * Whether the row came from this marketplace, by its provider's own ID: only then do KNOWN's defaults apply, and its
- * sensitive fields with no row get named. A row of a field KNOWN marks sensitive is hidden whatever its source.
+ * Whether the row came from this marketplace, by its provider's own ID: only then do KNOWN's defaults apply, and only
+ * under its heading are KNOWN's sensitive fields with no row named. That gate is for a field with no row alone: a row of
+ * a field KNOWN marks sensitive is hidden from anywhere, looked up by its key (rowSaid), whatever its provider says.
  */
 const isFromHere = (row: Row): boolean => row.source === MARKETPLACE
 
@@ -398,7 +408,7 @@ function hasDeclaredKind(row: Row, spec: Field): boolean {
 function optionOf(key: string, rows: readonly Row[], marketplaces: Marketplaces, known: Known): Option | Refused {
   const plugin = pluginOfKey(key)
   if (!maySet(key) || plugin === undefined) return { deny: OWNER_ONLY }
-  const spec = known[plugin]?.[key.slice(plugin.length + 1)]
+  const spec = specOfKey(key, known)
   if (spec === undefined || spec.sensitive === true) return { deny: OWNER_ONLY }
   if (!isOursAlone(marketplaces, plugin)) return { deny: OWNER_ONLY }
   const matching = rows.filter(row => row.key === key)
@@ -508,9 +518,11 @@ const maySetRow = (row: Row, rows: readonly Row[], marketplaces: Marketplaces, k
 
 /**
  * One row's line, among all the rows listed: key, label, kind: value; set or at its default; who may change it; its
- * lock. A field `known` marks sensitive is never shown, whatever the row's source: a same-name plugin's row of it is
- * hidden too, leaning toward hiding. Its default applies to a row from this marketplace only: a same-name plugin from
- * anywhere else reads `default unknown`.
+ * lock. A row of a field `known` marks sensitive is never shown, whatever its provider says: the mark is looked up by
+ * the key alone (specOfKey: the plugin the key names, and the rest of the key), and by the row's provider's plugin as
+ * well, and either hides it. So a same-name plugin's row of it, from anywhere, another plugin's row of that key, and a
+ * row whose provider doesn't parse are hidden too, leaning toward hiding. Its default applies to a row from this
+ * marketplace only, looked up by its provider: a same-name plugin from anywhere else reads `default unknown`.
  */
 function rowSaid(row: Row, rows: readonly Row[], marketplaces: Marketplaces, known: Known): string {
   const field = fieldOf(row)
@@ -518,7 +530,8 @@ function rowSaid(row: Row, rows: readonly Row[], marketplaces: Marketplaces, kno
   const kind = row.kind === 'choice' ? `choice of ${(row.options ?? []).map(named).join(', ')}` : row.kind
   const head = `- ${named(row.key)}, ${JSON.stringify(row.label)}, ${kind}`
   const locked = row.isLocked ? '; locked: a trusted source owns it' : ''
-  if (spec?.sensitive === true) return `${head}: sensitive: not shown; owner only${locked}`
+  // Sensitive by the key's own plugin and field, whoever's row it is, or by the row's provider: either hides it.
+  if (specOfKey(row.key, known)?.sensitive === true || spec?.sensitive === true) return `${head}: sensitive: not shown; owner only${locked}`
   const may = maySetRow(row, rows, marketplaces, known) ? 'agents may set' : 'owner only'
   const fallback = isFromHere(row) ? spec?.default : undefined
   let state: string
@@ -543,7 +556,8 @@ function fromSaid(source: string | undefined): string {
 /**
  * One plugin's part: its heading (its bare name, and where its rows came from), its rows, and, for a plugin from this
  * marketplace, the sensitive fields `known` names for it that have no row. A same-name plugin from anywhere else gets
- * none of them named.
+ * none of those named. The gate is for a field with no row alone: a row of a sensitive field is hidden in any group,
+ * from anywhere (rowSaid).
  */
 function groupSaid(rows: readonly Row[], all: readonly Row[], marketplaces: Marketplaces, known: Known): string {
   const [first] = rows
@@ -558,7 +572,7 @@ function groupSaid(rows: readonly Row[], all: readonly Row[], marketplaces: Mark
 
 /** The last paragraph of every read that lists a row. */
 export const SENSITIVE_NOTE =
-  'A sensitive field has no row in /config, and self-settings never reads its value; it names one, and knows each default, only for the plugins of its own marketplace, claude-code-self-tools.'
+  'A sensitive field has no row in /config, and self-settings never reads its value. It knows each default, and names a sensitive field with no row, only for the plugins of its own marketplace, claude-code-self-tools; a row of a field it knows as sensitive is never shown, wherever the row came from.'
 
 /** What a read that lists a row says when the `enabledPlugins` setting couldn't be read, before SENSITIVE_NOTE. */
 export const UNREAD_NOTE = "The enabledPlugins setting couldn't be read, so settings_set changes no option until it can be."
